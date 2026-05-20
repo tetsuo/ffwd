@@ -92,6 +92,11 @@ typedef struct {
     int    rope_cache_cap;
 } pplx_ctx_t;
 
+typedef struct {
+    const int *ids;
+    int n_tokens;
+} pplx_input_t;
+
 /* ========================================================================
  * API
  * ======================================================================== */
@@ -124,6 +129,25 @@ void pplx_free(pplx_ctx_t *ctx);
 float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
 
 /*
+ * Compute one embedding into caller-provided out[hidden_size].
+ * Returns 0 on success, -1 on error.
+ */
+int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                    float *out_embedding);
+
+/*
+ * Compute embeddings for a true packed/ragged batch.
+ *
+ * out_embeddings is caller-provided [batch, hidden_size].
+ * Each sequence attends only to tokens from the same input, and RoPE
+ * positions restart at zero for every input.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
+                     float *out_embeddings);
+
+/*
  * Run the transformer forward pass WITHOUT pooling.
  * Returns the full [n_tokens * hidden_size] output after final RMSNorm.
  * Caller frees the returned buffer.  NULL on error.
@@ -132,6 +156,13 @@ float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
  * per-token embeddings before splitting by separator positions.
  */
 float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
+
+/*
+ * Run the transformer forward pass into caller-provided
+ * out_states[n_tokens * hidden_size]. Returns 0 on success, -1 on error.
+ */
+int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                      float *out_states);
 
 /*
  * Cosine similarity between two L2-normalized vectors.

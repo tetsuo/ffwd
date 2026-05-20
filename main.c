@@ -30,6 +30,7 @@ static void print_usage(const char *prog)
         "  -d <dir>     Model directory (required)\n"
         "  --mlx        Use Apple MLX GPU backend\n"
         "  --daemon     Read lines from stdin, write JSON embeddings to stdout\n"
+        "  -b <n>       Max texts per engine batch (default: all; daemon: 1)\n"
         "  -t <n>       CPU threads (default: all cores)\n"
         "  -e           Print raw embeddings (with multiple texts)\n"
         "  -v           Verbose (-vv for debug)\n"
@@ -61,46 +62,48 @@ typedef struct {
 } engine_t;
 
 typedef struct {
-    float *emb;       /* malloc'd float[dim], caller frees */
-    int    n_tokens;
-    double ms;
-} embed_result_t;
+    int *ids;
+    int  n_tokens;
+} token_buf_t;
 
-static embed_result_t embed_text(engine_t *e, const char *text)
+static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
+                              int batch, float *out_embeddings)
 {
-    embed_result_t r = {0};
+#ifdef USE_MLX
+    if (e->mlx_ctx)
+        return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
+    else
+#endif
+        return pplx_embed_batch(e->ctx, inputs, batch, out_embeddings);
+}
 
-    int n = 0;
-    int *ids = qwen_tokenizer_encode(e->tok, text, &n);
-    if (!ids || n == 0) {
+static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->ids = qwen_tokenizer_encode(e->tok, text, &out->n_tokens);
+    if (!out->ids || out->n_tokens == 0) {
         fprintf(stderr, "tokenization failed: %s\n", text);
-        free(ids);
-        return r;
+        free(out->ids);
+        out->ids = NULL;
+        out->n_tokens = 0;
+        return -1;
     }
 
     if (pplx_verbose >= 1) {
-        fprintf(stderr, "tokens (%d): ", n);
-        for (int i = 0; i < n && i < 20; i++) fprintf(stderr, "%d ", ids[i]);
-        if (n > 20) fprintf(stderr, "...");
+        fprintf(stderr, "tokens (%d): ", out->n_tokens);
+        for (int i = 0; i < out->n_tokens && i < 20; i++)
+            fprintf(stderr, "%d ", out->ids[i]);
+        if (out->n_tokens > 20) fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
+    return 0;
+}
 
-    double t0 = now_ms();
-#ifdef USE_MLX
-    if (e->mlx_ctx)
-        r.emb = pplx_mlx_embed(e->mlx_ctx, ids, n);
-    else
-#endif
-        r.emb = pplx_embed(e->ctx, ids, n);
-    r.ms = now_ms() - t0;
-    r.n_tokens = n;
-    free(ids);
-
-    if (!r.emb) fprintf(stderr, "forward pass failed\n");
-    if (pplx_verbose >= 1)
-        fprintf(stderr, "embed: %d tokens in %.1f ms\n", r.n_tokens, r.ms);
-
-    return r;
+static void free_tokens(token_buf_t *tokens, int n)
+{
+    if (!tokens) return;
+    for (int i = 0; i < n; i++)
+        free(tokens[i].ids);
 }
 
 /* ========================================================================
@@ -131,12 +134,86 @@ static void print_embedding_json(const float *emb, int dim, int n_tokens, double
  * Daemon mode: read lines from stdin, write JSON to stdout
  * ======================================================================== */
 
-static int run_daemon(engine_t *e)
+static int process_daemon_batch(engine_t *e, char **lines, int n_lines)
+{
+    if (n_lines <= 0) return 0;
+
+    token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_lines, sizeof(token_buf_t));
+    pplx_input_t *inputs = (pplx_input_t *)malloc((size_t)n_lines * sizeof(pplx_input_t));
+    int *input_to_line = (int *)malloc((size_t)n_lines * sizeof(int));
+    float *embs = (float *)malloc((size_t)n_lines * e->dim * sizeof(float));
+    if (!tokens || !inputs || !input_to_line || !embs) {
+        fprintf(stderr, "OOM\n");
+        free(tokens); free(inputs); free(input_to_line); free(embs);
+        for (int i = 0; i < n_lines; i++)
+            printf("{\"error\":\"embedding failed\"}\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    int n_inputs = 0;
+    for (int i = 0; i < n_lines; i++) {
+        if (tokenize_text(e, lines[i], &tokens[i]) == 0) {
+            inputs[n_inputs].ids = tokens[i].ids;
+            inputs[n_inputs].n_tokens = tokens[i].n_tokens;
+            input_to_line[n_inputs] = i;
+            n_inputs++;
+        }
+    }
+
+    double ms = 0.0;
+    int rc = 0;
+    if (n_inputs > 0) {
+        double t0 = now_ms();
+        rc = engine_embed_batch(e, inputs, n_inputs, embs);
+        ms = now_ms() - t0;
+        if (pplx_verbose >= 1)
+            fprintf(stderr, "embed batch: %d texts in %.1f ms\n", n_inputs, ms);
+    }
+
+    int next_valid = 0;
+    for (int i = 0; i < n_lines; i++) {
+        if (!tokens[i].ids) {
+            printf("{\"error\":\"tokenization failed\"}\n");
+            continue;
+        }
+        if (rc != 0) {
+            printf("{\"error\":\"embedding failed\"}\n");
+            continue;
+        }
+        while (next_valid < n_inputs && input_to_line[next_valid] != i)
+            next_valid++;
+        if (next_valid >= n_inputs) {
+            printf("{\"error\":\"embedding failed\"}\n");
+            continue;
+        }
+        print_embedding_json(embs + (size_t)next_valid * e->dim,
+                             e->dim, tokens[i].n_tokens, ms);
+        next_valid++;
+    }
+    fflush(stdout);
+
+    free_tokens(tokens, n_lines);
+    free(tokens); free(inputs); free(input_to_line); free(embs);
+    return rc == 0 ? 0 : 1;
+}
+
+static int run_daemon(engine_t *e, int batch_size)
 {
     char line[65536];
+    if (batch_size <= 0) batch_size = 1;
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "daemon: ready, reading from stdin\n");
+        fprintf(stderr, "daemon: ready, reading from stdin (batch_size=%d)\n",
+                batch_size);
+
+    char **batch_lines = (char **)calloc((size_t)batch_size, sizeof(char *));
+    if (!batch_lines) {
+        fprintf(stderr, "OOM\n");
+        return 1;
+    }
+    int n_batch = 0;
+    int rc = 0;
 
     while (fgets(line, sizeof(line), stdin)) {
         /* Strip newline */
@@ -149,47 +226,71 @@ static int run_daemon(engine_t *e)
             fprintf(stderr, "daemon: \"%.*s%s\"\n",
                     (int)(len > 60 ? 60 : len), line, len > 60 ? "..." : "");
 
-        embed_result_t r = embed_text(e, line);
-        if (r.emb) {
-            print_embedding_json(r.emb, e->dim, r.n_tokens, r.ms);
-            free(r.emb);
-        } else {
-            /* Output an error line so the consumer stays in sync */
-            printf("{\"error\":\"embedding failed\"}\n");
-            fflush(stdout);
+        batch_lines[n_batch] = strdup(line);
+        if (!batch_lines[n_batch]) {
+            fprintf(stderr, "OOM\n");
+            rc = 1;
+            break;
+        }
+        n_batch++;
+
+        if (n_batch == batch_size) {
+            if (process_daemon_batch(e, batch_lines, n_batch) != 0)
+                rc = 1;
+            for (int i = 0; i < n_batch; i++) {
+                free(batch_lines[i]);
+                batch_lines[i] = NULL;
+            }
+            n_batch = 0;
         }
     }
+
+    if (n_batch > 0) {
+        if (process_daemon_batch(e, batch_lines, n_batch) != 0)
+            rc = 1;
+        for (int i = 0; i < n_batch; i++)
+            free(batch_lines[i]);
+    }
+    free(batch_lines);
 
     if (pplx_verbose >= 1)
         fprintf(stderr, "daemon: stdin EOF\n");
 
-    return 0;
+    return rc;
 }
 
 /* ========================================================================
  * Batch mode: embed args or stdin lines, then print similarity or vectors
  * ======================================================================== */
 
-static int run_batch(engine_t *e, int argc, char **argv, int arg_start, int print_embs)
+static int append_text(char ***texts, int *n_texts, int *cap, const char *s)
+{
+    if (*n_texts == *cap) {
+        int new_cap = *cap ? *cap * 2 : 8;
+        char **new_texts = (char **)realloc(*texts, (size_t)new_cap * sizeof(char *));
+        if (!new_texts) return -1;
+        *texts = new_texts;
+        *cap = new_cap;
+    }
+
+    (*texts)[*n_texts] = strdup(s);
+    if (!(*texts)[*n_texts]) return -1;
+    (*n_texts)++;
+    return 0;
+}
+
+static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
+                     int print_embs, int batch_size)
 {
     int     n_texts = 0, cap = 0;
     char  **texts = NULL;
-    float **embs  = NULL;
-
-#define APPEND(s) do {                                          \
-    if (n_texts == cap) {                                        \
-        cap = cap ? cap * 2 : 8;                                 \
-        texts = realloc(texts, cap * sizeof(char *));            \
-        embs  = realloc(embs,  cap * sizeof(float *));           \
-        if (!texts || !embs) { fprintf(stderr, "OOM\n"); return 1; } \
-    }                                                            \
-    texts[n_texts] = strdup(s);                                  \
-    embs[n_texts]  = NULL;                                       \
-    n_texts++;                                                   \
-} while (0)
+    int     rc = 0;
 
     if (arg_start < argc) {
-        for (int i = arg_start; i < argc; i++) APPEND(argv[i]);
+        for (int i = arg_start; i < argc; i++) {
+            if (append_text(&texts, &n_texts, &cap, argv[i]) != 0)
+                goto oom_texts;
+        }
     } else {
         char line[65536];
         while (fgets(line, sizeof(line), stdin)) {
@@ -197,29 +298,59 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start, int prin
             while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'))
                 line[--l] = '\0';
             if (l == 0) continue;
-            APPEND(line);
+            if (append_text(&texts, &n_texts, &cap, line) != 0)
+                goto oom_texts;
         }
     }
-#undef APPEND
 
     if (n_texts == 0) {
         fprintf(stderr, "no input texts\n");
-        free(texts); free(embs);
+        free(texts);
         return 1;
     }
 
     int dim = e->dim;
+    token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_texts, sizeof(token_buf_t));
+    pplx_input_t *inputs = (pplx_input_t *)malloc((size_t)n_texts * sizeof(pplx_input_t));
+    float *embs = (float *)malloc((size_t)n_texts * dim * sizeof(float));
+    if (!tokens || !inputs || !embs) {
+        fprintf(stderr, "OOM\n");
+        free(tokens); free(inputs); free(embs);
+        for (int i = 0; i < n_texts; i++) free(texts[i]);
+        free(texts);
+        return 1;
+    }
 
     for (int i = 0; i < n_texts; i++) {
         if (pplx_verbose >= 1)
             fprintf(stderr, "[%d/%d] \"%s\"\n", i+1, n_texts, texts[i]);
-        embed_result_t r = embed_text(e, texts[i]);
-        embs[i] = r.emb;
-        if (!embs[i]) goto done;
+        if (tokenize_text(e, texts[i], &tokens[i]) != 0) {
+            rc = 1;
+            goto done;
+        }
+        inputs[i].ids = tokens[i].ids;
+        inputs[i].n_tokens = tokens[i].n_tokens;
+    }
+
+    int max_batch = batch_size > 0 ? batch_size : n_texts;
+    for (int start = 0; start < n_texts; start += max_batch) {
+        int cur = n_texts - start;
+        if (cur > max_batch) cur = max_batch;
+
+        double t0 = now_ms();
+        if (engine_embed_batch(e, inputs + start, cur,
+                               embs + (size_t)start * dim) != 0) {
+            fprintf(stderr, "forward pass failed\n");
+            rc = 1;
+            goto done;
+        }
+        if (pplx_verbose >= 1)
+            fprintf(stderr, "embed batch: [%d..%d] %d texts in %.1f ms\n",
+                    start, start + cur - 1, cur, now_ms() - t0);
     }
 
     if (n_texts == 1) {
-        print_embedding_raw(embs[0], dim);
+        print_embedding_raw(embs, dim);
     } else {
         printf("Cosine similarity matrix (%d texts):\n", n_texts);
         printf("%-4s", "");
@@ -228,22 +359,30 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start, int prin
         for (int i = 0; i < n_texts; i++) {
             printf("[%d] ", i);
             for (int j = 0; j < n_texts; j++)
-                printf("  %.4f", (double)pplx_cosine_similarity(embs[i], embs[j], dim));
+                printf("  %.4f", (double)pplx_cosine_similarity(
+                    embs + (size_t)i * dim, embs + (size_t)j * dim, dim));
             printf("  \"%s\"\n", texts[i]);
         }
         if (print_embs) {
             printf("\nEmbeddings:\n");
             for (int i = 0; i < n_texts; i++) {
                 printf("[%d] ", i);
-                print_embedding_raw(embs[i], dim);
+                print_embedding_raw(embs + (size_t)i * dim, dim);
             }
         }
     }
 
 done:
-    for (int i = 0; i < n_texts; i++) { free(texts[i]); free(embs[i]); }
-    free(texts); free(embs);
-    return 0;
+    free_tokens(tokens, n_texts);
+    for (int i = 0; i < n_texts; i++) free(texts[i]);
+    free(texts); free(tokens); free(inputs); free(embs);
+    return rc;
+
+oom_texts:
+    fprintf(stderr, "OOM\n");
+    for (int i = 0; i < n_texts; i++) free(texts[i]);
+    free(texts);
+    return 1;
 }
 
 /* ========================================================================
@@ -258,12 +397,16 @@ int main(int argc, char *argv[])
     int verbose    = 0;
     int use_mlx    = 0;
     int daemon     = 0;
+    int batch_size = 0;
 
     int arg_start = 1;
     while (arg_start < argc && argv[arg_start][0] == '-') {
         const char *f = argv[arg_start];
         if      (!strcmp(f, "-d"))      { model_dir = argv[++arg_start]; }
         else if (!strcmp(f, "-t"))      { n_threads = atoi(argv[++arg_start]); }
+        else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
+            batch_size = atoi(argv[++arg_start]);
+        }
         else if (!strcmp(f, "-e"))      { print_embs = 1; }
         else if (!strcmp(f, "-v"))      { verbose++; }
         else if (!strcmp(f, "-vv"))     { verbose = 2; }
@@ -330,9 +473,9 @@ int main(int argc, char *argv[])
     /* Run */
     int rc;
     if (daemon)
-        rc = run_daemon(&e);
+        rc = run_daemon(&e, batch_size > 0 ? batch_size : 1);
     else
-        rc = run_batch(&e, argc, argv, arg_start, print_embs);
+        rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size);
 
     /* Cleanup */
     if (e.ctx) pplx_free(e.ctx);

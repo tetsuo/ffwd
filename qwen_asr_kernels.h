@@ -124,6 +124,22 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset);
 
+/*
+ * Bidirectional GQA attention over a packed/ragged batch.
+ *
+ * Q: [total_seq, n_heads * head_dim]
+ * K,V: [total_seq, n_kv_heads * head_dim]
+ * offsets: [batch + 1], token spans for each sequence.
+ *
+ * Attention is block-diagonal: tokens only attend within their own
+ * offsets[b]..offsets[b+1] span.
+ */
+void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
+                                             const float *K, const float *V,
+                                             const int *offsets, int batch,
+                                             int n_heads, int n_kv_heads,
+                                             int head_dim, float scale);
+
 /* ========================================================================
  * Position Embeddings
  * ======================================================================== */

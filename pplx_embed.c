@@ -316,28 +316,54 @@ void pplx_free(pplx_ctx_t *ctx)
 }
 
 /* ========================================================================
- * Forward pass (returns full token-level embeddings)
+ * Packed forward pass
  * ======================================================================== */
 
-float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+static int build_offsets(const pplx_input_t *inputs, int batch,
+                         int *offsets, int *total_out, int *max_out)
 {
-    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+    if (!inputs || batch <= 0 || !offsets || !total_out || !max_out)
+        return -1;
+
+    int total = 0;
+    int max_seq = 0;
+    for (int b = 0; b < batch; b++) {
+        if (!inputs[b].ids || inputs[b].n_tokens <= 0)
+            return -1;
+        if (total > INT32_MAX - inputs[b].n_tokens)
+            return -1;
+        offsets[b] = total;
+        total += inputs[b].n_tokens;
+        if (inputs[b].n_tokens > max_seq)
+            max_seq = inputs[b].n_tokens;
+    }
+    offsets[batch] = total;
+    *total_out = total;
+    *max_out = max_seq;
+    return 0;
+}
+
+static int forward_packed_inplace(pplx_ctx_t *ctx, const pplx_input_t *inputs,
+                                  int batch, const int *offsets,
+                                  int total_seq, int max_seq)
+{
+    if (!ctx || !inputs || batch <= 0 || !offsets || total_seq <= 0 || max_seq <= 0)
+        return -1;
 
     const pplx_config_t  *cfg = &ctx->config;
     const pplx_weights_t *w   = &ctx->weights;
 
-    int hidden    = cfg->hidden_size;
-    int n_heads   = cfg->n_heads;
+    int hidden     = cfg->hidden_size;
+    int n_heads    = cfg->n_heads;
     int n_kv_heads = cfg->n_kv_heads;
-    int head_dim  = cfg->head_dim;
-    int q_dim     = cfg->q_dim;
-    int kv_dim    = cfg->kv_dim;
-    int inter     = cfg->intermediate_size;
-    float eps     = cfg->rms_norm_eps;
-    int seq       = n_tokens;
+    int head_dim   = cfg->head_dim;
+    int q_dim      = cfg->q_dim;
+    int kv_dim     = cfg->kv_dim;
+    int inter      = cfg->intermediate_size;
+    float eps      = cfg->rms_norm_eps;
 
-    if (ensure_buffers(ctx, seq) != 0) return NULL;
-    if (ensure_rope_cache(ctx, seq) != 0) return NULL;
+    if (ensure_buffers(ctx, total_seq) != 0) return -1;
+    if (ensure_rope_cache(ctx, max_seq) != 0) return -1;
 
     const float *rope_cos = ctx->rope_cos;
     const float *rope_sin = ctx->rope_sin;
@@ -353,106 +379,179 @@ float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
     float *ffn_up   = ctx->ffn_up;
     float *ffn_out  = ctx->ffn_out;
 
-    /* 1. Token embedding lookup */
-    for (int i = 0; i < seq; i++) {
-        int id = token_ids[i];
-        if (id < 0 || id >= cfg->vocab_size) {
-            fprintf(stderr, "pplx: invalid token id %d at position %d\n", id, i);
-            return NULL;
+    /* 1. Token embedding lookup into packed [total_seq, hidden]. */
+    for (int b = 0; b < batch; b++) {
+        int start = offsets[b];
+        for (int i = 0; i < inputs[b].n_tokens; i++) {
+            int id = inputs[b].ids[i];
+            if (id < 0 || id >= cfg->vocab_size) {
+                fprintf(stderr, "pplx: invalid token id %d at input %d position %d\n",
+                        id, b, i);
+                return -1;
+            }
+            memcpy(x + (size_t)(start + i) * hidden,
+                   w->embed_tokens + (size_t)id * hidden,
+                   (size_t)hidden * sizeof(float));
         }
-        memcpy(x + i * hidden,
-               w->embed_tokens + (size_t)id * hidden,
-               hidden * sizeof(float));
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* 2. Transformer layers */
+    /* 2. Transformer layers. Linear/MLP ops run over all packed tokens;
+     * attention is explicitly block-diagonal by sequence offsets. */
     for (int layer = 0; layer < cfg->n_layers; layer++) {
         const pplx_layer_t *l = &w->layers[layer];
 
-        /* Input RMSNorm */
-        qwen_rms_norm(x_norm, x, l->input_norm, seq, hidden, eps);
+        qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
 
-        /* QKV projections */
-        qwen_linear_nobias(q_buf, x_norm, l->wq, seq, hidden, q_dim);
-        qwen_linear_nobias(k_buf, x_norm, l->wk, seq, hidden, kv_dim);
-        qwen_linear_nobias(v_buf, x_norm, l->wv, seq, hidden, kv_dim);
+        qwen_linear_nobias(q_buf, x_norm, l->wq, total_seq, hidden, q_dim);
+        qwen_linear_nobias(k_buf, x_norm, l->wk, total_seq, hidden, kv_dim);
+        qwen_linear_nobias(v_buf, x_norm, l->wv, total_seq, hidden, kv_dim);
 
-        /* Per-head Q/K RMSNorm */
-        qwen_rms_norm_per_head(q_buf, l->q_norm, seq, n_heads,    head_dim, eps);
-        qwen_rms_norm_per_head(k_buf, l->k_norm, seq, n_kv_heads, head_dim, eps);
+        qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads,    head_dim, eps);
+        qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
 
-        /* RoPE */
-        qwen_apply_rope_neox(q_buf, rope_cos, rope_sin, seq, n_heads,    head_dim);
-        qwen_apply_rope_neox(k_buf, rope_cos, rope_sin, seq, n_kv_heads, head_dim);
+        for (int b = 0; b < batch; b++) {
+            int start = offsets[b];
+            int len = offsets[b + 1] - start;
+            qwen_apply_rope_neox(q_buf + (size_t)start * q_dim,
+                                 rope_cos, rope_sin, len, n_heads, head_dim);
+            qwen_apply_rope_neox(k_buf + (size_t)start * kv_dim,
+                                 rope_cos, rope_sin, len, n_kv_heads, head_dim);
+        }
 
-        /* Bidirectional GQA attention (q_offset = seq-1 removes causal mask) */
-        qwen_causal_attention(attn_out, q_buf, k_buf, v_buf,
-                              seq, seq, n_heads, n_kv_heads,
-                              head_dim, scale, seq - 1);
+        qwen_bidirectional_gqa_attention_packed(attn_out, q_buf, k_buf, v_buf,
+                                                offsets, batch, n_heads,
+                                                n_kv_heads, head_dim, scale);
 
-        /* Output projection + residual */
-        qwen_linear_nobias(proj_out, attn_out, l->wo, seq, q_dim, hidden);
-        qwen_add_inplace(x, proj_out, seq * hidden);
+        qwen_linear_nobias(proj_out, attn_out, l->wo, total_seq, q_dim, hidden);
+        qwen_add_inplace(x, proj_out, total_seq * hidden);
 
-        /* Post-attention RMSNorm */
-        qwen_rms_norm(x_norm, x, l->post_attn_norm, seq, hidden, eps);
+        qwen_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
 
-        /* SwiGLU MLP */
-        qwen_linear_nobias(ffn_gate, x_norm, l->gate_proj, seq, hidden, inter);
-        qwen_linear_nobias(ffn_up,   x_norm, l->up_proj,   seq, hidden, inter);
-        qwen_silu(ffn_gate, seq * inter);
-        qwen_mul_inplace(ffn_gate, ffn_up, seq * inter);
-        qwen_linear_nobias(ffn_out, ffn_gate, l->down_proj, seq, inter, hidden);
-        qwen_add_inplace(x, ffn_out, seq * hidden);
+        qwen_linear_nobias(ffn_gate, x_norm, l->gate_proj, total_seq, hidden, inter);
+        qwen_linear_nobias(ffn_up,   x_norm, l->up_proj,   total_seq, hidden, inter);
+        qwen_silu(ffn_gate, total_seq * inter);
+        qwen_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
+        qwen_linear_nobias(ffn_out, ffn_gate, l->down_proj, total_seq, inter, hidden);
+        qwen_add_inplace(x, ffn_out, total_seq * hidden);
     }
 
-    /* 3. Final RMSNorm (in-place) */
-    qwen_rms_norm(x, x, w->norm, seq, hidden, eps);
+    qwen_rms_norm(x, x, w->norm, total_seq, hidden, eps);
+    return 0;
+}
 
-    /* Copy result out (caller frees) */
-    size_t out_size = (size_t)seq * hidden * sizeof(float);
-    float *out = (float *)malloc(out_size);
-    if (out) memcpy(out, x, out_size);
-    return out;
+static void pool_embeddings(const pplx_ctx_t *ctx, const int *offsets,
+                            int batch, float *out_embeddings)
+{
+    int hidden = ctx->config.hidden_size;
+    const float *x = ctx->x;
+
+    for (int b = 0; b < batch; b++) {
+        int start = offsets[b];
+        int end = offsets[b + 1];
+        int len = end - start;
+        float *emb = out_embeddings + (size_t)b * hidden;
+
+        memset(emb, 0, (size_t)hidden * sizeof(float));
+        for (int i = start; i < end; i++) {
+            const float *row = x + (size_t)i * hidden;
+            for (int d = 0; d < hidden; d++)
+                emb[d] += row[d];
+        }
+
+        float inv_len = 1.0f / (float)len;
+        for (int d = 0; d < hidden; d++)
+            emb[d] *= inv_len;
+
+        float norm_sq = 0.0f;
+        for (int d = 0; d < hidden; d++)
+            norm_sq += emb[d] * emb[d];
+        float nv = sqrtf(norm_sq);
+        if (nv > 1e-8f) {
+            float inv = 1.0f / nv;
+            for (int d = 0; d < hidden; d++)
+                emb[d] *= inv;
+        }
+    }
 }
 
 /* ========================================================================
- * Embed (forward + mean pool + L2 norm)
+ * Public forward/embed APIs
  * ======================================================================== */
+
+int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                      float *out_states)
+{
+    if (!ctx || !token_ids || n_tokens <= 0 || !out_states) return -1;
+
+    pplx_input_t input = { token_ids, n_tokens };
+    int offsets[2] = { 0, n_tokens };
+    if (forward_packed_inplace(ctx, &input, 1, offsets, n_tokens, n_tokens) != 0)
+        return -1;
+
+    size_t out_size = (size_t)n_tokens * ctx->config.hidden_size * sizeof(float);
+    memcpy(out_states, ctx->x, out_size);
+    return 0;
+}
+
+float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+{
+    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+
+    size_t n = (size_t)n_tokens * ctx->config.hidden_size;
+    float *out = (float *)malloc(n * sizeof(float));
+    if (!out) return NULL;
+
+    if (pplx_forward_into(ctx, token_ids, n_tokens, out) != 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
+                     float *out_embeddings)
+{
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+
+    int *offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
+    if (!offsets) return -1;
+
+    int total_seq = 0;
+    int max_seq = 0;
+    if (build_offsets(inputs, batch, offsets, &total_seq, &max_seq) != 0) {
+        free(offsets);
+        return -1;
+    }
+
+    int rc = forward_packed_inplace(ctx, inputs, batch, offsets, total_seq, max_seq);
+    if (rc == 0)
+        pool_embeddings(ctx, offsets, batch, out_embeddings);
+
+    free(offsets);
+    return rc;
+}
+
+int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                    float *out_embedding)
+{
+    pplx_input_t input = { token_ids, n_tokens };
+    return pplx_embed_batch(ctx, &input, 1, out_embedding);
+}
 
 float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
 {
-    float *all = pplx_forward(ctx, token_ids, n_tokens);
-    if (!all) return NULL;
+    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
 
     int hidden = ctx->config.hidden_size;
-    int seq    = n_tokens;
+    float *emb = (float *)malloc((size_t)hidden * sizeof(float));
+    if (!emb) return NULL;
 
-    /* Mean pool */
-    float *emb = (float *)calloc(hidden, sizeof(float));
-    if (!emb) { free(all); return NULL; }
-
-    for (int i = 0; i < seq; i++) {
-        const float *row = all + i * hidden;
-        for (int d = 0; d < hidden; d++)
-            emb[d] += row[d];
+    if (pplx_embed_into(ctx, token_ids, n_tokens, emb) != 0) {
+        free(emb);
+        return NULL;
     }
-    free(all);
-
-    float inv_seq = 1.0f / (float)seq;
-    for (int d = 0; d < hidden; d++) emb[d] *= inv_seq;
-
-    /* L2 normalize */
-    float norm_sq = 0.0f;
-    for (int d = 0; d < hidden; d++) norm_sq += emb[d] * emb[d];
-    float nv = sqrtf(norm_sq);
-    if (nv > 1e-8f) {
-        float inv = 1.0f / nv;
-        for (int d = 0; d < hidden; d++) emb[d] *= inv;
-    }
-
     return emb;
 }
 

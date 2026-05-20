@@ -239,104 +239,152 @@ void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
  * Forward pass
  * ======================================================================== */
 
-float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
+int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
+                         int batch, float *out_embeddings)
 {
-    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
 
     const pplx_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
 
-    int hidden    = c->hidden_size;
-    int n_heads   = c->n_heads;
+    int hidden     = c->hidden_size;
+    int n_heads    = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
-    int head_dim  = c->head_dim;
-    int q_dim     = c->q_dim;
-    int seq       = n_tokens;
-    float scale   = 1.0f / sqrtf((float)head_dim);
+    int head_dim   = c->head_dim;
+    int q_dim      = c->q_dim;
+    int max_seq    = 0;
+    int has_padding = 0;
 
-    /* 1. Embedding lookup */
-    int ids_shape[] = {seq};
-    mlx_array ids = mlx_array_new_data(token_ids, ids_shape, 1, MLX_INT32);
-    mlx_array x   = mlx_array_new();
+    for (int b = 0; b < batch; b++) {
+        if (!inputs[b].ids || inputs[b].n_tokens <= 0) return -1;
+        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
+    }
+    if (max_seq <= 0) return -1;
+
+    for (int b = 0; b < batch; b++) {
+        if (inputs[b].n_tokens != max_seq) has_padding = 1;
+    }
+
+    size_t elems = (size_t)batch * (size_t)max_seq;
+    int *padded_ids = (int *)malloc(elems * sizeof(int));
+    float *pool_mask_data = (float *)malloc(elems * sizeof(float));
+    float *attn_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
+    float *len_data = (float *)malloc((size_t)batch * sizeof(float));
+    if (!padded_ids || !pool_mask_data || (has_padding && !attn_mask_data) || !len_data) {
+        free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+        return -1;
+    }
+
+    for (int b = 0; b < batch; b++) {
+        len_data[b] = (float)inputs[b].n_tokens;
+        for (int t = 0; t < max_seq; t++) {
+            size_t idx = (size_t)b * max_seq + t;
+            if (t < inputs[b].n_tokens) {
+                int id = inputs[b].ids[t];
+                if (id < 0 || id >= c->vocab_size) {
+                    fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
+                            id, b, t);
+                    free(padded_ids); free(pool_mask_data);
+                    free(attn_mask_data); free(len_data);
+                    return -1;
+                }
+                padded_ids[idx] = id;
+                pool_mask_data[idx] = 1.0f;
+                if (has_padding) attn_mask_data[idx] = 0.0f;
+            } else {
+                padded_ids[idx] = 0;
+                pool_mask_data[idx] = 0.0f;
+                if (has_padding) attn_mask_data[idx] = -1.0e9f;
+            }
+        }
+    }
+
+    int ids_shape[] = {batch, max_seq};
+    int pool_mask_shape[] = {batch, max_seq, 1};
+    int attn_mask_shape[] = {batch, 1, 1, max_seq};
+    int len_shape[] = {batch, 1};
+
+    mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
+    mlx_array pool_mask = mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32);
+    mlx_array attn_mask = has_padding
+        ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
+        : (mlx_array){0};
+    mlx_array lengths = mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32);
+    free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+
+    if (!arr_ok(ids) || !arr_ok(pool_mask) || (has_padding && !arr_ok(attn_mask)) ||
+        !arr_ok(lengths)) {
+        mlx_array_free(ids); mlx_array_free(pool_mask);
+        if (has_padding) mlx_array_free(attn_mask);
+        mlx_array_free(lengths);
+        return -1;
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    mlx_array null_arr = (mlx_array){0};
+
+    /* 1. Embedding lookup: [B, T] -> [B, T, hidden]. */
+    mlx_array x = mlx_array_new();
     mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
     mlx_array_free(ids);
 
-    /* 2. Transformer layers */
+    /* 2. Transformer layers. */
     for (int layer = 0; layer < c->n_layers; layer++) {
         mlx_layer_t *l = &ctx->layers[layer];
 
-        /* Input RMSNorm */
         mlx_array xn = mlx_array_new();
         mlx_fast_rms_norm(&xn, x, l->input_norm, c->rms_norm_eps, S);
 
-        /* QKV projections */
         mlx_array q_flat = linear(xn, l->wq, S);
         mlx_array k_flat = linear(xn, l->wk, S);
         mlx_array v_flat = linear(xn, l->wv, S);
         mlx_array_free(xn);
 
-        /* Reshape to [seq, n_heads, head_dim] */
-        int q_shape[] = {seq, n_heads,    head_dim};
-        int k_shape[] = {seq, n_kv_heads, head_dim};
+        int q_shape[] = {batch, max_seq, n_heads,    head_dim};
+        int k_shape[] = {batch, max_seq, n_kv_heads, head_dim};
         mlx_array q = mlx_array_new();
         mlx_array k = mlx_array_new();
         mlx_array v = mlx_array_new();
-        mlx_reshape(&q, q_flat, q_shape, 3, S);
-        mlx_reshape(&k, k_flat, k_shape, 3, S);
-        mlx_reshape(&v, v_flat, k_shape, 3, S);
+        mlx_reshape(&q, q_flat, q_shape, 4, S);
+        mlx_reshape(&k, k_flat, k_shape, 4, S);
+        mlx_reshape(&v, v_flat, k_shape, 4, S);
         mlx_array_free(q_flat); mlx_array_free(k_flat); mlx_array_free(v_flat);
 
-        /* Per-head Q/K RMSNorm */
         mlx_array qn = mlx_array_new();
         mlx_array kn = mlx_array_new();
         mlx_fast_rms_norm(&qn, q, l->q_norm, c->rms_norm_eps, S);
         mlx_fast_rms_norm(&kn, k, l->k_norm, c->rms_norm_eps, S);
         mlx_array_free(q); mlx_array_free(k);
 
-        /* Transpose to [1, n_heads, seq, head_dim] for RoPE + SDPA */
+        /* [B, T, heads, D] -> [B, heads, T, D] for RoPE + SDPA. */
         int perm[] = {0, 2, 1, 3};
-        mlx_array qe = mlx_array_new(), ke = mlx_array_new(), ve = mlx_array_new();
-        mlx_expand_dims(&qe, qn, 0, S);
-        mlx_expand_dims(&ke, kn, 0, S);
-        mlx_expand_dims(&ve, v,  0, S);
-        mlx_array_free(qn); mlx_array_free(kn);
-
         mlx_array qt = mlx_array_new(), kt = mlx_array_new(), vt = mlx_array_new();
-        mlx_transpose_axes(&qt, qe, perm, 4, S);
-        mlx_transpose_axes(&kt, ke, perm, 4, S);
-        mlx_transpose_axes(&vt, ve, perm, 4, S);
-        mlx_array_free(qe); mlx_array_free(ke); mlx_array_free(ve);
-        mlx_array_free(v);
+        mlx_transpose_axes(&qt, qn, perm, 4, S);
+        mlx_transpose_axes(&kt, kn, perm, 4, S);
+        mlx_transpose_axes(&vt, v,  perm, 4, S);
+        mlx_array_free(qn); mlx_array_free(kn); mlx_array_free(v);
 
-        /* RoPE (NeoX: traditional=false) */
         mlx_optional_float base = {.value = c->rope_theta, .has_value = true};
-        mlx_array null_arr = (mlx_array){0};
         mlx_array qr = mlx_array_new(), kr = mlx_array_new();
         mlx_fast_rope(&qr, qt, head_dim, false, base, 1.0f, 0, null_arr, S);
         mlx_fast_rope(&kr, kt, head_dim, false, base, 1.0f, 0, null_arr, S);
         mlx_array_free(qt); mlx_array_free(kt);
 
-        /* Bidirectional SDPA (mask_mode="" = no causal mask, GQA via broadcast) */
         mlx_array attn = mlx_array_new();
         mlx_fast_scaled_dot_product_attention(
-            &attn, qr, kr, vt, scale, "", null_arr, null_arr, S);
+            &attn, qr, kr, vt, scale, "",
+            has_padding ? attn_mask : null_arr, null_arr, S);
         mlx_array_free(qr); mlx_array_free(kr); mlx_array_free(vt);
 
-        /* Transpose back and reshape to [seq, q_dim] */
         mlx_array attn_t = mlx_array_new();
         mlx_transpose_axes(&attn_t, attn, perm, 4, S);
         mlx_array_free(attn);
 
-        mlx_array attn_sq = mlx_array_new();
-        mlx_squeeze_axis(&attn_sq, attn_t, 0, S);
+        int flat_shape[] = {batch, max_seq, q_dim};
+        mlx_array attn_flat = mlx_array_new();
+        mlx_reshape(&attn_flat, attn_t, flat_shape, 3, S);
         mlx_array_free(attn_t);
 
-        int flat_shape[] = {seq, q_dim};
-        mlx_array attn_flat = mlx_array_new();
-        mlx_reshape(&attn_flat, attn_sq, flat_shape, 2, S);
-        mlx_array_free(attn_sq);
-
-        /* Output projection + residual */
         mlx_array proj = linear(attn_flat, l->wo, S);
         mlx_array_free(attn_flat);
         mlx_array x2 = mlx_array_new();
@@ -344,11 +392,9 @@ float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
         mlx_array_free(x); mlx_array_free(proj);
         x = x2;
 
-        /* Post-attention RMSNorm */
         mlx_array xn2 = mlx_array_new();
         mlx_fast_rms_norm(&xn2, x, l->post_attn_norm, c->rms_norm_eps, S);
 
-        /* SwiGLU MLP */
         mlx_array gate = linear(xn2, l->gate_proj, S);
         mlx_array up   = linear(xn2, l->up_proj, S);
         mlx_array_free(xn2);
@@ -372,32 +418,64 @@ float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
         x = x3;
     }
 
-    /* 3. Final RMSNorm */
+    /* 3. Final RMSNorm. */
     mlx_array x_normed = mlx_array_new();
     mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
     mlx_array_free(x);
 
-    /* 4. Mean pool over seq dim */
-    mlx_array emb = mlx_array_new();
-    mlx_mean_axis(&emb, x_normed, 0, false, S);
+    /* 4. Masked mean pool over T. */
+    mlx_array masked = mlx_array_new();
+    mlx_multiply(&masked, x_normed, pool_mask, S);
     mlx_array_free(x_normed);
+    mlx_array_free(pool_mask);
 
-    /* 5. L2 normalize */
-    int norm_axes[] = {0};
+    mlx_array emb_sum = mlx_array_new();
+    mlx_sum_axis(&emb_sum, masked, 1, false, S);
+    mlx_array_free(masked);
+
+    mlx_array emb = mlx_array_new();
+    mlx_divide(&emb, emb_sum, lengths, S);
+    mlx_array_free(emb_sum); mlx_array_free(lengths);
+
+    /* 5. L2 normalize each row. */
+    int norm_axes[] = {1};
     mlx_array nv = mlx_array_new();
     mlx_linalg_norm_l2(&nv, emb, norm_axes, 1, true, S);
     mlx_array emb_n = mlx_array_new();
     mlx_divide(&emb_n, emb, nv, S);
     mlx_array_free(emb); mlx_array_free(nv);
+    if (has_padding) mlx_array_free(attn_mask);
 
-    /* 6. Eval and copy to CPU */
+    /* 6. Eval and copy [B, hidden] to CPU. */
     mlx_array_eval(emb_n);
     const float *data = mlx_array_data_float32(emb_n);
-    float *out = NULL;
+    int rc = -1;
     if (data) {
-        out = (float *)malloc(hidden * sizeof(float));
-        if (out) memcpy(out, data, hidden * sizeof(float));
+        memcpy(out_embeddings, data, (size_t)batch * hidden * sizeof(float));
+        rc = 0;
     }
     mlx_array_free(emb_n);
+    return rc;
+}
+
+int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                        int n_tokens, float *out_embedding)
+{
+    pplx_input_t input = { token_ids, n_tokens };
+    return pplx_mlx_embed_batch(ctx, &input, 1, out_embedding);
+}
+
+float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
+{
+    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+
+    int hidden = ctx->config.hidden_size;
+    float *out = (float *)malloc((size_t)hidden * sizeof(float));
+    if (!out) return NULL;
+
+    if (pplx_mlx_embed_into(ctx, token_ids, n_tokens, out) != 0) {
+        free(out);
+        return NULL;
+    }
     return out;
 }
