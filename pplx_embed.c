@@ -7,10 +7,50 @@
 #include <string.h>
 #include <math.h>
 
+typedef struct {
+    const float *wq;            /* [q_dim,   hidden] */
+    const float *wk;            /* [kv_dim,  hidden] */
+    const float *wv;            /* [kv_dim,  hidden] */
+    const float *wo;            /* [hidden,  q_dim]  */
+    const float *q_norm;        /* [head_dim] */
+    const float *k_norm;        /* [head_dim] */
+    const float *input_norm;    /* [hidden] */
+    const float *post_attn_norm;/* [hidden] */
+    const float *gate_proj;     /* [intermediate, hidden] */
+    const float *up_proj;       /* [intermediate, hidden] */
+    const float *down_proj;     /* [hidden, intermediate] */
+} pplx_layer_t;
+
+typedef struct {
+    const float *embed_tokens;  /* [vocab_size, hidden] */
+    pplx_layer_t *layers;       /* [n_layers] heap-allocated */
+    const float *norm;          /* [hidden] */
+} pplx_weights_t;
+
 struct pplx_model {
     pplx_config_t  config;
     pplx_weights_t weights;
     void *safetensors;          /* multi_safetensors_t*, keeps mmap alive */
+};
+
+struct pplx_workspace {
+    const pplx_model_t *model;  /* immutable model this workspace belongs to */
+    int    buf_seq_cap;
+    float *x;                   /* [seq, hidden]       */
+    float *x_norm;              /* [seq, hidden]       */
+    float *q;                   /* [seq, q_dim]        */
+    float *k;                   /* [seq, kv_dim]       */
+    float *v;                   /* [seq, kv_dim]       */
+    float *attn_out;            /* [seq, q_dim]        */
+    float *proj_out;            /* [seq, hidden]       */
+    float *ffn_gate;            /* [seq, intermediate] */
+    float *ffn_up;              /* [seq, intermediate] */
+    float *ffn_out;             /* [seq, hidden]       */
+
+    /* RoPE cosine/sine cache [n_pos, head_dim], grown lazily. */
+    float *rope_cos;
+    float *rope_sin;
+    int    rope_cache_cap;
 };
 
 /* ========================================================================
@@ -70,7 +110,7 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "pplx_load: cannot open %s\n", path);
+        fprintf(stderr, "pplx_model_load: cannot open %s\n", path);
         return -1;
     }
 
@@ -101,13 +141,13 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
 
     /* Sanity checks */
     if (cfg->hidden_size <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0) {
-        fprintf(stderr, "pplx_load: invalid config in %s "
+        fprintf(stderr, "pplx_model_load: invalid config in %s "
                 "(hidden=%d, layers=%d, heads=%d)\n",
                 path, cfg->hidden_size, cfg->n_layers, cfg->n_heads);
         return -1;
     }
     if (cfg->n_layers > PPLX_MAX_LAYERS) {
-        fprintf(stderr, "pplx_load: too many layers (%d > %d)\n",
+        fprintf(stderr, "pplx_model_load: too many layers (%d > %d)\n",
                 cfg->n_layers, PPLX_MAX_LAYERS);
         return -1;
     }
@@ -240,14 +280,14 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     /* Open safetensors (handles single file or multi-shard) */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
     if (!ms) {
-        fprintf(stderr, "pplx_load: failed to open safetensors in %s\n", model_dir);
+        fprintf(stderr, "pplx_model_load: failed to open safetensors in %s\n", model_dir);
         free(model);
         return NULL;
     }
     model->safetensors = ms;
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "pplx_load: loading weights from %s\n", model_dir);
+        fprintf(stderr, "pplx_model_load: loading weights from %s\n", model_dir);
 
     /* Token embeddings */
     pplx_weights_t *w = &model->weights;
@@ -292,7 +332,7 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     if (!w->norm) goto fail;
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "pplx_load: %d layers loaded (%d-dim embeddings)\n",
+        fprintf(stderr, "pplx_model_load: %d layers loaded (%d-dim embeddings)\n",
                 cfg->n_layers, cfg->hidden_size);
 
     return model;
@@ -334,44 +374,6 @@ void pplx_workspace_free(pplx_workspace_t *ws)
 const pplx_config_t *pplx_model_config(const pplx_model_t *model)
 {
     return model ? &model->config : NULL;
-}
-
-const pplx_config_t *pplx_config(const pplx_ctx_t *ctx)
-{
-    return (ctx && ctx->model) ? pplx_model_config(ctx->model) : NULL;
-}
-
-pplx_ctx_t *pplx_load(const char *model_dir)
-{
-    pplx_model_t *model = pplx_model_load(model_dir);
-    if (!model) return NULL;
-
-    pplx_workspace_t *ws = pplx_workspace_new(model);
-    if (!ws) {
-        pplx_model_free(model);
-        return NULL;
-    }
-
-    pplx_ctx_t *ctx = (pplx_ctx_t *)calloc(1, sizeof(pplx_ctx_t));
-    if (!ctx) {
-        pplx_workspace_free(ws);
-        pplx_model_free(model);
-        return NULL;
-    }
-
-    ctx->model = model;
-    ctx->workspace = ws;
-    ctx->config = model->config;
-    ctx->weights = model->weights;
-    return ctx;
-}
-
-void pplx_free(pplx_ctx_t *ctx)
-{
-    if (!ctx) return;
-    pplx_workspace_free(ctx->workspace);
-    pplx_model_free(ctx->model);
-    free(ctx);
 }
 
 /* ========================================================================
@@ -622,42 +624,6 @@ float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
         return NULL;
     }
     return emb;
-}
-
-int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                      float *out_states)
-{
-    if (!ctx) return -1;
-    return pplx_model_forward_into(ctx->model, ctx->workspace,
-                                   token_ids, n_tokens, out_states);
-}
-
-float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
-{
-    if (!ctx) return NULL;
-    return pplx_model_forward(ctx->model, ctx->workspace, token_ids, n_tokens);
-}
-
-int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
-                     float *out_embeddings)
-{
-    if (!ctx) return -1;
-    return pplx_model_embed_batch(ctx->model, ctx->workspace,
-                                  inputs, batch, out_embeddings);
-}
-
-int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                    float *out_embedding)
-{
-    if (!ctx) return -1;
-    return pplx_model_embed_into(ctx->model, ctx->workspace,
-                                 token_ids, n_tokens, out_embedding);
-}
-
-float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
-{
-    if (!ctx) return NULL;
-    return pplx_model_embed(ctx->model, ctx->workspace, token_ids, n_tokens);
 }
 
 /* ========================================================================

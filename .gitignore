@@ -1,2 +1,6 @@
 *.o
 pplx_embed
+book/
+.venv/
+__pycache__/
+*.pyc

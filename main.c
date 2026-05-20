@@ -53,7 +53,8 @@ static void print_usage(const char *prog)
  * ======================================================================== */
 
 typedef struct {
-    pplx_ctx_t       *ctx;
+    pplx_model_t     *model;
+    pplx_workspace_t *workspace;
 #ifdef USE_MLX
     pplx_mlx_ctx_t   *mlx_ctx;
 #endif
@@ -74,7 +75,8 @@ static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
         return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
     else
 #endif
-        return pplx_embed_batch(e->ctx, inputs, batch, out_embeddings);
+        return pplx_model_embed_batch(e->model, e->workspace,
+                                      inputs, batch, out_embeddings);
 }
 
 static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
@@ -457,14 +459,29 @@ int main(int argc, char *argv[])
 #ifdef USE_MLX
     if (use_mlx) {
         e.mlx_ctx = pplx_mlx_load(model_dir);
-        if (!e.mlx_ctx) { fprintf(stderr, "failed to load model\n"); return 1; }
+        if (!e.mlx_ctx) {
+            fprintf(stderr, "failed to load model\n");
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
         e.dim = pplx_mlx_config(e.mlx_ctx)->hidden_size;
     } else
 #endif
     {
-        e.ctx = pplx_load(model_dir);
-        if (!e.ctx) { fprintf(stderr, "failed to load model\n"); return 1; }
-        e.dim = pplx_config(e.ctx)->hidden_size;
+        e.model = pplx_model_load(model_dir);
+        if (!e.model) {
+            fprintf(stderr, "failed to load model\n");
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.workspace = pplx_workspace_new(e.model);
+        if (!e.workspace) {
+            fprintf(stderr, "failed to allocate workspace\n");
+            pplx_model_free(e.model);
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.dim = pplx_model_config(e.model)->hidden_size;
     }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
@@ -478,7 +495,8 @@ int main(int argc, char *argv[])
         rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size);
 
     /* Cleanup */
-    if (e.ctx) pplx_free(e.ctx);
+    if (e.workspace) pplx_workspace_free(e.workspace);
+    if (e.model) pplx_model_free(e.model);
 #ifdef USE_MLX
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif

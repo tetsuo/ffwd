@@ -37,67 +37,11 @@ typedef struct {
 } pplx_config_t;
 
 /* ========================================================================
- * Per-Layer Weights  (all F32, direct mmap pointers - read-only)
- * ======================================================================== */
-
-typedef struct {
-    const float *wq;            /* [q_dim,   hidden] */
-    const float *wk;            /* [kv_dim,  hidden] */
-    const float *wv;            /* [kv_dim,  hidden] */
-    const float *wo;            /* [hidden,  q_dim]  */
-    const float *q_norm;        /* [head_dim] */
-    const float *k_norm;        /* [head_dim] */
-    const float *input_norm;    /* [hidden] */
-    const float *post_attn_norm;/* [hidden] */
-    const float *gate_proj;     /* [intermediate, hidden] */
-    const float *up_proj;       /* [intermediate, hidden] */
-    const float *down_proj;     /* [hidden, intermediate] */
-} pplx_layer_t;
-
-/* ========================================================================
- * Full Model Weights
- * ======================================================================== */
-
-typedef struct {
-    const float *embed_tokens;  /* [vocab_size, hidden] */
-    pplx_layer_t *layers;       /* [n_layers] heap-allocated */
-    const float *norm;          /* [hidden] */
-} pplx_weights_t;
-
-/* ========================================================================
  * Model + workspace ownership
  * ======================================================================== */
 
 typedef struct pplx_model pplx_model_t;
-
-typedef struct {
-    const pplx_model_t *model;  /* immutable model this workspace belongs to */
-    /* Working buffers, grown lazily to buf_seq_cap */
-    int    buf_seq_cap;
-    float *x;                   /* [seq, hidden]       */
-    float *x_norm;              /* [seq, hidden]       */
-    float *q;                   /* [seq, q_dim]        */
-    float *k;                   /* [seq, kv_dim]       */
-    float *v;                   /* [seq, kv_dim]       */
-    float *attn_out;            /* [seq, q_dim]        */
-    float *proj_out;            /* [seq, hidden]       */
-    float *ffn_gate;            /* [seq, intermediate] */
-    float *ffn_up;              /* [seq, intermediate] */
-    float *ffn_out;             /* [seq, hidden]       */
-
-    /* RoPE cosine/sine cache [n_pos, head_dim], grown lazily */
-    float *rope_cos;
-    float *rope_sin;
-    int    rope_cache_cap;
-} pplx_workspace_t;
-
-/* Convenience context: owns one model and one workspace. */
-typedef struct {
-    pplx_model_t     *model;
-    pplx_workspace_t *workspace;
-    pplx_config_t     config;   /* backward-compatible snapshot */
-    pplx_weights_t    weights;  /* backward-compatible read-only aliases */
-} pplx_ctx_t;
+typedef struct pplx_workspace pplx_workspace_t;
 
 typedef struct {
     const int *ids;
@@ -109,7 +53,7 @@ typedef struct {
  * ======================================================================== */
 
 /*
- * Load model from directory containing:
+ * Load immutable model data from a directory containing:
  *   config.json                          - model hyperparameters
  *   model.safetensors (or sharded)       - F32 weights
  *   vocab.json + merges.txt              - BPE tokenizer
@@ -117,30 +61,18 @@ typedef struct {
  * Reads config.json to determine model size (0.6B vs 4B).
  * Returns NULL on error.
  */
-pplx_ctx_t *pplx_load(const char *model_dir);
-
-/* Free all resources */
-void pplx_free(pplx_ctx_t *ctx);
-
-/*
- * Load/free immutable model data only. A model owns config, mmap'd
- * safetensors, and read-only weight pointers. It can be shared by multiple
- * workspaces, but the model must outlive all workspaces created from it.
- */
 pplx_model_t *pplx_model_load(const char *model_dir);
 void pplx_model_free(pplx_model_t *model);
 
 /*
- * Allocate/free mutable scratch buffers for a model. A workspace is not
- * thread-safe, but multiple workspaces can use the same immutable model in
- * different threads.
+ * Allocate/free mutable scratch buffers for a model. The model must outlive
+ * workspaces created from it.
  */
 pplx_workspace_t *pplx_workspace_new(const pplx_model_t *model);
 void pplx_workspace_free(pplx_workspace_t *ws);
 
-/* Config accessors for opaque-ish model/context ownership. */
+/* Config accessor for opaque model ownership. */
 const pplx_config_t *pplx_model_config(const pplx_model_t *model);
-const pplx_config_t *pplx_config(const pplx_ctx_t *ctx);
 
 /*
  * Compute embedding for a token sequence.
@@ -153,14 +85,16 @@ const pplx_config_t *pplx_config(const pplx_ctx_t *ctx);
  *
  * Returns malloc'd float[hidden_size] (caller frees). NULL on error.
  */
-float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
+float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
+                        const int *token_ids, int n_tokens);
 
 /*
  * Compute one embedding into caller-provided out[hidden_size].
  * Returns 0 on success, -1 on error.
  */
-int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                    float *out_embedding);
+int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens,
+                          float *out_embedding);
 
 /*
  * Compute embeddings for a true packed/ragged batch.
@@ -171,17 +105,9 @@ int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
  *
  * Returns 0 on success, -1 on error.
  */
-int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
-                     float *out_embeddings);
-
 int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
                            const pplx_input_t *inputs, int batch,
                            float *out_embeddings);
-int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
-                          const int *token_ids, int n_tokens,
-                          float *out_embedding);
-float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
-                        const int *token_ids, int n_tokens);
 
 /*
  * Run the transformer forward pass WITHOUT pooling.
@@ -191,20 +117,16 @@ float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
  * Useful for contextual (late-chunking) models where you need
  * per-token embeddings before splitting by separator positions.
  */
-float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
+float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens);
 
 /*
  * Run the transformer forward pass into caller-provided
  * out_states[n_tokens * hidden_size]. Returns 0 on success, -1 on error.
  */
-int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                      float *out_states);
-
 int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
                             const int *token_ids, int n_tokens,
                             float *out_states);
-float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
-                          const int *token_ids, int n_tokens);
 
 /*
  * Cosine similarity between two L2-normalized vectors.

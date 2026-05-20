@@ -68,7 +68,7 @@ const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx)
 }
 
 /* ========================================================================
- * Load  (reuses the same parse_config logic via pplx_load then copies)
+ * Load
  * ======================================================================== */
 
 /* We duplicate a minimal config parser here so MLX can load standalone.
