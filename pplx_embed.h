@@ -65,14 +65,13 @@ typedef struct {
 } pplx_weights_t;
 
 /* ========================================================================
- * Context (model + working buffers)
+ * Model + workspace ownership
  * ======================================================================== */
 
-typedef struct {
-    pplx_config_t  config;
-    pplx_weights_t weights;
-    void *safetensors;          /* multi_safetensors_t*, keeps mmap alive */
+typedef struct pplx_model pplx_model_t;
 
+typedef struct {
+    const pplx_model_t *model;  /* immutable model this workspace belongs to */
     /* Working buffers, grown lazily to buf_seq_cap */
     int    buf_seq_cap;
     float *x;                   /* [seq, hidden]       */
@@ -90,6 +89,14 @@ typedef struct {
     float *rope_cos;
     float *rope_sin;
     int    rope_cache_cap;
+} pplx_workspace_t;
+
+/* Convenience context: owns one model and one workspace. */
+typedef struct {
+    pplx_model_t     *model;
+    pplx_workspace_t *workspace;
+    pplx_config_t     config;   /* backward-compatible snapshot */
+    pplx_weights_t    weights;  /* backward-compatible read-only aliases */
 } pplx_ctx_t;
 
 typedef struct {
@@ -114,6 +121,26 @@ pplx_ctx_t *pplx_load(const char *model_dir);
 
 /* Free all resources */
 void pplx_free(pplx_ctx_t *ctx);
+
+/*
+ * Load/free immutable model data only. A model owns config, mmap'd
+ * safetensors, and read-only weight pointers. It can be shared by multiple
+ * workspaces, but the model must outlive all workspaces created from it.
+ */
+pplx_model_t *pplx_model_load(const char *model_dir);
+void pplx_model_free(pplx_model_t *model);
+
+/*
+ * Allocate/free mutable scratch buffers for a model. A workspace is not
+ * thread-safe, but multiple workspaces can use the same immutable model in
+ * different threads.
+ */
+pplx_workspace_t *pplx_workspace_new(const pplx_model_t *model);
+void pplx_workspace_free(pplx_workspace_t *ws);
+
+/* Config accessors for opaque-ish model/context ownership. */
+const pplx_config_t *pplx_model_config(const pplx_model_t *model);
+const pplx_config_t *pplx_config(const pplx_ctx_t *ctx);
 
 /*
  * Compute embedding for a token sequence.
@@ -147,6 +174,15 @@ int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
 int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
                      float *out_embeddings);
 
+int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
+                           const pplx_input_t *inputs, int batch,
+                           float *out_embeddings);
+int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens,
+                          float *out_embedding);
+float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
+                        const int *token_ids, int n_tokens);
+
 /*
  * Run the transformer forward pass WITHOUT pooling.
  * Returns the full [n_tokens * hidden_size] output after final RMSNorm.
@@ -163,6 +199,12 @@ float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens);
  */
 int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
                       float *out_states);
+
+int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
+                            const int *token_ids, int n_tokens,
+                            float *out_states);
+float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens);
 
 /*
  * Cosine similarity between two L2-normalized vectors.

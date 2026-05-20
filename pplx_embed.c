@@ -7,6 +7,12 @@
 #include <string.h>
 #include <math.h>
 
+struct pplx_model {
+    pplx_config_t  config;
+    pplx_weights_t weights;
+    void *safetensors;          /* multi_safetensors_t*, keeps mmap alive */
+};
+
 /* ========================================================================
  * Globals
  * ======================================================================== */
@@ -140,14 +146,12 @@ static const float *load_f32_direct(multi_safetensors_t *ms, const char *name)
  * Working buffer management
  * ======================================================================== */
 
-static int ensure_buffers(pplx_ctx_t *ctx, int seq)
+static int ensure_buffers(pplx_workspace_t *ws, const pplx_config_t *c, int seq)
 {
-    if (seq <= ctx->buf_seq_cap) return 0;
+    if (seq <= ws->buf_seq_cap) return 0;
 
-    int cap = ctx->buf_seq_cap > 0 ? ctx->buf_seq_cap : 64;
+    int cap = ws->buf_seq_cap > 0 ? ws->buf_seq_cap : 64;
     while (cap < seq) cap *= 2;
-
-    const pplx_config_t *c = &ctx->config;
 
 #define R(ptr, n) do {                                          \
     void *_t = realloc((ptr), (size_t)(n) * sizeof(float));     \
@@ -155,20 +159,20 @@ static int ensure_buffers(pplx_ctx_t *ctx, int seq)
     (ptr) = (float *)_t;                                         \
 } while (0)
 
-    R(ctx->x,        cap * c->hidden_size);
-    R(ctx->x_norm,   cap * c->hidden_size);
-    R(ctx->q,        cap * c->q_dim);
-    R(ctx->k,        cap * c->kv_dim);
-    R(ctx->v,        cap * c->kv_dim);
-    R(ctx->attn_out, cap * c->q_dim);
-    R(ctx->proj_out, cap * c->hidden_size);
-    R(ctx->ffn_gate, cap * c->intermediate_size);
-    R(ctx->ffn_up,   cap * c->intermediate_size);
-    R(ctx->ffn_out,  cap * c->hidden_size);
+    R(ws->x,        cap * c->hidden_size);
+    R(ws->x_norm,   cap * c->hidden_size);
+    R(ws->q,        cap * c->q_dim);
+    R(ws->k,        cap * c->kv_dim);
+    R(ws->v,        cap * c->kv_dim);
+    R(ws->attn_out, cap * c->q_dim);
+    R(ws->proj_out, cap * c->hidden_size);
+    R(ws->ffn_gate, cap * c->intermediate_size);
+    R(ws->ffn_up,   cap * c->intermediate_size);
+    R(ws->ffn_out,  cap * c->hidden_size);
 
 #undef R
 
-    ctx->buf_seq_cap = cap;
+    ws->buf_seq_cap = cap;
     return 0;
 }
 
@@ -176,32 +180,33 @@ static int ensure_buffers(pplx_ctx_t *ctx, int seq)
  * RoPE cache
  * ======================================================================== */
 
-static int ensure_rope_cache(pplx_ctx_t *ctx, int n_pos)
+static int ensure_rope_cache(pplx_workspace_t *ws, const pplx_config_t *cfg,
+                             int n_pos)
 {
-    if (n_pos <= ctx->rope_cache_cap) return 0;
+    if (n_pos <= ws->rope_cache_cap) return 0;
 
-    int cap = ctx->rope_cache_cap > 0 ? ctx->rope_cache_cap : 512;
+    int cap = ws->rope_cache_cap > 0 ? ws->rope_cache_cap : 512;
     while (cap < n_pos) cap *= 2;
 
-    int   head_dim = ctx->config.head_dim;
+    int   head_dim = cfg->head_dim;
     int   half     = head_dim / 2;
-    float theta    = ctx->config.rope_theta;
+    float theta    = cfg->rope_theta;
 
     size_t n = (size_t)cap * head_dim;
-    float *nc = (float *)realloc(ctx->rope_cos, n * sizeof(float));
-    float *ns = (float *)realloc(ctx->rope_sin, n * sizeof(float));
+    float *nc = (float *)realloc(ws->rope_cos, n * sizeof(float));
+    float *ns = (float *)realloc(ws->rope_sin, n * sizeof(float));
     if (!nc || !ns) {
-        if (nc) ctx->rope_cos = nc;
-        if (ns) ctx->rope_sin = ns;
+        if (nc) ws->rope_cos = nc;
+        if (ns) ws->rope_sin = ns;
         return -1;
     }
-    ctx->rope_cos = nc;
-    ctx->rope_sin = ns;
+    ws->rope_cos = nc;
+    ws->rope_sin = ns;
 
-    for (int pos = ctx->rope_cache_cap; pos < cap; pos++) {
+    for (int pos = ws->rope_cache_cap; pos < cap; pos++) {
         float fp = (float)pos;
-        float *c = ctx->rope_cos + (size_t)pos * head_dim;
-        float *s = ctx->rope_sin + (size_t)pos * head_dim;
+        float *c = ws->rope_cos + (size_t)pos * head_dim;
+        float *s = ws->rope_sin + (size_t)pos * head_dim;
         for (int d = 0; d < half; d++) {
             float inv = 1.0f / powf(theta, (float)(2 * d) / (float)head_dim);
             float angle = fp * inv;
@@ -211,41 +216,41 @@ static int ensure_rope_cache(pplx_ctx_t *ctx, int n_pos)
         }
     }
 
-    ctx->rope_cache_cap = cap;
+    ws->rope_cache_cap = cap;
     return 0;
 }
 
 /* ========================================================================
- * Load
+ * Model / workspace load and free
  * ======================================================================== */
 
-pplx_ctx_t *pplx_load(const char *model_dir)
+pplx_model_t *pplx_model_load(const char *model_dir)
 {
-    pplx_ctx_t *ctx = (pplx_ctx_t *)calloc(1, sizeof(pplx_ctx_t));
-    if (!ctx) return NULL;
+    pplx_model_t *model = (pplx_model_t *)calloc(1, sizeof(pplx_model_t));
+    if (!model) return NULL;
 
     /* Parse config.json */
-    if (parse_config(&ctx->config, model_dir) != 0) {
-        free(ctx);
+    if (parse_config(&model->config, model_dir) != 0) {
+        free(model);
         return NULL;
     }
 
-    const pplx_config_t *cfg = &ctx->config;
+    const pplx_config_t *cfg = &model->config;
 
     /* Open safetensors (handles single file or multi-shard) */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
     if (!ms) {
         fprintf(stderr, "pplx_load: failed to open safetensors in %s\n", model_dir);
-        free(ctx);
+        free(model);
         return NULL;
     }
-    ctx->safetensors = ms;
+    model->safetensors = ms;
 
     if (pplx_verbose >= 1)
         fprintf(stderr, "pplx_load: loading weights from %s\n", model_dir);
 
     /* Token embeddings */
-    pplx_weights_t *w = &ctx->weights;
+    pplx_weights_t *w = &model->weights;
     w->embed_tokens = load_f32_direct(ms, "embed_tokens.weight");
     if (!w->embed_tokens) goto fail;
 
@@ -290,28 +295,82 @@ pplx_ctx_t *pplx_load(const char *model_dir)
         fprintf(stderr, "pplx_load: %d layers loaded (%d-dim embeddings)\n",
                 cfg->n_layers, cfg->hidden_size);
 
-    return ctx;
+    return model;
 
 fail:
-    pplx_free(ctx);
+    pplx_model_free(model);
     return NULL;
 }
 
-/* ========================================================================
- * Free
- * ======================================================================== */
+void pplx_model_free(pplx_model_t *model)
+{
+    if (!model) return;
+    if (model->safetensors)
+        multi_safetensors_close((multi_safetensors_t *)model->safetensors);
+    free(model->weights.layers);
+    free(model);
+}
+
+pplx_workspace_t *pplx_workspace_new(const pplx_model_t *model)
+{
+    if (!model) return NULL;
+    pplx_workspace_t *ws = (pplx_workspace_t *)calloc(1, sizeof(pplx_workspace_t));
+    if (!ws) return NULL;
+    ws->model = model;
+    return ws;
+}
+
+void pplx_workspace_free(pplx_workspace_t *ws)
+{
+    if (!ws) return;
+    free(ws->x);       free(ws->x_norm);
+    free(ws->q);       free(ws->k);        free(ws->v);
+    free(ws->attn_out); free(ws->proj_out);
+    free(ws->ffn_gate); free(ws->ffn_up);   free(ws->ffn_out);
+    free(ws->rope_cos); free(ws->rope_sin);
+    free(ws);
+}
+
+const pplx_config_t *pplx_model_config(const pplx_model_t *model)
+{
+    return model ? &model->config : NULL;
+}
+
+const pplx_config_t *pplx_config(const pplx_ctx_t *ctx)
+{
+    return (ctx && ctx->model) ? pplx_model_config(ctx->model) : NULL;
+}
+
+pplx_ctx_t *pplx_load(const char *model_dir)
+{
+    pplx_model_t *model = pplx_model_load(model_dir);
+    if (!model) return NULL;
+
+    pplx_workspace_t *ws = pplx_workspace_new(model);
+    if (!ws) {
+        pplx_model_free(model);
+        return NULL;
+    }
+
+    pplx_ctx_t *ctx = (pplx_ctx_t *)calloc(1, sizeof(pplx_ctx_t));
+    if (!ctx) {
+        pplx_workspace_free(ws);
+        pplx_model_free(model);
+        return NULL;
+    }
+
+    ctx->model = model;
+    ctx->workspace = ws;
+    ctx->config = model->config;
+    ctx->weights = model->weights;
+    return ctx;
+}
 
 void pplx_free(pplx_ctx_t *ctx)
 {
     if (!ctx) return;
-    if (ctx->safetensors)
-        multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
-    free(ctx->weights.layers);
-    free(ctx->x);       free(ctx->x_norm);
-    free(ctx->q);       free(ctx->k);        free(ctx->v);
-    free(ctx->attn_out); free(ctx->proj_out);
-    free(ctx->ffn_gate); free(ctx->ffn_up);   free(ctx->ffn_out);
-    free(ctx->rope_cos); free(ctx->rope_sin);
+    pplx_workspace_free(ctx->workspace);
+    pplx_model_free(ctx->model);
     free(ctx);
 }
 
@@ -343,15 +402,18 @@ static int build_offsets(const pplx_input_t *inputs, int batch,
     return 0;
 }
 
-static int forward_packed_inplace(pplx_ctx_t *ctx, const pplx_input_t *inputs,
+static int forward_packed_inplace(const pplx_model_t *model,
+                                  pplx_workspace_t *ws,
+                                  const pplx_input_t *inputs,
                                   int batch, const int *offsets,
                                   int total_seq, int max_seq)
 {
-    if (!ctx || !inputs || batch <= 0 || !offsets || total_seq <= 0 || max_seq <= 0)
+    if (!model || !ws || ws->model != model || !inputs ||
+        batch <= 0 || !offsets || total_seq <= 0 || max_seq <= 0)
         return -1;
 
-    const pplx_config_t  *cfg = &ctx->config;
-    const pplx_weights_t *w   = &ctx->weights;
+    const pplx_config_t  *cfg = &model->config;
+    const pplx_weights_t *w   = &model->weights;
 
     int hidden     = cfg->hidden_size;
     int n_heads    = cfg->n_heads;
@@ -362,22 +424,22 @@ static int forward_packed_inplace(pplx_ctx_t *ctx, const pplx_input_t *inputs,
     int inter      = cfg->intermediate_size;
     float eps      = cfg->rms_norm_eps;
 
-    if (ensure_buffers(ctx, total_seq) != 0) return -1;
-    if (ensure_rope_cache(ctx, max_seq) != 0) return -1;
+    if (ensure_buffers(ws, cfg, total_seq) != 0) return -1;
+    if (ensure_rope_cache(ws, cfg, max_seq) != 0) return -1;
 
-    const float *rope_cos = ctx->rope_cos;
-    const float *rope_sin = ctx->rope_sin;
+    const float *rope_cos = ws->rope_cos;
+    const float *rope_sin = ws->rope_sin;
 
-    float *x        = ctx->x;
-    float *x_norm   = ctx->x_norm;
-    float *q_buf    = ctx->q;
-    float *k_buf    = ctx->k;
-    float *v_buf    = ctx->v;
-    float *attn_out = ctx->attn_out;
-    float *proj_out = ctx->proj_out;
-    float *ffn_gate = ctx->ffn_gate;
-    float *ffn_up   = ctx->ffn_up;
-    float *ffn_out  = ctx->ffn_out;
+    float *x        = ws->x;
+    float *x_norm   = ws->x_norm;
+    float *q_buf    = ws->q;
+    float *k_buf    = ws->k;
+    float *v_buf    = ws->v;
+    float *attn_out = ws->attn_out;
+    float *proj_out = ws->proj_out;
+    float *ffn_gate = ws->ffn_gate;
+    float *ffn_up   = ws->ffn_up;
+    float *ffn_out  = ws->ffn_out;
 
     /* 1. Token embedding lookup into packed [total_seq, hidden]. */
     for (int b = 0; b < batch; b++) {
@@ -441,11 +503,11 @@ static int forward_packed_inplace(pplx_ctx_t *ctx, const pplx_input_t *inputs,
     return 0;
 }
 
-static void pool_embeddings(const pplx_ctx_t *ctx, const int *offsets,
-                            int batch, float *out_embeddings)
+static void pool_embeddings(const pplx_model_t *model, const pplx_workspace_t *ws,
+                            const int *offsets, int batch, float *out_embeddings)
 {
-    int hidden = ctx->config.hidden_size;
-    const float *x = ctx->x;
+    int hidden = model->config.hidden_size;
+    const float *x = ws->x;
 
     for (int b = 0; b < batch; b++) {
         int start = offsets[b];
@@ -480,40 +542,44 @@ static void pool_embeddings(const pplx_ctx_t *ctx, const int *offsets,
  * Public forward/embed APIs
  * ======================================================================== */
 
-int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                      float *out_states)
+int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
+                            const int *token_ids, int n_tokens,
+                            float *out_states)
 {
-    if (!ctx || !token_ids || n_tokens <= 0 || !out_states) return -1;
+    if (!model || !ws || !token_ids || n_tokens <= 0 || !out_states) return -1;
 
     pplx_input_t input = { token_ids, n_tokens };
     int offsets[2] = { 0, n_tokens };
-    if (forward_packed_inplace(ctx, &input, 1, offsets, n_tokens, n_tokens) != 0)
+    if (forward_packed_inplace(model, ws, &input, 1, offsets,
+                               n_tokens, n_tokens) != 0)
         return -1;
 
-    size_t out_size = (size_t)n_tokens * ctx->config.hidden_size * sizeof(float);
-    memcpy(out_states, ctx->x, out_size);
+    size_t out_size = (size_t)n_tokens * model->config.hidden_size * sizeof(float);
+    memcpy(out_states, ws->x, out_size);
     return 0;
 }
 
-float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens)
 {
-    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+    if (!model || !ws || !token_ids || n_tokens <= 0) return NULL;
 
-    size_t n = (size_t)n_tokens * ctx->config.hidden_size;
+    size_t n = (size_t)n_tokens * model->config.hidden_size;
     float *out = (float *)malloc(n * sizeof(float));
     if (!out) return NULL;
 
-    if (pplx_forward_into(ctx, token_ids, n_tokens, out) != 0) {
+    if (pplx_model_forward_into(model, ws, token_ids, n_tokens, out) != 0) {
         free(out);
         return NULL;
     }
     return out;
 }
 
-int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
-                     float *out_embeddings)
+int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
+                           const pplx_input_t *inputs, int batch,
+                           float *out_embeddings)
 {
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+    if (!model || !ws || !inputs || batch <= 0 || !out_embeddings) return -1;
 
     int *offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
     if (!offsets) return -1;
@@ -525,34 +591,73 @@ int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
         return -1;
     }
 
-    int rc = forward_packed_inplace(ctx, inputs, batch, offsets, total_seq, max_seq);
+    int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
+                                    total_seq, max_seq);
     if (rc == 0)
-        pool_embeddings(ctx, offsets, batch, out_embeddings);
+        pool_embeddings(model, ws, offsets, batch, out_embeddings);
 
     free(offsets);
     return rc;
 }
 
-int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
-                    float *out_embedding)
+int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
+                          const int *token_ids, int n_tokens,
+                          float *out_embedding)
 {
     pplx_input_t input = { token_ids, n_tokens };
-    return pplx_embed_batch(ctx, &input, 1, out_embedding);
+    return pplx_model_embed_batch(model, ws, &input, 1, out_embedding);
 }
 
-float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
+                        const int *token_ids, int n_tokens)
 {
-    if (!ctx || !token_ids || n_tokens <= 0) return NULL;
+    if (!model || !ws || !token_ids || n_tokens <= 0) return NULL;
 
-    int hidden = ctx->config.hidden_size;
+    int hidden = model->config.hidden_size;
     float *emb = (float *)malloc((size_t)hidden * sizeof(float));
     if (!emb) return NULL;
 
-    if (pplx_embed_into(ctx, token_ids, n_tokens, emb) != 0) {
+    if (pplx_model_embed_into(model, ws, token_ids, n_tokens, emb) != 0) {
         free(emb);
         return NULL;
     }
     return emb;
+}
+
+int pplx_forward_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                      float *out_states)
+{
+    if (!ctx) return -1;
+    return pplx_model_forward_into(ctx->model, ctx->workspace,
+                                   token_ids, n_tokens, out_states);
+}
+
+float *pplx_forward(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+{
+    if (!ctx) return NULL;
+    return pplx_model_forward(ctx->model, ctx->workspace, token_ids, n_tokens);
+}
+
+int pplx_embed_batch(pplx_ctx_t *ctx, const pplx_input_t *inputs, int batch,
+                     float *out_embeddings)
+{
+    if (!ctx) return -1;
+    return pplx_model_embed_batch(ctx->model, ctx->workspace,
+                                  inputs, batch, out_embeddings);
+}
+
+int pplx_embed_into(pplx_ctx_t *ctx, const int *token_ids, int n_tokens,
+                    float *out_embedding)
+{
+    if (!ctx) return -1;
+    return pplx_model_embed_into(ctx->model, ctx->workspace,
+                                 token_ids, n_tokens, out_embedding);
+}
+
+float *pplx_embed(pplx_ctx_t *ctx, const int *token_ids, int n_tokens)
+{
+    if (!ctx) return NULL;
+    return pplx_model_embed(ctx->model, ctx->workspace, token_ids, n_tokens);
 }
 
 /* ========================================================================

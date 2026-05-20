@@ -464,7 +464,7 @@ int main(int argc, char *argv[])
     {
         e.ctx = pplx_load(model_dir);
         if (!e.ctx) { fprintf(stderr, "failed to load model\n"); return 1; }
-        e.dim = e.ctx->config.hidden_size;
+        e.dim = pplx_config(e.ctx)->hidden_size;
     }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
