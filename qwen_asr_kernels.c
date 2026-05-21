@@ -1215,7 +1215,13 @@ void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
                                              const int *offsets, int batch,
                                              int n_heads, int n_kv_heads,
                                              int head_dim, float scale) {
-    if (tp.n_threads > 1 && n_heads >= 2 && batch > 0) {
+    long long qk_work = 0;
+    for (int b = 0; b < batch; b++) {
+        int len = offsets[b + 1] - offsets[b];
+        qk_work += (long long)len * len * n_heads;
+    }
+
+    if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096) {
         packed_gqa_attn_task_t task = {
             .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
             .batch = batch, .n_heads = n_heads, .n_kv_heads = n_kv_heads,
