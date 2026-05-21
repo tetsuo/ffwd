@@ -241,7 +241,56 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
  * Weight loading (direct mmap pointers into safetensors)
  * ======================================================================== */
 
-static const float *load_f32_direct(multi_safetensors_t *ms, const char *name)
+static int tensor_has_f32_shape(const safetensors_file_t *sf,
+                                const safetensor_t *t, const char *name,
+                                const int64_t *shape, int ndim)
+{
+    if (t->dtype != DTYPE_F32) {
+        fprintf(stderr, "pplx: expected F32 for %s, got dtype=%d\n",
+                name, (int)t->dtype);
+        return 0;
+    }
+    if (t->ndim != ndim) {
+        fprintf(stderr, "pplx: bad rank for %s: got %d, expected %d\n",
+                name, t->ndim, ndim);
+        return 0;
+    }
+
+    size_t numel = 1;
+    for (int i = 0; i < ndim; i++) {
+        if (t->shape[i] != shape[i]) {
+            fprintf(stderr, "pplx: bad shape for %s at dim %d: "
+                    "got %lld, expected %lld\n",
+                    name, i, (long long)t->shape[i], (long long)shape[i]);
+            return 0;
+        }
+        if (shape[i] < 0 || (uint64_t)shape[i] > SIZE_MAX / numel) {
+            fprintf(stderr, "pplx: shape too large for %s\n", name);
+            return 0;
+        }
+        numel *= (size_t)shape[i];
+    }
+
+    size_t bytes;
+    if (mul_size(numel, sizeof(float), &bytes) != 0 ||
+        t->data_size != bytes) {
+        fprintf(stderr, "pplx: bad data size for %s: got %zu, expected %zu\n",
+                name, t->data_size, bytes);
+        return 0;
+    }
+
+    size_t data_start = 8 + sf->header_size;
+    if (data_start > sf->file_size ||
+        t->data_offset > sf->file_size - data_start ||
+        t->data_size > sf->file_size - data_start - t->data_offset) {
+        fprintf(stderr, "pplx: tensor data out of bounds for %s\n", name);
+        return 0;
+    }
+    return 1;
+}
+
+static const float *load_f32_direct(multi_safetensors_t *ms, const char *name,
+                                    const int64_t *shape, int ndim)
 {
     safetensors_file_t *sf = NULL;
     const safetensor_t *t  = multi_safetensors_find(ms, name, &sf);
@@ -249,11 +298,8 @@ static const float *load_f32_direct(multi_safetensors_t *ms, const char *name)
         fprintf(stderr, "pplx: tensor not found: %s\n", name);
         return NULL;
     }
-    if (t->dtype != DTYPE_F32) {
-        fprintf(stderr, "pplx: expected F32 for %s, got dtype=%d\n",
-                name, (int)t->dtype);
+    if (!tensor_has_f32_shape(sf, t, name, shape, ndim))
         return NULL;
-    }
     return (const float *)safetensors_data(sf, t);
 }
 
@@ -364,7 +410,9 @@ pplx_model_t *pplx_model_load(const char *model_dir)
 
     /* Token embeddings */
     pplx_weights_t *w = &model->weights;
-    w->embed_tokens = load_f32_direct(ms, "embed_tokens.weight");
+    const int64_t embed_shape[2] = { cfg->vocab_size, cfg->hidden_size };
+    w->embed_tokens = load_f32_direct(ms, "embed_tokens.weight",
+                                      embed_shape, 2);
     if (!w->embed_tokens) goto fail;
 
     /* Allocate layer array */
@@ -376,32 +424,53 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     for (int i = 0; i < cfg->n_layers; i++) {
         pplx_layer_t *l = &w->layers[i];
 
-#define LOAD(field, fmt) do {                               \
+#define LOAD1(field, fmt, d0) do {                          \
+    const int64_t expect[1] = { (d0) };                     \
     snprintf(name, sizeof(name), fmt, i);                   \
-    l->field = load_f32_direct(ms, name);                   \
+    l->field = load_f32_direct(ms, name, expect, 1);        \
     if (!l->field) goto fail;                               \
 } while (0)
 
-        LOAD(wq,             "layers.%d.self_attn.q_proj.weight");
-        LOAD(wk,             "layers.%d.self_attn.k_proj.weight");
-        LOAD(wv,             "layers.%d.self_attn.v_proj.weight");
-        LOAD(wo,             "layers.%d.self_attn.o_proj.weight");
-        LOAD(q_norm,         "layers.%d.self_attn.q_norm.weight");
-        LOAD(k_norm,         "layers.%d.self_attn.k_norm.weight");
-        LOAD(input_norm,     "layers.%d.input_layernorm.weight");
-        LOAD(post_attn_norm, "layers.%d.post_attention_layernorm.weight");
-        LOAD(gate_proj,      "layers.%d.mlp.gate_proj.weight");
-        LOAD(up_proj,        "layers.%d.mlp.up_proj.weight");
-        LOAD(down_proj,      "layers.%d.mlp.down_proj.weight");
+#define LOAD2(field, fmt, d0, d1) do {                      \
+    const int64_t expect[2] = { (d0), (d1) };                \
+    snprintf(name, sizeof(name), fmt, i);                   \
+    l->field = load_f32_direct(ms, name, expect, 2);        \
+    if (!l->field) goto fail;                               \
+} while (0)
 
-#undef LOAD
+        LOAD2(wq,             "layers.%d.self_attn.q_proj.weight",
+              cfg->q_dim, cfg->hidden_size);
+        LOAD2(wk,             "layers.%d.self_attn.k_proj.weight",
+              cfg->kv_dim, cfg->hidden_size);
+        LOAD2(wv,             "layers.%d.self_attn.v_proj.weight",
+              cfg->kv_dim, cfg->hidden_size);
+        LOAD2(wo,             "layers.%d.self_attn.o_proj.weight",
+              cfg->hidden_size, cfg->q_dim);
+        LOAD1(q_norm,         "layers.%d.self_attn.q_norm.weight",
+              cfg->head_dim);
+        LOAD1(k_norm,         "layers.%d.self_attn.k_norm.weight",
+              cfg->head_dim);
+        LOAD1(input_norm,     "layers.%d.input_layernorm.weight",
+              cfg->hidden_size);
+        LOAD1(post_attn_norm, "layers.%d.post_attention_layernorm.weight",
+              cfg->hidden_size);
+        LOAD2(gate_proj,      "layers.%d.mlp.gate_proj.weight",
+              cfg->intermediate_size, cfg->hidden_size);
+        LOAD2(up_proj,        "layers.%d.mlp.up_proj.weight",
+              cfg->intermediate_size, cfg->hidden_size);
+        LOAD2(down_proj,      "layers.%d.mlp.down_proj.weight",
+              cfg->hidden_size, cfg->intermediate_size);
+
+#undef LOAD2
+#undef LOAD1
 
         if (pplx_verbose >= 2)
             fprintf(stderr, "  layer %d loaded\n", i);
     }
 
     /* Final RMSNorm */
-    w->norm = load_f32_direct(ms, "norm.weight");
+    const int64_t norm_shape[1] = { cfg->hidden_size };
+    w->norm = load_f32_direct(ms, "norm.weight", norm_shape, 1);
     if (!w->norm) goto fail;
 
     if (pplx_verbose >= 1)
