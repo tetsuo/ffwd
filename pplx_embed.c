@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 typedef struct {
     const float *wq;            /* [q_dim,   hidden] */
@@ -61,6 +62,57 @@ int pplx_verbose = 0;
 int qwen_verbose = 0;
 
 /* ========================================================================
+ * Size helpers
+ * ======================================================================== */
+
+static int mul_size(size_t a, size_t b, size_t *out)
+{
+    if (a != 0 && b > SIZE_MAX / a) return -1;
+    *out = a * b;
+    return 0;
+}
+
+static int grow_cap(int current, int needed, int *out)
+{
+    if (needed <= 0) return -1;
+
+    int cap = current > 0 ? current : 64;
+    while (cap < needed) {
+        if (cap > INT_MAX / 2) return -1;
+        cap *= 2;
+    }
+    *out = cap;
+    return 0;
+}
+
+static int realloc_floats(float **ptr, size_t count)
+{
+    size_t bytes;
+    if (mul_size(count, sizeof(float), &bytes) != 0) return -1;
+
+    void *p = realloc(*ptr, bytes);
+    if (!p && bytes != 0) return -1;
+    *ptr = (float *)p;
+    return 0;
+}
+
+static float *malloc_floats(size_t count)
+{
+    size_t bytes;
+    if (mul_size(count, sizeof(float), &bytes) != 0) return NULL;
+    return (float *)malloc(bytes);
+}
+
+static int realloc_floats_2d(float **ptr, int rows, int cols)
+{
+    if (rows < 0 || cols < 0) return -1;
+
+    size_t count;
+    if (mul_size((size_t)rows, (size_t)cols, &count) != 0) return -1;
+    return realloc_floats(ptr, count);
+}
+
+/* ========================================================================
  * Minimal JSON helpers for config.json parsing
  * ======================================================================== */
 
@@ -106,7 +158,11 @@ static double json_get_double(const char *json, const char *key, double fallback
 static int parse_config(pplx_config_t *cfg, const char *model_dir)
 {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    int n = snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "pplx_model_load: model path too long\n");
+        return -1;
+    }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -114,11 +170,17 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
         return -1;
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc(sz + 1);
-    if (!buf || fread(buf, 1, sz, f) != (size_t)sz) {
+    if (sz < 0 || (size_t)sz == SIZE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
         fclose(f); free(buf); return -1;
     }
     fclose(f);
@@ -134,16 +196,29 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
     cfg->rms_norm_eps     = (float)json_get_double(buf, "rms_norm_eps", 1e-6);
     cfg->rope_theta       = (float)json_get_double(buf, "rope_theta", 1000000.0);
 
-    cfg->q_dim  = cfg->n_heads    * cfg->head_dim;
-    cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
+    cfg->q_dim = 0;
+    cfg->kv_dim = 0;
+    if (cfg->n_heads > 0 && cfg->head_dim > 0 &&
+        cfg->n_heads <= INT_MAX / cfg->head_dim)
+        cfg->q_dim = cfg->n_heads * cfg->head_dim;
+    if (cfg->n_kv_heads > 0 && cfg->head_dim > 0 &&
+        cfg->n_kv_heads <= INT_MAX / cfg->head_dim)
+        cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
 
     free(buf);
 
     /* Sanity checks */
-    if (cfg->hidden_size <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0) {
+    if (cfg->hidden_size <= 0 || cfg->n_layers <= 0 ||
+        cfg->n_heads <= 0 || cfg->n_kv_heads <= 0 ||
+        cfg->head_dim <= 0 || cfg->intermediate_size <= 0 ||
+        cfg->vocab_size <= 0 || cfg->q_dim <= 0 || cfg->kv_dim <= 0 ||
+        (cfg->head_dim & 1) || cfg->n_heads % cfg->n_kv_heads != 0 ||
+        !isfinite(cfg->rms_norm_eps) || cfg->rms_norm_eps <= 0.0f ||
+        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f) {
         fprintf(stderr, "pplx_model_load: invalid config in %s "
-                "(hidden=%d, layers=%d, heads=%d)\n",
-                path, cfg->hidden_size, cfg->n_layers, cfg->n_heads);
+                "(hidden=%d, layers=%d, heads=%d/%d, head_dim=%d, inter=%d)\n",
+                path, cfg->hidden_size, cfg->n_layers, cfg->n_heads,
+                cfg->n_kv_heads, cfg->head_dim, cfg->intermediate_size);
         return -1;
     }
     if (cfg->n_layers > PPLX_MAX_LAYERS) {
@@ -190,25 +265,23 @@ static int ensure_buffers(pplx_workspace_t *ws, const pplx_config_t *c, int seq)
 {
     if (seq <= ws->buf_seq_cap) return 0;
 
-    int cap = ws->buf_seq_cap > 0 ? ws->buf_seq_cap : 64;
-    while (cap < seq) cap *= 2;
+    int cap;
+    if (grow_cap(ws->buf_seq_cap, seq, &cap) != 0) return -1;
 
 #define R(ptr, n) do {                                          \
-    void *_t = realloc((ptr), (size_t)(n) * sizeof(float));     \
-    if (!_t) return -1;                                          \
-    (ptr) = (float *)_t;                                         \
+    if (realloc_floats_2d(&(ptr), cap, (n)) != 0) return -1;     \
 } while (0)
 
-    R(ws->x,        cap * c->hidden_size);
-    R(ws->x_norm,   cap * c->hidden_size);
-    R(ws->q,        cap * c->q_dim);
-    R(ws->k,        cap * c->kv_dim);
-    R(ws->v,        cap * c->kv_dim);
-    R(ws->attn_out, cap * c->q_dim);
-    R(ws->proj_out, cap * c->hidden_size);
-    R(ws->ffn_gate, cap * c->intermediate_size);
-    R(ws->ffn_up,   cap * c->intermediate_size);
-    R(ws->ffn_out,  cap * c->hidden_size);
+    R(ws->x,        c->hidden_size);
+    R(ws->x_norm,   c->hidden_size);
+    R(ws->q,        c->q_dim);
+    R(ws->k,        c->kv_dim);
+    R(ws->v,        c->kv_dim);
+    R(ws->attn_out, c->q_dim);
+    R(ws->proj_out, c->hidden_size);
+    R(ws->ffn_gate, c->intermediate_size);
+    R(ws->ffn_up,   c->intermediate_size);
+    R(ws->ffn_out,  c->hidden_size);
 
 #undef R
 
@@ -226,22 +299,22 @@ static int ensure_rope_cache(pplx_workspace_t *ws, const pplx_config_t *cfg,
     if (n_pos <= ws->rope_cache_cap) return 0;
 
     int cap = ws->rope_cache_cap > 0 ? ws->rope_cache_cap : 512;
-    while (cap < n_pos) cap *= 2;
+    while (cap < n_pos) {
+        if (cap > INT_MAX / 2) return -1;
+        cap *= 2;
+    }
 
     int   head_dim = cfg->head_dim;
     int   half     = head_dim / 2;
     float theta    = cfg->rope_theta;
 
-    size_t n = (size_t)cap * head_dim;
-    float *nc = (float *)realloc(ws->rope_cos, n * sizeof(float));
-    float *ns = (float *)realloc(ws->rope_sin, n * sizeof(float));
-    if (!nc || !ns) {
-        if (nc) ws->rope_cos = nc;
-        if (ns) ws->rope_sin = ns;
+    size_t count;
+    if (mul_size((size_t)cap, (size_t)head_dim, &count) != 0)
         return -1;
-    }
-    ws->rope_cos = nc;
-    ws->rope_sin = ns;
+    if (realloc_floats(&ws->rope_cos, count) != 0)
+        return -1;
+    if (realloc_floats(&ws->rope_sin, count) != 0)
+        return -1;
 
     for (int pos = ws->rope_cache_cap; pos < cap; pos++) {
         float fp = (float)pos;
@@ -550,14 +623,19 @@ int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
 {
     if (!model || !ws || !token_ids || n_tokens <= 0 || !out_states) return -1;
 
+    size_t count, bytes;
+    if (mul_size((size_t)n_tokens, (size_t)model->config.hidden_size,
+                 &count) != 0 ||
+        mul_size(count, sizeof(float), &bytes) != 0)
+        return -1;
+
     pplx_input_t input = { token_ids, n_tokens };
     int offsets[2] = { 0, n_tokens };
     if (forward_packed_inplace(model, ws, &input, 1, offsets,
                                n_tokens, n_tokens) != 0)
         return -1;
 
-    size_t out_size = (size_t)n_tokens * model->config.hidden_size * sizeof(float);
-    memcpy(out_states, ws->x, out_size);
+    memcpy(out_states, ws->x, bytes);
     return 0;
 }
 
@@ -566,8 +644,10 @@ float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
 {
     if (!model || !ws || !token_ids || n_tokens <= 0) return NULL;
 
-    size_t n = (size_t)n_tokens * model->config.hidden_size;
-    float *out = (float *)malloc(n * sizeof(float));
+    size_t n;
+    if (mul_size((size_t)n_tokens, (size_t)model->config.hidden_size, &n) != 0)
+        return NULL;
+    float *out = malloc_floats(n);
     if (!out) return NULL;
 
     if (pplx_model_forward_into(model, ws, token_ids, n_tokens, out) != 0) {
@@ -583,7 +663,11 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
 {
     if (!model || !ws || !inputs || batch <= 0 || !out_embeddings) return -1;
 
-    int *offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
+    if (batch == INT_MAX) return -1;
+    size_t offset_bytes;
+    if (mul_size((size_t)batch + 1, sizeof(int), &offset_bytes) != 0)
+        return -1;
+    int *offsets = (int *)malloc(offset_bytes);
     if (!offsets) return -1;
 
     int total_seq = 0;
@@ -616,7 +700,7 @@ float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
     if (!model || !ws || !token_ids || n_tokens <= 0) return NULL;
 
     int hidden = model->config.hidden_size;
-    float *emb = (float *)malloc((size_t)hidden * sizeof(float));
+    float *emb = malloc_floats((size_t)hidden);
     if (!emb) return NULL;
 
     if (pplx_model_embed_into(model, ws, token_ids, n_tokens, emb) != 0) {
