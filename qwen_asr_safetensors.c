@@ -40,16 +40,18 @@ static int parse_string(const char **p, char *out, size_t max_len) {
     return 0;
 }
 
-static int64_t parse_int(const char **p) {
+static int parse_int(const char **p, int64_t *out) {
     skip_whitespace(p);
     int64_t val = 0;
     int neg = 0;
     if (**p == '-') { neg = 1; (*p)++; }
+    if (**p < '0' || **p > '9') return -1;
     while (**p >= '0' && **p <= '9') {
         val = val * 10 + (**p - '0');
         (*p)++;
     }
-    return neg ? -val : val;
+    *out = neg ? -val : val;
+    return 0;
 }
 
 static safetensor_dtype_t parse_dtype(const char *s) {
@@ -91,25 +93,33 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
             if (**p != '[') return -1;
             (*p)++;
             t->ndim = 0;
-            while (**p && **p != ']' && t->ndim < 8) {
+            while (**p && **p != ']') {
                 skip_whitespace(p);
                 if (**p == ',') { (*p)++; continue; }
-                t->shape[t->ndim++] = parse_int(p);
+                if (t->ndim >= 8) return -1;
+                if (parse_int(p, &t->shape[t->ndim]) != 0) return -1;
+                t->ndim++;
             }
-            if (**p == ']') (*p)++;
+            if (**p != ']') return -1;
+            (*p)++;
         } else if (strcmp(key, "data_offsets") == 0) {
             if (**p != '[') return -1;
             (*p)++;
             skip_whitespace(p);
-            size_t start = (size_t)parse_int(p);
+            int64_t start_i;
+            if (parse_int(p, &start_i) != 0) return -1;
             skip_whitespace(p);
-            if (**p == ',') (*p)++;
+            if (**p != ',') return -1;
+            (*p)++;
             skip_whitespace(p);
-            size_t end = (size_t)parse_int(p);
-            t->data_offset = start;
-            t->data_size = end - start;
+            int64_t end_i;
+            if (parse_int(p, &end_i) != 0) return -1;
+            if (start_i < 0 || end_i < start_i) return -1;
+            t->data_offset = (size_t)start_i;
+            t->data_size = (size_t)(end_i - start_i);
             skip_whitespace(p);
-            if (**p == ']') (*p)++;
+            if (**p != ']') return -1;
+            (*p)++;
         } else {
             /* Skip unknown value */
             if (**p == '"') {
@@ -138,7 +148,8 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
             }
         }
     }
-    if (**p == '}') (*p)++;
+    if (**p != '}') return -1;
+    (*p)++;
     return 0;
 }
 
@@ -150,7 +161,7 @@ static int parse_header(safetensors_file_t *sf) {
 
     sf->num_tensors = 0;
 
-    while (*p && *p != '}' && sf->num_tensors < SAFETENSORS_MAX_TENSORS) {
+    while (*p && *p != '}') {
         skip_whitespace(&p);
         if (*p == ',') { p++; continue; }
         if (*p == '}') break;
@@ -174,11 +185,18 @@ static int parse_header(safetensors_file_t *sf) {
             continue;
         }
 
+        if (sf->num_tensors >= SAFETENSORS_MAX_TENSORS) {
+            fprintf(stderr, "safetensors: too many tensors in %s (max %d)\n",
+                    sf->path ? sf->path : "<unknown>", SAFETENSORS_MAX_TENSORS);
+            return -1;
+        }
+
         safetensor_t *t = &sf->tensors[sf->num_tensors];
         snprintf(t->name, sizeof(t->name), "%s", name);
         if (parse_tensor_entry(&p, t) != 0) return -1;
         sf->num_tensors++;
     }
+    if (*p != '}') return -1;
     return 0;
 }
 
@@ -301,6 +319,23 @@ void safetensors_print_all(const safetensors_file_t *sf) {
  * Multi-shard operations
  * ======================================================================== */
 
+static int cmp_shard_names(const void *a, const void *b) {
+    const char *sa = (const char *)a;
+    const char *sb = (const char *)b;
+    return strcmp(sa, sb);
+}
+
+static int parse_shard_name(const char *name, int *idx, int *total) {
+    int i = 0, n = 0, consumed = 0;
+    if (sscanf(name, "model-%d-of-%d.safetensors%n", &i, &n, &consumed) != 2)
+        return -1;
+    if (name[consumed] != '\0' || i <= 0 || n <= 0 || i > n)
+        return -1;
+    *idx = i;
+    *total = n;
+    return 0;
+}
+
 multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     multi_safetensors_t *ms = calloc(1, sizeof(multi_safetensors_t));
     if (!ms) return NULL;
@@ -316,25 +351,52 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return ms;
     }
 
-    /* Try multi-shard: model-00001-of-NNNNN.safetensors */
-    for (int i = 1; i <= SAFETENSORS_MAX_SHARDS; i++) {
-        snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
-                 model_dir, i, i); /* placeholder - need to detect count */
-        /* We don't know the total count yet, try common patterns */
-        break;
-    }
-
     /* Scan directory for shard files */
     DIR *dir = opendir(model_dir);
     if (!dir) { free(ms); return NULL; }
 
     struct dirent *entry;
     char shard_names[SAFETENSORS_MAX_SHARDS][256];
+    int seen[SAFETENSORS_MAX_SHARDS] = {0};
     int n_shards = 0;
+    int expected_total = 0;
 
-    while ((entry = readdir(dir)) != NULL && n_shards < SAFETENSORS_MAX_SHARDS) {
+    while ((entry = readdir(dir)) != NULL) {
         if (strncmp(entry->d_name, "model-", 6) == 0 &&
             strstr(entry->d_name, ".safetensors") != NULL) {
+            int shard_idx = 0, shard_total = 0;
+            if (parse_shard_name(entry->d_name, &shard_idx, &shard_total) != 0) {
+                fprintf(stderr, "multi_safetensors_open: bad shard name: %s\n",
+                        entry->d_name);
+                closedir(dir);
+                free(ms);
+                return NULL;
+            }
+            if (shard_total > SAFETENSORS_MAX_SHARDS) {
+                fprintf(stderr, "multi_safetensors_open: too many shards (%d > %d)\n",
+                        shard_total, SAFETENSORS_MAX_SHARDS);
+                closedir(dir);
+                free(ms);
+                return NULL;
+            }
+            if (expected_total == 0) {
+                expected_total = shard_total;
+            } else if (expected_total != shard_total) {
+                fprintf(stderr, "multi_safetensors_open: inconsistent shard total in %s\n",
+                        entry->d_name);
+                closedir(dir);
+                free(ms);
+                return NULL;
+            }
+            if (seen[shard_idx - 1]) {
+                fprintf(stderr, "multi_safetensors_open: duplicate shard index %d\n",
+                        shard_idx);
+                closedir(dir);
+                free(ms);
+                return NULL;
+            }
+            seen[shard_idx - 1] = 1;
+
             snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]),
                      "%s", entry->d_name);
             n_shards++;
@@ -347,9 +409,23 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         free(ms);
         return NULL;
     }
+    if (expected_total != n_shards) {
+        fprintf(stderr, "multi_safetensors_open: expected %d shard(s), found %d in %s\n",
+                expected_total, n_shards, model_dir);
+        free(ms);
+        return NULL;
+    }
+    for (int i = 0; i < expected_total; i++) {
+        if (!seen[i]) {
+            fprintf(stderr, "multi_safetensors_open: missing shard %d of %d in %s\n",
+                    i + 1, expected_total, model_dir);
+            free(ms);
+            return NULL;
+        }
+    }
 
     /* Sort shard names to ensure consistent ordering */
-    qsort(shard_names, n_shards, 256, (int(*)(const void*,const void*))strcmp);
+    qsort(shard_names, n_shards, sizeof(shard_names[0]), cmp_shard_names);
 
     /* Open each shard */
     for (int i = 0; i < n_shards; i++) {
