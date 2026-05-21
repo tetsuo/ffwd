@@ -55,6 +55,17 @@ static int utf8_encode_cp(int cp, char out[4]) {
     return 3;
 }
 
+static int utf8_encode_full_cp(int cp, char out[4]) {
+    if (cp < 0x80) return utf8_encode_cp(cp, out);
+    if (cp < 0x800) return utf8_encode_cp(cp, out);
+    if (cp < 0x10000) return utf8_encode_cp(cp, out);
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
 /*
  * Decode a GPT-2 encoded token string (vocab key) to raw bytes/UTF-8 text.
  * Returns allocated string (caller must free).
@@ -336,6 +347,387 @@ static char *text_to_bpe_unicode(const char *text) {
     return out;
 }
 
+static int encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped,
+                           int **out_ids, int *out_n);
+
+static int utf8_decode_cp_len(const unsigned char *p, const unsigned char *end,
+                              int *cp_out, int *len_out) {
+    if (p >= end || *p == '\0') return 0;
+
+    unsigned char c = *p;
+    if ((c & 0x80) == 0) {
+        *cp_out = c;
+        *len_out = 1;
+        return 1;
+    }
+    if ((c & 0xE0) == 0xC0 && p + 1 < end &&
+        (p[1] & 0xC0) == 0x80) {
+        *cp_out = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+        *len_out = 2;
+        return 1;
+    }
+    if ((c & 0xF0) == 0xE0 && p + 2 < end &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        *cp_out = ((c & 0x0F) << 12) |
+                  ((p[1] & 0x3F) << 6) |
+                  (p[2] & 0x3F);
+        *len_out = 3;
+        return 1;
+    }
+    if ((c & 0xF8) == 0xF0 && p + 3 < end &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+        (p[3] & 0xC0) == 0x80) {
+        *cp_out = ((c & 0x07) << 18) |
+                  ((p[1] & 0x3F) << 12) |
+                  ((p[2] & 0x3F) << 6) |
+                  (p[3] & 0x3F);
+        *len_out = 4;
+        return 1;
+    }
+
+    *cp_out = c;
+    *len_out = 1;
+    return 1;
+}
+
+static int is_ascii_alpha_cp(int cp) {
+    return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z');
+}
+
+static int is_number_cp(int cp) {
+    if (cp >= '0' && cp <= '9') return 1;
+    if (cp >= 0x0660 && cp <= 0x0669) return 1;
+    if (cp >= 0x06F0 && cp <= 0x06F9) return 1;
+    if (cp >= 0x0966 && cp <= 0x096F) return 1;
+    if (cp >= 0xFF10 && cp <= 0xFF19) return 1;
+    return 0;
+}
+
+static int is_space_cp(int cp) {
+    return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' ||
+           cp == '\f' || cp == '\v' || cp == 0x85 || cp == 0xA0 ||
+           cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F ||
+           cp == 0x205F || cp == 0x3000;
+}
+
+static int is_symbolish_cp(int cp) {
+    if (cp < 0x80) return 0;
+    if (cp >= 0x0300 && cp <= 0x036F) return 1;
+    if (cp >= 0x00A1 && cp <= 0x00BF &&
+        cp != 0x00AA && cp != 0x00B5 && cp != 0x00BA)
+        return 1;
+    if (cp == 0x00D7 || cp == 0x00F7) return 1;
+    if (cp >= 0x064B && cp <= 0x065F) return 1;
+    if ((cp >= 0x0900 && cp <= 0x0903) ||
+        (cp >= 0x093A && cp <= 0x094F) ||
+        (cp >= 0x0951 && cp <= 0x0957) ||
+        (cp >= 0x0962 && cp <= 0x0963))
+        return 1;
+    if (cp >= 0x2000 && cp <= 0x206F) return 1;
+    if (cp >= 0x2190 && cp <= 0x27BF) return 1;
+    if (cp >= 0x2E00 && cp <= 0x2E7F) return 1;
+    if (cp >= 0x3000 && cp <= 0x303F) return 1;
+    if (cp >= 0x1F000 && cp <= 0x1FAFF) return 1;
+    return 0;
+}
+
+static int compose_latin_mark(int base, int mark) {
+    switch (mark) {
+    case 0x0300:
+        switch (base) {
+        case 'A': return 0x00C0; case 'E': return 0x00C8;
+        case 'I': return 0x00CC; case 'O': return 0x00D2;
+        case 'U': return 0x00D9; case 'a': return 0x00E0;
+        case 'e': return 0x00E8; case 'i': return 0x00EC;
+        case 'o': return 0x00F2; case 'u': return 0x00F9;
+        }
+        break;
+    case 0x0301:
+        switch (base) {
+        case 'A': return 0x00C1; case 'C': return 0x0106;
+        case 'E': return 0x00C9; case 'I': return 0x00CD;
+        case 'L': return 0x0139; case 'N': return 0x0143;
+        case 'O': return 0x00D3; case 'R': return 0x0154;
+        case 'S': return 0x015A; case 'U': return 0x00DA;
+        case 'Y': return 0x00DD; case 'Z': return 0x0179;
+        case 'a': return 0x00E1; case 'c': return 0x0107;
+        case 'e': return 0x00E9; case 'i': return 0x00ED;
+        case 'l': return 0x013A; case 'n': return 0x0144;
+        case 'o': return 0x00F3; case 'r': return 0x0155;
+        case 's': return 0x015B; case 'u': return 0x00FA;
+        case 'y': return 0x00FD; case 'z': return 0x017A;
+        }
+        break;
+    case 0x0302:
+        switch (base) {
+        case 'A': return 0x00C2; case 'E': return 0x00CA;
+        case 'I': return 0x00CE; case 'O': return 0x00D4;
+        case 'U': return 0x00DB; case 'a': return 0x00E2;
+        case 'e': return 0x00EA; case 'i': return 0x00EE;
+        case 'o': return 0x00F4; case 'u': return 0x00FB;
+        }
+        break;
+    case 0x0303:
+        switch (base) {
+        case 'A': return 0x00C3; case 'N': return 0x00D1;
+        case 'O': return 0x00D5; case 'a': return 0x00E3;
+        case 'n': return 0x00F1; case 'o': return 0x00F5;
+        }
+        break;
+    case 0x0308:
+        switch (base) {
+        case 'A': return 0x00C4; case 'E': return 0x00CB;
+        case 'I': return 0x00CF; case 'O': return 0x00D6;
+        case 'U': return 0x00DC; case 'Y': return 0x0178;
+        case 'a': return 0x00E4; case 'e': return 0x00EB;
+        case 'i': return 0x00EF; case 'o': return 0x00F6;
+        case 'u': return 0x00FC; case 'y': return 0x00FF;
+        }
+        break;
+    case 0x030A:
+        switch (base) {
+        case 'A': return 0x00C5; case 'a': return 0x00E5;
+        }
+        break;
+    case 0x0327:
+        switch (base) {
+        case 'C': return 0x00C7; case 'c': return 0x00E7;
+        }
+        break;
+    }
+    return 0;
+}
+
+static char *normalize_nfc_latin(const char *text) {
+    const unsigned char *p = (const unsigned char *)text;
+    const unsigned char *end = p + strlen(text);
+    char *out = (char *)malloc((size_t)(end - p) * 2 + 1);
+    if (!out) return NULL;
+
+    size_t w = 0;
+    while (p < end) {
+        const unsigned char *cur = p;
+        int cp = 0, len = 0;
+        if (!utf8_decode_cp_len(p, end, &cp, &len)) break;
+        p += len;
+
+        if (p < end) {
+            int mark = 0, mark_len = 0;
+            utf8_decode_cp_len(p, end, &mark, &mark_len);
+            int composed = compose_latin_mark(cp, mark);
+            if (composed) {
+                char tmp[4];
+                int n = utf8_encode_full_cp(composed, tmp);
+                for (int i = 0; i < n; i++) out[w++] = tmp[i];
+                p += mark_len;
+                continue;
+            }
+        }
+
+        memcpy(out + w, cur, (size_t)len);
+        w += (size_t)len;
+    }
+
+    out[w] = '\0';
+    return out;
+}
+
+static int is_letter_cp(int cp) {
+    if (is_ascii_alpha_cp(cp)) return 1;
+    if (cp < 0x80 || is_space_cp(cp) || is_number_cp(cp) ||
+        is_symbolish_cp(cp))
+        return 0;
+    return 1;
+}
+
+static int is_word_cp(int cp) {
+    return is_letter_cp(cp) || is_number_cp(cp);
+}
+
+static int is_newline_cp(int cp) {
+    return cp == '\n' || cp == '\r';
+}
+
+static int ascii_lower(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+static int match_contraction(const unsigned char *p, const unsigned char *end) {
+    if (p >= end || *p != '\'') return 0;
+    int remain = (int)(end - p);
+    if (remain >= 2) {
+        int c1 = ascii_lower(p[1]);
+        if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd')
+            return 2;
+    }
+    if (remain >= 3) {
+        int c1 = ascii_lower(p[1]);
+        int c2 = ascii_lower(p[2]);
+        if ((c1 == 'r' && c2 == 'e') ||
+            (c1 == 'v' && c2 == 'e') ||
+            (c1 == 'l' && c2 == 'l'))
+            return 3;
+    }
+    return 0;
+}
+
+static int append_encoded_piece(const qwen_tokenizer_t *tok,
+                                const char *piece, size_t piece_len,
+                                int **ids, int *n_ids, int *cap) {
+    if (piece_len == 0) return 0;
+
+    char *tmp = (char *)malloc(piece_len + 1);
+    if (!tmp) return -1;
+    memcpy(tmp, piece, piece_len);
+    tmp[piece_len] = '\0';
+
+    char *mapped = text_to_bpe_unicode(tmp);
+    free(tmp);
+    if (!mapped) return -1;
+
+    int *piece_ids = NULL;
+    int n_piece = 0;
+    if (encode_bpe_word(tok, mapped, &piece_ids, &n_piece) != 0) {
+        free(mapped);
+        free(piece_ids);
+        return -1;
+    }
+    free(mapped);
+
+    for (int i = 0; i < n_piece; i++) {
+        if (append_id(ids, n_ids, cap, piece_ids[i]) != 0) {
+            free(piece_ids);
+            return -1;
+        }
+    }
+    free(piece_ids);
+    return 0;
+}
+
+static int encode_pretokenized(const qwen_tokenizer_t *tok, const char *text,
+                               int **out_ids, int *out_n) {
+    const unsigned char *start = (const unsigned char *)text;
+    const unsigned char *p = start;
+    const unsigned char *end = start + strlen(text);
+    int *ids = NULL;
+    int n_ids = 0, cap = 0;
+
+    while (p < end) {
+        const unsigned char *piece = p;
+        int cp = 0, len = 0;
+        if (!utf8_decode_cp_len(p, end, &cp, &len)) break;
+
+        int clen = match_contraction(p, end);
+        if (clen > 0) {
+            p += clen;
+        } else {
+            const unsigned char *next = p + len;
+            int next_cp = 0, next_len = 0;
+            int has_next = utf8_decode_cp_len(next, end, &next_cp, &next_len);
+
+            if (!is_newline_cp(cp) && !is_word_cp(cp) &&
+                has_next && is_letter_cp(next_cp)) {
+                p = next + next_len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_letter_cp(c)) break;
+                    p += l;
+                }
+            } else if (is_letter_cp(cp)) {
+                p += len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_letter_cp(c)) break;
+                    p += l;
+                }
+            } else if (is_number_cp(cp)) {
+                p += len;
+            } else if (is_space_cp(cp)) {
+                const unsigned char *q = p;
+                int saw_newline = 0;
+                while (q < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(q, end, &c, &l);
+                    if (!is_space_cp(c)) break;
+                    if (is_newline_cp(c)) saw_newline = 1;
+                    q += l;
+                    if (saw_newline) {
+                        while (q < end) {
+                            int c2 = 0, l2 = 0;
+                            utf8_decode_cp_len(q, end, &c2, &l2);
+                            if (!is_newline_cp(c2)) break;
+                            q += l2;
+                        }
+                        break;
+                    }
+                }
+
+                if (saw_newline) {
+                    p = q;
+                } else if (cp == ' ' && has_next && !is_space_cp(next_cp) &&
+                           !is_word_cp(next_cp)) {
+                    p = next + next_len;
+                    while (p < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(p, end, &c, &l);
+                        if (is_space_cp(c) || is_word_cp(c)) break;
+                        p += l;
+                    }
+                    while (p < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(p, end, &c, &l);
+                        if (!is_newline_cp(c)) break;
+                        p += l;
+                    }
+                } else {
+                    const unsigned char *last = p;
+                    const unsigned char *q2 = p;
+                    int count = 0;
+                    while (q2 < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(q2, end, &c, &l);
+                        if (!is_space_cp(c)) break;
+                        last = q2;
+                        q2 += l;
+                        count++;
+                    }
+                    if (q2 < end && count > 1)
+                        p = last;
+                    else
+                        p = q2;
+                }
+            } else {
+                p += len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (is_space_cp(c) || is_word_cp(c)) break;
+                    p += l;
+                }
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_newline_cp(c)) break;
+                    p += l;
+                }
+            }
+        }
+
+        if (append_encoded_piece(tok, (const char *)piece, (size_t)(p - piece),
+                                 &ids, &n_ids, &cap) != 0) {
+            free(ids);
+            return -1;
+        }
+    }
+
+    *out_ids = ids;
+    *out_n = n_ids;
+    return 0;
+}
+
 /* Encode one mapped BPE unicode string to token IDs. */
 static int encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int **out_ids, int *out_n) {
     *out_ids = NULL;
@@ -604,17 +996,17 @@ int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *o
     if (out_n_tokens) *out_n_tokens = 0;
     if (!tok || !text || text[0] == '\0') return NULL;
 
-    char *mapped = text_to_bpe_unicode(text);
-    if (!mapped) return NULL;
+    char *normalized = normalize_nfc_latin(text);
+    if (!normalized) return NULL;
 
     int *ids = NULL;
     int n_ids = 0;
-    if (encode_bpe_word(tok, mapped, &ids, &n_ids) != 0) {
-        free(mapped);
+    if (encode_pretokenized(tok, normalized, &ids, &n_ids) != 0) {
+        free(normalized);
         free(ids);
         return NULL;
     }
-    free(mapped);
+    free(normalized);
 
     if (out_n_tokens) *out_n_tokens = n_ids;
     return ids;
