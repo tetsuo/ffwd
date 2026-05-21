@@ -368,6 +368,50 @@ static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf1
 }
 
 typedef struct {
+    float *y;
+    const float *x;
+    const uint16_t *W_bf16;
+    const float *bias;
+    int seq_len;
+    int in_dim;
+    int out_dim;
+} bf16_linear_rows_task_t;
+
+static void bf16_linear_rows_worker(int tid, int n_threads, void *arg) {
+    bf16_linear_rows_task_t *t = (bf16_linear_rows_task_t *)arg;
+    int chunk = (t->seq_len + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->seq_len) end = t->seq_len;
+    if (start >= end) return;
+
+    for (int s = start; s < end; s++) {
+        bf16_matvec_fused(t->y + (size_t)s * t->out_dim,
+                          t->x + (size_t)s * t->in_dim,
+                          t->W_bf16, t->bias, t->in_dim, t->out_dim);
+    }
+}
+
+static void bf16_linear_rows(float *y, const float *x, const uint16_t *W_bf16,
+                             const float *bias, int seq_len, int in_dim,
+                             int out_dim) {
+    bf16_linear_rows_task_t task = {
+        .y = y,
+        .x = x,
+        .W_bf16 = W_bf16,
+        .bias = bias,
+        .seq_len = seq_len,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    };
+
+    if (tp.n_threads > 1 && seq_len >= 2)
+        parallel_for(bf16_linear_rows_worker, &task);
+    else
+        bf16_linear_rows_worker(0, 1, &task);
+}
+
+typedef struct {
     float *q;
     float *k;
     float *v;
@@ -460,6 +504,10 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
     }
+    if (seq_len <= 16) {
+        bf16_linear_rows(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
+        return;
+    }
     size_t n = (size_t)out_dim * in_dim;
     const float *W_f32 = bf16_get_f32_view(W_bf16, n);
     if (!W_f32) return;
@@ -470,6 +518,10 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim) {
     if (seq_len == 1) {
         bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
+        return;
+    }
+    if (seq_len <= 16) {
+        bf16_linear_rows(y, x, W_bf16, b, seq_len, in_dim, out_dim);
         return;
     }
     size_t n = (size_t)out_dim * in_dim;

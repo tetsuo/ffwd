@@ -44,11 +44,16 @@ static mlx_array load_tensor(multi_safetensors_t *ms, const char *name,
         fprintf(stderr, "mlx: tensor not found: %s\n", name);
         return (mlx_array){0};
     }
-    if (t->dtype != DTYPE_F32) {
-        fprintf(stderr, "mlx: expected F32 for %s\n", name);
+    mlx_dtype dtype;
+    if (t->dtype == DTYPE_F32) {
+        dtype = MLX_FLOAT32;
+    } else if (t->dtype == DTYPE_BF16) {
+        dtype = MLX_BFLOAT16;
+    } else {
+        fprintf(stderr, "mlx: expected F32 or BF16 for %s\n", name);
         return (mlx_array){0};
     }
-    return mlx_array_new_data(safetensors_data(sf, t), shape, ndim, MLX_FLOAT32);
+    return mlx_array_new_data(safetensors_data(sf, t), shape, ndim, dtype);
 }
 
 /* y = x @ W^T */
@@ -319,6 +324,16 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         mlx_array_free(lengths);
         return -1;
     }
+    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+        mlx_array attn_mask_bf16 = mlx_array_new();
+        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
+        mlx_array_free(attn_mask);
+        attn_mask = attn_mask_bf16;
+        if (!arr_ok(attn_mask)) {
+            mlx_array_free(ids); mlx_array_free(pool_mask); mlx_array_free(lengths);
+            return -1;
+        }
+    }
 
     float scale = 1.0f / sqrtf((float)head_dim);
     mlx_array null_arr = (mlx_array){0};
@@ -447,14 +462,18 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     if (has_padding) mlx_array_free(attn_mask);
 
     /* 6. Eval and copy [B, hidden] to CPU. */
-    mlx_array_eval(emb_n);
-    const float *data = mlx_array_data_float32(emb_n);
+    mlx_array emb_f32 = mlx_array_new();
+    mlx_astype(&emb_f32, emb_n, MLX_FLOAT32, S);
+    mlx_array_free(emb_n);
+
+    mlx_array_eval(emb_f32);
+    const float *data = mlx_array_data_float32(emb_f32);
     int rc = -1;
     if (data) {
         memcpy(out_embeddings, data, (size_t)batch * hidden * sizeof(float));
         rc = 0;
     }
-    mlx_array_free(emb_n);
+    mlx_array_free(emb_f32);
     return rc;
 }
 
