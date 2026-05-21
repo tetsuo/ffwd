@@ -9,21 +9,26 @@
 #include <limits.h>
 
 typedef struct {
-    const float *wq;            /* [q_dim,   hidden] */
-    const float *wk;            /* [kv_dim,  hidden] */
-    const float *wv;            /* [kv_dim,  hidden] */
-    const float *wo;            /* [hidden,  q_dim]  */
+    safetensor_dtype_t dtype;
+    const void *data;
+} pplx_weight_ref_t;
+
+typedef struct {
+    pplx_weight_ref_t wq;       /* [q_dim,   hidden] */
+    pplx_weight_ref_t wk;       /* [kv_dim,  hidden] */
+    pplx_weight_ref_t wv;       /* [kv_dim,  hidden] */
+    pplx_weight_ref_t wo;       /* [hidden,  q_dim]  */
     const float *q_norm;        /* [head_dim] */
     const float *k_norm;        /* [head_dim] */
     const float *input_norm;    /* [hidden] */
     const float *post_attn_norm;/* [hidden] */
-    const float *gate_proj;     /* [intermediate, hidden] */
-    const float *up_proj;       /* [intermediate, hidden] */
-    const float *down_proj;     /* [hidden, intermediate] */
+    pplx_weight_ref_t gate_proj;/* [intermediate, hidden] */
+    pplx_weight_ref_t up_proj;  /* [intermediate, hidden] */
+    pplx_weight_ref_t down_proj;/* [hidden, intermediate] */
 } pplx_layer_t;
 
 typedef struct {
-    const float *embed_tokens;  /* [vocab_size, hidden] */
+    pplx_weight_ref_t embed_tokens; /* [vocab_size, hidden] */
     pplx_layer_t *layers;       /* [n_layers] heap-allocated */
     const float *norm;          /* [hidden] */
 } pplx_weights_t;
@@ -241,13 +246,36 @@ static int parse_config(pplx_config_t *cfg, const char *model_dir)
  * Weight loading (direct mmap pointers into safetensors)
  * ======================================================================== */
 
-static int tensor_has_f32_shape(const safetensors_file_t *sf,
-                                const safetensor_t *t, const char *name,
-                                const int64_t *shape, int ndim)
+static size_t dtype_size(safetensor_dtype_t dtype)
 {
-    if (t->dtype != DTYPE_F32) {
-        fprintf(stderr, "pplx: expected F32 for %s, got dtype=%d\n",
-                name, (int)t->dtype);
+    switch (dtype) {
+    case DTYPE_F32:  return sizeof(float);
+    case DTYPE_BF16: return sizeof(uint16_t);
+    default:         return 0;
+    }
+}
+
+static const char *dtype_name(safetensor_dtype_t dtype)
+{
+    switch (dtype) {
+    case DTYPE_F32:  return "F32";
+    case DTYPE_F16:  return "F16";
+    case DTYPE_BF16: return "BF16";
+    case DTYPE_I32:  return "I32";
+    case DTYPE_I64:  return "I64";
+    case DTYPE_BOOL: return "BOOL";
+    default:         return "UNKNOWN";
+    }
+}
+
+static int tensor_has_supported_shape(const safetensors_file_t *sf,
+                                      const safetensor_t *t, const char *name,
+                                      const int64_t *shape, int ndim,
+                                      int bf16_ok)
+{
+    if (t->dtype != DTYPE_F32 && !(bf16_ok && t->dtype == DTYPE_BF16)) {
+        fprintf(stderr, "pplx: unsupported dtype for %s: got %s, expected %s\n",
+                name, dtype_name(t->dtype), bf16_ok ? "F32 or BF16" : "F32");
         return 0;
     }
     if (t->ndim != ndim) {
@@ -271,8 +299,15 @@ static int tensor_has_f32_shape(const safetensors_file_t *sf,
         numel *= (size_t)shape[i];
     }
 
+    size_t elem_size = dtype_size(t->dtype);
+    if (elem_size == 0) {
+        fprintf(stderr, "pplx: unsupported dtype for %s: got %s\n",
+                name, dtype_name(t->dtype));
+        return 0;
+    }
+
     size_t bytes;
-    if (mul_size(numel, sizeof(float), &bytes) != 0 ||
+    if (mul_size(numel, elem_size, &bytes) != 0 ||
         t->data_size != bytes) {
         fprintf(stderr, "pplx: bad data size for %s: got %zu, expected %zu\n",
                 name, t->data_size, bytes);
@@ -289,8 +324,27 @@ static int tensor_has_f32_shape(const safetensors_file_t *sf,
     return 1;
 }
 
-static const float *load_f32_direct(multi_safetensors_t *ms, const char *name,
-                                    const int64_t *shape, int ndim)
+static pplx_weight_ref_t load_weight_direct(multi_safetensors_t *ms,
+                                            const char *name,
+                                            const int64_t *shape, int ndim)
+{
+    pplx_weight_ref_t ref = { DTYPE_UNKNOWN, NULL };
+    safetensors_file_t *sf = NULL;
+    const safetensor_t *t  = multi_safetensors_find(ms, name, &sf);
+    if (!t) {
+        fprintf(stderr, "pplx: tensor not found: %s\n", name);
+        return ref;
+    }
+    if (!tensor_has_supported_shape(sf, t, name, shape, ndim, 1))
+        return ref;
+
+    ref.dtype = t->dtype;
+    ref.data = safetensors_data(sf, t);
+    return ref;
+}
+
+static float *load_norm_f32(multi_safetensors_t *ms, const char *name,
+                            const int64_t *shape, int ndim)
 {
     safetensors_file_t *sf = NULL;
     const safetensor_t *t  = multi_safetensors_find(ms, name, &sf);
@@ -298,9 +352,42 @@ static const float *load_f32_direct(multi_safetensors_t *ms, const char *name,
         fprintf(stderr, "pplx: tensor not found: %s\n", name);
         return NULL;
     }
-    if (!tensor_has_f32_shape(sf, t, name, shape, ndim))
+    if (!tensor_has_supported_shape(sf, t, name, shape, ndim, 1))
         return NULL;
-    return (const float *)safetensors_data(sf, t);
+    return safetensors_get_f32(sf, t);
+}
+
+static void bf16_row_to_f32(float *dst, const uint16_t *src, int n)
+{
+    for (int i = 0; i < n; i++) {
+        uint32_t u = ((uint32_t)src[i]) << 16;
+        memcpy(dst + i, &u, sizeof(float));
+    }
+}
+
+static void copy_weight_row(float *dst, const pplx_weight_ref_t *w,
+                            size_t row, int row_width)
+{
+    if (w->dtype == DTYPE_F32) {
+        const float *src = (const float *)w->data + row * (size_t)row_width;
+        memcpy(dst, src, (size_t)row_width * sizeof(float));
+    } else {
+        const uint16_t *src = (const uint16_t *)w->data + row * (size_t)row_width;
+        bf16_row_to_f32(dst, src, row_width);
+    }
+}
+
+static void linear_nobias_weight(float *y, const float *x,
+                                 const pplx_weight_ref_t *w,
+                                 int seq_len, int in_dim, int out_dim)
+{
+    if (w->dtype == DTYPE_F32) {
+        qwen_linear_nobias(y, x, (const float *)w->data,
+                           seq_len, in_dim, out_dim);
+    } else {
+        qwen_linear_nobias_bf16(y, x, (const uint16_t *)w->data,
+                                seq_len, in_dim, out_dim);
+    }
 }
 
 /* ========================================================================
@@ -411,9 +498,9 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     /* Token embeddings */
     pplx_weights_t *w = &model->weights;
     const int64_t embed_shape[2] = { cfg->vocab_size, cfg->hidden_size };
-    w->embed_tokens = load_f32_direct(ms, "embed_tokens.weight",
-                                      embed_shape, 2);
-    if (!w->embed_tokens) goto fail;
+    w->embed_tokens = load_weight_direct(ms, "embed_tokens.weight",
+                                         embed_shape, 2);
+    if (!w->embed_tokens.data) goto fail;
 
     /* Allocate layer array */
     w->layers = (pplx_layer_t *)calloc(cfg->n_layers, sizeof(pplx_layer_t));
@@ -424,18 +511,18 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     for (int i = 0; i < cfg->n_layers; i++) {
         pplx_layer_t *l = &w->layers[i];
 
-#define LOAD1(field, fmt, d0) do {                          \
+#define LOAD_NORM(field, fmt, d0) do {                      \
     const int64_t expect[1] = { (d0) };                     \
     snprintf(name, sizeof(name), fmt, i);                   \
-    l->field = load_f32_direct(ms, name, expect, 1);        \
+    l->field = load_norm_f32(ms, name, expect, 1);          \
     if (!l->field) goto fail;                               \
 } while (0)
 
 #define LOAD2(field, fmt, d0, d1) do {                      \
     const int64_t expect[2] = { (d0), (d1) };                \
     snprintf(name, sizeof(name), fmt, i);                   \
-    l->field = load_f32_direct(ms, name, expect, 2);        \
-    if (!l->field) goto fail;                               \
+    l->field = load_weight_direct(ms, name, expect, 2);     \
+    if (!l->field.data) goto fail;                          \
 } while (0)
 
         LOAD2(wq,             "layers.%d.self_attn.q_proj.weight",
@@ -446,14 +533,14 @@ pplx_model_t *pplx_model_load(const char *model_dir)
               cfg->kv_dim, cfg->hidden_size);
         LOAD2(wo,             "layers.%d.self_attn.o_proj.weight",
               cfg->hidden_size, cfg->q_dim);
-        LOAD1(q_norm,         "layers.%d.self_attn.q_norm.weight",
-              cfg->head_dim);
-        LOAD1(k_norm,         "layers.%d.self_attn.k_norm.weight",
-              cfg->head_dim);
-        LOAD1(input_norm,     "layers.%d.input_layernorm.weight",
-              cfg->hidden_size);
-        LOAD1(post_attn_norm, "layers.%d.post_attention_layernorm.weight",
-              cfg->hidden_size);
+        LOAD_NORM(q_norm,         "layers.%d.self_attn.q_norm.weight",
+                  cfg->head_dim);
+        LOAD_NORM(k_norm,         "layers.%d.self_attn.k_norm.weight",
+                  cfg->head_dim);
+        LOAD_NORM(input_norm,     "layers.%d.input_layernorm.weight",
+                  cfg->hidden_size);
+        LOAD_NORM(post_attn_norm, "layers.%d.post_attention_layernorm.weight",
+                  cfg->hidden_size);
         LOAD2(gate_proj,      "layers.%d.mlp.gate_proj.weight",
               cfg->intermediate_size, cfg->hidden_size);
         LOAD2(up_proj,        "layers.%d.mlp.up_proj.weight",
@@ -462,7 +549,7 @@ pplx_model_t *pplx_model_load(const char *model_dir)
               cfg->hidden_size, cfg->intermediate_size);
 
 #undef LOAD2
-#undef LOAD1
+#undef LOAD_NORM
 
         if (pplx_verbose >= 2)
             fprintf(stderr, "  layer %d loaded\n", i);
@@ -470,7 +557,7 @@ pplx_model_t *pplx_model_load(const char *model_dir)
 
     /* Final RMSNorm */
     const int64_t norm_shape[1] = { cfg->hidden_size };
-    w->norm = load_f32_direct(ms, "norm.weight", norm_shape, 1);
+    w->norm = load_norm_f32(ms, "norm.weight", norm_shape, 1);
     if (!w->norm) goto fail;
 
     if (pplx_verbose >= 1)
@@ -487,6 +574,16 @@ fail:
 void pplx_model_free(pplx_model_t *model)
 {
     if (!model) return;
+    if (model->weights.layers) {
+        for (int i = 0; i < model->config.n_layers; i++) {
+            pplx_layer_t *l = &model->weights.layers[i];
+            free((void *)l->q_norm);
+            free((void *)l->k_norm);
+            free((void *)l->input_norm);
+            free((void *)l->post_attn_norm);
+        }
+    }
+    free((void *)model->weights.norm);
     if (model->safetensors)
         multi_safetensors_close((multi_safetensors_t *)model->safetensors);
     free(model->weights.layers);
@@ -596,9 +693,8 @@ static int forward_packed_inplace(const pplx_model_t *model,
                         id, b, i);
                 return -1;
             }
-            memcpy(x + (size_t)(start + i) * hidden,
-                   w->embed_tokens + (size_t)id * hidden,
-                   (size_t)hidden * sizeof(float));
+            copy_weight_row(x + (size_t)(start + i) * hidden,
+                            &w->embed_tokens, (size_t)id, hidden);
         }
     }
 
@@ -611,9 +707,9 @@ static int forward_packed_inplace(const pplx_model_t *model,
 
         qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
 
-        qwen_linear_nobias(q_buf, x_norm, l->wq, total_seq, hidden, q_dim);
-        qwen_linear_nobias(k_buf, x_norm, l->wk, total_seq, hidden, kv_dim);
-        qwen_linear_nobias(v_buf, x_norm, l->wv, total_seq, hidden, kv_dim);
+        linear_nobias_weight(q_buf, x_norm, &l->wq, total_seq, hidden, q_dim);
+        linear_nobias_weight(k_buf, x_norm, &l->wk, total_seq, hidden, kv_dim);
+        linear_nobias_weight(v_buf, x_norm, &l->wv, total_seq, hidden, kv_dim);
 
         qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads,    head_dim, eps);
         qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
@@ -631,15 +727,15 @@ static int forward_packed_inplace(const pplx_model_t *model,
                                                 offsets, batch, n_heads,
                                                 n_kv_heads, head_dim, scale);
 
-        qwen_linear_nobias(proj_out, attn_out, l->wo, total_seq, q_dim, hidden);
+        linear_nobias_weight(proj_out, attn_out, &l->wo, total_seq, q_dim, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);
 
         qwen_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
 
-        qwen_linear_nobias(ffn_gate, x_norm, l->gate_proj, total_seq, hidden, inter);
-        qwen_linear_nobias(ffn_up,   x_norm, l->up_proj,   total_seq, hidden, inter);
+        linear_nobias_weight(ffn_gate, x_norm, &l->gate_proj, total_seq, hidden, inter);
+        linear_nobias_weight(ffn_up,   x_norm, &l->up_proj,   total_seq, hidden, inter);
         qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
-        qwen_linear_nobias(ffn_out, ffn_gate, l->down_proj, total_seq, inter, hidden);
+        linear_nobias_weight(ffn_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
         qwen_add_inplace(x, ffn_out, total_seq * hidden);
     }
 

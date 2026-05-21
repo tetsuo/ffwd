@@ -55,7 +55,7 @@ typedef struct {
 /*
  * Load immutable model data from a directory containing:
  *   config.json                          - model hyperparameters
- *   model.safetensors (or sharded)       - F32 weights
+ *   model.safetensors (or sharded)       - F32 or BF16 weights
  *   vocab.json + merges.txt              - BPE tokenizer
  *
  * Reads config.json to determine model size (0.6B vs 4B).
