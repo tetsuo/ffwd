@@ -93,6 +93,8 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
 void qwen_silu(float *x, int n);
 void qwen_gelu(float *x, int n);
 void qwen_softmax(float *x, int rows, int cols);
+/* gate = SiLU(gate) * up */
+void qwen_silu_mul_inplace(float *gate, const float *up, int n);
 /* out[seq,inter] = SiLU(gate_up[seq,2*inter][:,even]) * gate_up[:,odd] */
 void qwen_swiglu_multiply(float *out, const float *gate_up, int seq_len, int intermediate);
 

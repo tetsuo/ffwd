@@ -887,6 +887,32 @@ void qwen_gelu(float *x, int n) {
     }
 }
 
+void qwen_silu_mul_inplace(float *gate, const float *up, int n) {
+#if defined(__APPLE__) && defined(USE_BLAS)
+    enum { CHUNK = 4096 };
+    float exp_neg[CHUNK];
+
+    for (int base = 0; base < n; base += CHUNK) {
+        int len = n - base;
+        if (len > CHUNK) len = CHUNK;
+
+        for (int i = 0; i < len; i++)
+            exp_neg[i] = -gate[base + i];
+        vvexpf(exp_neg, exp_neg, &len);
+
+        for (int i = 0; i < len; i++) {
+            float g = gate[base + i];
+            gate[base + i] = (g / (1.0f + exp_neg[i])) * up[base + i];
+        }
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        float g = gate[i];
+        gate[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+#endif
+}
+
 typedef struct {
     float *out;
     const float *gate_up;

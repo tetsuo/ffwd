@@ -550,7 +550,8 @@ static int forward_packed_inplace(const pplx_model_t *model,
                                   pplx_workspace_t *ws,
                                   const pplx_input_t *inputs,
                                   int batch, const int *offsets,
-                                  int total_seq, int max_seq)
+                                  int total_seq, int max_seq,
+                                  int apply_final_norm)
 {
     if (!model || !ws || ws->model != model || !inputs ||
         batch <= 0 || !offsets || total_seq <= 0 || max_seq <= 0)
@@ -637,20 +638,25 @@ static int forward_packed_inplace(const pplx_model_t *model,
 
         qwen_linear_nobias(ffn_gate, x_norm, l->gate_proj, total_seq, hidden, inter);
         qwen_linear_nobias(ffn_up,   x_norm, l->up_proj,   total_seq, hidden, inter);
-        qwen_silu(ffn_gate, total_seq * inter);
-        qwen_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
+        qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
         qwen_linear_nobias(ffn_out, ffn_gate, l->down_proj, total_seq, inter, hidden);
         qwen_add_inplace(x, ffn_out, total_seq * hidden);
     }
 
-    qwen_rms_norm(x, x, w->norm, total_seq, hidden, eps);
+    if (apply_final_norm)
+        qwen_rms_norm(x, x, w->norm, total_seq, hidden, eps);
     return 0;
 }
 
-static void pool_embeddings(const pplx_model_t *model, const pplx_workspace_t *ws,
-                            const int *offsets, int batch, float *out_embeddings)
+static void pool_normalized_embeddings(const pplx_model_t *model,
+                                       const pplx_workspace_t *ws,
+                                       const int *offsets, int batch,
+                                       float *out_embeddings)
 {
-    int hidden = model->config.hidden_size;
+    const pplx_config_t *cfg = &model->config;
+    int hidden = cfg->hidden_size;
+    float eps = cfg->rms_norm_eps;
+    const float *norm_weight = model->weights.norm;
     const float *x = ws->x;
 
     for (int b = 0; b < batch; b++) {
@@ -662,8 +668,14 @@ static void pool_embeddings(const pplx_model_t *model, const pplx_workspace_t *w
         memset(emb, 0, (size_t)hidden * sizeof(float));
         for (int i = start; i < end; i++) {
             const float *row = x + (size_t)i * hidden;
+
+            float sum_sq = 0.0f;
             for (int d = 0; d < hidden; d++)
-                emb[d] += row[d];
+                sum_sq += row[d] * row[d];
+
+            float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
+            for (int d = 0; d < hidden; d++)
+                emb[d] += row[d] * rms_inv * norm_weight[d];
         }
 
         float inv_len = 1.0f / (float)len;
@@ -701,7 +713,7 @@ int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
     pplx_input_t input = { token_ids, n_tokens };
     int offsets[2] = { 0, n_tokens };
     if (forward_packed_inplace(model, ws, &input, 1, offsets,
-                               n_tokens, n_tokens) != 0)
+                               n_tokens, n_tokens, 1) != 0)
         return -1;
 
     memcpy(out_states, ws->x, bytes);
@@ -747,9 +759,9 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
     }
 
     int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
-                                    total_seq, max_seq);
+                                    total_seq, max_seq, 0);
     if (rc == 0)
-        pool_embeddings(model, ws, offsets, batch, out_embeddings);
+        pool_normalized_embeddings(model, ws, offsets, batch, out_embeddings);
 
     free(offsets);
     return rc;
