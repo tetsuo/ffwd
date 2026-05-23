@@ -422,17 +422,13 @@ typedef struct {
     int in_dim;
     int q_dim;
     int kv_dim;
+    int seq_len;
     int total_dim;
 } qkv_matvec_task_t;
 
-static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
-    qkv_matvec_task_t *t = (qkv_matvec_task_t *)arg;
-    int chunk = (t->total_dim + n_threads - 1) / n_threads;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > t->total_dim) end = t->total_dim;
-    if (start >= end) return;
-
+static void qkv_matvec_range(const qkv_matvec_task_t *t, int row,
+                             int start, int end) {
+    const float *x_row = t->x + (size_t)row * t->in_dim;
     int q_end = t->q_dim;
     int k_end = q_end + t->kv_dim;
     int v_end = k_end + t->kv_dim;
@@ -441,7 +437,7 @@ static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
         int s = start;
         int e = end < q_end ? end : q_end;
         if (s < e) {
-            bf16_matvec_fused(t->q + s, t->x,
+            bf16_matvec_fused(t->q + (size_t)row * t->q_dim + s, x_row,
                               t->Wq_bf16 + (size_t)s * t->in_dim,
                               NULL, t->in_dim, e - s);
         }
@@ -452,7 +448,7 @@ static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
         int e_abs = end < k_end ? end : k_end;
         int e = e_abs - q_end;
         if (s < e) {
-            bf16_matvec_fused(t->k + s, t->x,
+            bf16_matvec_fused(t->k + (size_t)row * t->kv_dim + s, x_row,
                               t->Wk_bf16 + (size_t)s * t->in_dim,
                               NULL, t->in_dim, e - s);
         }
@@ -463,10 +459,29 @@ static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
         int e_abs = end < v_end ? end : v_end;
         int e = e_abs - k_end;
         if (s < e) {
-            bf16_matvec_fused(t->v + s, t->x,
+            bf16_matvec_fused(t->v + (size_t)row * t->kv_dim + s, x_row,
                               t->Wv_bf16 + (size_t)s * t->in_dim,
                               NULL, t->in_dim, e - s);
         }
+    }
+}
+
+static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
+    qkv_matvec_task_t *t = (qkv_matvec_task_t *)arg;
+    int total_work = t->seq_len * t->total_dim;
+    int chunk = (total_work + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > total_work) end = total_work;
+    if (start >= end) return;
+
+    while (start < end) {
+        int row = start / t->total_dim;
+        int pos = start - row * t->total_dim;
+        int row_end = (row + 1) * t->total_dim;
+        int stop = end < row_end ? end : row_end;
+        qkv_matvec_range(t, row, pos, stop - row * t->total_dim);
+        start = stop;
     }
 }
 
@@ -474,11 +489,20 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wq_bf16,
                                  const uint16_t *Wk_bf16,
                                  const uint16_t *Wv_bf16,
-                                 int in_dim, int q_dim, int kv_dim) {
+                                 int seq_len, int in_dim, int q_dim,
+                                 int kv_dim) {
+    if (seq_len <= 0) return;
+
     if (tp.n_threads <= 1) {
-        bf16_matvec_fused(q, x, Wq_bf16, NULL, in_dim, q_dim);
-        bf16_matvec_fused(k, x, Wk_bf16, NULL, in_dim, kv_dim);
-        bf16_matvec_fused(v, x, Wv_bf16, NULL, in_dim, kv_dim);
+        for (int s = 0; s < seq_len; s++) {
+            const float *x_row = x + (size_t)s * in_dim;
+            bf16_matvec_fused(q + (size_t)s * q_dim, x_row,
+                              Wq_bf16, NULL, in_dim, q_dim);
+            bf16_matvec_fused(k + (size_t)s * kv_dim, x_row,
+                              Wk_bf16, NULL, in_dim, kv_dim);
+            bf16_matvec_fused(v + (size_t)s * kv_dim, x_row,
+                              Wv_bf16, NULL, in_dim, kv_dim);
+        }
         return;
     }
 
@@ -493,6 +517,7 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
         .in_dim = in_dim,
         .q_dim = q_dim,
         .kv_dim = kv_dim,
+        .seq_len = seq_len,
         .total_dim = q_dim + 2 * kv_dim,
     };
     parallel_for(qkv_matvec_worker, &task);

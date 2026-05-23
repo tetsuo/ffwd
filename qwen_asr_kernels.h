@@ -41,12 +41,13 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
-/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+/* Small-sequence BF16 path: compute Q/K/V matvecs with one threaded dispatch. */
 void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wq_bf16,
                                  const uint16_t *Wk_bf16,
                                  const uint16_t *Wv_bf16,
-                                 int in_dim, int q_dim, int kv_dim);
+                                 int seq_len, int in_dim, int q_dim,
+                                 int kv_dim);
 
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);

@@ -389,6 +389,27 @@ static void linear_nobias_weight(float *y, const float *x,
     }
 }
 
+static void linear_qkv_weight(float *q, float *k, float *v, const float *x,
+                              const pplx_weight_ref_t *wq,
+                              const pplx_weight_ref_t *wk,
+                              const pplx_weight_ref_t *wv,
+                              int seq_len, int in_dim, int q_dim, int kv_dim)
+{
+    if (wq->dtype == DTYPE_BF16 && wk->dtype == DTYPE_BF16 &&
+        wv->dtype == DTYPE_BF16 && seq_len <= 16) {
+        qwen_linear_nobias_bf16_qkv(q, k, v, x,
+                                    (const uint16_t *)wq->data,
+                                    (const uint16_t *)wk->data,
+                                    (const uint16_t *)wv->data,
+                                    seq_len, in_dim, q_dim, kv_dim);
+        return;
+    }
+
+    linear_nobias_weight(q, x, wq, seq_len, in_dim, q_dim);
+    linear_nobias_weight(k, x, wk, seq_len, in_dim, kv_dim);
+    linear_nobias_weight(v, x, wv, seq_len, in_dim, kv_dim);
+}
+
 /* ========================================================================
  * Working buffer management
  * ======================================================================== */
@@ -704,9 +725,9 @@ static int forward_packed_inplace(const pplx_model_t *model,
 
         qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
 
-        linear_nobias_weight(q_buf, x_norm, &l->wq, total_seq, hidden, q_dim);
-        linear_nobias_weight(k_buf, x_norm, &l->wk, total_seq, hidden, kv_dim);
-        linear_nobias_weight(v_buf, x_norm, &l->wv, total_seq, hidden, kv_dim);
+        linear_qkv_weight(q_buf, k_buf, v_buf, x_norm,
+                          &l->wq, &l->wk, &l->wv,
+                          total_seq, hidden, q_dim, kv_dim);
 
         qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads,    head_dim, eps);
         qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
