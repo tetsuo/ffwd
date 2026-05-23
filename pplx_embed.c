@@ -79,6 +79,13 @@ static int mul_size(size_t a, size_t b, size_t *out)
     return 0;
 }
 
+static int add_size(size_t a, size_t b, size_t *out)
+{
+    if (b > SIZE_MAX - a) return -1;
+    *out = a + b;
+    return 0;
+}
+
 static int grow_cap(int current, int needed, int *out)
 {
     if (needed <= 0) return -1;
@@ -654,6 +661,57 @@ void pplx_workspace_free(pplx_workspace_t *ws)
 const pplx_config_t *pplx_model_config(const pplx_model_t *model)
 {
     return model ? &model->config : NULL;
+}
+
+size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
+{
+    if (!ws) return 0;
+
+    size_t total = sizeof(*ws);
+    const pplx_model_t *model = ws->model;
+    if (!model) return total;
+
+    const pplx_config_t *c = &model->config;
+    size_t row_floats = 0;
+    const int dims[] = {
+        c->hidden_size,          /* x */
+        c->hidden_size,          /* x_norm */
+        c->q_dim,                /* q */
+        c->kv_dim,               /* k */
+        c->kv_dim,               /* v */
+        c->q_dim,                /* attn_out */
+        c->hidden_size,          /* proj_out */
+        c->intermediate_size,    /* ffn_gate */
+        c->intermediate_size,    /* ffn_up */
+    };
+
+    for (size_t i = 0; i < sizeof(dims) / sizeof(dims[0]); i++) {
+        if (dims[i] < 0 ||
+            add_size(row_floats, (size_t)dims[i], &row_floats) != 0)
+            return SIZE_MAX;
+    }
+
+    size_t buf_floats = 0;
+    if (ws->buf_seq_cap > 0 &&
+        mul_size((size_t)ws->buf_seq_cap, row_floats, &buf_floats) != 0)
+        return SIZE_MAX;
+
+    size_t rope_floats = 0;
+    if (ws->rope_cache_cap > 0) {
+        size_t rope_rows = 0;
+        if (mul_size((size_t)ws->rope_cache_cap, (size_t)c->head_dim,
+                     &rope_rows) != 0 ||
+            mul_size(rope_rows, 2, &rope_floats) != 0)
+            return SIZE_MAX;
+    }
+
+    size_t all_floats = 0, bytes = 0;
+    if (add_size(buf_floats, rope_floats, &all_floats) != 0 ||
+        mul_size(all_floats, sizeof(float), &bytes) != 0 ||
+        add_size(total, bytes, &total) != 0)
+        return SIZE_MAX;
+
+    return total;
 }
 
 /* ========================================================================

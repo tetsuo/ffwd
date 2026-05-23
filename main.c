@@ -121,14 +121,21 @@ static void print_embedding_raw(const float *emb, int dim)
     putchar('\n');
 }
 
-static void print_embedding_json(const float *emb, int dim, int n_tokens, double ms)
+static size_t engine_workspace_nbytes(const engine_t *e)
+{
+    return (e && e->workspace) ? pplx_workspace_nbytes(e->workspace) : 0;
+}
+
+static void print_embedding_json(const float *emb, int dim, int n_tokens,
+                                 double ms, size_t workspace_bytes)
 {
     printf("{\"embedding\":[");
     for (int i = 0; i < dim; i++) {
         if (i > 0) putchar(',');
         printf("%.8f", (double)emb[i]);
     }
-    printf("],\"dim\":%d,\"tokens\":%d,\"ms\":%.1f}\n", dim, n_tokens, ms);
+    printf("],\"dim\":%d,\"tokens\":%d,\"ms\":%.1f,\"workspace_bytes\":%zu}\n",
+           dim, n_tokens, ms, workspace_bytes);
     fflush(stdout);
 }
 
@@ -190,7 +197,8 @@ static int process_daemon_batch(engine_t *e, char **lines, int n_lines)
             continue;
         }
         print_embedding_json(embs + (size_t)next_valid * e->dim,
-                             e->dim, tokens[i].n_tokens, ms);
+                             e->dim, tokens[i].n_tokens, ms,
+                             engine_workspace_nbytes(e));
         next_valid++;
     }
     fflush(stdout);

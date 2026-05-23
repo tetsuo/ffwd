@@ -75,6 +75,14 @@ void pplx_workspace_free(pplx_workspace_t *ws);
 const pplx_config_t *pplx_model_config(const pplx_model_t *model);
 
 /*
+ * Current mutable workspace memory owned by this workspace, in bytes.
+ *
+ * This includes the workspace struct, scratch buffers, and RoPE cache capacity.
+ * It does not include immutable mmap'd model weights.
+ */
+size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
+
+/*
  * Compute embedding for a token sequence.
  *
  *   1. Token embedding lookup
