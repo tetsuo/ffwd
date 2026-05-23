@@ -65,6 +65,9 @@ struct pplx_workspace {
 int pplx_verbose = 0;
 int qwen_verbose = 0;
 
+#define PPLX_BF16_QKV_FUSE_MAX_SEQ 16
+#define PPLX_BF16_PAIR_FUSE_MAX_SEQ 4
+
 /* ========================================================================
  * Size helpers
  * ======================================================================== */
@@ -396,7 +399,8 @@ static void linear_qkv_weight(float *q, float *k, float *v, const float *x,
                               int seq_len, int in_dim, int q_dim, int kv_dim)
 {
     if (wq->dtype == DTYPE_BF16 && wk->dtype == DTYPE_BF16 &&
-        wv->dtype == DTYPE_BF16 && seq_len <= 16) {
+        wv->dtype == DTYPE_BF16 &&
+        seq_len <= PPLX_BF16_QKV_FUSE_MAX_SEQ) {
         qwen_linear_nobias_bf16_qkv(q, k, v, x,
                                     (const uint16_t *)wq->data,
                                     (const uint16_t *)wk->data,
@@ -408,6 +412,24 @@ static void linear_qkv_weight(float *q, float *k, float *v, const float *x,
     linear_nobias_weight(q, x, wq, seq_len, in_dim, q_dim);
     linear_nobias_weight(k, x, wk, seq_len, in_dim, kv_dim);
     linear_nobias_weight(v, x, wv, seq_len, in_dim, kv_dim);
+}
+
+static void linear_pair_weight(float *a, float *b, const float *x,
+                               const pplx_weight_ref_t *wa,
+                               const pplx_weight_ref_t *wb,
+                               int seq_len, int in_dim, int a_dim, int b_dim)
+{
+    if (wa->dtype == DTYPE_BF16 && wb->dtype == DTYPE_BF16 &&
+        seq_len <= PPLX_BF16_PAIR_FUSE_MAX_SEQ) {
+        qwen_linear_nobias_bf16_pair(a, b, x,
+                                     (const uint16_t *)wa->data,
+                                     (const uint16_t *)wb->data,
+                                     seq_len, in_dim, a_dim, b_dim);
+        return;
+    }
+
+    linear_nobias_weight(a, x, wa, seq_len, in_dim, a_dim);
+    linear_nobias_weight(b, x, wb, seq_len, in_dim, b_dim);
 }
 
 /* ========================================================================
@@ -750,8 +772,9 @@ static int forward_packed_inplace(const pplx_model_t *model,
 
         qwen_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
 
-        linear_nobias_weight(ffn_gate, x_norm, &l->gate_proj, total_seq, hidden, inter);
-        linear_nobias_weight(ffn_up,   x_norm, &l->up_proj,   total_seq, hidden, inter);
+        linear_pair_weight(ffn_gate, ffn_up, x_norm,
+                           &l->gate_proj, &l->up_proj,
+                           total_seq, hidden, inter, inter);
         qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
         linear_nobias_weight(proj_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);

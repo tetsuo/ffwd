@@ -41,6 +41,13 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
+/* Small-sequence BF16 path: compute two projections with one threaded dispatch. */
+void qwen_linear_nobias_bf16_pair(float *a, float *b, const float *x,
+                                  const uint16_t *Wa_bf16,
+                                  const uint16_t *Wb_bf16,
+                                  int seq_len, int in_dim, int a_dim,
+                                  int b_dim);
+
 /* Small-sequence BF16 path: compute Q/K/V matvecs with one threaded dispatch. */
 void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wq_bf16,

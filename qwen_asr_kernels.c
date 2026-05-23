@@ -412,6 +412,99 @@ static void bf16_linear_rows(float *y, const float *x, const uint16_t *W_bf16,
 }
 
 typedef struct {
+    float *a;
+    float *b;
+    const float *x;
+    const uint16_t *Wa_bf16;
+    const uint16_t *Wb_bf16;
+    int seq_len;
+    int in_dim;
+    int a_dim;
+    int b_dim;
+    int total_dim;
+} pair_matvec_task_t;
+
+static void pair_matvec_range(const pair_matvec_task_t *t, int row,
+                              int start, int end) {
+    const float *x_row = t->x + (size_t)row * t->in_dim;
+    int a_end = t->a_dim;
+    int b_end = a_end + t->b_dim;
+
+    if (start < a_end) {
+        int s = start;
+        int e = end < a_end ? end : a_end;
+        if (s < e) {
+            bf16_matvec_fused(t->a + (size_t)row * t->a_dim + s, x_row,
+                              t->Wa_bf16 + (size_t)s * t->in_dim,
+                              NULL, t->in_dim, e - s);
+        }
+    }
+
+    if (end > a_end && start < b_end) {
+        int s = start > a_end ? start - a_end : 0;
+        int e_abs = end < b_end ? end : b_end;
+        int e = e_abs - a_end;
+        if (s < e) {
+            bf16_matvec_fused(t->b + (size_t)row * t->b_dim + s, x_row,
+                              t->Wb_bf16 + (size_t)s * t->in_dim,
+                              NULL, t->in_dim, e - s);
+        }
+    }
+}
+
+static void pair_matvec_worker(int tid, int n_threads, void *arg) {
+    pair_matvec_task_t *t = (pair_matvec_task_t *)arg;
+    int total_work = t->seq_len * t->total_dim;
+    int chunk = (total_work + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > total_work) end = total_work;
+    if (start >= end) return;
+
+    while (start < end) {
+        int row = start / t->total_dim;
+        int pos = start - row * t->total_dim;
+        int row_end = (row + 1) * t->total_dim;
+        int stop = end < row_end ? end : row_end;
+        pair_matvec_range(t, row, pos, stop - row * t->total_dim);
+        start = stop;
+    }
+}
+
+void qwen_linear_nobias_bf16_pair(float *a, float *b, const float *x,
+                                  const uint16_t *Wa_bf16,
+                                  const uint16_t *Wb_bf16,
+                                  int seq_len, int in_dim, int a_dim,
+                                  int b_dim) {
+    if (seq_len <= 0) return;
+
+    if (tp.n_threads <= 1) {
+        for (int s = 0; s < seq_len; s++) {
+            const float *x_row = x + (size_t)s * in_dim;
+            bf16_matvec_fused(a + (size_t)s * a_dim, x_row,
+                              Wa_bf16, NULL, in_dim, a_dim);
+            bf16_matvec_fused(b + (size_t)s * b_dim, x_row,
+                              Wb_bf16, NULL, in_dim, b_dim);
+        }
+        return;
+    }
+
+    pair_matvec_task_t task = {
+        .a = a,
+        .b = b,
+        .x = x,
+        .Wa_bf16 = Wa_bf16,
+        .Wb_bf16 = Wb_bf16,
+        .seq_len = seq_len,
+        .in_dim = in_dim,
+        .a_dim = a_dim,
+        .b_dim = b_dim,
+        .total_dim = a_dim + b_dim,
+    };
+    parallel_for(pair_matvec_worker, &task);
+}
+
+typedef struct {
     float *q;
     float *k;
     float *v;
