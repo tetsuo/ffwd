@@ -205,6 +205,32 @@ static uint64_t fnv1a_hash(const char *s) {
     return h;
 }
 
+static uint64_t fnv1a_hash_pair(const char *a, const char *b) {
+    uint64_t h = 1469598103934665603ULL;
+    while (*a) {
+        h ^= (unsigned char)*a++;
+        h *= 1099511628211ULL;
+    }
+    h ^= (unsigned char)' ';
+    h *= 1099511628211ULL;
+    while (*b) {
+        h ^= (unsigned char)*b++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int pair_key_eq(const char *key, const char *a, const char *b) {
+    while (*a) {
+        if (*key++ != *a++) return 0;
+    }
+    if (*key++ != ' ') return 0;
+    while (*b) {
+        if (*key++ != *b++) return 0;
+    }
+    return *key == '\0';
+}
+
 static int next_pow2(int x) {
     int p = 1;
     while (p < x) p <<= 1;
@@ -238,6 +264,19 @@ static int map_get(const str_int_entry_t *map, int cap, const char *key) {
         int idx = (pos + i) & mask;
         if (!map[idx].key) return -1;
         if (strcmp(map[idx].key, key) == 0) return map[idx].value;
+    }
+    return -1;
+}
+
+static int map_get_pair(const str_int_entry_t *map, int cap,
+                        const char *a, const char *b) {
+    if (!map || cap <= 0 || !a || !b) return -1;
+    int mask = cap - 1;
+    int pos = (int)(fnv1a_hash_pair(a, b) & (uint64_t)mask);
+    for (int i = 0; i < cap; i++) {
+        int idx = (pos + i) & mask;
+        if (!map[idx].key) return -1;
+        if (pair_key_eq(map[idx].key, a, b)) return map[idx].value;
     }
     return -1;
 }
@@ -303,16 +342,8 @@ static char *str_concat2(const char *a, const char *b) {
 static int merge_rank(const qwen_tokenizer_t *tok, const char *a, const char *b) {
     if (!tok->merge_map || tok->merge_map_cap <= 0) return INT_MAX;
 
-    size_t la = strlen(a), lb = strlen(b);
-    char *pair = (char *)malloc(la + 1 + lb + 1);
-    if (!pair) return INT_MAX;
-    memcpy(pair, a, la);
-    pair[la] = ' ';
-    memcpy(pair + la + 1, b, lb);
-    pair[la + 1 + lb] = '\0';
-
-    int rank = map_get((const str_int_entry_t *)tok->merge_map, tok->merge_map_cap, pair);
-    free(pair);
+    int rank = map_get_pair((const str_int_entry_t *)tok->merge_map,
+                            tok->merge_map_cap, a, b);
     return rank >= 0 ? rank : INT_MAX;
 }
 
