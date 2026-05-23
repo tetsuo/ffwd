@@ -51,7 +51,6 @@ struct pplx_workspace {
     float *proj_out;            /* [seq, hidden]       */
     float *ffn_gate;            /* [seq, intermediate] */
     float *ffn_up;              /* [seq, intermediate] */
-    float *ffn_out;             /* [seq, hidden]       */
 
     /* RoPE cosine/sine cache [n_pos, head_dim], grown lazily. */
     float *rope_cos;
@@ -414,7 +413,6 @@ static int ensure_buffers(pplx_workspace_t *ws, const pplx_config_t *c, int seq)
     R(ws->proj_out, c->hidden_size);
     R(ws->ffn_gate, c->intermediate_size);
     R(ws->ffn_up,   c->intermediate_size);
-    R(ws->ffn_out,  c->hidden_size);
 
 #undef R
 
@@ -605,7 +603,7 @@ void pplx_workspace_free(pplx_workspace_t *ws)
     free(ws->x);       free(ws->x_norm);
     free(ws->q);       free(ws->k);        free(ws->v);
     free(ws->attn_out); free(ws->proj_out);
-    free(ws->ffn_gate); free(ws->ffn_up);   free(ws->ffn_out);
+    free(ws->ffn_gate); free(ws->ffn_up);
     free(ws->rope_cos); free(ws->rope_sin);
     free(ws);
 }
@@ -681,7 +679,6 @@ static int forward_packed_inplace(const pplx_model_t *model,
     float *proj_out = ws->proj_out;
     float *ffn_gate = ws->ffn_gate;
     float *ffn_up   = ws->ffn_up;
-    float *ffn_out  = ws->ffn_out;
 
     /* 1. Token embedding lookup into packed [total_seq, hidden]. */
     for (int b = 0; b < batch; b++) {
@@ -735,8 +732,8 @@ static int forward_packed_inplace(const pplx_model_t *model,
         linear_nobias_weight(ffn_gate, x_norm, &l->gate_proj, total_seq, hidden, inter);
         linear_nobias_weight(ffn_up,   x_norm, &l->up_proj,   total_seq, hidden, inter);
         qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
-        linear_nobias_weight(ffn_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
-        qwen_add_inplace(x, ffn_out, total_seq * hidden);
+        linear_nobias_weight(proj_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
+        qwen_add_inplace(x, proj_out, total_seq * hidden);
     }
 
     if (apply_final_norm)
