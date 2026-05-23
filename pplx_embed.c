@@ -68,6 +68,7 @@ int qwen_verbose = 0;
 #define PPLX_BF16_QKV_FUSE_MAX_SEQ 16
 #define PPLX_BF16_PAIR_FUSE_MAX_SEQ 4
 #define PPLX_MIN_WORKSPACE_SEQ_CAP 16
+#define PPLX_WORKSPACE_SEQ_GRANULARITY 16
 
 /* ========================================================================
  * Size helpers
@@ -91,11 +92,20 @@ static int grow_cap(int current, int needed, int *out)
 {
     if (needed <= 0) return -1;
 
-    int cap = current > 0 ? current : PPLX_MIN_WORKSPACE_SEQ_CAP;
-    while (cap < needed) {
-        if (cap > INT_MAX / 2) return -1;
-        cap *= 2;
+    int cap = needed;
+    if (cap < PPLX_MIN_WORKSPACE_SEQ_CAP)
+        cap = PPLX_MIN_WORKSPACE_SEQ_CAP;
+
+    int rem = cap % PPLX_WORKSPACE_SEQ_GRANULARITY;
+    if (rem != 0) {
+        int add = PPLX_WORKSPACE_SEQ_GRANULARITY - rem;
+        if (cap > INT_MAX - add) return -1;
+        cap += add;
     }
+
+    if (cap < current)
+        cap = current;
+
     *out = cap;
     return 0;
 }
