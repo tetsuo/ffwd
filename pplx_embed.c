@@ -52,6 +52,9 @@ struct pplx_workspace {
     float *ffn_gate;            /* [seq, intermediate] */
     float *ffn_up;              /* [seq, intermediate] */
 
+    int   *offsets;             /* [batch + 1] packed sequence offsets */
+    int    offsets_cap;
+
     /* RoPE cosine/sine cache [n_pos, head_dim], grown lazily. */
     float *rope_cos;
     float *rope_sin;
@@ -135,6 +138,17 @@ static int realloc_floats_2d(float **ptr, int rows, int cols)
     size_t count;
     if (mul_size((size_t)rows, (size_t)cols, &count) != 0) return -1;
     return realloc_floats(ptr, count);
+}
+
+static int realloc_ints(int **ptr, size_t count)
+{
+    size_t bytes;
+    if (mul_size(count, sizeof(int), &bytes) != 0) return -1;
+
+    void *p = realloc(*ptr, bytes);
+    if (!p && bytes != 0) return -1;
+    *ptr = (int *)p;
+    return 0;
 }
 
 /* ========================================================================
@@ -525,6 +539,19 @@ static int ensure_rope_cache(pplx_workspace_t *ws, const pplx_config_t *cfg,
     return 0;
 }
 
+static int ensure_offsets(pplx_workspace_t *ws, int batch)
+{
+    if (!ws || batch <= 0 || batch == INT_MAX) return -1;
+
+    int needed = batch + 1;
+    if (needed <= ws->offsets_cap) return 0;
+
+    if (realloc_ints(&ws->offsets, (size_t)needed) != 0)
+        return -1;
+    ws->offsets_cap = needed;
+    return 0;
+}
+
 /* ========================================================================
  * Model / workspace load and free
  * ======================================================================== */
@@ -665,6 +692,7 @@ void pplx_workspace_free(pplx_workspace_t *ws)
     free(ws->q);       free(ws->k);        free(ws->v);
     free(ws->attn_out); free(ws->proj_out);
     free(ws->ffn_gate); free(ws->ffn_up);
+    free(ws->offsets);
     free(ws->rope_cos); free(ws->rope_sin);
     free(ws);
 }
@@ -720,6 +748,13 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
     if (add_size(buf_floats, rope_floats, &all_floats) != 0 ||
         mul_size(all_floats, sizeof(float), &bytes) != 0 ||
         add_size(total, bytes, &total) != 0)
+        return SIZE_MAX;
+
+    size_t offset_bytes = 0;
+    if (ws->offsets_cap > 0 &&
+        mul_size((size_t)ws->offsets_cap, sizeof(int), &offset_bytes) != 0)
+        return SIZE_MAX;
+    if (add_size(total, offset_bytes, &total) != 0)
         return SIZE_MAX;
 
     return total;
@@ -950,26 +985,19 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
 {
     if (!model || !ws || !inputs || batch <= 0 || !out_embeddings) return -1;
 
-    if (batch == INT_MAX) return -1;
-    size_t offset_bytes;
-    if (mul_size((size_t)batch + 1, sizeof(int), &offset_bytes) != 0)
-        return -1;
-    int *offsets = (int *)malloc(offset_bytes);
-    if (!offsets) return -1;
+    if (ensure_offsets(ws, batch) != 0) return -1;
+    int *offsets = ws->offsets;
 
     int total_seq = 0;
     int max_seq = 0;
-    if (build_offsets(inputs, batch, offsets, &total_seq, &max_seq) != 0) {
-        free(offsets);
+    if (build_offsets(inputs, batch, offsets, &total_seq, &max_seq) != 0)
         return -1;
-    }
 
     int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
                                     total_seq, max_seq, 0);
     if (rc == 0)
         pool_normalized_embeddings(model, ws, offsets, batch, out_embeddings);
 
-    free(offsets);
     return rc;
 }
 
