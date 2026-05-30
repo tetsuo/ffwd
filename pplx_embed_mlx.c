@@ -695,31 +695,109 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
     return 0;
 }
 
-static int pplx_mlx_forward_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
-                                 int n_tokens, float *out_states)
-{
-    pplx_input_t input = { token_ids, n_tokens };
-    return pplx_mlx_forward_slice_batch(ctx, &input, 1, NULL, 0,
-                                        ctx->config.n_layers, 1, out_states);
-}
-
 int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
                          int n_tokens, const pplx_span_t *spans,
                          int n_spans, float *out_embeddings)
 {
     if (!ctx || !token_ids || n_tokens <= 0 || !spans || n_spans <= 0 ||
-        !out_embeddings)
+        !out_embeddings || ctx->layer_start != 0 ||
+        ctx->layer_end != ctx->config.n_layers ||
+        !arr_ok(ctx->embed_tokens) || !arr_ok(ctx->norm))
         return -1;
 
-    int hidden = ctx->config.hidden_size;
-    float *states = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
-    if (!states) return -1;
+    const pplx_config_t *c = &ctx->config;
+    mlx_stream S = ctx->stream;
+    int hidden = c->hidden_size;
+    for (int t = 0; t < n_tokens; t++) {
+        if (token_ids[t] < 0 || token_ids[t] >= c->vocab_size) {
+            fprintf(stderr, "mlx: invalid token id %d at position %d\n",
+                    token_ids[t], t);
+            return -1;
+        }
+    }
+    for (int s = 0; s < n_spans; s++) {
+        if (spans[s].start < 0 || spans[s].start > n_tokens ||
+            spans[s].n_tokens <= 0 ||
+            spans[s].n_tokens > n_tokens - spans[s].start)
+            return -1;
+    }
 
-    int rc = pplx_mlx_forward_into(ctx, token_ids, n_tokens, states);
-    if (rc == 0)
-        rc = pplx_pool_spans(&ctx->config, states, n_tokens, spans, n_spans,
-                             out_embeddings);
-    free(states);
+    mlx_array ids = (mlx_array){0};
+    mlx_array x = (mlx_array){0};
+    mlx_array x_normed = (mlx_array){0};
+    mlx_array x_f32 = (mlx_array){0};
+    mlx_array embeddings = (mlx_array){0};
+    mlx_array *pooled = (mlx_array *)calloc((size_t)n_spans, sizeof(*pooled));
+    mlx_vector_array pooled_vec = (mlx_vector_array){0};
+    int rc = -1;
+    if (!pooled) return -1;
+
+    int ids_shape[] = {1, n_tokens};
+    ids = mlx_array_new_data(token_ids, ids_shape, 2, MLX_INT32);
+    if (!arr_ok(ids)) goto cleanup;
+
+    x = mlx_array_new();
+    mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
+    mlx_array_free(ids);
+    ids = (mlx_array){0};
+    if (!arr_ok(x)) goto cleanup;
+
+    x = mlx_forward_layers(ctx, x, 1, n_tokens, 0, (mlx_array){0},
+                           0, c->n_layers);
+    if (!arr_ok(x)) goto cleanup;
+
+    x_normed = mlx_array_new();
+    mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
+    mlx_array_free(x);
+    x = (mlx_array){0};
+    if (!arr_ok(x_normed)) goto cleanup;
+
+    x_f32 = mlx_array_new();
+    mlx_astype(&x_f32, x_normed, MLX_FLOAT32, S);
+    mlx_array_free(x_normed);
+    x_normed = (mlx_array){0};
+    if (!arr_ok(x_f32)) goto cleanup;
+
+    for (int s = 0; s < n_spans; s++) {
+        int start[] = {0, spans[s].start, 0};
+        int stop[] = {1, spans[s].start + spans[s].n_tokens, hidden};
+        int strides[] = {1, 1, 1};
+        mlx_array slice = mlx_array_new();
+        mlx_slice(&slice, x_f32, start, 3, stop, 3, strides, 3, S);
+        if (!arr_ok(slice)) {
+            mlx_array_free(slice);
+            goto cleanup;
+        }
+
+        pooled[s] = mlx_array_new();
+        mlx_mean_axis(&pooled[s], slice, 1, false, S);
+        mlx_array_free(slice);
+        if (!arr_ok(pooled[s])) goto cleanup;
+    }
+
+    pooled_vec = mlx_vector_array_new_data(pooled, (size_t)n_spans);
+    if (!pooled_vec.ctx) goto cleanup;
+    embeddings = mlx_array_new();
+    mlx_concatenate_axis(&embeddings, pooled_vec, 0, S);
+    if (!arr_ok(embeddings)) goto cleanup;
+
+    mlx_array_eval(embeddings);
+    const float *data = mlx_array_data_float32(embeddings);
+    if (data) {
+        memcpy(out_embeddings, data,
+               (size_t)n_spans * hidden * sizeof(float));
+        rc = 0;
+    }
+
+cleanup:
+    mlx_array_free(embeddings);
+    if (pooled_vec.ctx) mlx_vector_array_free(pooled_vec);
+    for (int s = 0; s < n_spans; s++) mlx_array_free(pooled[s]);
+    free(pooled);
+    mlx_array_free(x_f32);
+    mlx_array_free(x_normed);
+    mlx_array_free(x);
+    mlx_array_free(ids);
     return rc;
 }
 
