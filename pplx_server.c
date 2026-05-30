@@ -821,9 +821,10 @@ static const char *encoding_from_root(cJSON *root, cJSON *detail) {
         return "base64_int8";
     }
     if (strcmp(encoding->valuestring, "base64_int8") &&
-        strcmp(encoding->valuestring, "base64_binary")) {
+        strcmp(encoding->valuestring, "base64_binary") &&
+        strcmp(encoding->valuestring, "float")) {
         ve_add(detail, "[\"body\",\"encoding_format\"]",
-               "value is not a valid enum member; permitted: 'base64_int8', 'base64_binary'",
+               "value is not a valid enum member; permitted: 'base64_int8', 'base64_binary', 'float'",
                "enum");
         return "base64_int8";
     }
@@ -973,6 +974,16 @@ static void append_embedding_object(sbuf *b, int index, const char *embedding) {
     sbuf_puts(b, "\"}");
 }
 
+static void append_float_embedding_object(sbuf *b, int index,
+                                          const float *emb, int dims) {
+    sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", index);
+    for (int i = 0; i < dims; i++) {
+        if (i) sbuf_putc(b, ',');
+        sbuf_printf(b, "%.9g", (double)emb[i]);
+    }
+    sbuf_puts(b, "]}");
+}
+
 static void set_response_from_buf(job *j, sbuf *b) {
     j->status = 200;
     j->content_type = "application/json";
@@ -982,16 +993,23 @@ static void set_response_from_buf(job *j, sbuf *b) {
 }
 
 static void render_embedding_response(embedding_request *r, const float *embs) {
-    char **encoded = xcalloc((size_t)r->n_inputs, sizeof(*encoded));
-    for (int i = 0; i < r->n_inputs; i++)
-        encoded[i] = encode_embedding(embs + (size_t)i * r->model->info->dim,
-                                      r->dims, r->encoding);
+    char **encoded = NULL;
+    if (strcmp(r->encoding, "float")) {
+        encoded = xcalloc((size_t)r->n_inputs, sizeof(*encoded));
+        for (int i = 0; i < r->n_inputs; i++)
+            encoded[i] = encode_embedding(embs + (size_t)i * r->model->info->dim,
+                                          r->dims, r->encoding);
+    }
 
     sbuf b = {0};
     sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");
     for (int i = 0; i < r->n_inputs; i++) {
         if (i) sbuf_putc(&b, ',');
-        append_embedding_object(&b, i, encoded[i]);
+        if (encoded)
+            append_embedding_object(&b, i, encoded[i]);
+        else
+            append_float_embedding_object(&b, i,
+                embs + (size_t)i * r->model->info->dim, r->dims);
     }
     double cost = ((double)r->total_tokens / 1000000.0) *
                   r->model->info->price_per_mtok;
@@ -1002,7 +1020,7 @@ static void render_embedding_response(embedding_request *r, const float *embs) {
         r->model->info->id, r->total_tokens, r->total_tokens, cost, cost);
     set_response_from_buf(r->j, &b);
 
-    for (int i = 0; i < r->n_inputs; i++) free(encoded[i]);
+    for (int i = 0; encoded && i < r->n_inputs; i++) free(encoded[i]);
     free(encoded);
 }
 
@@ -1073,14 +1091,17 @@ static void handle_context_job(job *j, cJSON *root, loaded_model *m,
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
     int n_docs = cJSON_GetArraySize(input);
     int *chunks = xcalloc((size_t)n_docs, sizeof(*chunks));
-    char ***encoded = xcalloc((size_t)n_docs, sizeof(*encoded));
+    char ***encoded = strcmp(encoding, "float")
+        ? xcalloc((size_t)n_docs, sizeof(*encoded)) : NULL;
+    float **float_embs = !strcmp(encoding, "float")
+        ? xcalloc((size_t)n_docs, sizeof(*float_embs)) : NULL;
     int total_tokens = 0;
 
     cJSON *doc_arr;
     int di = 0;
     cJSON_ArrayForEach(doc_arr, input) {
         chunks[di] = cJSON_GetArraySize(doc_arr);
-        encoded[di] = xcalloc((size_t)chunks[di], sizeof(char *));
+        if (encoded) encoded[di] = xcalloc((size_t)chunks[di], sizeof(char *));
         token_buf *chunk_tokens = xcalloc((size_t)chunks[di], sizeof(*chunk_tokens));
         pplx_span_t *spans = xcalloc((size_t)chunks[di], sizeof(*spans));
         int doc_tokens = 0;
@@ -1120,10 +1141,14 @@ static void handle_context_job(job *j, cJSON *root, loaded_model *m,
             free(chunk_tokens); free(spans);
             goto done;
         }
-        for (ci = 0; ci < chunks[di]; ci++)
-            encoded[di][ci] = encode_embedding(embs + (size_t)ci * m->info->dim,
-                                               dims, encoding);
-        free(embs);
+        if (encoded) {
+            for (ci = 0; ci < chunks[di]; ci++)
+                encoded[di][ci] = encode_embedding(embs + (size_t)ci * m->info->dim,
+                                                   dims, encoding);
+            free(embs);
+        } else {
+            float_embs[di] = embs;
+        }
         free(doc_ids);
         free_token_bufs(chunk_tokens, chunks[di]);
         free(chunk_tokens);
@@ -1138,7 +1163,11 @@ static void handle_context_job(job *j, cJSON *root, loaded_model *m,
         sbuf_printf(&b, "{\"object\":\"list\",\"index\":%d,\"data\":[", di);
         for (int ci = 0; ci < chunks[di]; ci++) {
             if (ci) sbuf_putc(&b, ',');
-            append_embedding_object(&b, ci, encoded[di][ci]);
+            if (encoded)
+                append_embedding_object(&b, ci, encoded[di][ci]);
+            else
+                append_float_embedding_object(&b, ci,
+                    float_embs[di] + (size_t)ci * m->info->dim, dims);
         }
         sbuf_puts(&b, "]}");
     }
@@ -1149,11 +1178,16 @@ static void handle_context_job(job *j, cJSON *root, loaded_model *m,
 
 done:
     for (di = 0; di < n_docs; di++) {
-        if (!encoded[di]) continue;
-        for (int ci = 0; ci < chunks[di]; ci++) free(encoded[di][ci]);
-        free(encoded[di]);
+        if (encoded) {
+            if (!encoded[di]) continue;
+            for (int ci = 0; ci < chunks[di]; ci++) free(encoded[di][ci]);
+            free(encoded[di]);
+        } else if (float_embs) {
+            free(float_embs[di]);
+        }
     }
     free(encoded);
+    free(float_embs);
     free(chunks);
 }
 
