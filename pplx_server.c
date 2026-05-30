@@ -51,6 +51,9 @@
 #define PPLX_API_MAX_CONTEXT_CHUNKS 16000
 #define PPLX_API_MAX_ITEM_TOKENS 32768
 #define PPLX_API_MAX_TOTAL_TOKENS 120000
+#define PPLX_SERVER_DEFAULT_BATCH_SIZE 8
+#define PPLX_SERVER_BATCH_WAIT_US 1000
+#define PPLX_SERVER_MICROBATCH_MAX_JOBS 128
 
 typedef struct {
     char *ptr;
@@ -214,6 +217,7 @@ typedef struct {
     const char *host;
     int port;
     int batch_size;
+    int batch_wait_us;
     int enable_cors;
     char *api_key;
     loaded_model models[4];
@@ -223,6 +227,8 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int stopping;
+    int worker_ready;
+    int worker_init_rc;
     job *job_head;
     job *job_tail;
     job *done_head;
@@ -540,6 +546,20 @@ static job *dequeue_job(http_server *s) {
     }
     pthread_mutex_unlock(&s->mu);
     return j;
+}
+
+static int drain_ready_jobs(http_server *s, job **jobs, int max_jobs) {
+    int n = 0;
+    pthread_mutex_lock(&s->mu);
+    while (n < max_jobs && s->job_head) {
+        job *j = s->job_head;
+        s->job_head = j->next;
+        if (!s->job_head) s->job_tail = NULL;
+        j->next = NULL;
+        jobs[n++] = j;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return n;
 }
 
 static void enqueue_job(job *j) {
@@ -890,9 +910,31 @@ typedef struct {
     int n_tokens;
 } token_buf;
 
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    int dims;
+    const char *encoding;
+    int n_inputs;
+    token_buf *tokens;
+    pplx_input_t *inputs;
+    int total_tokens;
+    int ready;
+} embedding_request;
+
 static void free_token_bufs(token_buf *t, int n) {
     if (!t) return;
     for (int i = 0; i < n; i++) free(t[i].ids);
+}
+
+static void embedding_request_free(embedding_request *r) {
+    if (!r) return;
+    free_token_bufs(r->tokens, r->n_inputs);
+    free(r->tokens);
+    free(r->inputs);
+    if (r->root) cJSON_Delete(r->root);
+    memset(r, 0, sizeof(*r));
 }
 
 static int tokenize_one(loaded_model *m, const char *text, token_buf *out) {
@@ -939,73 +981,91 @@ static void set_response_from_buf(job *j, sbuf *b) {
     memset(b, 0, sizeof(*b));
 }
 
-static void handle_embeddings_job(job *j, cJSON *root, loaded_model *m,
-                                  int dims, const char *encoding) {
-    cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
-    int n_inputs = cJSON_IsString(input) ? 1 : cJSON_GetArraySize(input);
-    token_buf *tokens = xcalloc((size_t)n_inputs, sizeof(*tokens));
-    pplx_input_t *inputs = xmalloc((size_t)n_inputs * sizeof(*inputs));
-    float *embs = xmalloc((size_t)n_inputs * m->info->dim * sizeof(float));
-    char **encoded = xcalloc((size_t)n_inputs, sizeof(*encoded));
-
-    int total_tokens = 0;
-    int idx = 0;
-    if (cJSON_IsString(input)) {
-        tokenize_one(m, input->valuestring, &tokens[0]);
-        inputs[0].ids = tokens[0].ids;
-        inputs[0].n_tokens = tokens[0].n_tokens;
-        total_tokens = tokens[0].n_tokens;
-    } else {
-        cJSON *item;
-        cJSON_ArrayForEach(item, input) {
-            tokenize_one(m, item->valuestring, &tokens[idx]);
-            inputs[idx].ids = tokens[idx].ids;
-            inputs[idx].n_tokens = tokens[idx].n_tokens;
-            total_tokens += tokens[idx].n_tokens;
-            idx++;
-        }
-    }
-
-    for (int i = 0; i < n_inputs; i++) {
-        if (!tokens[i].ids) {
-            job_set_error(j, 500, "tokenization failed", "server_error");
-            goto done;
-        }
-    }
-    int max_batch = j->srv->batch_size > 0 ? j->srv->batch_size : n_inputs;
-    for (int start = 0; start < n_inputs; start += max_batch) {
-        int cur = n_inputs - start;
-        if (cur > max_batch) cur = max_batch;
-        if (model_embed_batch(m, inputs + start, cur,
-                              embs + (size_t)start * m->info->dim) != 0) {
-            job_set_error(j, 500, "embedding failed", "server_error");
-            goto done;
-        }
-    }
-    for (int i = 0; i < n_inputs; i++)
-        encoded[i] = encode_embedding(embs + (size_t)i * m->info->dim, dims, encoding);
+static void render_embedding_response(embedding_request *r, const float *embs) {
+    char **encoded = xcalloc((size_t)r->n_inputs, sizeof(*encoded));
+    for (int i = 0; i < r->n_inputs; i++)
+        encoded[i] = encode_embedding(embs + (size_t)i * r->model->info->dim,
+                                      r->dims, r->encoding);
 
     sbuf b = {0};
     sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    for (int i = 0; i < n_inputs; i++) {
+    for (int i = 0; i < r->n_inputs; i++) {
         if (i) sbuf_putc(&b, ',');
         append_embedding_object(&b, i, encoded[i]);
     }
-    double cost = ((double)total_tokens / 1000000.0) * m->info->price_per_mtok;
+    double cost = ((double)r->total_tokens / 1000000.0) *
+                  r->model->info->price_per_mtok;
     sbuf_printf(&b,
         "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
         "\"total_tokens\":%d,\"cost\":{\"input_cost\":%.10g,"
         "\"total_cost\":%.10g,\"currency\":\"USD\"}}}",
-        m->info->id, total_tokens, total_tokens, cost, cost);
-    set_response_from_buf(j, &b);
+        r->model->info->id, r->total_tokens, r->total_tokens, cost, cost);
+    set_response_from_buf(r->j, &b);
 
-done:
-    for (int i = 0; i < n_inputs; i++) free(encoded[i]);
+    for (int i = 0; i < r->n_inputs; i++) free(encoded[i]);
     free(encoded);
+}
+
+static int embedding_request_compatible(const embedding_request *a,
+                                        const embedding_request *b) {
+    return a->ready && b->ready &&
+           a->model == b->model &&
+           a->dims == b->dims &&
+           !strcmp(a->encoding, b->encoding);
+}
+
+static void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
+    if (n_reqs <= 0) return;
+    loaded_model *m = reqs[0]->model;
+    int dim = m->info->dim;
+    int total_inputs = 0;
+    for (int i = 0; i < n_reqs; i++)
+        total_inputs += reqs[i]->n_inputs;
+
+    pplx_input_t *inputs = xmalloc((size_t)total_inputs * sizeof(*inputs));
+    float *embs = xmalloc((size_t)total_inputs * dim * sizeof(float));
+
+    int pos = 0;
+    for (int i = 0; i < n_reqs; i++) {
+        memcpy(inputs + pos, reqs[i]->inputs,
+               (size_t)reqs[i]->n_inputs * sizeof(*inputs));
+        pos += reqs[i]->n_inputs;
+    }
+
+    int max_batch = reqs[0]->j->srv->batch_size > 0
+        ? reqs[0]->j->srv->batch_size : total_inputs;
+    int failed = 0;
+    for (int start = 0; start < total_inputs; start += max_batch) {
+        int cur = total_inputs - start;
+        if (cur > max_batch) cur = max_batch;
+        if (model_embed_batch(m, inputs + start, cur,
+                              embs + (size_t)start * dim) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+
+    pos = 0;
+    for (int i = 0; i < n_reqs; i++) {
+        if (failed) {
+            job_set_error(reqs[i]->j, 500, "embedding failed", "server_error");
+        } else {
+            render_embedding_response(reqs[i], embs + (size_t)pos * dim);
+        }
+        pos += reqs[i]->n_inputs;
+    }
+
     free(embs);
     free(inputs);
-    free_token_bufs(tokens, n_inputs);
-    free(tokens);
+}
+
+static void execute_embedding_requests(embedding_request *reqs, int n_reqs) {
+    if (n_reqs <= 0) return;
+    embedding_request **list = xmalloc((size_t)n_reqs * sizeof(*list));
+    for (int i = 0; i < n_reqs; i++)
+        list[i] = &reqs[i];
+    execute_embedding_request_list(list, n_reqs);
+    free(list);
 }
 
 static void handle_context_job(job *j, cJSON *root, loaded_model *m,
@@ -1097,20 +1157,6 @@ done:
     free(chunks);
 }
 
-static void validate_text_tokens(cJSON *detail, loaded_model *m, const char *loc,
-                                 const char *text, int *total_tokens) {
-    token_buf t;
-    if (tokenize_one(m, text, &t) != 0) {
-        ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
-        return;
-    }
-    if (t.n_tokens > PPLX_API_MAX_ITEM_TOKENS)
-        ve_add(detail, loc, "input exceeds 32768 token limit", "value_error.context_length");
-    if (*total_tokens <= PPLX_API_MAX_TOTAL_TOKENS)
-        *total_tokens += t.n_tokens;
-    free(t.ids);
-}
-
 static int validate_common(cJSON *root, cJSON *detail, int expect_context,
                            loaded_model **out_model, int *out_dims,
                            const char **out_encoding, http_server *s) {
@@ -1145,25 +1191,29 @@ static int validate_common(cJSON *root, cJSON *detail, int expect_context,
            !s->models[model_slot_for_id(model_id)].info ? 503 : 0;
 }
 
-static void process_embeddings(job *j, cJSON *root, http_server *s) {
+static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
+                                      embedding_request *out) {
+    memset(out, 0, sizeof(*out));
+    out->j = j;
+    out->root = root;
+
     cJSON *detail = cJSON_CreateArray();
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
     int unloaded = validate_common(root, detail, 0, &m, &dims, &encoding, s);
+    out->model = m;
+    out->dims = dims;
+    out->encoding = encoding;
 
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
     int n_inputs = 0;
-    int total_tokens = 0;
     if (!input) {
         ve_add(detail, "[\"body\",\"input\"]", "field required", "missing");
     } else if (cJSON_IsString(input)) {
         if (!input->valuestring || input->valuestring[0] == '\0')
             ve_add(detail, "[\"body\",\"input\"]", "input must not be empty",
                    "value_error.empty");
-        else if (m)
-            validate_text_tokens(detail, m, "[\"body\",\"input\"]",
-                                 input->valuestring, &total_tokens);
         n_inputs = 1;
     } else if (cJSON_IsArray(input)) {
         n_inputs = cJSON_GetArraySize(input);
@@ -1182,8 +1232,6 @@ static void process_embeddings(job *j, cJSON *root, http_server *s) {
                 ve_add(detail, loc, "input item must be a string", "type_error.string");
             } else if (!item->valuestring || item->valuestring[0] == '\0') {
                 ve_add(detail, loc, "input item must not be empty", "value_error.empty");
-            } else if (m) {
-                validate_text_tokens(detail, m, loc, item->valuestring, &total_tokens);
             }
             i++;
         }
@@ -1191,19 +1239,74 @@ static void process_embeddings(job *j, cJSON *root, http_server *s) {
         ve_add(detail, "[\"body\",\"input\"]",
                "input must be a string or an array of strings", "type_error");
     }
-    if (total_tokens > PPLX_API_MAX_TOTAL_TOKENS)
-        ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
-               "value_error.context_length");
+
+    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
+        job_set_error(j, 503, "requested model is valid but not loaded",
+                      "model_not_loaded");
+        cJSON_Delete(detail);
+        return;
+    }
+
+    if (cJSON_GetArraySize(detail) == 0 && m) {
+        out->n_inputs = n_inputs;
+        out->tokens = xcalloc((size_t)n_inputs, sizeof(*out->tokens));
+        out->inputs = xmalloc((size_t)n_inputs * sizeof(*out->inputs));
+
+        int idx = 0;
+        if (cJSON_IsString(input)) {
+            if (tokenize_one(m, input->valuestring, &out->tokens[0]) != 0) {
+                ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
+                       "value_error.tokenization");
+            } else {
+                out->inputs[0].ids = out->tokens[0].ids;
+                out->inputs[0].n_tokens = out->tokens[0].n_tokens;
+                out->total_tokens = out->tokens[0].n_tokens;
+                if (out->tokens[0].n_tokens > PPLX_API_MAX_ITEM_TOKENS)
+                    ve_add(detail, "[\"body\",\"input\"]",
+                           "input exceeds 32768 token limit",
+                           "value_error.context_length");
+            }
+        } else {
+            cJSON *item;
+            cJSON_ArrayForEach(item, input) {
+                char loc[64];
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", idx);
+                if (tokenize_one(m, item->valuestring, &out->tokens[idx]) != 0) {
+                    ve_add(detail, loc, "tokenization failed",
+                           "value_error.tokenization");
+                } else {
+                    out->inputs[idx].ids = out->tokens[idx].ids;
+                    out->inputs[idx].n_tokens = out->tokens[idx].n_tokens;
+                    out->total_tokens += out->tokens[idx].n_tokens;
+                    if (out->tokens[idx].n_tokens > PPLX_API_MAX_ITEM_TOKENS)
+                        ve_add(detail, loc, "input exceeds 32768 token limit",
+                               "value_error.context_length");
+                }
+                idx++;
+            }
+        }
+
+        if (out->total_tokens > PPLX_API_MAX_TOTAL_TOKENS)
+            ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
+                   "value_error.context_length");
+    }
 
     if (cJSON_GetArraySize(detail) > 0) {
         job_set_422(j, detail);
-    } else if (unloaded) {
-        job_set_error(j, 503, "requested model is valid but not loaded",
-                      "model_not_loaded");
+        embedding_request_free(out);
+        out->j = j;
     } else {
-        handle_embeddings_job(j, root, m, dims, encoding);
+        out->ready = 1;
     }
     cJSON_Delete(detail);
+}
+
+static void process_embeddings(job *j, cJSON *root, http_server *s) {
+    embedding_request r;
+    prepare_embedding_request(j, root, s, &r);
+    if (r.ready)
+        execute_embedding_requests(&r, 1);
+    embedding_request_free(&r);
 }
 
 static void process_contextual(job *j, cJSON *root, http_server *s) {
@@ -1300,33 +1403,165 @@ static void process_contextual(job *j, cJSON *root, http_server *s) {
     cJSON_Delete(detail);
 }
 
-static void process_job(job *j) {
+static int parse_job_root(job *j, cJSON **out_root) {
     cJSON *detail = cJSON_CreateArray();
     cJSON *root = parse_json_body(j, detail);
     if (!root) {
         job_set_422(j, detail);
         cJSON_Delete(detail);
-        return;
+        *out_root = NULL;
+        return -1;
     }
     cJSON_Delete(detail);
+    *out_root = root;
+    return 0;
+}
 
-    if (!strcmp(j->path, "/v1/embeddings"))
+static void process_job(job *j) {
+    cJSON *root = NULL;
+    if (parse_job_root(j, &root) != 0)
+        return;
+    if (!strcmp(j->path, "/v1/embeddings")) {
         process_embeddings(j, root, j->srv);
-    else if (!strcmp(j->path, "/v1/contextualizedembeddings"))
+        return;
+    } else if (!strcmp(j->path, "/v1/contextualizedembeddings"))
         process_contextual(j, root, j->srv);
     else
         job_set_error(j, 404, "unknown endpoint", "invalid_request_error");
     cJSON_Delete(root);
 }
 
+static void process_job_group(http_server *s, job **jobs, int n_jobs) {
+    embedding_request *reqs = xcalloc((size_t)n_jobs, sizeof(*reqs));
+    int *is_standard = xcalloc((size_t)n_jobs, sizeof(*is_standard));
+    int *done = xcalloc((size_t)n_jobs, sizeof(*done));
+    embedding_request **group = xmalloc((size_t)n_jobs * sizeof(*group));
+
+    for (int i = 0; i < n_jobs; i++) {
+        if (strcmp(jobs[i]->path, "/v1/embeddings"))
+            continue;
+        cJSON *root = NULL;
+        is_standard[i] = 1;
+        if (parse_job_root(jobs[i], &root) == 0)
+            prepare_embedding_request(jobs[i], root, s, &reqs[i]);
+    }
+
+    for (int i = 0; i < n_jobs; i++) {
+        if (done[i])
+            continue;
+
+        if (!is_standard[i]) {
+            process_job(jobs[i]);
+            enqueue_done(jobs[i]);
+            done[i] = 1;
+            continue;
+        }
+
+        if (!reqs[i].ready) {
+            enqueue_done(jobs[i]);
+            done[i] = 1;
+            continue;
+        }
+
+        int group_n = 1;
+        group[0] = &reqs[i];
+        for (int k = i + 1; k < n_jobs; k++) {
+            if (!done[k] && is_standard[k] && reqs[k].ready &&
+                embedding_request_compatible(&reqs[i], &reqs[k]))
+                group[group_n++] = &reqs[k];
+        }
+
+        execute_embedding_request_list(group, group_n);
+        for (int k = 0; k < group_n; k++) {
+            int idx = (int)(group[k] - reqs);
+            enqueue_done(jobs[idx]);
+            done[idx] = 1;
+        }
+    }
+
+    for (int i = 0; i < n_jobs; i++)
+        embedding_request_free(&reqs[i]);
+    free(group);
+    free(done);
+    free(is_standard);
+    free(reqs);
+}
+
 static void *worker_main(void *arg) {
     http_server *s = arg;
+#ifdef USE_MLX
+    if (s->use_mlx) {
+        int rc = 0;
+        for (int i = 0; i < 4; i++) {
+            loaded_model *m = &s->models[i];
+            if (!m->info) continue;
+            m->mlx_ctx = pplx_mlx_load(m->path);
+            if (!m->mlx_ctx) {
+                server_log("pplx-serve: failed to load MLX model on worker: %s",
+                           m->path);
+                rc = 1;
+                break;
+            }
+            if (pplx_mlx_config(m->mlx_ctx)->hidden_size != m->info->dim) {
+                server_log("pplx-serve: model %s has unexpected dimension %d",
+                           m->info->id,
+                           pplx_mlx_config(m->mlx_ctx)->hidden_size);
+                rc = 1;
+                break;
+            }
+        }
+        pthread_mutex_lock(&s->mu);
+        s->worker_init_rc = rc;
+        s->worker_ready = 1;
+        if (rc) s->stopping = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        if (rc) {
+            for (int i = 0; i < 4; i++) {
+                loaded_model *m = &s->models[i];
+                if (m->mlx_ctx) {
+                    pplx_mlx_free(m->mlx_ctx);
+                    m->mlx_ctx = NULL;
+                }
+            }
+            return NULL;
+        }
+    } else
+#endif
+    {
+        pthread_mutex_lock(&s->mu);
+        s->worker_ready = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+    }
+
     for (;;) {
         job *j = dequeue_job(s);
         if (!j) break;
-        process_job(j);
-        enqueue_done(j);
+        job *jobs[PPLX_SERVER_MICROBATCH_MAX_JOBS];
+        int n_jobs = 1;
+        jobs[0] = j;
+
+        if (!strcmp(j->path, "/v1/embeddings") && s->batch_size > 1) {
+            if (s->batch_wait_us > 0)
+                usleep((useconds_t)s->batch_wait_us);
+            n_jobs += drain_ready_jobs(s, jobs + 1,
+                                       PPLX_SERVER_MICROBATCH_MAX_JOBS - 1);
+        }
+
+        process_job_group(s, jobs, n_jobs);
     }
+#ifdef USE_MLX
+    if (s->use_mlx) {
+        for (int i = 0; i < 4; i++) {
+            loaded_model *m = &s->models[i];
+            if (m->mlx_ctx) {
+                pplx_mlx_free(m->mlx_ctx);
+                m->mlx_ctx = NULL;
+            }
+        }
+    }
+#endif
     return NULL;
 }
 
@@ -1362,16 +1597,9 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     }
 #ifdef USE_MLX
     if (s->use_mlx) {
-        m->mlx_ctx = pplx_mlx_load(path);
-        if (!m->mlx_ctx) {
-            server_log("pplx-serve: failed to load MLX model: %s", path);
-            return -1;
-        }
-        if (pplx_mlx_config(m->mlx_ctx)->hidden_size != m->info->dim) {
-            server_log("pplx-serve: model %s has unexpected dimension %d",
-                       m->info->id, pplx_mlx_config(m->mlx_ctx)->hidden_size);
-            return -1;
-        }
+        /* MLX streams are thread-local. The inference worker loads the MLX
+         * model so all MLX arrays/streams are created, used, and freed by the
+         * same thread. */
         return 0;
     }
 #endif
@@ -1417,7 +1645,10 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     memset(&s, 0, sizeof(s));
     s.host = cfg->host && cfg->host[0] ? cfg->host : "127.0.0.1";
     s.port = cfg->port > 0 ? cfg->port : 8000;
-    s.batch_size = cfg->batch_size > 0 ? cfg->batch_size : 1;
+    s.batch_size = cfg->batch_size > 0
+        ? cfg->batch_size : PPLX_SERVER_DEFAULT_BATCH_SIZE;
+    s.batch_wait_us = cfg->batch_wait_us >= 0
+        ? cfg->batch_wait_us : PPLX_SERVER_BATCH_WAIT_US;
     s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
     if (cfg->api_key && cfg->api_key[0])
@@ -1473,6 +1704,20 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
         fprintf(stderr, "pplx-serve: failed to start worker\n");
         aeDeleteEventLoop(s.loop);
         free_models(&s);
+        return 1;
+    }
+    pthread_mutex_lock(&s.mu);
+    while (!s.worker_ready)
+        pthread_cond_wait(&s.cv, &s.mu);
+    int worker_init_rc = s.worker_init_rc;
+    pthread_mutex_unlock(&s.mu);
+    if (worker_init_rc) {
+        pthread_join(s.worker, NULL);
+        aeDeleteEventLoop(s.loop);
+        free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
         return 1;
     }
 

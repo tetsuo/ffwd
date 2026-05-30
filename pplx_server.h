@@ -14,6 +14,7 @@ typedef struct {
     const char *host;
     int port;
     int batch_size;
+    int batch_wait_us;
     int use_mlx;
     int enable_cors;
     const char *api_key;
