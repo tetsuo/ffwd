@@ -923,6 +923,26 @@ typedef struct {
     int ready;
 } embedding_request;
 
+typedef struct {
+    int *ids;
+    int n_tokens;
+    pplx_span_t *spans;
+    int n_spans;
+} contextual_doc;
+
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    int dims;
+    const char *encoding;
+    contextual_doc *docs;
+    int n_docs;
+    int total_chunks;
+    int total_tokens;
+    int ready;
+} contextual_request;
+
 static void free_token_bufs(token_buf *t, int n) {
     if (!t) return;
     for (int i = 0; i < n; i++) free(t[i].ids);
@@ -933,6 +953,17 @@ static void embedding_request_free(embedding_request *r) {
     free_token_bufs(r->tokens, r->n_inputs);
     free(r->tokens);
     free(r->inputs);
+    if (r->root) cJSON_Delete(r->root);
+    memset(r, 0, sizeof(*r));
+}
+
+static void contextual_request_free(contextual_request *r) {
+    if (!r) return;
+    for (int i = 0; i < r->n_docs; i++) {
+        free(r->docs[i].ids);
+        free(r->docs[i].spans);
+    }
+    free(r->docs);
     if (r->root) cJSON_Delete(r->root);
     memset(r, 0, sizeof(*r));
 }
@@ -957,14 +988,15 @@ static int model_embed_batch(loaded_model *m, const pplx_input_t *inputs,
     return pplx_model_embed_batch(m->cpu_model, m->cpu_ws, inputs, batch, out);
 }
 
-static int model_embed_spans(loaded_model *m, const int *ids, int n_tokens,
-                             const pplx_span_t *spans, int n_spans, float *out) {
+static int model_embed_spans_batch(loaded_model *m,
+                                   const pplx_context_input_t *inputs,
+                                   int batch, float *out) {
 #ifdef USE_MLX
     if (m->mlx_ctx)
-        return pplx_mlx_embed_spans(m->mlx_ctx, ids, n_tokens, spans, n_spans, out);
+        return pplx_mlx_embed_spans_batch(m->mlx_ctx, inputs, batch, out);
 #endif
-    return pplx_model_embed_spans(m->cpu_model, m->cpu_ws, ids, n_tokens,
-                                  spans, n_spans, out);
+    return pplx_model_embed_spans_batch(m->cpu_model, m->cpu_ws, inputs, batch,
+                                        out);
 }
 
 static void append_embedding_object(sbuf *b, int index, const char *embedding) {
@@ -1119,118 +1151,169 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
     free(items);
 }
 
-static void execute_embedding_requests(embedding_request *reqs, int n_reqs) {
-    if (n_reqs <= 0) return;
-    embedding_request **list = xmalloc((size_t)n_reqs * sizeof(*list));
-    for (int i = 0; i < n_reqs; i++)
-        list[i] = &reqs[i];
-    execute_embedding_request_list(list, n_reqs);
-    free(list);
-}
-
-static void handle_context_job(job *j, cJSON *root, loaded_model *m,
-                               int dims, const char *encoding) {
-    cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
-    int n_docs = cJSON_GetArraySize(input);
-    int *chunks = xcalloc((size_t)n_docs, sizeof(*chunks));
-    char ***encoded = strcmp(encoding, "float")
-        ? xcalloc((size_t)n_docs, sizeof(*encoded)) : NULL;
-    float **float_embs = !strcmp(encoding, "float")
-        ? xcalloc((size_t)n_docs, sizeof(*float_embs)) : NULL;
-    int total_tokens = 0;
-
-    cJSON *doc_arr;
-    int di = 0;
-    cJSON_ArrayForEach(doc_arr, input) {
-        chunks[di] = cJSON_GetArraySize(doc_arr);
-        if (encoded) encoded[di] = xcalloc((size_t)chunks[di], sizeof(char *));
-        token_buf *chunk_tokens = xcalloc((size_t)chunks[di], sizeof(*chunk_tokens));
-        pplx_span_t *spans = xcalloc((size_t)chunks[di], sizeof(*spans));
-        int doc_tokens = 0;
-        cJSON *chunk;
-        int ci = 0;
-        cJSON_ArrayForEach(chunk, doc_arr) {
-            if (tokenize_one(m, chunk->valuestring, &chunk_tokens[ci]) != 0) {
-                job_set_error(j, 500, "tokenization failed", "server_error");
-                free_token_bufs(chunk_tokens, chunks[di]);
-                free(chunk_tokens); free(spans);
-                goto done;
-            }
-            doc_tokens += chunk_tokens[ci].n_tokens;
-            if (ci + 1 < chunks[di]) doc_tokens += m->newline_n;
-            ci++;
-        }
-        int *doc_ids = xmalloc((size_t)doc_tokens * sizeof(int));
-        int pos = 0;
-        for (ci = 0; ci < chunks[di]; ci++) {
-            spans[ci].start = pos;
-            spans[ci].n_tokens = chunk_tokens[ci].n_tokens;
-            memcpy(doc_ids + pos, chunk_tokens[ci].ids,
-                   (size_t)chunk_tokens[ci].n_tokens * sizeof(int));
-            pos += chunk_tokens[ci].n_tokens;
-            if (ci + 1 < chunks[di] && m->newline_n > 0) {
-                memcpy(doc_ids + pos, m->newline_ids,
-                       (size_t)m->newline_n * sizeof(int));
-                pos += m->newline_n;
-            }
-        }
-        total_tokens += doc_tokens;
-        float *embs = xmalloc((size_t)chunks[di] * m->info->dim * sizeof(float));
-        if (model_embed_spans(m, doc_ids, doc_tokens, spans, chunks[di], embs) != 0) {
-            free(embs); free(doc_ids);
-            job_set_error(j, 500, "contextual embedding failed", "server_error");
-            free_token_bufs(chunk_tokens, chunks[di]);
-            free(chunk_tokens); free(spans);
-            goto done;
-        }
-        if (encoded) {
-            for (ci = 0; ci < chunks[di]; ci++)
-                encoded[di][ci] = encode_embedding(embs + (size_t)ci * m->info->dim,
-                                                   dims, encoding);
-            free(embs);
-        } else {
-            float_embs[di] = embs;
-        }
-        free(doc_ids);
-        free_token_bufs(chunk_tokens, chunks[di]);
-        free(chunk_tokens);
-        free(spans);
-        di++;
-    }
-
+static void render_contextual_response(contextual_request *r,
+                                       const float *embs) {
     sbuf b = {0};
     sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    for (di = 0; di < n_docs; di++) {
+    int span_offset = 0;
+    for (int di = 0; di < r->n_docs; di++) {
         if (di) sbuf_putc(&b, ',');
         sbuf_printf(&b, "{\"object\":\"list\",\"index\":%d,\"data\":[", di);
-        for (int ci = 0; ci < chunks[di]; ci++) {
+        for (int ci = 0; ci < r->docs[di].n_spans; ci++) {
             if (ci) sbuf_putc(&b, ',');
-            if (encoded)
-                append_embedding_object(&b, ci, encoded[di][ci]);
-            else
+            const float *emb = embs + (size_t)span_offset * r->model->info->dim;
+            if (!strcmp(r->encoding, "float")) {
                 append_float_embedding_object(&b, ci,
-                    float_embs[di] + (size_t)ci * m->info->dim, dims);
+                                              emb, r->dims);
+            } else {
+                char *encoded = encode_embedding(emb, r->dims, r->encoding);
+                append_embedding_object(&b, ci, encoded);
+                free(encoded);
+            }
+            span_offset++;
         }
         sbuf_puts(&b, "]}");
     }
     sbuf_printf(&b,
         "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,\"total_tokens\":%d}}",
-        m->info->id, total_tokens, total_tokens);
-    set_response_from_buf(j, &b);
+        r->model->info->id, r->total_tokens, r->total_tokens);
+    set_response_from_buf(r->j, &b);
+}
 
-done:
-    for (di = 0; di < n_docs; di++) {
-        if (encoded) {
-            if (!encoded[di]) continue;
-            for (int ci = 0; ci < chunks[di]; ci++) free(encoded[di][ci]);
-            free(encoded[di]);
-        } else if (float_embs) {
-            free(float_embs[di]);
+static int contextual_request_compatible(const contextual_request *a,
+                                         const contextual_request *b) {
+    return a->ready && b->ready &&
+           a->model == b->model &&
+           a->dims == b->dims &&
+           !strcmp(a->encoding, b->encoding);
+}
+
+static int contextual_request_fits_group(const contextual_request *r,
+                                         int group_docs, int group_tokens,
+                                         int max_batch, int max_batch_tokens) {
+    if (group_docs == 0) return 1;
+    return r->n_docs <= max_batch - group_docs &&
+           r->total_tokens <= max_batch_tokens - group_tokens;
+}
+
+typedef struct {
+    pplx_context_input_t input;
+    int output_span_index;
+    int order;
+} contextual_batch_item;
+
+static int contextual_batch_item_cmp(const void *a, const void *b) {
+    const contextual_batch_item *ia = a;
+    const contextual_batch_item *ib = b;
+    if (ia->input.input.n_tokens < ib->input.input.n_tokens) return -1;
+    if (ia->input.input.n_tokens > ib->input.input.n_tokens) return 1;
+    return ia->order - ib->order;
+}
+
+static void execute_contextual_request_list(contextual_request **reqs,
+                                            int n_reqs) {
+    if (n_reqs <= 0) return;
+    loaded_model *m = reqs[0]->model;
+    int dim = m->info->dim;
+    int total_docs = 0;
+    int total_chunks = 0;
+    for (int i = 0; i < n_reqs; i++) {
+        if (total_docs > INT_MAX - reqs[i]->n_docs ||
+            total_chunks > INT_MAX - reqs[i]->total_chunks) {
+            for (int k = 0; k < n_reqs; k++)
+                job_set_error(reqs[k]->j, 500, "contextual batch is too large",
+                              "server_error");
+            return;
+        }
+        total_docs += reqs[i]->n_docs;
+        total_chunks += reqs[i]->total_chunks;
+    }
+    if ((size_t)total_chunks > SIZE_MAX / (size_t)dim / sizeof(float)) {
+        for (int i = 0; i < n_reqs; i++)
+            job_set_error(reqs[i]->j, 500, "contextual batch is too large",
+                          "server_error");
+        return;
+    }
+
+    contextual_batch_item *items =
+        xmalloc((size_t)total_docs * sizeof(*items));
+    float *embs = xmalloc((size_t)total_chunks * dim * sizeof(*embs));
+    int pos = 0;
+    int span_offset = 0;
+    for (int i = 0; i < n_reqs; i++) {
+        for (int d = 0; d < reqs[i]->n_docs; d++) {
+            contextual_doc *doc = &reqs[i]->docs[d];
+            items[pos].input.input.ids = doc->ids;
+            items[pos].input.input.n_tokens = doc->n_tokens;
+            items[pos].input.spans = doc->spans;
+            items[pos].input.n_spans = doc->n_spans;
+            items[pos].output_span_index = span_offset;
+            items[pos].order = pos;
+            span_offset += doc->n_spans;
+            pos++;
         }
     }
-    free(encoded);
-    free(float_embs);
-    free(chunks);
+    qsort(items, (size_t)total_docs, sizeof(*items), contextual_batch_item_cmp);
+
+    int max_batch = reqs[0]->j->srv->batch_size > 0
+        ? reqs[0]->j->srv->batch_size : total_docs;
+    if (max_batch > total_docs) max_batch = total_docs;
+    int max_batch_tokens = reqs[0]->j->srv->max_batch_tokens;
+    pplx_context_input_t *inputs =
+        xmalloc((size_t)max_batch * sizeof(*inputs));
+    float *batch_embs = NULL;
+    size_t batch_emb_cap = 0;
+
+    int failed = 0;
+    for (int start = 0; start < total_docs;) {
+        int cur = 0;
+        int tokens = 0;
+        int chunks = 0;
+        while (start + cur < total_docs && cur < max_batch) {
+            const pplx_context_input_t *input = &items[start + cur].input;
+            if (cur > 0 && input->input.n_tokens > max_batch_tokens - tokens)
+                break;
+            inputs[cur] = *input;
+            tokens += input->input.n_tokens;
+            chunks += input->n_spans;
+            cur++;
+        }
+        size_t needed = (size_t)chunks * dim;
+        if (needed > batch_emb_cap) {
+            batch_embs = xrealloc(batch_embs, needed * sizeof(*batch_embs));
+            batch_emb_cap = needed;
+        }
+        if (model_embed_spans_batch(m, inputs, cur, batch_embs) != 0) {
+            failed = 1;
+            break;
+        }
+        int batch_span = 0;
+        for (int i = 0; i < cur; i++) {
+            int n_spans = inputs[i].n_spans;
+            memcpy(embs + (size_t)items[start + i].output_span_index * dim,
+                   batch_embs + (size_t)batch_span * dim,
+                   (size_t)n_spans * dim * sizeof(*embs));
+            batch_span += n_spans;
+        }
+        start += cur;
+    }
+
+    span_offset = 0;
+    for (int i = 0; i < n_reqs; i++) {
+        if (failed) {
+            job_set_error(reqs[i]->j, 500, "contextual embedding failed",
+                          "server_error");
+        } else {
+            render_contextual_response(reqs[i],
+                                       embs + (size_t)span_offset * dim);
+        }
+        span_offset += reqs[i]->total_chunks;
+    }
+
+    free(batch_embs);
+    free(inputs);
+    free(embs);
+    free(items);
 }
 
 static int validate_common(cJSON *root, cJSON *detail, int expect_context,
@@ -1377,23 +1460,24 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
     cJSON_Delete(detail);
 }
 
-static void process_embeddings(job *j, cJSON *root, http_server *s) {
-    embedding_request r;
-    prepare_embedding_request(j, root, s, &r);
-    if (r.ready)
-        execute_embedding_requests(&r, 1);
-    embedding_request_free(&r);
-}
+static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
+                                       contextual_request *out) {
+    memset(out, 0, sizeof(*out));
+    out->j = j;
+    out->root = root;
 
-static void process_contextual(job *j, cJSON *root, http_server *s) {
     cJSON *detail = cJSON_CreateArray();
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
     int unloaded = validate_common(root, detail, 1, &m, &dims, &encoding, s);
+    out->model = m;
+    out->dims = dims;
+    out->encoding = encoding;
 
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
-    int n_docs = 0, total_chunks = 0, total_tokens = 0;
+    int n_docs = 0;
+    int total_chunks = 0;
     if (!input) {
         ve_add(detail, "[\"body\",\"input\"]", "field required", "missing");
     } else if (!cJSON_IsArray(input)) {
@@ -1419,14 +1503,16 @@ static void process_contextual(job *j, cJSON *root, http_server *s) {
                 continue;
             }
             int doc_chunks = cJSON_GetArraySize(doc_arr);
-            total_chunks += doc_chunks;
+            if (doc_chunks > PPLX_API_MAX_CONTEXT_CHUNKS - total_chunks)
+                total_chunks = PPLX_API_MAX_CONTEXT_CHUNKS + 1;
+            else
+                total_chunks += doc_chunks;
             if (doc_chunks < 1) {
                 char loc[64];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
                 ve_add(detail, loc, "document must contain at least 1 chunk",
                        "value_error.list.min_items");
             }
-            int doc_tokens = 0;
             cJSON *chunk;
             int ci = 0;
             cJSON_ArrayForEach(chunk, doc_arr) {
@@ -1436,45 +1522,101 @@ static void process_contextual(job *j, cJSON *root, http_server *s) {
                     ve_add(detail, loc, "chunk must be a string", "type_error.string");
                 } else if (!chunk->valuestring || chunk->valuestring[0] == '\0') {
                     ve_add(detail, loc, "chunk must not be empty", "value_error.empty");
-                } else if (m) {
-                    token_buf t;
-                    if (tokenize_one(m, chunk->valuestring, &t) != 0) {
-                        ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
-                    } else {
-                        doc_tokens += t.n_tokens;
-                        total_tokens += t.n_tokens;
-                        free(t.ids);
-                    }
                 }
                 ci++;
-            }
-            if (m && doc_chunks > 1) {
-                doc_tokens += (doc_chunks - 1) * m->newline_n;
-                total_tokens += (doc_chunks - 1) * m->newline_n;
-            }
-            if (doc_tokens > PPLX_API_MAX_ITEM_TOKENS) {
-                char loc[64];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
-                ve_add(detail, loc, "document exceeds 32768 token limit",
-                       "value_error.context_length");
             }
             di++;
         }
         if (total_chunks > PPLX_API_MAX_CONTEXT_CHUNKS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 16000 chunks",
                    "value_error.list.max_items");
-        if (total_tokens > PPLX_API_MAX_TOTAL_TOKENS)
-            ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
+    }
+
+    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
+        job_set_error(j, 503, "requested model is valid but not loaded",
+                      "model_not_loaded");
+        cJSON_Delete(detail);
+        return;
+    }
+
+    if (cJSON_GetArraySize(detail) == 0 && m) {
+        out->n_docs = n_docs;
+        out->docs = xcalloc((size_t)n_docs, sizeof(*out->docs));
+        int64_t request_tokens = 0;
+        cJSON *doc_arr;
+        int di = 0;
+        cJSON_ArrayForEach(doc_arr, input) {
+            contextual_doc *doc = &out->docs[di];
+            int n_chunks = cJSON_GetArraySize(doc_arr);
+            token_buf *chunk_tokens =
+                xcalloc((size_t)n_chunks, sizeof(*chunk_tokens));
+            doc->spans = xcalloc((size_t)n_chunks, sizeof(*doc->spans));
+            doc->n_spans = n_chunks;
+            int64_t doc_tokens = n_chunks > 1
+                ? (int64_t)(n_chunks - 1) * m->newline_n : 0;
+            int doc_valid = 1;
+
+            cJSON *chunk;
+            int ci = 0;
+            cJSON_ArrayForEach(chunk, doc_arr) {
+                char loc[80];
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", di, ci);
+                if (tokenize_one(m, chunk->valuestring, &chunk_tokens[ci]) != 0) {
+                    ve_add(detail, loc, "tokenization failed",
+                           "value_error.tokenization");
+                    doc_valid = 0;
+                } else {
+                    doc_tokens += chunk_tokens[ci].n_tokens;
+                }
+                ci++;
+            }
+
+            if (doc_tokens > PPLX_API_MAX_ITEM_TOKENS) {
+                char loc[64];
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
+                ve_add(detail, loc, "document exceeds 32768 token limit",
+                       "value_error.context_length");
+                doc_valid = 0;
+            }
+            request_tokens += doc_tokens;
+
+            if (doc_valid) {
+                doc->n_tokens = (int)doc_tokens;
+                doc->ids = xmalloc((size_t)doc->n_tokens * sizeof(*doc->ids));
+                int pos = 0;
+                for (ci = 0; ci < n_chunks; ci++) {
+                    doc->spans[ci].start = pos;
+                    doc->spans[ci].n_tokens = chunk_tokens[ci].n_tokens;
+                    memcpy(doc->ids + pos, chunk_tokens[ci].ids,
+                           (size_t)chunk_tokens[ci].n_tokens * sizeof(*doc->ids));
+                    pos += chunk_tokens[ci].n_tokens;
+                    if (ci + 1 < n_chunks) {
+                        memcpy(doc->ids + pos, m->newline_ids,
+                               (size_t)m->newline_n * sizeof(*doc->ids));
+                        pos += m->newline_n;
+                    }
+                }
+            }
+            free_token_bufs(chunk_tokens, n_chunks);
+            free(chunk_tokens);
+            di++;
+        }
+        if (request_tokens > PPLX_API_MAX_TOTAL_TOKENS) {
+            ve_add(detail, "[\"body\",\"input\"]",
+                   "request exceeds 120000 token limit",
                    "value_error.context_length");
+        } else {
+            out->total_tokens = (int)request_tokens;
+            out->total_chunks = total_chunks;
+        }
     }
 
     if (cJSON_GetArraySize(detail) > 0) {
         job_set_422(j, detail);
-    } else if (unloaded) {
-        job_set_error(j, 503, "requested model is valid but not loaded",
-                      "model_not_loaded");
+        contextual_request_free(out);
+        out->j = j;
     } else {
-        handle_context_job(j, root, m, dims, encoding);
+        out->ready = 1;
     }
     cJSON_Delete(detail);
 }
@@ -1493,81 +1635,112 @@ static int parse_job_root(job *j, cJSON **out_root) {
     return 0;
 }
 
-static void process_job(job *j) {
+static void process_unknown_job(job *j) {
     cJSON *root = NULL;
     if (parse_job_root(j, &root) != 0)
         return;
-    if (!strcmp(j->path, "/v1/embeddings")) {
-        process_embeddings(j, root, j->srv);
-        return;
-    } else if (!strcmp(j->path, "/v1/contextualizedembeddings"))
-        process_contextual(j, root, j->srv);
-    else
-        job_set_error(j, 404, "unknown endpoint", "invalid_request_error");
+    job_set_error(j, 404, "unknown endpoint", "invalid_request_error");
     cJSON_Delete(root);
 }
 
 static void process_job_group(http_server *s, job **jobs, int n_jobs) {
-    embedding_request *reqs = xcalloc((size_t)n_jobs, sizeof(*reqs));
-    int *is_standard = xcalloc((size_t)n_jobs, sizeof(*is_standard));
+    embedding_request *std_reqs = xcalloc((size_t)n_jobs, sizeof(*std_reqs));
+    contextual_request *ctx_reqs = xcalloc((size_t)n_jobs, sizeof(*ctx_reqs));
+    int *kind = xcalloc((size_t)n_jobs, sizeof(*kind));
     int *done = xcalloc((size_t)n_jobs, sizeof(*done));
-    embedding_request **group = xmalloc((size_t)n_jobs * sizeof(*group));
+    embedding_request **std_group = xmalloc((size_t)n_jobs * sizeof(*std_group));
+    contextual_request **ctx_group = xmalloc((size_t)n_jobs * sizeof(*ctx_group));
 
     for (int i = 0; i < n_jobs; i++) {
-        if (strcmp(jobs[i]->path, "/v1/embeddings"))
-            continue;
         cJSON *root = NULL;
-        is_standard[i] = 1;
-        if (parse_job_root(jobs[i], &root) == 0)
-            prepare_embedding_request(jobs[i], root, s, &reqs[i]);
+        if (!strcmp(jobs[i]->path, "/v1/embeddings")) {
+            kind[i] = 1;
+        } else if (!strcmp(jobs[i]->path, "/v1/contextualizedembeddings")) {
+            kind[i] = 2;
+        } else {
+            continue;
+        }
+        if (parse_job_root(jobs[i], &root) != 0)
+            continue;
+        if (kind[i] == 1)
+            prepare_embedding_request(jobs[i], root, s, &std_reqs[i]);
+        else
+            prepare_contextual_request(jobs[i], root, s, &ctx_reqs[i]);
     }
 
     for (int i = 0; i < n_jobs; i++) {
         if (done[i])
             continue;
 
-        if (!is_standard[i]) {
-            process_job(jobs[i]);
+        if (!kind[i]) {
+            process_unknown_job(jobs[i]);
             enqueue_done(jobs[i]);
             done[i] = 1;
             continue;
         }
 
-        if (!reqs[i].ready) {
+        if ((kind[i] == 1 && !std_reqs[i].ready) ||
+            (kind[i] == 2 && !ctx_reqs[i].ready)) {
             enqueue_done(jobs[i]);
             done[i] = 1;
             continue;
         }
 
-        int group_n = 1;
-        int group_inputs = reqs[i].n_inputs;
-        int group_tokens = reqs[i].total_tokens;
-        group[0] = &reqs[i];
-        for (int k = i + 1; k < n_jobs; k++) {
-            if (!done[k] && is_standard[k] && reqs[k].ready &&
-                embedding_request_compatible(&reqs[i], &reqs[k]) &&
-                embedding_request_fits_group(&reqs[k], group_inputs,
-                    group_tokens, s->batch_size, s->max_batch_tokens)) {
-                group[group_n++] = &reqs[k];
-                group_inputs += reqs[k].n_inputs;
-                group_tokens += reqs[k].total_tokens;
+        if (kind[i] == 1) {
+            int group_n = 1;
+            int group_inputs = std_reqs[i].n_inputs;
+            int group_tokens = std_reqs[i].total_tokens;
+            std_group[0] = &std_reqs[i];
+            for (int k = i + 1; k < n_jobs; k++) {
+                if (!done[k] && kind[k] == 1 && std_reqs[k].ready &&
+                    embedding_request_compatible(&std_reqs[i], &std_reqs[k]) &&
+                    embedding_request_fits_group(&std_reqs[k], group_inputs,
+                        group_tokens, s->batch_size, s->max_batch_tokens)) {
+                    std_group[group_n++] = &std_reqs[k];
+                    group_inputs += std_reqs[k].n_inputs;
+                    group_tokens += std_reqs[k].total_tokens;
+                }
             }
-        }
-
-        execute_embedding_request_list(group, group_n);
-        for (int k = 0; k < group_n; k++) {
-            int idx = (int)(group[k] - reqs);
-            enqueue_done(jobs[idx]);
-            done[idx] = 1;
+            execute_embedding_request_list(std_group, group_n);
+            for (int k = 0; k < group_n; k++) {
+                int idx = (int)(std_group[k] - std_reqs);
+                enqueue_done(jobs[idx]);
+                done[idx] = 1;
+            }
+        } else {
+            int group_n = 1;
+            int group_docs = ctx_reqs[i].n_docs;
+            int group_tokens = ctx_reqs[i].total_tokens;
+            ctx_group[0] = &ctx_reqs[i];
+            for (int k = i + 1; k < n_jobs; k++) {
+                if (!done[k] && kind[k] == 2 && ctx_reqs[k].ready &&
+                    contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]) &&
+                    contextual_request_fits_group(&ctx_reqs[k], group_docs,
+                        group_tokens, s->batch_size, s->max_batch_tokens)) {
+                    ctx_group[group_n++] = &ctx_reqs[k];
+                    group_docs += ctx_reqs[k].n_docs;
+                    group_tokens += ctx_reqs[k].total_tokens;
+                }
+            }
+            execute_contextual_request_list(ctx_group, group_n);
+            for (int k = 0; k < group_n; k++) {
+                int idx = (int)(ctx_group[k] - ctx_reqs);
+                enqueue_done(jobs[idx]);
+                done[idx] = 1;
+            }
         }
     }
 
-    for (int i = 0; i < n_jobs; i++)
-        embedding_request_free(&reqs[i]);
-    free(group);
+    for (int i = 0; i < n_jobs; i++) {
+        embedding_request_free(&std_reqs[i]);
+        contextual_request_free(&ctx_reqs[i]);
+    }
+    free(ctx_group);
+    free(std_group);
     free(done);
-    free(is_standard);
-    free(reqs);
+    free(kind);
+    free(ctx_reqs);
+    free(std_reqs);
 }
 
 static void *worker_main(void *arg) {
@@ -1625,7 +1798,9 @@ static void *worker_main(void *arg) {
         int n_jobs = 1;
         jobs[0] = j;
 
-        if (!strcmp(j->path, "/v1/embeddings") && s->batch_size > 1) {
+        if ((!strcmp(j->path, "/v1/embeddings") ||
+             !strcmp(j->path, "/v1/contextualizedembeddings")) &&
+            s->batch_size > 1) {
             if (s->batch_wait_us > 0)
                 usleep((useconds_t)s->batch_wait_us);
             n_jobs += drain_ready_jobs(s, jobs + 1,

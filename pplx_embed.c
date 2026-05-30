@@ -1044,23 +1044,80 @@ int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
     return 0;
 }
 
+int pplx_model_embed_spans_batch(const pplx_model_t *model,
+                                 pplx_workspace_t *ws,
+                                 const pplx_context_input_t *inputs, int batch,
+                                 float *out_embeddings)
+{
+    if (!model || !ws || !inputs || batch <= 0 || !out_embeddings)
+        return -1;
+
+    if (ensure_offsets(ws, batch) != 0) return -1;
+    if ((size_t)batch > SIZE_MAX / sizeof(pplx_input_t)) return -1;
+    pplx_input_t *packed_inputs = malloc((size_t)batch * sizeof(*packed_inputs));
+    if (!packed_inputs) return -1;
+    int *offsets = ws->offsets;
+    int total_seq = 0;
+    int max_seq = 0;
+    int total_spans = 0;
+    for (int b = 0; b < batch; b++) {
+        const pplx_context_input_t *input = &inputs[b];
+        int n_tokens = input->input.n_tokens;
+        if (!input->input.ids || n_tokens <= 0 || !input->spans ||
+            input->n_spans <= 0 || total_seq > INT_MAX - n_tokens ||
+            total_spans > INT_MAX - input->n_spans) {
+            free(packed_inputs);
+            return -1;
+        }
+        packed_inputs[b] = input->input;
+        offsets[b] = total_seq;
+        total_seq += n_tokens;
+        total_spans += input->n_spans;
+        if (n_tokens > max_seq) max_seq = n_tokens;
+        for (int s = 0; s < input->n_spans; s++) {
+            int start = input->spans[s].start;
+            int len = input->spans[s].n_tokens;
+            if (start < 0 || len <= 0 || start > n_tokens ||
+                len > n_tokens - start) {
+                free(packed_inputs);
+                return -1;
+            }
+        }
+    }
+    offsets[batch] = total_seq;
+
+    if (forward_packed_inplace(model, ws, packed_inputs, batch, offsets,
+                               total_seq, max_seq, 1) != 0) {
+        free(packed_inputs);
+        return -1;
+    }
+    free(packed_inputs);
+
+    int span_offset = 0;
+    int hidden = model->config.hidden_size;
+    for (int b = 0; b < batch; b++) {
+        const pplx_context_input_t *input = &inputs[b];
+        if (pplx_pool_spans(&model->config,
+                            ws->x + (size_t)offsets[b] * hidden,
+                            input->input.n_tokens, input->spans, input->n_spans,
+                            out_embeddings + (size_t)span_offset * hidden) != 0)
+            return -1;
+        span_offset += input->n_spans;
+    }
+    return 0;
+}
+
 int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
                            const int *token_ids, int n_tokens,
                            const pplx_span_t *spans, int n_spans,
                            float *out_embeddings)
 {
-    if (!model || !ws || !token_ids || n_tokens <= 0 || !spans ||
-        n_spans <= 0 || !out_embeddings)
-        return -1;
-
-    pplx_input_t input = { token_ids, n_tokens };
-    int offsets[2] = { 0, n_tokens };
-    if (forward_packed_inplace(model, ws, &input, 1, offsets,
-                               n_tokens, n_tokens, 1) != 0)
-        return -1;
-
-    return pplx_pool_spans(&model->config, ws->x, n_tokens, spans, n_spans,
-                           out_embeddings);
+    pplx_context_input_t input = {
+        .input = { token_ids, n_tokens },
+        .spans = spans,
+        .n_spans = n_spans,
+    };
+    return pplx_model_embed_spans_batch(model, ws, &input, 1, out_embeddings);
 }
 
 float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,

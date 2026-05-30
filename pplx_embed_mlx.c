@@ -695,12 +695,12 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
     return 0;
 }
 
-int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
-                         int n_tokens, const pplx_span_t *spans,
-                         int n_spans, float *out_embeddings)
+int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
+                               const pplx_context_input_t *inputs, int batch,
+                               float *out_embeddings)
 {
-    if (!ctx || !token_ids || n_tokens <= 0 || !spans || n_spans <= 0 ||
-        !out_embeddings || ctx->layer_start != 0 ||
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings ||
+        ctx->layer_start != 0 ||
         ctx->layer_end != ctx->config.n_layers ||
         !arr_ok(ctx->embed_tokens) || !arr_ok(ctx->norm))
         return -1;
@@ -708,33 +708,95 @@ int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
     const pplx_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
     int hidden = c->hidden_size;
-    for (int t = 0; t < n_tokens; t++) {
-        if (token_ids[t] < 0 || token_ids[t] >= c->vocab_size) {
-            fprintf(stderr, "mlx: invalid token id %d at position %d\n",
-                    token_ids[t], t);
+    int max_seq = 0;
+    int total_spans = 0;
+    int has_padding = 0;
+    for (int b = 0; b < batch; b++) {
+        const pplx_context_input_t *input = &inputs[b];
+        int n_tokens = input->input.n_tokens;
+        if (!input->input.ids || n_tokens <= 0 || !input->spans ||
+            input->n_spans <= 0 || total_spans > INT_MAX - input->n_spans)
             return -1;
+        total_spans += input->n_spans;
+        if (n_tokens > max_seq) max_seq = n_tokens;
+        for (int t = 0; t < n_tokens; t++) {
+            if (input->input.ids[t] < 0 ||
+                input->input.ids[t] >= c->vocab_size) {
+                fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
+                        input->input.ids[t], b, t);
+                return -1;
+            }
+        }
+        for (int s = 0; s < input->n_spans; s++) {
+            if (input->spans[s].start < 0 ||
+                input->spans[s].start > n_tokens ||
+                input->spans[s].n_tokens <= 0 ||
+                input->spans[s].n_tokens > n_tokens - input->spans[s].start)
+                return -1;
         }
     }
-    for (int s = 0; s < n_spans; s++) {
-        if (spans[s].start < 0 || spans[s].start > n_tokens ||
-            spans[s].n_tokens <= 0 ||
-            spans[s].n_tokens > n_tokens - spans[s].start)
-            return -1;
+    for (int b = 0; b < batch; b++)
+        if (inputs[b].input.n_tokens != max_seq) has_padding = 1;
+
+    if ((size_t)batch > SIZE_MAX / (size_t)max_seq) return -1;
+    size_t rows = (size_t)batch * (size_t)max_seq;
+    if (rows > SIZE_MAX / sizeof(int) ||
+        (has_padding && rows > SIZE_MAX / sizeof(float)))
+        return -1;
+    int *padded_ids = (int *)malloc(rows * sizeof(*padded_ids));
+    float *attn_mask_data = has_padding
+        ? (float *)malloc(rows * sizeof(*attn_mask_data)) : NULL;
+    if (!padded_ids || (has_padding && !attn_mask_data)) {
+        free(padded_ids);
+        free(attn_mask_data);
+        return -1;
+    }
+    for (int b = 0; b < batch; b++) {
+        const pplx_input_t *input = &inputs[b].input;
+        for (int t = 0; t < max_seq; t++) {
+            size_t row = (size_t)b * max_seq + t;
+            if (t < input->n_tokens) {
+                padded_ids[row] = input->ids[t];
+                if (has_padding) attn_mask_data[row] = 0.0f;
+            } else {
+                padded_ids[row] = 0;
+                if (has_padding) attn_mask_data[row] = -1.0e9f;
+            }
+        }
     }
 
     mlx_array ids = (mlx_array){0};
+    mlx_array attn_mask = (mlx_array){0};
     mlx_array x = (mlx_array){0};
     mlx_array x_normed = (mlx_array){0};
     mlx_array x_f32 = (mlx_array){0};
     mlx_array embeddings = (mlx_array){0};
-    mlx_array *pooled = (mlx_array *)calloc((size_t)n_spans, sizeof(*pooled));
+    mlx_array *pooled = (mlx_array *)calloc((size_t)total_spans, sizeof(*pooled));
     mlx_vector_array pooled_vec = (mlx_vector_array){0};
     int rc = -1;
-    if (!pooled) return -1;
+    if (!pooled) {
+        free(padded_ids);
+        free(attn_mask_data);
+        return -1;
+    }
 
-    int ids_shape[] = {1, n_tokens};
-    ids = mlx_array_new_data(token_ids, ids_shape, 2, MLX_INT32);
+    int ids_shape[] = {batch, max_seq};
+    int attn_mask_shape[] = {batch, 1, 1, max_seq};
+    ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
+    attn_mask = has_padding
+        ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
+        : (mlx_array){0};
+    free(padded_ids);
+    free(attn_mask_data);
     if (!arr_ok(ids)) goto cleanup;
+    if (has_padding && !arr_ok(attn_mask)) goto cleanup;
+    if (has_padding && mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
+        mlx_array attn_mask_bf16 = mlx_array_new();
+        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
+        mlx_array_free(attn_mask);
+        attn_mask = attn_mask_bf16;
+        if (!arr_ok(attn_mask)) goto cleanup;
+    }
 
     x = mlx_array_new();
     mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
@@ -742,8 +804,12 @@ int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
     ids = (mlx_array){0};
     if (!arr_ok(x)) goto cleanup;
 
-    x = mlx_forward_layers(ctx, x, 1, n_tokens, 0, (mlx_array){0},
+    x = mlx_forward_layers(ctx, x, batch, max_seq, has_padding, attn_mask,
                            0, c->n_layers);
+    if (has_padding) {
+        mlx_array_free(attn_mask);
+        attn_mask = (mlx_array){0};
+    }
     if (!arr_ok(x)) goto cleanup;
 
     x_normed = mlx_array_new();
@@ -758,24 +824,29 @@ int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
     x_normed = (mlx_array){0};
     if (!arr_ok(x_f32)) goto cleanup;
 
-    for (int s = 0; s < n_spans; s++) {
-        int start[] = {0, spans[s].start, 0};
-        int stop[] = {1, spans[s].start + spans[s].n_tokens, hidden};
-        int strides[] = {1, 1, 1};
-        mlx_array slice = mlx_array_new();
-        mlx_slice(&slice, x_f32, start, 3, stop, 3, strides, 3, S);
-        if (!arr_ok(slice)) {
-            mlx_array_free(slice);
-            goto cleanup;
-        }
+    int pooled_count = 0;
+    for (int b = 0; b < batch; b++) {
+        for (int s = 0; s < inputs[b].n_spans; s++) {
+            const pplx_span_t *span = &inputs[b].spans[s];
+            int start[] = {b, span->start, 0};
+            int stop[] = {b + 1, span->start + span->n_tokens, hidden};
+            int strides[] = {1, 1, 1};
+            mlx_array slice = mlx_array_new();
+            mlx_slice(&slice, x_f32, start, 3, stop, 3, strides, 3, S);
+            if (!arr_ok(slice)) {
+                mlx_array_free(slice);
+                goto cleanup;
+            }
 
-        pooled[s] = mlx_array_new();
-        mlx_mean_axis(&pooled[s], slice, 1, false, S);
-        mlx_array_free(slice);
-        if (!arr_ok(pooled[s])) goto cleanup;
+            pooled[pooled_count] = mlx_array_new();
+            mlx_mean_axis(&pooled[pooled_count], slice, 1, false, S);
+            mlx_array_free(slice);
+            if (!arr_ok(pooled[pooled_count])) goto cleanup;
+            pooled_count++;
+        }
     }
 
-    pooled_vec = mlx_vector_array_new_data(pooled, (size_t)n_spans);
+    pooled_vec = mlx_vector_array_new_data(pooled, (size_t)total_spans);
     if (!pooled_vec.ctx) goto cleanup;
     embeddings = mlx_array_new();
     mlx_concatenate_axis(&embeddings, pooled_vec, 0, S);
@@ -785,20 +856,33 @@ int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
     const float *data = mlx_array_data_float32(embeddings);
     if (data) {
         memcpy(out_embeddings, data,
-               (size_t)n_spans * hidden * sizeof(float));
+               (size_t)total_spans * hidden * sizeof(float));
         rc = 0;
     }
 
 cleanup:
     mlx_array_free(embeddings);
     if (pooled_vec.ctx) mlx_vector_array_free(pooled_vec);
-    for (int s = 0; s < n_spans; s++) mlx_array_free(pooled[s]);
+    for (int s = 0; s < total_spans; s++) mlx_array_free(pooled[s]);
     free(pooled);
     mlx_array_free(x_f32);
     mlx_array_free(x_normed);
     mlx_array_free(x);
+    mlx_array_free(attn_mask);
     mlx_array_free(ids);
     return rc;
+}
+
+int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                         int n_tokens, const pplx_span_t *spans,
+                         int n_spans, float *out_embeddings)
+{
+    pplx_context_input_t input = {
+        .input = { token_ids, n_tokens },
+        .spans = spans,
+        .n_spans = n_spans,
+    };
+    return pplx_mlx_embed_spans_batch(ctx, &input, 1, out_embeddings);
 }
 
 float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)

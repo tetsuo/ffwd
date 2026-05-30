@@ -53,6 +53,12 @@ typedef struct {
     int n_tokens;
 } pplx_span_t;
 
+typedef struct {
+    pplx_input_t input;
+    const pplx_span_t *spans;
+    int n_spans;
+} pplx_context_input_t;
+
 /* ========================================================================
  * API
  * ======================================================================== */
@@ -206,6 +212,17 @@ int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
                            const int *token_ids, int n_tokens,
                            const pplx_span_t *spans, int n_spans,
                            float *out_embeddings);
+
+/*
+ * Run a packed/ragged contextual document batch and pool every selected span.
+ *
+ * Documents attend independently, RoPE positions restart for each document,
+ * and out_embeddings contains spans in document order.
+ */
+int pplx_model_embed_spans_batch(const pplx_model_t *model,
+                                 pplx_workspace_t *ws,
+                                 const pplx_context_input_t *inputs, int batch,
+                                 float *out_embeddings);
 
 /*
  * L2-normalize vec[dim] in place.

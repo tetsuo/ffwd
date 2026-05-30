@@ -74,6 +74,14 @@ int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
                          int n_tokens, const pplx_span_t *spans,
                          int n_spans, float *out_embeddings);
 
+/*
+ * Run a padded dense contextual document batch and pool every selected span.
+ * out_embeddings contains spans in document order.
+ */
+int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
+                               const pplx_context_input_t *inputs, int batch,
+                               float *out_embeddings);
+
 /* Get the config (so main.c can read hidden_size etc.) */
 const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx);
 
