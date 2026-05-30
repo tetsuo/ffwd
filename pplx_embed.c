@@ -1070,12 +1070,40 @@ float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
 }
 
 /* ========================================================================
- * Cosine similarity
+ * Vector helpers
  * ======================================================================== */
+
+int pplx_l2_normalize(float *vec, int dim)
+{
+    if (!vec || dim <= 0) return -1;
+
+    float norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++)
+        norm_sq += vec[i] * vec[i];
+
+    if (!(norm_sq > 0.0f) || !isfinite(norm_sq)) return -1;
+
+    float inv_norm = 1.0f / sqrtf(norm_sq);
+    for (int i = 0; i < dim; i++)
+        vec[i] *= inv_norm;
+    return 0;
+}
 
 float pplx_cosine_similarity(const float *a, const float *b, int dim)
 {
+    if (!a || !b || dim <= 0) return 0.0f;
+
     float dot = 0.0f;
-    for (int i = 0; i < dim; i++) dot += a[i] * b[i];
-    return dot;
+    float norm_a_sq = 0.0f;
+    float norm_b_sq = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        dot += a[i] * b[i];
+        norm_a_sq += a[i] * a[i];
+        norm_b_sq += b[i] * b[i];
+    }
+
+    if (!(norm_a_sq > 0.0f) || !(norm_b_sq > 0.0f) ||
+        !isfinite(norm_a_sq) || !isfinite(norm_b_sq))
+        return 0.0f;
+    return dot / sqrtf(norm_a_sq * norm_b_sq);
 }

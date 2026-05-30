@@ -165,7 +165,16 @@ int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
                            float *out_embeddings);
 
 /*
+ * L2-normalize vec[dim] in place.
+ *
+ * Returns 0 on success. Returns -1 for invalid arguments or a zero-length
+ * vector, which cannot be normalized.
+ */
+int pplx_l2_normalize(float *vec, int dim);
+
+/*
  * Cosine similarity between two vectors.
+ * Returns 0 for invalid arguments or if either vector has zero length.
  */
 float pplx_cosine_similarity(const float *a, const float *b, int dim);
 
