@@ -1,6 +1,7 @@
 /* main.c - pplx_embed command-line tool */
 
 #include "pplx_embed.h"
+#include "pplx_distributed.h"
 #include "pplx_server.h"
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_tokenizer.h"
@@ -32,6 +33,11 @@ static void print_usage(const char *prog)
         "  --mlx        Use Apple MLX GPU backend\n"
         "  --stdin      Read lines from stdin, write JSON embeddings to stdout\n"
         "  --serve      Serve the Perplexity-compatible HTTP API\n"
+        "  --dist-worker\n"
+        "               Serve one final distributed layer shard\n"
+        "  --dist-remote HOST:PORT\n"
+        "               Use one remote final shard for CLI or --stdin inference\n"
+        "  --layers A:B Distributed half-open layer range, for example 0:14\n"
         "  --model ID=DIR\n"
         "               Load model ID from directory for --serve (repeatable)\n"
         "  --backend cpu|mlx\n"
@@ -54,12 +60,15 @@ static void print_usage(const char *prog)
         "  no args         Batch: read all stdin lines, then similarity matrix\n"
         "  --stdin         Streaming: read stdin lines, write JSON per line\n"
         "  --serve         HTTP server for /v1/embeddings and /v1/contextualizedembeddings\n"
+        "  --dist-worker   Final layer-shard worker\n"
         "\n"
         "Examples:\n"
         "  %s -d ./model \"query: what is AI?\"\n"
         "  %s -d ./model --mlx --stdin < texts.txt\n"
-        "  %s --serve --model pplx-embed-v1-0.6b=./model --port 8000\n",
-        prog, prog, prog, prog);
+        "  %s --serve --model pplx-embed-v1-0.6b=./model --port 8000\n"
+        "  %s -d ./model --dist-worker --layers 14:28 --port 9000\n"
+        "  %s -d ./model --dist-remote 127.0.0.1:9000 --layers 0:14 \"text\"\n",
+        prog, prog, prog, prog, prog, prog);
 }
 
 /* ========================================================================
@@ -69,6 +78,7 @@ static void print_usage(const char *prog)
 typedef struct {
     pplx_model_t     *model;
     pplx_workspace_t *workspace;
+    pplx_dist_client_t *dist;
 #ifdef USE_MLX
     pplx_mlx_ctx_t   *mlx_ctx;
 #endif
@@ -90,6 +100,9 @@ typedef struct {
 static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
                               int batch, float *out_embeddings)
 {
+    if (e->dist)
+        return pplx_dist_client_embed_batch(e->dist, inputs, batch,
+                                            out_embeddings);
 #ifdef USE_MLX
     if (e->mlx_ctx)
         return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
@@ -97,6 +110,30 @@ static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
 #endif
         return pplx_model_embed_batch(e->model, e->workspace,
                                       inputs, batch, out_embeddings);
+}
+
+static int parse_layers(const char *arg, int *start, int *end)
+{
+    int used = 0;
+    if (!arg || sscanf(arg, "%d:%d%n", start, end, &used) != 2 ||
+        arg[used] != '\0' || *start < 0 || *start >= *end)
+        return -1;
+    return 0;
+}
+
+static int parse_endpoint(const char *arg, char *host, size_t hostlen, int *port)
+{
+    const char *colon = arg ? strrchr(arg, ':') : NULL;
+    if (!colon || colon == arg || !colon[1]) return -1;
+    size_t n = (size_t)(colon - arg);
+    if (n >= hostlen) return -1;
+    memcpy(host, arg, n);
+    host[n] = '\0';
+    int used = 0;
+    if (sscanf(colon + 1, "%d%n", port, &used) != 1 ||
+        colon[1 + used] != '\0' || *port <= 0 || *port > 65535)
+        return -1;
+    return 0;
 }
 
 static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
@@ -467,6 +504,10 @@ int main(int argc, char *argv[])
     int use_mlx    = 0;
     int stdin_mode = 0;
     int serve_mode = 0;
+    int dist_worker_mode = 0;
+    const char *dist_remote = NULL;
+    int layer_start = -1;
+    int layer_end = -1;
     int batch_size = 0;
     int batch_wait_us = -1;
     const char *backend = "cpu";
@@ -515,6 +556,13 @@ int main(int argc, char *argv[])
         }
         else if (!strcmp(f, "--host"))   { host = argv[++arg_start]; }
         else if (!strcmp(f, "--port"))   { port = atoi(argv[++arg_start]); }
+        else if (!strcmp(f, "--layers")) {
+            if (parse_layers(argv[++arg_start], &layer_start, &layer_end) != 0) {
+                fprintf(stderr, "--layers expects START:END with START < END\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
         else if (!strcmp(f, "--cors"))   { cors = 1; }
         else if (!strcmp(f, "--api-key")){ api_key = argv[++arg_start]; }
         else if (!strcmp(f, "-e"))      { print_embs = 1; }
@@ -522,6 +570,8 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "-vv"))     { verbose = 2; }
         else if (!strcmp(f, "--stdin")) { stdin_mode = 1; }
         else if (!strcmp(f, "--serve")) { serve_mode = 1; }
+        else if (!strcmp(f, "--dist-worker")) { dist_worker_mode = 1; }
+        else if (!strcmp(f, "--dist-remote")) { dist_remote = argv[++arg_start]; }
         else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
@@ -545,8 +595,8 @@ int main(int argc, char *argv[])
     qwen_verbose = verbose;
 
     if (serve_mode) {
-        if (stdin_mode) {
-            fprintf(stderr, "--serve and --stdin are mutually exclusive\n");
+        if (stdin_mode || dist_worker_mode || dist_remote) {
+            fprintf(stderr, "--serve cannot be combined with --stdin or distributed CLI modes\n");
             free_model_specs(&model_specs);
             return 1;
         }
@@ -592,6 +642,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (dist_worker_mode && dist_remote) {
+        fprintf(stderr, "--dist-worker and --dist-remote are mutually exclusive\n");
+        return 1;
+    }
+    if ((dist_worker_mode || dist_remote) &&
+        (layer_start < 0 || layer_end < 0)) {
+        fprintf(stderr, "distributed mode requires --layers START:END\n");
+        return 1;
+    }
+    if (dist_remote && layer_start != 0) {
+        fprintf(stderr, "--dist-remote coordinator layers must start at zero\n");
+        return 1;
+    }
+
     /* Threads (CPU backend) */
     if (!use_mlx) {
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
@@ -600,6 +664,10 @@ int main(int argc, char *argv[])
     } else {
         if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
     }
+
+    if (dist_worker_mode)
+        return pplx_dist_run_worker(model_dir, host, port, layer_start,
+                                    layer_end, use_mlx);
 
     /* Tokenizer */
     char vocab_path[1024];
@@ -615,7 +683,24 @@ int main(int argc, char *argv[])
     t0 = now_ms();
 
 #ifdef USE_MLX
-    if (use_mlx) {
+    if (dist_remote) {
+        char remote_host[1024];
+        int remote_port = 0;
+        if (parse_endpoint(dist_remote, remote_host, sizeof(remote_host),
+                           &remote_port) != 0) {
+            fprintf(stderr, "--dist-remote expects HOST:PORT\n");
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.dist = pplx_dist_client_open(model_dir, remote_host, remote_port,
+                                       layer_end, use_mlx);
+        if (!e.dist) {
+            fprintf(stderr, "failed to connect distributed worker\n");
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.dim = pplx_dist_client_config(e.dist)->hidden_size;
+    } else if (use_mlx) {
         e.mlx_ctx = pplx_mlx_load(model_dir);
         if (!e.mlx_ctx) {
             fprintf(stderr, "failed to load model\n");
@@ -626,20 +711,39 @@ int main(int argc, char *argv[])
     } else
 #endif
     {
-        e.model = pplx_model_load(model_dir);
-        if (!e.model) {
-            fprintf(stderr, "failed to load model\n");
-            qwen_tokenizer_free(tok);
-            return 1;
+        if (dist_remote) {
+            char remote_host[1024];
+            int remote_port = 0;
+            if (parse_endpoint(dist_remote, remote_host, sizeof(remote_host),
+                               &remote_port) != 0) {
+                fprintf(stderr, "--dist-remote expects HOST:PORT\n");
+                qwen_tokenizer_free(tok);
+                return 1;
+            }
+            e.dist = pplx_dist_client_open(model_dir, remote_host, remote_port,
+                                           layer_end, use_mlx);
+            if (!e.dist) {
+                fprintf(stderr, "failed to connect distributed worker\n");
+                qwen_tokenizer_free(tok);
+                return 1;
+            }
+            e.dim = pplx_dist_client_config(e.dist)->hidden_size;
+        } else {
+            e.model = pplx_model_load(model_dir);
+            if (!e.model) {
+                fprintf(stderr, "failed to load model\n");
+                qwen_tokenizer_free(tok);
+                return 1;
+            }
+            e.workspace = pplx_workspace_new(e.model);
+            if (!e.workspace) {
+                fprintf(stderr, "failed to allocate workspace\n");
+                pplx_model_free(e.model);
+                qwen_tokenizer_free(tok);
+                return 1;
+            }
+            e.dim = pplx_model_config(e.model)->hidden_size;
         }
-        e.workspace = pplx_workspace_new(e.model);
-        if (!e.workspace) {
-            fprintf(stderr, "failed to allocate workspace\n");
-            pplx_model_free(e.model);
-            qwen_tokenizer_free(tok);
-            return 1;
-        }
-        e.dim = pplx_model_config(e.model)->hidden_size;
     }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
@@ -655,6 +759,7 @@ int main(int argc, char *argv[])
     /* Cleanup */
     if (e.workspace) pplx_workspace_free(e.workspace);
     if (e.model) pplx_model_free(e.model);
+    if (e.dist) pplx_dist_client_free(e.dist);
 #ifdef USE_MLX
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif

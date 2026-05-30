@@ -11,6 +11,7 @@ UNAME_S := $(shell uname -s)
 
 # Source files
 SRCS = pplx_embed.c \
+       pplx_distributed.c \
        pplx_server.c \
        qwen_asr_kernels.c \
        qwen_asr_kernels_generic.c \
@@ -107,13 +108,16 @@ $(TARGET): $(OBJS) $(EXTRA_OBJS) main.o
 pplx_embed.o: pplx_embed.c pplx_embed.h qwen_asr_kernels.h qwen_asr_safetensors.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
+pplx_distributed.o: pplx_distributed.c pplx_distributed.h pplx_embed.h pplx_embed_mlx.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 pplx_server.o: pplx_server.c pplx_server.h pplx_embed.h pplx_embed_mlx.h qwen_asr_tokenizer.h deps/ae/ae.h deps/ae/anet.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 pplx_embed_mlx.o: pplx_embed_mlx.c pplx_embed_mlx.h pplx_embed.h qwen_asr_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-main.o: main.c pplx_embed.h pplx_server.h qwen_asr_kernels.h qwen_asr_tokenizer.h
+main.o: main.c pplx_embed.h pplx_distributed.h pplx_server.h qwen_asr_kernels.h qwen_asr_tokenizer.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h
