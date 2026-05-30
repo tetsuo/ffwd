@@ -46,6 +46,19 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                          int batch, float *out_embeddings);
 
 /*
+ * MLX equivalent of pplx_model_forward_slice_batch().
+ *
+ * Hidden states cross the API boundary as packed float32 rows even though MLX
+ * executes a padded dense batch internally.
+ */
+int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
+                                 const pplx_input_t *inputs, int batch,
+                                 const float *input_states,
+                                 int layer_start, int layer_end,
+                                 int apply_final_norm,
+                                 float *out_states);
+
+/*
  * Run one contextual sequence and pool selected token spans.
  * Returns 0 on success, -1 on error.
  */

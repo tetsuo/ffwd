@@ -764,7 +764,7 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
  * Packed forward pass
  * ======================================================================== */
 
-static int build_offsets(const pplx_input_t *inputs, int batch,
+static int build_offsets(const pplx_input_t *inputs, int batch, int require_ids,
                          int *offsets, int *total_out, int *max_out)
 {
     if (!inputs || batch <= 0 || !offsets || !total_out || !max_out)
@@ -773,7 +773,7 @@ static int build_offsets(const pplx_input_t *inputs, int batch,
     int total = 0;
     int max_seq = 0;
     for (int b = 0; b < batch; b++) {
-        if (!inputs[b].ids || inputs[b].n_tokens <= 0)
+        if ((require_ids && !inputs[b].ids) || inputs[b].n_tokens <= 0)
             return -1;
         if (total > INT32_MAX - inputs[b].n_tokens)
             return -1;
@@ -788,12 +788,14 @@ static int build_offsets(const pplx_input_t *inputs, int batch,
     return 0;
 }
 
-static int forward_packed_inplace(const pplx_model_t *model,
-                                  pplx_workspace_t *ws,
-                                  const pplx_input_t *inputs,
-                                  int batch, const int *offsets,
-                                  int total_seq, int max_seq,
-                                  int apply_final_norm)
+static int forward_packed_slice_inplace(const pplx_model_t *model,
+                                        pplx_workspace_t *ws,
+                                        const pplx_input_t *inputs,
+                                        int batch, const int *offsets,
+                                        int total_seq, int max_seq,
+                                        const float *input_states,
+                                        int layer_start, int layer_end,
+                                        int apply_final_norm)
 {
     if (!model || !ws || ws->model != model || !inputs ||
         batch <= 0 || !offsets || total_seq <= 0 || max_seq <= 0)
@@ -801,6 +803,12 @@ static int forward_packed_inplace(const pplx_model_t *model,
 
     const pplx_config_t  *cfg = &model->config;
     const pplx_weights_t *w   = &model->weights;
+    if (layer_start < 0 || layer_start > layer_end ||
+        layer_end > cfg->n_layers ||
+        (layer_start == 0 && input_states) ||
+        (layer_start != 0 && !input_states) ||
+        (apply_final_norm && layer_end != cfg->n_layers))
+        return -1;
 
     int hidden     = cfg->hidden_size;
     int n_heads    = cfg->n_heads;
@@ -827,26 +835,31 @@ static int forward_packed_inplace(const pplx_model_t *model,
     float *ffn_gate = ws->ffn_gate;
     float *ffn_up   = ws->ffn_up;
 
-    /* 1. Token embedding lookup into packed [total_seq, hidden]. */
-    for (int b = 0; b < batch; b++) {
-        int start = offsets[b];
-        for (int i = 0; i < inputs[b].n_tokens; i++) {
-            int id = inputs[b].ids[i];
-            if (id < 0 || id >= cfg->vocab_size) {
-                fprintf(stderr, "pplx: invalid token id %d at input %d position %d\n",
-                        id, b, i);
-                return -1;
+    /* A first stage performs embedding lookup. Later stages resume from a
+     * packed hidden-state tensor received from the preceding stage. */
+    if (layer_start == 0) {
+        for (int b = 0; b < batch; b++) {
+            int start = offsets[b];
+            for (int i = 0; i < inputs[b].n_tokens; i++) {
+                int id = inputs[b].ids[i];
+                if (id < 0 || id >= cfg->vocab_size) {
+                    fprintf(stderr, "pplx: invalid token id %d at input %d position %d\n",
+                            id, b, i);
+                    return -1;
+                }
+                copy_weight_row(x + (size_t)(start + i) * hidden,
+                                &w->embed_tokens, (size_t)id, hidden);
             }
-            copy_weight_row(x + (size_t)(start + i) * hidden,
-                            &w->embed_tokens, (size_t)id, hidden);
         }
+    } else {
+        memcpy(x, input_states, (size_t)total_seq * hidden * sizeof(float));
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
     /* 2. Transformer layers. Linear/MLP ops run over all packed tokens;
      * attention is explicitly block-diagonal by sequence offsets. */
-    for (int layer = 0; layer < cfg->n_layers; layer++) {
+    for (int layer = layer_start; layer < layer_end; layer++) {
         const pplx_layer_t *l = &w->layers[layer];
 
         qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
@@ -887,6 +900,19 @@ static int forward_packed_inplace(const pplx_model_t *model,
     if (apply_final_norm)
         qwen_rms_norm(x, x, w->norm, total_seq, hidden, eps);
     return 0;
+}
+
+static int forward_packed_inplace(const pplx_model_t *model,
+                                  pplx_workspace_t *ws,
+                                  const pplx_input_t *inputs,
+                                  int batch, const int *offsets,
+                                  int total_seq, int max_seq,
+                                  int apply_final_norm)
+{
+    return forward_packed_slice_inplace(model, ws, inputs, batch, offsets,
+                                        total_seq, max_seq, NULL, 0,
+                                        model->config.n_layers,
+                                        apply_final_norm);
 }
 
 static void pool_embeddings(const pplx_model_t *model,
@@ -1034,7 +1060,7 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
 
     int total_seq = 0;
     int max_seq = 0;
-    if (build_offsets(inputs, batch, offsets, &total_seq, &max_seq) != 0)
+    if (build_offsets(inputs, batch, 1, offsets, &total_seq, &max_seq) != 0)
         return -1;
 
     int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
@@ -1043,6 +1069,72 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
         pool_embeddings(model, ws, offsets, batch, out_embeddings);
 
     return rc;
+}
+
+int pplx_model_forward_slice_batch(const pplx_model_t *model,
+                                   pplx_workspace_t *ws,
+                                   const pplx_input_t *inputs, int batch,
+                                   const float *input_states,
+                                   int layer_start, int layer_end,
+                                   int apply_final_norm,
+                                   float *out_states)
+{
+    if (!model || !ws || !inputs || batch <= 0 || !out_states ||
+        layer_start < 0 || layer_start > layer_end ||
+        layer_end > model->config.n_layers)
+        return -1;
+
+    if (ensure_offsets(ws, batch) != 0) return -1;
+    int *offsets = ws->offsets;
+
+    int total_seq = 0;
+    int max_seq = 0;
+    if (build_offsets(inputs, batch, layer_start == 0, offsets,
+                      &total_seq, &max_seq) != 0)
+        return -1;
+
+    int rc = forward_packed_slice_inplace(model, ws, inputs, batch, offsets,
+                                          total_seq, max_seq, input_states,
+                                          layer_start, layer_end,
+                                          apply_final_norm);
+    if (rc == 0) {
+        size_t count;
+        if (mul_size((size_t)total_seq,
+                     (size_t)model->config.hidden_size, &count) != 0)
+            return -1;
+        memcpy(out_states, ws->x, count * sizeof(float));
+    }
+    return rc;
+}
+
+int pplx_pool_batch(const pplx_config_t *cfg, const float *states,
+                    const int *seq_lengths, int batch,
+                    float *out_embeddings)
+{
+    if (!cfg || !states || !seq_lengths || batch <= 0 || !out_embeddings ||
+        cfg->hidden_size <= 0)
+        return -1;
+
+    int offset = 0;
+    for (int b = 0; b < batch; b++) {
+        int len = seq_lengths[b];
+        if (len <= 0 || offset > INT_MAX - len)
+            return -1;
+
+        float *emb = out_embeddings + (size_t)b * cfg->hidden_size;
+        memset(emb, 0, (size_t)cfg->hidden_size * sizeof(float));
+        for (int t = 0; t < len; t++) {
+            const float *row = states + (size_t)(offset + t) * cfg->hidden_size;
+            for (int d = 0; d < cfg->hidden_size; d++)
+                emb[d] += row[d];
+        }
+
+        float inv_len = 1.0f / (float)len;
+        for (int d = 0; d < cfg->hidden_size; d++)
+            emb[d] *= inv_len;
+        offset += len;
+    }
+    return 0;
 }
 
 int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,

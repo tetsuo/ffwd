@@ -126,6 +126,37 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
                            float *out_embeddings);
 
 /*
+ * Run a contiguous transformer layer range for a packed/ragged batch.
+ *
+ * layer_start is inclusive and layer_end is exclusive. For a range beginning
+ * at layer 0, input_states must be NULL and every input must provide token
+ * ids. For a later range, input_states must contain the preceding range's
+ * packed [sum(n_tokens), hidden_size] output; token ids are not required.
+ *
+ * apply_final_norm is valid only for a range ending at the final transformer
+ * layer. out_states receives packed [sum(n_tokens), hidden_size] states.
+ *
+ * This is the core execution boundary used by layer-sharded inference.
+ */
+int pplx_model_forward_slice_batch(const pplx_model_t *model,
+                                   pplx_workspace_t *ws,
+                                   const pplx_input_t *inputs, int batch,
+                                   const float *input_states,
+                                   int layer_start, int layer_end,
+                                   int apply_final_norm,
+                                   float *out_states);
+
+/*
+ * Mean-pool packed final hidden states for a ragged batch.
+ *
+ * states is [sum(n_tokens), hidden_size]. seq_lengths contains one positive
+ * token count per sequence. The states must already include final RMSNorm.
+ */
+int pplx_pool_batch(const pplx_config_t *cfg, const float *states,
+                    const int *seq_lengths, int batch,
+                    float *out_embeddings);
+
+/*
  * Run the transformer forward pass WITHOUT pooling.
  * Returns the full [n_tokens * hidden_size] output after final RMSNorm.
  * Caller frees the returned buffer.  NULL on error.

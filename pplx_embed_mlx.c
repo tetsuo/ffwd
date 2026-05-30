@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 /* ========================================================================
  * Per-layer MLX weight arrays
@@ -244,107 +245,21 @@ void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
  * Forward pass
  * ======================================================================== */
 
-int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
-                         int batch, float *out_embeddings)
+static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
+                                    int batch, int max_seq, int has_padding,
+                                    mlx_array attn_mask,
+                                    int layer_start, int layer_end)
 {
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
-
     const pplx_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
-
-    int hidden     = c->hidden_size;
-    int n_heads    = c->n_heads;
+    int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
-    int head_dim   = c->head_dim;
-    int q_dim      = c->q_dim;
-    int max_seq    = 0;
-    int has_padding = 0;
-
-    for (int b = 0; b < batch; b++) {
-        if (!inputs[b].ids || inputs[b].n_tokens <= 0) return -1;
-        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
-    }
-    if (max_seq <= 0) return -1;
-
-    for (int b = 0; b < batch; b++) {
-        if (inputs[b].n_tokens != max_seq) has_padding = 1;
-    }
-
-    size_t elems = (size_t)batch * (size_t)max_seq;
-    int *padded_ids = (int *)malloc(elems * sizeof(int));
-    float *pool_mask_data = (float *)malloc(elems * sizeof(float));
-    float *attn_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
-    float *len_data = (float *)malloc((size_t)batch * sizeof(float));
-    if (!padded_ids || !pool_mask_data || (has_padding && !attn_mask_data) || !len_data) {
-        free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
-        return -1;
-    }
-
-    for (int b = 0; b < batch; b++) {
-        len_data[b] = (float)inputs[b].n_tokens;
-        for (int t = 0; t < max_seq; t++) {
-            size_t idx = (size_t)b * max_seq + t;
-            if (t < inputs[b].n_tokens) {
-                int id = inputs[b].ids[t];
-                if (id < 0 || id >= c->vocab_size) {
-                    fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
-                            id, b, t);
-                    free(padded_ids); free(pool_mask_data);
-                    free(attn_mask_data); free(len_data);
-                    return -1;
-                }
-                padded_ids[idx] = id;
-                pool_mask_data[idx] = 1.0f;
-                if (has_padding) attn_mask_data[idx] = 0.0f;
-            } else {
-                padded_ids[idx] = 0;
-                pool_mask_data[idx] = 0.0f;
-                if (has_padding) attn_mask_data[idx] = -1.0e9f;
-            }
-        }
-    }
-
-    int ids_shape[] = {batch, max_seq};
-    int pool_mask_shape[] = {batch, max_seq, 1};
-    int attn_mask_shape[] = {batch, 1, 1, max_seq};
-    int len_shape[] = {batch, 1};
-
-    mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
-    mlx_array pool_mask = mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32);
-    mlx_array attn_mask = has_padding
-        ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
-        : (mlx_array){0};
-    mlx_array lengths = mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32);
-    free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
-
-    if (!arr_ok(ids) || !arr_ok(pool_mask) || (has_padding && !arr_ok(attn_mask)) ||
-        !arr_ok(lengths)) {
-        mlx_array_free(ids); mlx_array_free(pool_mask);
-        if (has_padding) mlx_array_free(attn_mask);
-        mlx_array_free(lengths);
-        return -1;
-    }
-    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
-        mlx_array attn_mask_bf16 = mlx_array_new();
-        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
-        mlx_array_free(attn_mask);
-        attn_mask = attn_mask_bf16;
-        if (!arr_ok(attn_mask)) {
-            mlx_array_free(ids); mlx_array_free(pool_mask); mlx_array_free(lengths);
-            return -1;
-        }
-    }
-
+    int head_dim = c->head_dim;
+    int q_dim = c->q_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
     mlx_array null_arr = (mlx_array){0};
 
-    /* 1. Embedding lookup: [B, T] -> [B, T, hidden]. */
-    mlx_array x = mlx_array_new();
-    mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
-    mlx_array_free(ids);
-
-    /* 2. Transformer layers. */
-    for (int layer = 0; layer < c->n_layers; layer++) {
+    for (int layer = layer_start; layer < layer_end; layer++) {
         mlx_layer_t *l = &ctx->layers[layer];
 
         mlx_array xn = mlx_array_new();
@@ -432,6 +347,104 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         mlx_array_free(x); mlx_array_free(ffn);
         x = x3;
     }
+    return x;
+}
+
+int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
+                         int batch, float *out_embeddings)
+{
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+
+    const pplx_config_t *c = &ctx->config;
+    mlx_stream S = ctx->stream;
+
+    int hidden     = c->hidden_size;
+    int max_seq    = 0;
+    int has_padding = 0;
+
+    for (int b = 0; b < batch; b++) {
+        if (!inputs[b].ids || inputs[b].n_tokens <= 0) return -1;
+        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
+    }
+    if (max_seq <= 0) return -1;
+
+    for (int b = 0; b < batch; b++) {
+        if (inputs[b].n_tokens != max_seq) has_padding = 1;
+    }
+
+    size_t elems = (size_t)batch * (size_t)max_seq;
+    int *padded_ids = (int *)malloc(elems * sizeof(int));
+    float *pool_mask_data = (float *)malloc(elems * sizeof(float));
+    float *attn_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
+    float *len_data = (float *)malloc((size_t)batch * sizeof(float));
+    if (!padded_ids || !pool_mask_data || (has_padding && !attn_mask_data) || !len_data) {
+        free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+        return -1;
+    }
+
+    for (int b = 0; b < batch; b++) {
+        len_data[b] = (float)inputs[b].n_tokens;
+        for (int t = 0; t < max_seq; t++) {
+            size_t idx = (size_t)b * max_seq + t;
+            if (t < inputs[b].n_tokens) {
+                int id = inputs[b].ids[t];
+                if (id < 0 || id >= c->vocab_size) {
+                    fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
+                            id, b, t);
+                    free(padded_ids); free(pool_mask_data);
+                    free(attn_mask_data); free(len_data);
+                    return -1;
+                }
+                padded_ids[idx] = id;
+                pool_mask_data[idx] = 1.0f;
+                if (has_padding) attn_mask_data[idx] = 0.0f;
+            } else {
+                padded_ids[idx] = 0;
+                pool_mask_data[idx] = 0.0f;
+                if (has_padding) attn_mask_data[idx] = -1.0e9f;
+            }
+        }
+    }
+
+    int ids_shape[] = {batch, max_seq};
+    int pool_mask_shape[] = {batch, max_seq, 1};
+    int attn_mask_shape[] = {batch, 1, 1, max_seq};
+    int len_shape[] = {batch, 1};
+
+    mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
+    mlx_array pool_mask = mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32);
+    mlx_array attn_mask = has_padding
+        ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
+        : (mlx_array){0};
+    mlx_array lengths = mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32);
+    free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+
+    if (!arr_ok(ids) || !arr_ok(pool_mask) || (has_padding && !arr_ok(attn_mask)) ||
+        !arr_ok(lengths)) {
+        mlx_array_free(ids); mlx_array_free(pool_mask);
+        if (has_padding) mlx_array_free(attn_mask);
+        mlx_array_free(lengths);
+        return -1;
+    }
+    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+        mlx_array attn_mask_bf16 = mlx_array_new();
+        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
+        mlx_array_free(attn_mask);
+        attn_mask = attn_mask_bf16;
+        if (!arr_ok(attn_mask)) {
+            mlx_array_free(ids); mlx_array_free(pool_mask); mlx_array_free(lengths);
+            return -1;
+        }
+    }
+
+    /* 1. Embedding lookup: [B, T] -> [B, T, hidden]. */
+    mlx_array x = mlx_array_new();
+    mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
+    mlx_array_free(ids);
+
+    /* 2. Transformer layers. */
+    x = mlx_forward_layers(ctx, x, batch, max_seq, has_padding, attn_mask,
+                           0, c->n_layers);
 
     /* 3. Final RMSNorm. */
     mlx_array x_normed = mlx_array_new();
@@ -478,140 +491,175 @@ int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
     return pplx_mlx_embed_batch(ctx, &input, 1, out_embedding);
 }
 
-static int pplx_mlx_forward_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
-                                 int n_tokens, float *out_states)
+int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
+                                 const pplx_input_t *inputs, int batch,
+                                 const float *input_states,
+                                 int layer_start, int layer_end,
+                                 int apply_final_norm,
+                                 float *out_states)
 {
-    if (!ctx || !token_ids || n_tokens <= 0 || !out_states) return -1;
+    if (!ctx || !inputs || batch <= 0 || !out_states ||
+        layer_start < 0 || layer_start > layer_end ||
+        layer_end > ctx->config.n_layers ||
+        (layer_start == 0 && input_states) ||
+        (layer_start != 0 && !input_states) ||
+        (apply_final_norm && layer_end != ctx->config.n_layers))
+        return -1;
 
     const pplx_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
+    int hidden = c->hidden_size;
+    int max_seq = 0;
+    int total_seq = 0;
+    int has_padding = 0;
+    for (int b = 0; b < batch; b++) {
+        if ((layer_start == 0 && !inputs[b].ids) || inputs[b].n_tokens <= 0 ||
+            total_seq > INT_MAX - inputs[b].n_tokens)
+            return -1;
+        total_seq += inputs[b].n_tokens;
+        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
+    }
+    for (int b = 0; b < batch; b++) {
+        if (inputs[b].n_tokens != max_seq) has_padding = 1;
+    }
 
-    int hidden     = c->hidden_size;
-    int n_heads    = c->n_heads;
-    int n_kv_heads = c->n_kv_heads;
-    int head_dim   = c->head_dim;
-    int q_dim      = c->q_dim;
+    if ((size_t)batch > SIZE_MAX / (size_t)max_seq) return -1;
+    size_t rows = (size_t)batch * (size_t)max_seq;
+    if (rows > SIZE_MAX / (size_t)hidden ||
+        rows * (size_t)hidden > SIZE_MAX / sizeof(float))
+        return -1;
+    size_t state_values = rows * (size_t)hidden;
 
-    for (int i = 0; i < n_tokens; i++) {
-        if (token_ids[i] < 0 || token_ids[i] >= c->vocab_size) {
-            fprintf(stderr, "mlx: invalid token id %d at position %d\n",
-                    token_ids[i], i);
+    int *padded_ids = layer_start == 0
+        ? (int *)malloc(rows * sizeof(int)) : NULL;
+    float *padded_states = layer_start != 0
+        ? (float *)calloc(state_values, sizeof(float)) : NULL;
+    float *attn_mask_data = has_padding
+        ? (float *)malloc(rows * sizeof(float)) : NULL;
+    if ((layer_start == 0 && !padded_ids) ||
+        (layer_start != 0 && !padded_states) ||
+        (has_padding && !attn_mask_data)) {
+        free(padded_ids); free(padded_states); free(attn_mask_data);
+        return -1;
+    }
+
+    int packed_offset = 0;
+    for (int b = 0; b < batch; b++) {
+        for (int t = 0; t < max_seq; t++) {
+            size_t dense_row = (size_t)b * max_seq + t;
+            if (t < inputs[b].n_tokens) {
+                if (layer_start == 0) {
+                    int id = inputs[b].ids[t];
+                    if (id < 0 || id >= c->vocab_size) {
+                        fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
+                                id, b, t);
+                        free(padded_ids); free(padded_states);
+                        free(attn_mask_data);
+                        return -1;
+                    }
+                    padded_ids[dense_row] = id;
+                } else {
+                    memcpy(padded_states + dense_row * hidden,
+                           input_states + (size_t)(packed_offset + t) * hidden,
+                           (size_t)hidden * sizeof(float));
+                }
+                if (has_padding) attn_mask_data[dense_row] = 0.0f;
+            } else {
+                if (layer_start == 0) padded_ids[dense_row] = 0;
+                if (has_padding) attn_mask_data[dense_row] = -1.0e9f;
+            }
+        }
+        packed_offset += inputs[b].n_tokens;
+    }
+
+    int attn_mask_shape[] = {batch, 1, 1, max_seq};
+    mlx_array attn_mask = has_padding
+        ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
+        : (mlx_array){0};
+    free(attn_mask_data);
+    if (has_padding && !arr_ok(attn_mask)) {
+        free(padded_ids); free(padded_states);
+        return -1;
+    }
+    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+        mlx_array attn_mask_bf16 = mlx_array_new();
+        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
+        mlx_array_free(attn_mask);
+        attn_mask = attn_mask_bf16;
+        if (!arr_ok(attn_mask)) {
+            free(padded_ids); free(padded_states);
             return -1;
         }
     }
 
-    int ids_shape[] = {1, n_tokens};
-    mlx_array ids = mlx_array_new_data((void *)token_ids, ids_shape, 2, MLX_INT32);
-    if (!arr_ok(ids)) return -1;
-
-    float scale = 1.0f / sqrtf((float)head_dim);
-    mlx_array null_arr = (mlx_array){0};
-
-    mlx_array x = mlx_array_new();
-    mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
-    mlx_array_free(ids);
-
-    for (int layer = 0; layer < c->n_layers; layer++) {
-        mlx_layer_t *l = &ctx->layers[layer];
-
-        mlx_array xn = mlx_array_new();
-        mlx_fast_rms_norm(&xn, x, l->input_norm, c->rms_norm_eps, S);
-
-        mlx_array q_flat = linear(xn, l->wq, S);
-        mlx_array k_flat = linear(xn, l->wk, S);
-        mlx_array v_flat = linear(xn, l->wv, S);
-        mlx_array_free(xn);
-
-        int q_shape[] = {1, n_tokens, n_heads, head_dim};
-        int k_shape[] = {1, n_tokens, n_kv_heads, head_dim};
-        mlx_array q = mlx_array_new(), k = mlx_array_new(), v = mlx_array_new();
-        mlx_reshape(&q, q_flat, q_shape, 4, S);
-        mlx_reshape(&k, k_flat, k_shape, 4, S);
-        mlx_reshape(&v, v_flat, k_shape, 4, S);
-        mlx_array_free(q_flat); mlx_array_free(k_flat); mlx_array_free(v_flat);
-
-        mlx_array qn = mlx_array_new(), kn = mlx_array_new();
-        mlx_fast_rms_norm(&qn, q, l->q_norm, c->rms_norm_eps, S);
-        mlx_fast_rms_norm(&kn, k, l->k_norm, c->rms_norm_eps, S);
-        mlx_array_free(q); mlx_array_free(k);
-
-        int perm[] = {0, 2, 1, 3};
-        mlx_array qt = mlx_array_new(), kt = mlx_array_new(), vt = mlx_array_new();
-        mlx_transpose_axes(&qt, qn, perm, 4, S);
-        mlx_transpose_axes(&kt, kn, perm, 4, S);
-        mlx_transpose_axes(&vt, v,  perm, 4, S);
-        mlx_array_free(qn); mlx_array_free(kn); mlx_array_free(v);
-
-        mlx_optional_float base = {.value = c->rope_theta, .has_value = true};
-        mlx_array qr = mlx_array_new(), kr = mlx_array_new();
-        mlx_fast_rope(&qr, qt, head_dim, false, base, 1.0f, 0, null_arr, S);
-        mlx_fast_rope(&kr, kt, head_dim, false, base, 1.0f, 0, null_arr, S);
-        mlx_array_free(qt); mlx_array_free(kt);
-
-        mlx_array attn = mlx_array_new();
-        mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "",
-                                              null_arr, null_arr, S);
-        mlx_array_free(qr); mlx_array_free(kr); mlx_array_free(vt);
-
-        mlx_array attn_t = mlx_array_new();
-        mlx_transpose_axes(&attn_t, attn, perm, 4, S);
-        mlx_array_free(attn);
-
-        int flat_shape[] = {1, n_tokens, q_dim};
-        mlx_array attn_flat = mlx_array_new();
-        mlx_reshape(&attn_flat, attn_t, flat_shape, 3, S);
-        mlx_array_free(attn_t);
-
-        mlx_array proj = linear(attn_flat, l->wo, S);
-        mlx_array_free(attn_flat);
-        mlx_array x2 = mlx_array_new();
-        mlx_add(&x2, x, proj, S);
-        mlx_array_free(x); mlx_array_free(proj);
-        x = x2;
-
-        mlx_array xn2 = mlx_array_new();
-        mlx_fast_rms_norm(&xn2, x, l->post_attn_norm, c->rms_norm_eps, S);
-
-        mlx_array gate = linear(xn2, l->gate_proj, S);
-        mlx_array up = linear(xn2, l->up_proj, S);
-        mlx_array_free(xn2);
-
-        mlx_array gate_sig = mlx_array_new();
-        mlx_sigmoid(&gate_sig, gate, S);
-        mlx_array silu_gate = mlx_array_new();
-        mlx_multiply(&silu_gate, gate, gate_sig, S);
-        mlx_array_free(gate); mlx_array_free(gate_sig);
-
-        mlx_array mid = mlx_array_new();
-        mlx_multiply(&mid, silu_gate, up, S);
-        mlx_array_free(silu_gate); mlx_array_free(up);
-
-        mlx_array ffn = linear(mid, l->down_proj, S);
-        mlx_array_free(mid);
-
-        mlx_array x3 = mlx_array_new();
-        mlx_add(&x3, x, ffn, S);
-        mlx_array_free(x); mlx_array_free(ffn);
-        x = x3;
+    mlx_array x;
+    if (layer_start == 0) {
+        int ids_shape[] = {batch, max_seq};
+        mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
+        free(padded_ids);
+        if (!arr_ok(ids)) {
+            if (has_padding) mlx_array_free(attn_mask);
+            return -1;
+        }
+        x = mlx_array_new();
+        mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
+        mlx_array_free(ids);
+    } else {
+        int states_shape[] = {batch, max_seq, hidden};
+        mlx_array states = mlx_array_new_data(padded_states, states_shape, 3,
+                                              MLX_FLOAT32);
+        free(padded_states);
+        if (!arr_ok(states)) {
+            if (has_padding) mlx_array_free(attn_mask);
+            return -1;
+        }
+        if (mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+            x = mlx_array_new();
+            mlx_astype(&x, states, MLX_BFLOAT16, S);
+            mlx_array_free(states);
+        } else {
+            x = states;
+        }
     }
 
-    mlx_array x_normed = mlx_array_new();
-    mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
-    mlx_array_free(x);
+    x = mlx_forward_layers(ctx, x, batch, max_seq, has_padding, attn_mask,
+                           layer_start, layer_end);
+    if (has_padding) mlx_array_free(attn_mask);
+
+    if (apply_final_norm) {
+        mlx_array x_normed = mlx_array_new();
+        mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
+        mlx_array_free(x);
+        x = x_normed;
+    }
 
     mlx_array x_f32 = mlx_array_new();
-    mlx_astype(&x_f32, x_normed, MLX_FLOAT32, S);
-    mlx_array_free(x_normed);
+    mlx_astype(&x_f32, x, MLX_FLOAT32, S);
+    mlx_array_free(x);
     mlx_array_eval(x_f32);
 
     const float *data = mlx_array_data_float32(x_f32);
-    int rc = -1;
-    if (data) {
-        memcpy(out_states, data, (size_t)n_tokens * hidden * sizeof(float));
-        rc = 0;
+    if (!data) {
+        mlx_array_free(x_f32);
+        return -1;
+    }
+    packed_offset = 0;
+    for (int b = 0; b < batch; b++) {
+        memcpy(out_states + (size_t)packed_offset * hidden,
+               data + (size_t)b * max_seq * hidden,
+               (size_t)inputs[b].n_tokens * hidden * sizeof(float));
+        packed_offset += inputs[b].n_tokens;
     }
     mlx_array_free(x_f32);
-    return rc;
+    return 0;
+}
+
+static int pplx_mlx_forward_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                                 int n_tokens, float *out_states)
+{
+    pplx_input_t input = { token_ids, n_tokens };
+    return pplx_mlx_forward_slice_batch(ctx, &input, 1, NULL, 0,
+                                        ctx->config.n_layers, 1, out_states);
 }
 
 int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
