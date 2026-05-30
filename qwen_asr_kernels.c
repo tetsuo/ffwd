@@ -1331,55 +1331,77 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                                 head_dim, scale, q_offset, 0, n_heads);
 }
 
-static void qwen_bidirectional_gqa_attention_packed_heads(
+#define QWEN_PACKED_ATTN_QUERY_TILE 32
+#define QWEN_PACKED_ATTN_BLAS_MIN_SEQ 128
+
+static void qwen_bidirectional_gqa_attention_packed_online_rows(
         float *out, const float *Q, const float *K, const float *V,
-        const int *offsets, int batch, int n_heads, int n_kv_heads,
-        int head_dim, float scale, int head_start, int head_end) {
+        int start, int end, int n_heads, int n_kv_heads, int head_dim,
+        float scale, int h, int query_start, int query_end) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
+    int kv_h = h / heads_per_kv;
 
-    for (int h = head_start; h < head_end; h++) {
-        int kv_h = h / heads_per_kv;
+    for (int i = query_start; i < query_end; i++) {
+        const float *q_row = Q + (size_t)i * q_hidden + h * head_dim;
+        float *o_row = out + (size_t)i * q_hidden + h * head_dim;
 
-        for (int b = 0; b < batch; b++) {
-            int start = offsets[b];
-            int end = offsets[b + 1];
+        float max_score = -1e30f;
+        float sum_exp = 0.0f;
+        for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
 
-            for (int i = start; i < end; i++) {
-                const float *q_row = Q + (size_t)i * q_hidden + h * head_dim;
-                float *o_row = out + (size_t)i * q_hidden + h * head_dim;
+        for (int j = start; j < end; j++) {
+            const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
+            const float *v_row = V + (size_t)j * kv_hidden + kv_h * head_dim;
 
-                float max_score = -1e30f;
-                float sum_exp = 0.0f;
-                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
 
-                for (int j = start; j < end; j++) {
-                    const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
-                    const float *v_row = V + (size_t)j * kv_hidden + kv_h * head_dim;
-
-                    float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                    if (score > max_score) {
-                        float correction = expf(max_score - score);
-                        sum_exp = sum_exp * correction + 1.0f;
-                        qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                        max_score = score;
-                    } else {
-                        float wt = expf(score - max_score);
-                        sum_exp += wt;
-                        qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                    }
-                }
-
-                if (sum_exp > 0.0f) {
-                    float inv_sum = 1.0f / sum_exp;
-                    qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
-                }
+            if (score > max_score) {
+                float correction = expf(max_score - score);
+                sum_exp = sum_exp * correction + 1.0f;
+                qwen_vec_scale_add(o_row, v_row, correction, head_dim);
+                max_score = score;
+            } else {
+                float wt = expf(score - max_score);
+                sum_exp += wt;
+                qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
             }
+        }
+
+        if (sum_exp > 0.0f) {
+            float inv_sum = 1.0f / sum_exp;
+            qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
         }
     }
 }
+
+#ifdef USE_BLAS
+static void qwen_bidirectional_gqa_attention_packed_blas_rows(
+        float *out, const float *Q, const float *K, const float *V,
+        int start, int end, int n_heads, int n_kv_heads, int head_dim,
+        float scale, int h, int query_start, int query_end, float *scores) {
+    int heads_per_kv = n_heads / n_kv_heads;
+    int q_hidden = n_heads * head_dim;
+    int kv_hidden = n_kv_heads * head_dim;
+    int kv_h = h / heads_per_kv;
+    int rows = query_end - query_start;
+    int keys = end - start;
+
+    const float *q = Q + (size_t)query_start * q_hidden + h * head_dim;
+    const float *k = K + (size_t)start * kv_hidden + kv_h * head_dim;
+    const float *v = V + (size_t)start * kv_hidden + kv_h * head_dim;
+    float *o = out + (size_t)query_start * q_hidden + h * head_dim;
+
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                rows, keys, head_dim, scale, q, q_hidden, k, kv_hidden,
+                0.0f, scores, keys);
+    qwen_softmax(scores, rows, keys);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                rows, head_dim, keys, 1.0f, scores, keys, v, kv_hidden,
+                0.0f, o, q_hidden);
+}
+#endif
 
 typedef struct {
     float *out;
@@ -1391,19 +1413,42 @@ typedef struct {
     int n_heads, n_kv_heads;
     int head_dim;
     float scale;
+    float *scores;
+    int max_seq;
 } packed_gqa_attn_task_t;
 
 static void packed_gqa_attn_worker(int tid, int n_threads, void *arg) {
     packed_gqa_attn_task_t *t = (packed_gqa_attn_task_t *)arg;
-    int chunk = (t->n_heads + n_threads - 1) / n_threads;
-    int h0 = tid * chunk;
-    int h1 = h0 + chunk;
-    if (h1 > t->n_heads) h1 = t->n_heads;
-    if (h0 >= h1) return;
+    int task_id = 0;
+#ifdef USE_BLAS
+    float *scores = t->scores
+        ? t->scores + (size_t)tid * QWEN_PACKED_ATTN_QUERY_TILE * t->max_seq
+        : NULL;
+#endif
 
-    qwen_bidirectional_gqa_attention_packed_heads(
-        t->out, t->Q, t->K, t->V, t->offsets, t->batch,
-        t->n_heads, t->n_kv_heads, t->head_dim, t->scale, h0, h1);
+    for (int h = 0; h < t->n_heads; h++) {
+        for (int b = 0; b < t->batch; b++) {
+            int start = t->offsets[b];
+            int end = t->offsets[b + 1];
+            for (int q0 = start; q0 < end; q0 += QWEN_PACKED_ATTN_QUERY_TILE) {
+                int q1 = q0 + QWEN_PACKED_ATTN_QUERY_TILE;
+                if (q1 > end) q1 = end;
+                if (task_id++ % n_threads != tid) continue;
+#ifdef USE_BLAS
+                if (scores && end - start >= QWEN_PACKED_ATTN_BLAS_MIN_SEQ) {
+                    qwen_bidirectional_gqa_attention_packed_blas_rows(
+                        t->out, t->Q, t->K, t->V, start, end, t->n_heads,
+                        t->n_kv_heads, t->head_dim, t->scale, h, q0, q1,
+                        scores);
+                    continue;
+                }
+#endif
+                qwen_bidirectional_gqa_attention_packed_online_rows(
+                    t->out, t->Q, t->K, t->V, start, end, t->n_heads,
+                    t->n_kv_heads, t->head_dim, t->scale, h, q0, q1);
+            }
+        }
+    }
 }
 
 void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
@@ -1412,24 +1457,35 @@ void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
                                              int n_heads, int n_kv_heads,
                                              int head_dim, float scale) {
     long long qk_work = 0;
+    int max_seq = 0;
     for (int b = 0; b < batch; b++) {
         int len = offsets[b + 1] - offsets[b];
         qk_work += (long long)len * len * n_heads;
+        if (len > max_seq) max_seq = len;
     }
 
+    float *scores = NULL;
+#ifdef USE_BLAS
+    /* Keep score scratch linear in sequence length; OOM falls back online. */
+    if (max_seq >= QWEN_PACKED_ATTN_BLAS_MIN_SEQ &&
+        (size_t)max_seq <= SIZE_MAX / (sizeof(float) *
+            QWEN_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads)) {
+        size_t n = (size_t)tp.n_threads * QWEN_PACKED_ATTN_QUERY_TILE * max_seq;
+        scores = malloc(n * sizeof(*scores));
+    }
+#endif
+    packed_gqa_attn_task_t task = {
+        .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
+        .batch = batch, .n_heads = n_heads, .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim, .scale = scale, .scores = scores,
+        .max_seq = max_seq
+    };
     if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096) {
-        packed_gqa_attn_task_t task = {
-            .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
-            .batch = batch, .n_heads = n_heads, .n_kv_heads = n_kv_heads,
-            .head_dim = head_dim, .scale = scale
-        };
         parallel_for(packed_gqa_attn_worker, &task);
-        return;
+    } else {
+        packed_gqa_attn_worker(0, 1, &task);
     }
-
-    qwen_bidirectional_gqa_attention_packed_heads(
-        out, Q, K, V, offsets, batch, n_heads, n_kv_heads,
-        head_dim, scale, 0, n_heads);
+    free(scores);
 }
 
 /* ========================================================================
