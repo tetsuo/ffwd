@@ -20,6 +20,14 @@ typedef struct pplx_mlx_ctx pplx_mlx_ctx_t;
  */
 pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir);
 
+/*
+ * Load one contiguous transformer layer range for distributed execution.
+ * Uses the same half-open range and endpoint ownership rules as
+ * pplx_model_load_slice().
+ */
+pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
+                                    int layer_start, int layer_end);
+
 void pplx_mlx_free(pplx_mlx_ctx_t *ctx);
 
 /*

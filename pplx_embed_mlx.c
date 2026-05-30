@@ -28,6 +28,8 @@ struct pplx_mlx_ctx {
     mlx_array norm;
     mlx_stream stream;
     multi_safetensors_t *ms;
+    int layer_start;             /* loaded transformer range, inclusive */
+    int layer_end;               /* loaded transformer range, exclusive */
 };
 
 /* ========================================================================
@@ -35,6 +37,11 @@ struct pplx_mlx_ctx {
  * ======================================================================== */
 
 static int arr_ok(mlx_array a) { return a.ctx != NULL; }
+
+static mlx_dtype mlx_weight_dtype(const pplx_mlx_ctx_t *ctx)
+{
+    return mlx_array_dtype(ctx->layers[ctx->layer_start].wq);
+}
 
 static mlx_array load_tensor(multi_safetensors_t *ms, const char *name,
                               const int *shape, int ndim)
@@ -143,7 +150,8 @@ static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
     return 0;
 }
 
-pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
+static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
+                                      int layer_start, int layer_end)
 {
     pplx_mlx_ctx_t *ctx = calloc(1, sizeof(pplx_mlx_ctx_t));
     if (!ctx) return NULL;
@@ -151,6 +159,17 @@ pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
     if (mlx_parse_config(&ctx->config, model_dir) != 0) { free(ctx); return NULL; }
 
     const pplx_config_t *c = &ctx->config;
+    if (layer_end == -1)
+        layer_end = c->n_layers;
+    if (layer_start < 0 || layer_start >= layer_end ||
+        layer_end > c->n_layers) {
+        fprintf(stderr, "mlx: invalid layer range [%d, %d) for %d-layer model\n",
+                layer_start, layer_end, c->n_layers);
+        free(ctx);
+        return NULL;
+    }
+    ctx->layer_start = layer_start;
+    ctx->layer_end = layer_end;
     ctx->stream = mlx_default_gpu_stream_new();
 
     ctx->ms = multi_safetensors_open(model_dir);
@@ -162,17 +181,20 @@ pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
     int h = c->hidden_size, qd = c->q_dim, kvd = c->kv_dim;
     int inter = c->intermediate_size, hd = c->head_dim;
 
-    /* Embedding table */
-    int emb_shape[] = {c->vocab_size, h};
-    ctx->embed_tokens = load_tensor(ctx->ms, "embed_tokens.weight", emb_shape, 2);
-    if (!arr_ok(ctx->embed_tokens)) goto fail;
+    /* Only the first stage needs token embeddings. */
+    if (layer_start == 0) {
+        int emb_shape[] = {c->vocab_size, h};
+        ctx->embed_tokens = load_tensor(ctx->ms, "embed_tokens.weight",
+                                        emb_shape, 2);
+        if (!arr_ok(ctx->embed_tokens)) goto fail;
+    }
 
     /* Layers */
     ctx->layers = calloc(c->n_layers, sizeof(mlx_layer_t));
     if (!ctx->layers) goto fail;
 
     char name[256];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_start; i < layer_end; i++) {
         mlx_layer_t *l = &ctx->layers[i];
 
 #define LD(fld, fmt, ...) do {                                    \
@@ -198,18 +220,32 @@ pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
         if (pplx_verbose >= 2) fprintf(stderr, "  mlx layer %d loaded\n", i);
     }
 
-    int ns[] = {h};
-    ctx->norm = load_tensor(ctx->ms, "norm.weight", ns, 1);
-    if (!arr_ok(ctx->norm)) goto fail;
+    if (layer_end == c->n_layers) {
+        int ns[] = {h};
+        ctx->norm = load_tensor(ctx->ms, "norm.weight", ns, 1);
+        if (!arr_ok(ctx->norm)) goto fail;
+    }
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "mlx: %d layers loaded (%d-dim)\n", c->n_layers, h);
+        fprintf(stderr, "mlx: layers [%d, %d) loaded (%d-dim)\n",
+                layer_start, layer_end, h);
 
     return ctx;
 
 fail:
     pplx_mlx_free(ctx);
     return NULL;
+}
+
+pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
+{
+    return mlx_load_range(model_dir, 0, -1);
+}
+
+pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
+                                    int layer_start, int layer_end)
+{
+    return mlx_load_range(model_dir, layer_start, layer_end);
 }
 
 /* ========================================================================
@@ -353,7 +389,9 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
 int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                          int batch, float *out_embeddings)
 {
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings ||
+        ctx->layer_start != 0 || ctx->layer_end != ctx->config.n_layers)
+        return -1;
 
     const pplx_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
@@ -426,7 +464,7 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         mlx_array_free(lengths);
         return -1;
     }
-    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+    if (has_padding && mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
         mlx_array attn_mask_bf16 = mlx_array_new();
         mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
         mlx_array_free(attn_mask);
@@ -501,9 +539,12 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
     if (!ctx || !inputs || batch <= 0 || !out_states ||
         layer_start < 0 || layer_start > layer_end ||
         layer_end > ctx->config.n_layers ||
+        layer_start < ctx->layer_start || layer_end > ctx->layer_end ||
         (layer_start == 0 && input_states) ||
         (layer_start != 0 && !input_states) ||
-        (apply_final_norm && layer_end != ctx->config.n_layers))
+        (layer_start == 0 && !arr_ok(ctx->embed_tokens)) ||
+        (apply_final_norm &&
+         (layer_end != ctx->config.n_layers || !arr_ok(ctx->norm))))
         return -1;
 
     const pplx_config_t *c = &ctx->config;
@@ -581,7 +622,7 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
         free(padded_ids); free(padded_states);
         return -1;
     }
-    if (has_padding && mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+    if (has_padding && mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
         mlx_array attn_mask_bf16 = mlx_array_new();
         mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
         mlx_array_free(attn_mask);
@@ -613,7 +654,7 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
             if (has_padding) mlx_array_free(attn_mask);
             return -1;
         }
-        if (mlx_array_dtype(ctx->embed_tokens) == MLX_BFLOAT16) {
+        if (mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
             x = mlx_array_new();
             mlx_astype(&x, states, MLX_BFLOAT16, S);
             mlx_array_free(states);

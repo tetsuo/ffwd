@@ -37,6 +37,8 @@ struct pplx_model {
     pplx_config_t  config;
     pplx_weights_t weights;
     void *safetensors;          /* multi_safetensors_t*, keeps mmap alive */
+    int layer_start;            /* loaded transformer range, inclusive */
+    int layer_end;              /* loaded transformer range, exclusive */
 };
 
 struct pplx_workspace {
@@ -556,7 +558,8 @@ static int ensure_offsets(pplx_workspace_t *ws, int batch)
  * Model / workspace load and free
  * ======================================================================== */
 
-pplx_model_t *pplx_model_load(const char *model_dir)
+static pplx_model_t *model_load_range(const char *model_dir,
+                                      int layer_start, int layer_end)
 {
     pplx_model_t *model = (pplx_model_t *)calloc(1, sizeof(pplx_model_t));
     if (!model) return NULL;
@@ -568,6 +571,17 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     }
 
     const pplx_config_t *cfg = &model->config;
+    if (layer_end == -1)
+        layer_end = cfg->n_layers;
+    if (layer_start < 0 || layer_start >= layer_end ||
+        layer_end > cfg->n_layers) {
+        fprintf(stderr, "pplx_model_load: invalid layer range [%d, %d) "
+                "for %d-layer model\n", layer_start, layer_end, cfg->n_layers);
+        free(model);
+        return NULL;
+    }
+    model->layer_start = layer_start;
+    model->layer_end = layer_end;
 
     /* Open safetensors (handles single file or multi-shard) */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
@@ -581,12 +595,14 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     if (pplx_verbose >= 1)
         fprintf(stderr, "pplx_model_load: loading weights from %s\n", model_dir);
 
-    /* Token embeddings */
+    /* Only the first stage needs token embeddings. */
     pplx_weights_t *w = &model->weights;
-    const int64_t embed_shape[2] = { cfg->vocab_size, cfg->hidden_size };
-    w->embed_tokens = load_weight_direct(ms, "embed_tokens.weight",
-                                         embed_shape, 2);
-    if (!w->embed_tokens.data) goto fail;
+    if (layer_start == 0) {
+        const int64_t embed_shape[2] = { cfg->vocab_size, cfg->hidden_size };
+        w->embed_tokens = load_weight_direct(ms, "embed_tokens.weight",
+                                             embed_shape, 2);
+        if (!w->embed_tokens.data) goto fail;
+    }
 
     /* Allocate layer array */
     w->layers = (pplx_layer_t *)calloc(cfg->n_layers, sizeof(pplx_layer_t));
@@ -594,7 +610,7 @@ pplx_model_t *pplx_model_load(const char *model_dir)
 
     /* Per-layer weights */
     char name[256];
-    for (int i = 0; i < cfg->n_layers; i++) {
+    for (int i = layer_start; i < layer_end; i++) {
         pplx_layer_t *l = &w->layers[i];
 
 #define LOAD_NORM(field, fmt, d0) do {                      \
@@ -641,20 +657,34 @@ pplx_model_t *pplx_model_load(const char *model_dir)
             fprintf(stderr, "  layer %d loaded\n", i);
     }
 
-    /* Final RMSNorm */
-    const int64_t norm_shape[1] = { cfg->hidden_size };
-    w->norm = load_norm_f32(ms, "norm.weight", norm_shape, 1);
-    if (!w->norm) goto fail;
+    /* Only the final stage applies the output RMSNorm. */
+    if (layer_end == cfg->n_layers) {
+        const int64_t norm_shape[1] = { cfg->hidden_size };
+        w->norm = load_norm_f32(ms, "norm.weight", norm_shape, 1);
+        if (!w->norm) goto fail;
+    }
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "pplx_model_load: %d layers loaded (%d-dim embeddings)\n",
-                cfg->n_layers, cfg->hidden_size);
+        fprintf(stderr, "pplx_model_load: layers [%d, %d) loaded "
+                "(%d-dim embeddings)\n",
+                layer_start, layer_end, cfg->hidden_size);
 
     return model;
 
 fail:
     pplx_model_free(model);
     return NULL;
+}
+
+pplx_model_t *pplx_model_load(const char *model_dir)
+{
+    return model_load_range(model_dir, 0, -1);
+}
+
+pplx_model_t *pplx_model_load_slice(const char *model_dir,
+                                    int layer_start, int layer_end)
+{
+    return model_load_range(model_dir, layer_start, layer_end);
 }
 
 void pplx_model_free(pplx_model_t *model)
@@ -805,9 +835,11 @@ static int forward_packed_slice_inplace(const pplx_model_t *model,
     const pplx_weights_t *w   = &model->weights;
     if (layer_start < 0 || layer_start > layer_end ||
         layer_end > cfg->n_layers ||
+        layer_start < model->layer_start || layer_end > model->layer_end ||
         (layer_start == 0 && input_states) ||
         (layer_start != 0 && !input_states) ||
-        (apply_final_norm && layer_end != cfg->n_layers))
+        (layer_start == 0 && !w->embed_tokens.data) ||
+        (apply_final_norm && (layer_end != cfg->n_layers || !w->norm)))
         return -1;
 
     int hidden     = cfg->hidden_size;

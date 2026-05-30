@@ -67,6 +67,18 @@ typedef struct {
  * Returns NULL on error.
  */
 pplx_model_t *pplx_model_load(const char *model_dir);
+
+/*
+ * Load one contiguous transformer layer range for distributed execution.
+ *
+ * layer_start is inclusive and layer_end is exclusive. A range beginning at
+ * zero also loads the token embedding table. A range ending at n_layers also
+ * loads the final RMSNorm. Safetensors remain mmap-backed, so unselected
+ * weights are not touched.
+ */
+pplx_model_t *pplx_model_load_slice(const char *model_dir,
+                                    int layer_start, int layer_end);
+
 void pplx_model_free(pplx_model_t *model);
 
 /*
