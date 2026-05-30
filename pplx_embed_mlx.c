@@ -484,6 +484,162 @@ int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
     return pplx_mlx_embed_batch(ctx, &input, 1, out_embedding);
 }
 
+static int pplx_mlx_forward_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                                 int n_tokens, float *out_states)
+{
+    if (!ctx || !token_ids || n_tokens <= 0 || !out_states) return -1;
+
+    const pplx_config_t *c = &ctx->config;
+    mlx_stream S = ctx->stream;
+
+    int hidden     = c->hidden_size;
+    int n_heads    = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim   = c->head_dim;
+    int q_dim      = c->q_dim;
+
+    for (int i = 0; i < n_tokens; i++) {
+        if (token_ids[i] < 0 || token_ids[i] >= c->vocab_size) {
+            fprintf(stderr, "mlx: invalid token id %d at position %d\n",
+                    token_ids[i], i);
+            return -1;
+        }
+    }
+
+    int ids_shape[] = {1, n_tokens};
+    mlx_array ids = mlx_array_new_data((void *)token_ids, ids_shape, 2, MLX_INT32);
+    if (!arr_ok(ids)) return -1;
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    mlx_array null_arr = (mlx_array){0};
+
+    mlx_array x = mlx_array_new();
+    mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
+    mlx_array_free(ids);
+
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        mlx_layer_t *l = &ctx->layers[layer];
+
+        mlx_array xn = mlx_array_new();
+        mlx_fast_rms_norm(&xn, x, l->input_norm, c->rms_norm_eps, S);
+
+        mlx_array q_flat = linear(xn, l->wq, S);
+        mlx_array k_flat = linear(xn, l->wk, S);
+        mlx_array v_flat = linear(xn, l->wv, S);
+        mlx_array_free(xn);
+
+        int q_shape[] = {1, n_tokens, n_heads, head_dim};
+        int k_shape[] = {1, n_tokens, n_kv_heads, head_dim};
+        mlx_array q = mlx_array_new(), k = mlx_array_new(), v = mlx_array_new();
+        mlx_reshape(&q, q_flat, q_shape, 4, S);
+        mlx_reshape(&k, k_flat, k_shape, 4, S);
+        mlx_reshape(&v, v_flat, k_shape, 4, S);
+        mlx_array_free(q_flat); mlx_array_free(k_flat); mlx_array_free(v_flat);
+
+        mlx_array qn = mlx_array_new(), kn = mlx_array_new();
+        mlx_fast_rms_norm(&qn, q, l->q_norm, c->rms_norm_eps, S);
+        mlx_fast_rms_norm(&kn, k, l->k_norm, c->rms_norm_eps, S);
+        mlx_array_free(q); mlx_array_free(k);
+
+        int perm[] = {0, 2, 1, 3};
+        mlx_array qt = mlx_array_new(), kt = mlx_array_new(), vt = mlx_array_new();
+        mlx_transpose_axes(&qt, qn, perm, 4, S);
+        mlx_transpose_axes(&kt, kn, perm, 4, S);
+        mlx_transpose_axes(&vt, v,  perm, 4, S);
+        mlx_array_free(qn); mlx_array_free(kn); mlx_array_free(v);
+
+        mlx_optional_float base = {.value = c->rope_theta, .has_value = true};
+        mlx_array qr = mlx_array_new(), kr = mlx_array_new();
+        mlx_fast_rope(&qr, qt, head_dim, false, base, 1.0f, 0, null_arr, S);
+        mlx_fast_rope(&kr, kt, head_dim, false, base, 1.0f, 0, null_arr, S);
+        mlx_array_free(qt); mlx_array_free(kt);
+
+        mlx_array attn = mlx_array_new();
+        mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, "",
+                                              null_arr, null_arr, S);
+        mlx_array_free(qr); mlx_array_free(kr); mlx_array_free(vt);
+
+        mlx_array attn_t = mlx_array_new();
+        mlx_transpose_axes(&attn_t, attn, perm, 4, S);
+        mlx_array_free(attn);
+
+        int flat_shape[] = {1, n_tokens, q_dim};
+        mlx_array attn_flat = mlx_array_new();
+        mlx_reshape(&attn_flat, attn_t, flat_shape, 3, S);
+        mlx_array_free(attn_t);
+
+        mlx_array proj = linear(attn_flat, l->wo, S);
+        mlx_array_free(attn_flat);
+        mlx_array x2 = mlx_array_new();
+        mlx_add(&x2, x, proj, S);
+        mlx_array_free(x); mlx_array_free(proj);
+        x = x2;
+
+        mlx_array xn2 = mlx_array_new();
+        mlx_fast_rms_norm(&xn2, x, l->post_attn_norm, c->rms_norm_eps, S);
+
+        mlx_array gate = linear(xn2, l->gate_proj, S);
+        mlx_array up = linear(xn2, l->up_proj, S);
+        mlx_array_free(xn2);
+
+        mlx_array gate_sig = mlx_array_new();
+        mlx_sigmoid(&gate_sig, gate, S);
+        mlx_array silu_gate = mlx_array_new();
+        mlx_multiply(&silu_gate, gate, gate_sig, S);
+        mlx_array_free(gate); mlx_array_free(gate_sig);
+
+        mlx_array mid = mlx_array_new();
+        mlx_multiply(&mid, silu_gate, up, S);
+        mlx_array_free(silu_gate); mlx_array_free(up);
+
+        mlx_array ffn = linear(mid, l->down_proj, S);
+        mlx_array_free(mid);
+
+        mlx_array x3 = mlx_array_new();
+        mlx_add(&x3, x, ffn, S);
+        mlx_array_free(x); mlx_array_free(ffn);
+        x = x3;
+    }
+
+    mlx_array x_normed = mlx_array_new();
+    mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
+    mlx_array_free(x);
+
+    mlx_array x_f32 = mlx_array_new();
+    mlx_astype(&x_f32, x_normed, MLX_FLOAT32, S);
+    mlx_array_free(x_normed);
+    mlx_array_eval(x_f32);
+
+    const float *data = mlx_array_data_float32(x_f32);
+    int rc = -1;
+    if (data) {
+        memcpy(out_states, data, (size_t)n_tokens * hidden * sizeof(float));
+        rc = 0;
+    }
+    mlx_array_free(x_f32);
+    return rc;
+}
+
+int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                         int n_tokens, const pplx_span_t *spans,
+                         int n_spans, float *out_embeddings)
+{
+    if (!ctx || !token_ids || n_tokens <= 0 || !spans || n_spans <= 0 ||
+        !out_embeddings)
+        return -1;
+
+    int hidden = ctx->config.hidden_size;
+    float *states = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
+    if (!states) return -1;
+
+    int rc = pplx_mlx_forward_into(ctx, token_ids, n_tokens, states);
+    if (rc == 0)
+        rc = pplx_pool_spans(&ctx->config, states, n_tokens, spans, n_spans,
+                             out_embeddings);
+    free(states);
+    return rc;
+}
+
 float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
 {
     if (!ctx || !token_ids || n_tokens <= 0) return NULL;

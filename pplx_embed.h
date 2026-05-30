@@ -48,6 +48,11 @@ typedef struct {
     int n_tokens;
 } pplx_input_t;
 
+typedef struct {
+    int start;
+    int n_tokens;
+} pplx_span_t;
+
 /* ========================================================================
  * API
  * ======================================================================== */
@@ -135,6 +140,26 @@ float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
 int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
                             const int *token_ids, int n_tokens,
                             float *out_states);
+
+/*
+ * Pool normalized embeddings from final hidden states.
+ *
+ * states is [n_tokens, hidden_size], normally produced by
+ * pplx_model_forward_into().  Each span is mean pooled and L2 normalized into
+ * out_embeddings[n_spans, hidden_size].
+ */
+int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
+                    const pplx_span_t *spans, int n_spans,
+                    float *out_embeddings);
+
+/*
+ * Run one contextual sequence and pool selected token spans.
+ * Returns 0 on success, -1 on error.
+ */
+int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
+                           const int *token_ids, int n_tokens,
+                           const pplx_span_t *spans, int n_spans,
+                           float *out_embeddings);
 
 /*
  * Cosine similarity between two L2-normalized vectors.

@@ -961,6 +961,68 @@ int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
     return 0;
 }
 
+int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
+                    const pplx_span_t *spans, int n_spans,
+                    float *out_embeddings)
+{
+    if (!cfg || !states || n_tokens <= 0 || !spans || n_spans <= 0 ||
+        !out_embeddings)
+        return -1;
+
+    int hidden = cfg->hidden_size;
+    if (hidden <= 0) return -1;
+
+    for (int s = 0; s < n_spans; s++) {
+        int start = spans[s].start;
+        int len = spans[s].n_tokens;
+        if (start < 0 || len <= 0 || start > n_tokens || len > n_tokens - start)
+            return -1;
+
+        float *emb = out_embeddings + (size_t)s * hidden;
+        memset(emb, 0, (size_t)hidden * sizeof(float));
+
+        for (int t = 0; t < len; t++) {
+            const float *row = states + (size_t)(start + t) * hidden;
+            for (int d = 0; d < hidden; d++)
+                emb[d] += row[d];
+        }
+
+        float inv_len = 1.0f / (float)len;
+        float norm_sq = 0.0f;
+        for (int d = 0; d < hidden; d++) {
+            emb[d] *= inv_len;
+            norm_sq += emb[d] * emb[d];
+        }
+
+        float nv = sqrtf(norm_sq);
+        if (nv > 1e-8f) {
+            float inv = 1.0f / nv;
+            for (int d = 0; d < hidden; d++)
+                emb[d] *= inv;
+        }
+    }
+    return 0;
+}
+
+int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
+                           const int *token_ids, int n_tokens,
+                           const pplx_span_t *spans, int n_spans,
+                           float *out_embeddings)
+{
+    if (!model || !ws || !token_ids || n_tokens <= 0 || !spans ||
+        n_spans <= 0 || !out_embeddings)
+        return -1;
+
+    pplx_input_t input = { token_ids, n_tokens };
+    int offsets[2] = { 0, n_tokens };
+    if (forward_packed_inplace(model, ws, &input, 1, offsets,
+                               n_tokens, n_tokens, 1) != 0)
+        return -1;
+
+    return pplx_pool_spans(&model->config, ws->x, n_tokens, spans, n_spans,
+                           out_embeddings);
+}
+
 float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
                           const int *token_ids, int n_tokens)
 {

@@ -1,6 +1,7 @@
 /* main.c - pplx_embed command-line tool */
 
 #include "pplx_embed.h"
+#include "pplx_server.h"
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_tokenizer.h"
 
@@ -29,8 +30,17 @@ static void print_usage(const char *prog)
         "Options:\n"
         "  -d <dir>     Model directory (required)\n"
         "  --mlx        Use Apple MLX GPU backend\n"
-        "  --daemon     Read lines from stdin, write JSON embeddings to stdout\n"
-        "  -b <n>       Max texts per engine batch (default: all; daemon: 1)\n"
+        "  --stdin      Read lines from stdin, write JSON embeddings to stdout\n"
+        "  --serve      Serve the Perplexity-compatible HTTP API\n"
+        "  --model ID=DIR\n"
+        "               Load model ID from directory for --serve (repeatable)\n"
+        "  --backend cpu|mlx\n"
+        "               Backend for --serve (default: cpu)\n"
+        "  --host HOST  Server bind host (default: 127.0.0.1)\n"
+        "  --port N     Server bind port (default: 8000)\n"
+        "  --cors       Enable CORS headers in --serve mode\n"
+        "  --api-key K  Require Authorization: Bearer K in --serve mode\n"
+        "  -b <n>       Max texts per engine batch (default: all; stdin/server: 1)\n"
         "  -t <n>       CPU threads (default: all cores)\n"
         "  -e           Print raw embeddings (with multiple texts)\n"
         "  -v           Verbose (-vv for debug)\n"
@@ -40,12 +50,14 @@ static void print_usage(const char *prog)
         "  1  text arg     Print embedding as space-separated floats\n"
         "  2+ text args    Print cosine similarity matrix\n"
         "  no args         Batch: read all stdin lines, then similarity matrix\n"
-        "  --daemon        Streaming: read stdin lines, write JSON per line\n"
+        "  --stdin         Streaming: read stdin lines, write JSON per line\n"
+        "  --serve         HTTP server for /v1/embeddings and /v1/contextualizedembeddings\n"
         "\n"
         "Examples:\n"
         "  %s -d ./model \"query: what is AI?\"\n"
-        "  %s -d ./model --mlx --daemon < texts.txt\n",
-        prog, prog, prog);
+        "  %s -d ./model --mlx --stdin < texts.txt\n"
+        "  %s --serve --model pplx-embed-v1-0.6b=./model --port 8000\n",
+        prog, prog, prog, prog);
 }
 
 /* ========================================================================
@@ -66,6 +78,12 @@ typedef struct {
     int *ids;
     int  n_tokens;
 } token_buf_t;
+
+typedef struct {
+    pplx_server_model_spec_t *v;
+    int n;
+    int cap;
+} model_specs_t;
 
 static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
                               int batch, float *out_embeddings)
@@ -108,6 +126,45 @@ static void free_tokens(token_buf_t *tokens, int n)
         free(tokens[i].ids);
 }
 
+static int append_model_spec(model_specs_t *specs, const char *arg)
+{
+    const char *eq = strchr(arg, '=');
+    if (!eq || eq == arg || !eq[1]) {
+        fprintf(stderr, "--model expects MODEL_ID=DIR\n");
+        return -1;
+    }
+    if (specs->n == specs->cap) {
+        int new_cap = specs->cap ? specs->cap * 2 : 4;
+        void *p = realloc(specs->v, (size_t)new_cap * sizeof(specs->v[0]));
+        if (!p) return -1;
+        specs->v = p;
+        specs->cap = new_cap;
+    }
+    size_t id_len = (size_t)(eq - arg);
+    char *id = (char *)malloc(id_len + 1);
+    char *path = strdup(eq + 1);
+    if (id) {
+        memcpy(id, arg, id_len);
+        id[id_len] = '\0';
+    }
+    specs->v[specs->n].id = id;
+    specs->v[specs->n].path = path;
+    if (!specs->v[specs->n].id || !specs->v[specs->n].path)
+        return -1;
+    specs->n++;
+    return 0;
+}
+
+static void free_model_specs(model_specs_t *specs)
+{
+    if (!specs) return;
+    for (int i = 0; i < specs->n; i++) {
+        free((char *)specs->v[i].id);
+        free((char *)specs->v[i].path);
+    }
+    free(specs->v);
+}
+
 /* ========================================================================
  * Output helpers
  * ======================================================================== */
@@ -140,10 +197,10 @@ static void print_embedding_json(const float *emb, int dim, int n_tokens,
 }
 
 /* ========================================================================
- * Daemon mode: read lines from stdin, write JSON to stdout
+ * Stdin mode: read lines from stdin, write JSON to stdout
  * ======================================================================== */
 
-static int process_daemon_batch(engine_t *e, char **lines, int n_lines)
+static int process_stdin_batch(engine_t *e, char **lines, int n_lines)
 {
     if (n_lines <= 0) return 0;
 
@@ -208,13 +265,13 @@ static int process_daemon_batch(engine_t *e, char **lines, int n_lines)
     return rc == 0 ? 0 : 1;
 }
 
-static int run_daemon(engine_t *e, int batch_size)
+static int run_stdin(engine_t *e, int batch_size)
 {
     char line[65536];
     if (batch_size <= 0) batch_size = 1;
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "daemon: ready, reading from stdin (batch_size=%d)\n",
+        fprintf(stderr, "stdin: ready, reading from stdin (batch_size=%d)\n",
                 batch_size);
 
     char **batch_lines = (char **)calloc((size_t)batch_size, sizeof(char *));
@@ -233,7 +290,7 @@ static int run_daemon(engine_t *e, int batch_size)
         if (len == 0) continue;
 
         if (pplx_verbose >= 1)
-            fprintf(stderr, "daemon: \"%.*s%s\"\n",
+            fprintf(stderr, "stdin: \"%.*s%s\"\n",
                     (int)(len > 60 ? 60 : len), line, len > 60 ? "..." : "");
 
         batch_lines[n_batch] = strdup(line);
@@ -245,7 +302,7 @@ static int run_daemon(engine_t *e, int batch_size)
         n_batch++;
 
         if (n_batch == batch_size) {
-            if (process_daemon_batch(e, batch_lines, n_batch) != 0)
+            if (process_stdin_batch(e, batch_lines, n_batch) != 0)
                 rc = 1;
             for (int i = 0; i < n_batch; i++) {
                 free(batch_lines[i]);
@@ -256,7 +313,7 @@ static int run_daemon(engine_t *e, int batch_size)
     }
 
     if (n_batch > 0) {
-        if (process_daemon_batch(e, batch_lines, n_batch) != 0)
+        if (process_stdin_batch(e, batch_lines, n_batch) != 0)
             rc = 1;
         for (int i = 0; i < n_batch; i++)
             free(batch_lines[i]);
@@ -264,7 +321,7 @@ static int run_daemon(engine_t *e, int batch_size)
     free(batch_lines);
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "daemon: stdin EOF\n");
+        fprintf(stderr, "stdin: EOF\n");
 
     return rc;
 }
@@ -406,8 +463,15 @@ int main(int argc, char *argv[])
     int print_embs = 0;
     int verbose    = 0;
     int use_mlx    = 0;
-    int daemon     = 0;
+    int stdin_mode = 0;
+    int serve_mode = 0;
     int batch_size = 0;
+    const char *backend = "cpu";
+    const char *host = "127.0.0.1";
+    const char *api_key = NULL;
+    int port = 8000;
+    int cors = 0;
+    model_specs_t model_specs = {0};
 
     int arg_start = 1;
     while (arg_start < argc && argv[arg_start][0] == '-') {
@@ -417,30 +481,104 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
             batch_size = atoi(argv[++arg_start]);
         }
+        else if (!strcmp(f, "--model")) {
+            if (append_model_spec(&model_specs, argv[++arg_start]) != 0) return 1;
+        }
+        else if (!strcmp(f, "--backend")) {
+            backend = argv[++arg_start];
+            if (!strcmp(backend, "mlx")) {
+#ifdef USE_MLX
+                use_mlx = 1;
+#else
+                fprintf(stderr, "mlx backend not available (build with: make mlx)\n");
+                free_model_specs(&model_specs);
+                return 1;
+#endif
+            } else if (!strcmp(backend, "cpu")) {
+                use_mlx = 0;
+            } else {
+                fprintf(stderr, "invalid --backend: %s\n", backend);
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+        else if (!strcmp(f, "--host"))   { host = argv[++arg_start]; }
+        else if (!strcmp(f, "--port"))   { port = atoi(argv[++arg_start]); }
+        else if (!strcmp(f, "--cors"))   { cors = 1; }
+        else if (!strcmp(f, "--api-key")){ api_key = argv[++arg_start]; }
         else if (!strcmp(f, "-e"))      { print_embs = 1; }
         else if (!strcmp(f, "-v"))      { verbose++; }
         else if (!strcmp(f, "-vv"))     { verbose = 2; }
-        else if (!strcmp(f, "--daemon")){ daemon = 1; }
+        else if (!strcmp(f, "--stdin")) { stdin_mode = 1; }
+        else if (!strcmp(f, "--serve")) { serve_mode = 1; }
         else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
+            backend = "mlx";
 #else
-            fprintf(stderr, "--mlx not available (build with: make mlx)\n"); return 1;
+            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
+            free_model_specs(&model_specs);
+            return 1;
 #endif
         }
-        else if (!strcmp(f, "-h") || !strcmp(f, "--help")) { print_usage(argv[0]); return 0; }
+        else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
+            print_usage(argv[0]);
+            free_model_specs(&model_specs);
+            return 0;
+        }
         else break;
         arg_start++;
+    }
+
+    pplx_verbose = verbose;
+    qwen_verbose = verbose;
+
+    if (serve_mode) {
+        if (stdin_mode) {
+            fprintf(stderr, "--serve and --stdin are mutually exclusive\n");
+            free_model_specs(&model_specs);
+            return 1;
+        }
+        if (model_specs.n == 0) {
+            fprintf(stderr, "--serve requires at least one --model MODEL_ID=DIR\n");
+            print_usage(argv[0]);
+            free_model_specs(&model_specs);
+            return 1;
+        }
+        if (!use_mlx) {
+            if (n_threads <= 0) n_threads = qwen_get_num_cpus();
+            qwen_set_threads(n_threads);
+            if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
+        } else if (verbose >= 1) {
+            fprintf(stderr, "Using MLX GPU backend\n");
+        }
+        pplx_server_config_t scfg = {
+            .models = model_specs.v,
+            .n_models = model_specs.n,
+            .host = host,
+            .port = port,
+            .batch_size = batch_size > 0 ? batch_size : 1,
+            .use_mlx = use_mlx,
+            .enable_cors = cors,
+            .api_key = api_key,
+        };
+        int rc = pplx_run_server(&scfg);
+        free_model_specs(&model_specs);
+        return rc;
+    }
+
+    if (model_specs.n != 0) {
+        fprintf(stderr, "--model is only valid with --serve\n");
+        free_model_specs(&model_specs);
+        return 1;
     }
 
     if (!model_dir || !model_dir[0]) {
         fprintf(stderr, "model directory required (-d <dir>)\n");
         print_usage(argv[0]);
+        free_model_specs(&model_specs);
         return 1;
     }
-
-    pplx_verbose = verbose;
-    qwen_verbose = verbose;
 
     /* Threads (CPU backend) */
     if (!use_mlx) {
@@ -497,8 +635,8 @@ int main(int argc, char *argv[])
 
     /* Run */
     int rc;
-    if (daemon)
-        rc = run_daemon(&e, batch_size > 0 ? batch_size : 1);
+    if (stdin_mode)
+        rc = run_stdin(&e, batch_size > 0 ? batch_size : 1);
     else
         rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size);
 
@@ -509,5 +647,6 @@ int main(int argc, char *argv[])
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif
     qwen_tokenizer_free(tok);
+    free_model_specs(&model_specs);
     return rc;
 }

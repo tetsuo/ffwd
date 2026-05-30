@@ -1,17 +1,26 @@
 CC          = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDFLAGS     = -lm -lpthread
+CJSON_CFLAGS ?= $(shell sh -c 'pkg-config --cflags libcjson 2>/dev/null')
+CJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs libcjson 2>/dev/null')
+ifeq ($(strip $(CJSON_LDFLAGS)),)
+    CJSON_LDFLAGS = -lcjson
+endif
 
 UNAME_S := $(shell uname -s)
 
 # Source files
 SRCS = pplx_embed.c \
+       pplx_server.c \
        qwen_asr_kernels.c \
        qwen_asr_kernels_generic.c \
        qwen_asr_kernels_neon.c \
        qwen_asr_kernels_avx.c \
        qwen_asr_tokenizer.c \
-       qwen_asr_safetensors.c
+       qwen_asr_safetensors.c \
+       deps/ae/ae.c \
+       deps/ae/anet.c \
+       deps/ae/monotonic.c
 
 MLX_SRCS = pplx_embed_mlx.c
 
@@ -40,6 +49,12 @@ help:
 # BLAS build (Apple Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
+ifeq ($(strip $(CJSON_CFLAGS)),)
+    CJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
+endif
+ifeq ($(strip $(CJSON_LDFLAGS)),-lcjson)
+    CJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lcjson
+endif
 blas: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
 else
@@ -84,19 +99,22 @@ debug:
 # Link
 # =============================================================================
 $(TARGET): $(OBJS) $(EXTRA_OBJS) main.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
 
 # =============================================================================
 # Compile rules
 # =============================================================================
 pplx_embed.o: pplx_embed.c pplx_embed.h qwen_asr_kernels.h qwen_asr_safetensors.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
+
+pplx_server.o: pplx_server.c pplx_server.h pplx_embed.h pplx_embed_mlx.h qwen_asr_tokenizer.h deps/ae/ae.h deps/ae/anet.h
+	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 pplx_embed_mlx.o: pplx_embed_mlx.c pplx_embed_mlx.h pplx_embed.h qwen_asr_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-main.o: main.c pplx_embed.h qwen_asr_kernels.h qwen_asr_tokenizer.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+main.o: main.c pplx_embed.h pplx_server.h qwen_asr_kernels.h qwen_asr_tokenizer.h
+	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -115,6 +133,9 @@ qwen_asr_tokenizer.o: qwen_asr_tokenizer.c qwen_asr_tokenizer.h qwen_asr_kernels
 
 qwen_asr_safetensors.o: qwen_asr_safetensors.c qwen_asr_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
+	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
 
 # =============================================================================
 clean:

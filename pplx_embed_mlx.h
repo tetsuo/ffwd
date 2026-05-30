@@ -45,6 +45,14 @@ int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
 int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                          int batch, float *out_embeddings);
 
+/*
+ * Run one contextual sequence and pool selected token spans.
+ * Returns 0 on success, -1 on error.
+ */
+int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
+                         int n_tokens, const pplx_span_t *spans,
+                         int n_spans, float *out_embeddings);
+
 /* Get the config (so main.c can read hidden_size etc.) */
 const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx);
 
