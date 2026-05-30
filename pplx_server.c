@@ -52,6 +52,7 @@
 #define PPLX_API_MAX_ITEM_TOKENS 32768
 #define PPLX_API_MAX_TOTAL_TOKENS 120000
 #define PPLX_SERVER_DEFAULT_BATCH_SIZE 8
+#define PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
 #define PPLX_SERVER_BATCH_WAIT_US 1000
 #define PPLX_SERVER_MICROBATCH_MAX_JOBS 128
 
@@ -217,6 +218,7 @@ typedef struct {
     const char *host;
     int port;
     int batch_size;
+    int max_batch_tokens;
     int batch_wait_us;
     int enable_cors;
     char *api_key;
@@ -1030,6 +1032,27 @@ static int embedding_request_compatible(const embedding_request *a,
            !strcmp(a->encoding, b->encoding);
 }
 
+typedef struct {
+    pplx_input_t input;
+    int output_index;
+} embedding_batch_item;
+
+static int embedding_batch_item_cmp(const void *a, const void *b) {
+    const embedding_batch_item *ia = a;
+    const embedding_batch_item *ib = b;
+    if (ia->input.n_tokens < ib->input.n_tokens) return -1;
+    if (ia->input.n_tokens > ib->input.n_tokens) return 1;
+    return ia->output_index - ib->output_index;
+}
+
+static int embedding_request_fits_group(const embedding_request *r,
+                                        int group_inputs, int group_tokens,
+                                        int max_batch, int max_batch_tokens) {
+    if (group_inputs == 0) return 1;
+    return r->n_inputs <= max_batch - group_inputs &&
+           r->total_tokens <= max_batch_tokens - group_tokens;
+}
+
 static void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
     if (n_reqs <= 0) return;
     loaded_model *m = reqs[0]->model;
@@ -1038,27 +1061,46 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
     for (int i = 0; i < n_reqs; i++)
         total_inputs += reqs[i]->n_inputs;
 
-    pplx_input_t *inputs = xmalloc((size_t)total_inputs * sizeof(*inputs));
+    embedding_batch_item *items = xmalloc((size_t)total_inputs * sizeof(*items));
     float *embs = xmalloc((size_t)total_inputs * dim * sizeof(float));
 
     int pos = 0;
     for (int i = 0; i < n_reqs; i++) {
-        memcpy(inputs + pos, reqs[i]->inputs,
-               (size_t)reqs[i]->n_inputs * sizeof(*inputs));
-        pos += reqs[i]->n_inputs;
+        for (int k = 0; k < reqs[i]->n_inputs; k++) {
+            items[pos].input = reqs[i]->inputs[k];
+            items[pos].output_index = pos;
+            pos++;
+        }
     }
+    qsort(items, (size_t)total_inputs, sizeof(*items), embedding_batch_item_cmp);
 
     int max_batch = reqs[0]->j->srv->batch_size > 0
         ? reqs[0]->j->srv->batch_size : total_inputs;
+    if (max_batch > total_inputs) max_batch = total_inputs;
+    int max_batch_tokens = reqs[0]->j->srv->max_batch_tokens;
+    pplx_input_t *inputs = xmalloc((size_t)max_batch * sizeof(*inputs));
+    float *batch_embs = xmalloc((size_t)max_batch * dim * sizeof(float));
+
     int failed = 0;
-    for (int start = 0; start < total_inputs; start += max_batch) {
-        int cur = total_inputs - start;
-        if (cur > max_batch) cur = max_batch;
-        if (model_embed_batch(m, inputs + start, cur,
-                              embs + (size_t)start * dim) != 0) {
+    for (int start = 0; start < total_inputs;) {
+        int cur = 0;
+        int tokens = 0;
+        while (start + cur < total_inputs && cur < max_batch) {
+            int n_tokens = items[start + cur].input.n_tokens;
+            if (cur > 0 && n_tokens > max_batch_tokens - tokens)
+                break;
+            inputs[cur] = items[start + cur].input;
+            tokens += n_tokens;
+            cur++;
+        }
+        if (model_embed_batch(m, inputs, cur, batch_embs) != 0) {
             failed = 1;
             break;
         }
+        for (int i = 0; i < cur; i++)
+            memcpy(embs + (size_t)items[start + i].output_index * dim,
+                   batch_embs + (size_t)i * dim, (size_t)dim * sizeof(float));
+        start += cur;
     }
 
     pos = 0;
@@ -1071,8 +1113,10 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
         pos += reqs[i]->n_inputs;
     }
 
-    free(embs);
+    free(batch_embs);
     free(inputs);
+    free(embs);
+    free(items);
 }
 
 static void execute_embedding_requests(embedding_request *reqs, int n_reqs) {
@@ -1496,11 +1540,18 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
         }
 
         int group_n = 1;
+        int group_inputs = reqs[i].n_inputs;
+        int group_tokens = reqs[i].total_tokens;
         group[0] = &reqs[i];
         for (int k = i + 1; k < n_jobs; k++) {
             if (!done[k] && is_standard[k] && reqs[k].ready &&
-                embedding_request_compatible(&reqs[i], &reqs[k]))
+                embedding_request_compatible(&reqs[i], &reqs[k]) &&
+                embedding_request_fits_group(&reqs[k], group_inputs,
+                    group_tokens, s->batch_size, s->max_batch_tokens)) {
                 group[group_n++] = &reqs[k];
+                group_inputs += reqs[k].n_inputs;
+                group_tokens += reqs[k].total_tokens;
+            }
         }
 
         execute_embedding_request_list(group, group_n);
@@ -1679,6 +1730,8 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     s.port = cfg->port > 0 ? cfg->port : 8000;
     s.batch_size = cfg->batch_size > 0
         ? cfg->batch_size : PPLX_SERVER_DEFAULT_BATCH_SIZE;
+    s.max_batch_tokens = cfg->max_batch_tokens > 0
+        ? cfg->max_batch_tokens : PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0
         ? cfg->batch_wait_us : PPLX_SERVER_BATCH_WAIT_US;
     s.enable_cors = cfg->enable_cors;

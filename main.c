@@ -47,6 +47,8 @@ static void print_usage(const char *prog)
         "  --cors       Enable CORS headers in --serve mode\n"
         "  --api-key K  Require Authorization: Bearer K in --serve mode\n"
         "  -b <n>       Max texts per engine batch (default: all; stdin: 1; server: 8)\n"
+        "  --max-batch-tokens N\n"
+        "               Server max tokens per standard inference batch (default: 16384)\n"
         "  --batch-wait-us N\n"
         "               Server micro-batch wait in microseconds (default: 1000; 0 disables)\n"
         "  -t <n>       CPU threads (default: all cores)\n"
@@ -509,6 +511,7 @@ int main(int argc, char *argv[])
     int layer_start = -1;
     int layer_end = -1;
     int batch_size = 0;
+    int max_batch_tokens = 0;
     int batch_wait_us = -1;
     const char *backend = "cpu";
     const char *host = "127.0.0.1";
@@ -529,6 +532,14 @@ int main(int argc, char *argv[])
             batch_wait_us = atoi(argv[++arg_start]);
             if (batch_wait_us < 0) {
                 fprintf(stderr, "--batch-wait-us must be >= 0\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+        else if (!strcmp(f, "--max-batch-tokens")) {
+            max_batch_tokens = atoi(argv[++arg_start]);
+            if (max_batch_tokens <= 0) {
+                fprintf(stderr, "--max-batch-tokens must be > 0\n");
                 free_model_specs(&model_specs);
                 return 1;
             }
@@ -619,6 +630,7 @@ int main(int argc, char *argv[])
             .host = host,
             .port = port,
             .batch_size = batch_size > 0 ? batch_size : 8,
+            .max_batch_tokens = max_batch_tokens,
             .batch_wait_us = batch_wait_us,
             .use_mlx = use_mlx,
             .enable_cors = cors,
