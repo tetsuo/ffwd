@@ -452,19 +452,13 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     mlx_divide(&emb, emb_sum, lengths, S);
     mlx_array_free(emb_sum); mlx_array_free(lengths);
 
-    /* 5. L2 normalize each row. */
-    int norm_axes[] = {1};
-    mlx_array nv = mlx_array_new();
-    mlx_linalg_norm_l2(&nv, emb, norm_axes, 1, true, S);
-    mlx_array emb_n = mlx_array_new();
-    mlx_divide(&emb_n, emb, nv, S);
-    mlx_array_free(emb); mlx_array_free(nv);
     if (has_padding) mlx_array_free(attn_mask);
 
-    /* 6. Eval and copy [B, hidden] to CPU. */
+    /* 5. Eval and copy [B, hidden] to CPU. Perplexity embeddings are
+     * intentionally unnormalized; callers should use cosine similarity. */
     mlx_array emb_f32 = mlx_array_new();
-    mlx_astype(&emb_f32, emb_n, MLX_FLOAT32, S);
-    mlx_array_free(emb_n);
+    mlx_astype(&emb_f32, emb, MLX_FLOAT32, S);
+    mlx_array_free(emb);
 
     mlx_array_eval(emb_f32);
     const float *data = mlx_array_data_float32(emb_f32);

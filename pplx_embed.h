@@ -94,7 +94,10 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
  *   2. N transformer layers (bidirectional GQA + RoPE + SwiGLU)
  *   3. Final RMSNorm
  *   4. Mean pooling over all positions
- *   5. L2 normalization
+ *
+ * Perplexity embeddings are intentionally not L2-normalized. Use cosine
+ * similarity for comparisons, or normalize explicitly before storing in vector
+ * databases that only support inner product.
  *
  * Returns malloc'd float[hidden_size] (caller frees). NULL on error.
  */
@@ -142,11 +145,11 @@ int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
                             float *out_states);
 
 /*
- * Pool normalized embeddings from final hidden states.
+ * Pool embeddings from final hidden states.
  *
  * states is [n_tokens, hidden_size], normally produced by
- * pplx_model_forward_into().  Each span is mean pooled and L2 normalized into
- * out_embeddings[n_spans, hidden_size].
+ * pplx_model_forward_into(). Each span is mean pooled into
+ * out_embeddings[n_spans, hidden_size] without L2 normalization.
  */
 int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
                     const pplx_span_t *spans, int n_spans,
@@ -162,7 +165,7 @@ int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
                            float *out_embeddings);
 
 /*
- * Cosine similarity between two L2-normalized vectors.
+ * Cosine similarity between two vectors.
  */
 float pplx_cosine_similarity(const float *a, const float *b, int dim);
 

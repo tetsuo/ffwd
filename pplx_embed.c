@@ -889,10 +889,10 @@ static int forward_packed_inplace(const pplx_model_t *model,
     return 0;
 }
 
-static void pool_normalized_embeddings(const pplx_model_t *model,
-                                       const pplx_workspace_t *ws,
-                                       const int *offsets, int batch,
-                                       float *out_embeddings)
+static void pool_embeddings(const pplx_model_t *model,
+                            const pplx_workspace_t *ws,
+                            const int *offsets, int batch,
+                            float *out_embeddings)
 {
     const pplx_config_t *cfg = &model->config;
     int hidden = cfg->hidden_size;
@@ -923,15 +923,6 @@ static void pool_normalized_embeddings(const pplx_model_t *model,
         for (int d = 0; d < hidden; d++)
             emb[d] *= inv_len;
 
-        float norm_sq = 0.0f;
-        for (int d = 0; d < hidden; d++)
-            norm_sq += emb[d] * emb[d];
-        float nv = sqrtf(norm_sq);
-        if (nv > 1e-8f) {
-            float inv = 1.0f / nv;
-            for (int d = 0; d < hidden; d++)
-                emb[d] *= inv;
-        }
     }
 }
 
@@ -988,17 +979,8 @@ int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
         }
 
         float inv_len = 1.0f / (float)len;
-        float norm_sq = 0.0f;
         for (int d = 0; d < hidden; d++) {
             emb[d] *= inv_len;
-            norm_sq += emb[d] * emb[d];
-        }
-
-        float nv = sqrtf(norm_sq);
-        if (nv > 1e-8f) {
-            float inv = 1.0f / nv;
-            for (int d = 0; d < hidden; d++)
-                emb[d] *= inv;
         }
     }
     return 0;
@@ -1058,7 +1040,7 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
     int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
                                     total_seq, max_seq, 0);
     if (rc == 0)
-        pool_normalized_embeddings(model, ws, offsets, batch, out_embeddings);
+        pool_embeddings(model, ws, offsets, batch, out_embeddings);
 
     return rc;
 }

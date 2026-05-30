@@ -875,6 +875,13 @@ static char *base64_encode(const unsigned char *src, size_t n) {
     return out;
 }
 
+static signed char quantize_int8_tanh(float x) {
+    int v = (int)lrintf(tanhf(x) * 127.0f);
+    if (v > 127) v = 127;
+    if (v < -128) v = -128;
+    return (signed char)v;
+}
+
 static char *encode_embedding(const float *emb, int dims, const char *encoding) {
     if (!strcmp(encoding, "base64_binary")) {
         size_t bytes = (size_t)dims / 8;
@@ -889,18 +896,8 @@ static char *encode_embedding(const float *emb, int dims, const char *encoding) 
     }
 
     signed char *q = xmalloc((size_t)dims);
-    float max_abs = 0.0f;
-    for (int i = 0; i < dims; i++) {
-        float a = fabsf(emb[i]);
-        if (a > max_abs) max_abs = a;
-    }
-    float scale = max_abs > 1e-12f ? 127.0f / max_abs : 0.0f;
-    for (int i = 0; i < dims; i++) {
-        int v = (int)lrintf(emb[i] * scale);
-        if (v > 127) v = 127;
-        if (v < -127) v = -127;
-        q[i] = (signed char)v;
-    }
+    for (int i = 0; i < dims; i++)
+        q[i] = quantize_int8_tanh(emb[i]);
     char *out = base64_encode((const unsigned char *)q, (size_t)dims);
     free(q);
     return out;
@@ -979,7 +976,8 @@ static void append_float_embedding_object(sbuf *b, int index,
     sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", index);
     for (int i = 0; i < dims; i++) {
         if (i) sbuf_putc(b, ',');
-        sbuf_printf(b, "%.9g", (double)emb[i]);
+        float v = (float)quantize_int8_tanh(emb[i]) / 128.0f;
+        sbuf_printf(b, "%.9g", (double)v);
     }
     sbuf_puts(b, "]}");
 }
