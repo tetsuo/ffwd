@@ -449,6 +449,22 @@ void multi_safetensors_close(multi_safetensors_t *ms) {
     free(ms);
 }
 
+int multi_safetensors_data_nbytes(const multi_safetensors_t *ms,
+                                  size_t *out_nbytes) {
+    if (!ms || !out_nbytes) return -1;
+    size_t total = 0;
+    for (int s = 0; s < ms->num_shards; s++) {
+        const safetensors_file_t *sf = ms->shards[s];
+        for (int i = 0; i < sf->num_tensors; i++) {
+            size_t n = sf->tensors[i].data_size;
+            if (n > SIZE_MAX - total) return -1;
+            total += n;
+        }
+    }
+    *out_nbytes = total;
+    return 0;
+}
+
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
                                             const char *name,
                                             safetensors_file_t **out_sf) {

@@ -4,6 +4,7 @@
 
 #include "pplx_server.h"
 #include "pplx_embed.h"
+#include "qwen_asr_safetensors.h"
 #include "qwen_asr_tokenizer.h"
 
 #ifdef USE_MLX
@@ -35,6 +36,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 #include <cjson/cJSON.h>
 
 #define PPLX_HTTP_IO_BUF 8192
@@ -55,6 +60,8 @@
 #define PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
 #define PPLX_SERVER_BATCH_WAIT_US 1000
 #define PPLX_SERVER_MICROBATCH_MAX_JOBS 128
+#define PPLX_MLX_MEMORY_BUDGET_PERCENT 90
+#define PPLX_MLX_RESIDENT_MULTIPLIER 2
 
 typedef struct {
     char *ptr;
@@ -1884,11 +1891,107 @@ static void free_models(http_server *s) {
     }
 }
 
+static uint64_t physical_memory_nbytes(void) {
+#ifdef __APPLE__
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) == 0 &&
+        len == sizeof(bytes) && bytes > 0)
+        return bytes;
+#endif
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0 ||
+        (uint64_t)pages > UINT64_MAX / (uint64_t)page_size)
+        return 0;
+    return (uint64_t)pages * (uint64_t)page_size;
+}
+
+static int validate_model_specs(const pplx_server_config_t *cfg) {
+    int seen[4] = {0};
+    for (int i = 0; i < cfg->n_models; i++) {
+        const pplx_server_model_spec_t *spec = &cfg->models[i];
+        model_slot slot = model_slot_for_id(spec->id);
+        if (slot == MODEL_UNKNOWN) {
+            fprintf(stderr, "pplx-serve: unknown model id: %s\n",
+                    spec->id ? spec->id : "<null>");
+            return -1;
+        }
+        if (!spec->path || !spec->path[0]) {
+            fprintf(stderr, "pplx-serve: model %s has an empty path\n",
+                    spec->id);
+            return -1;
+        }
+        if (seen[slot]) {
+            fprintf(stderr, "pplx-serve: duplicate model id: %s\n", spec->id);
+            return -1;
+        }
+        seen[slot] = 1;
+    }
+    return 0;
+}
+
+static int mlx_memory_preflight(const pplx_server_config_t *cfg) {
+    if (!cfg->use_mlx) return 0;
+
+    uint64_t payload = 0;
+    for (int i = 0; i < cfg->n_models; i++) {
+        multi_safetensors_t *ms =
+            multi_safetensors_open(cfg->models[i].path);
+        size_t model_payload = 0;
+        if (!ms || multi_safetensors_data_nbytes(ms, &model_payload) != 0) {
+            multi_safetensors_close(ms);
+            fprintf(stderr, "pplx-serve: failed to inspect MLX model: %s\n",
+                    cfg->models[i].path);
+            return -1;
+        }
+        multi_safetensors_close(ms);
+        if ((uint64_t)model_payload > UINT64_MAX - payload) {
+            fprintf(stderr, "pplx-serve: MLX model payload size overflow\n");
+            return -1;
+        }
+        payload += (uint64_t)model_payload;
+    }
+
+    if (payload > UINT64_MAX / PPLX_MLX_RESIDENT_MULTIPLIER) {
+        fprintf(stderr, "pplx-serve: MLX resident-memory estimate overflow\n");
+        return -1;
+    }
+    uint64_t estimated = payload * PPLX_MLX_RESIDENT_MULTIPLIER;
+    uint64_t physical = physical_memory_nbytes();
+    if (physical == 0) {
+        server_log("pplx-serve: warning: could not determine physical memory; "
+                   "skipping MLX memory preflight");
+        return 0;
+    }
+    uint64_t budget =
+        physical / 100 * PPLX_MLX_MEMORY_BUDGET_PERCENT +
+        physical % 100 * PPLX_MLX_MEMORY_BUDGET_PERCENT / 100;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    server_log("pplx-serve: MLX memory preflight: %.1f GiB tensors, "
+               "%.1f GiB estimated resident, %.1f GiB safety budget",
+               (double)payload / gib, (double)estimated / gib,
+               (double)budget / gib);
+    if (estimated <= budget) return 0;
+    if (cfg->allow_memory_overcommit) {
+        server_log("pplx-serve: warning: MLX memory estimate exceeds safety "
+                   "budget; continuing due to --allow-memory-overcommit");
+        return 0;
+    }
+    server_log("pplx-serve: refusing MLX model set above host-memory safety "
+               "budget");
+    server_log("pplx-serve: use BF16 artifacts, load fewer models, or pass "
+               "--allow-memory-overcommit");
+    return -1;
+}
+
 int pplx_run_server(const pplx_server_config_t *cfg) {
     if (!cfg || !cfg->models || cfg->n_models <= 0) {
         fprintf(stderr, "pplx-serve: at least one --model MODEL_ID=PATH is required\n");
         return 1;
     }
+    if (validate_model_specs(cfg) != 0 || mlx_memory_preflight(cfg) != 0)
+        return 1;
 
     http_server s;
     memset(&s, 0, sizeof(s));

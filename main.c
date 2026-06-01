@@ -42,6 +42,8 @@ static void print_usage(const char *prog)
         "               Load model ID from directory for --serve (repeatable)\n"
         "  --backend cpu|mlx\n"
         "               Backend for --serve (default: cpu)\n"
+        "  --allow-memory-overcommit\n"
+        "               Allow an MLX server model set above the host-memory safety budget\n"
         "  --host HOST  Server bind host (default: 127.0.0.1)\n"
         "  --port N     Server bind port (default: 8000)\n"
         "  --cors       Enable CORS headers in --serve mode\n"
@@ -507,6 +509,7 @@ int main(int argc, char *argv[])
     int stdin_mode = 0;
     int serve_mode = 0;
     int dist_worker_mode = 0;
+    int allow_memory_overcommit = 0;
     const char *dist_remote = NULL;
     int layer_start = -1;
     int layer_end = -1;
@@ -567,6 +570,9 @@ int main(int argc, char *argv[])
         }
         else if (!strcmp(f, "--host"))   { host = argv[++arg_start]; }
         else if (!strcmp(f, "--port"))   { port = atoi(argv[++arg_start]); }
+        else if (!strcmp(f, "--allow-memory-overcommit")) {
+            allow_memory_overcommit = 1;
+        }
         else if (!strcmp(f, "--layers")) {
             if (parse_layers(argv[++arg_start], &layer_start, &layer_end) != 0) {
                 fprintf(stderr, "--layers expects START:END with START < END\n");
@@ -633,6 +639,7 @@ int main(int argc, char *argv[])
             .max_batch_tokens = max_batch_tokens,
             .batch_wait_us = batch_wait_us,
             .use_mlx = use_mlx,
+            .allow_memory_overcommit = allow_memory_overcommit,
             .enable_cors = cors,
             .api_key = api_key,
         };

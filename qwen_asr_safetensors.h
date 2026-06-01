@@ -54,6 +54,8 @@ void safetensors_close(safetensors_file_t *sf);
 /* Open model from directory (auto-detects single file or multi-shard) */
 multi_safetensors_t *multi_safetensors_open(const char *model_dir);
 void multi_safetensors_close(multi_safetensors_t *ms);
+int multi_safetensors_data_nbytes(const multi_safetensors_t *ms,
+                                  size_t *out_nbytes);
 
 /* Find a tensor by name across all shards */
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,

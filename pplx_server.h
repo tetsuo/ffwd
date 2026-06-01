@@ -17,6 +17,7 @@ typedef struct {
     int max_batch_tokens;
     int batch_wait_us;
     int use_mlx;
+    int allow_memory_overcommit;
     int enable_cors;
     const char *api_key;
 } pplx_server_config_t;
