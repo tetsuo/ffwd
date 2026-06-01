@@ -17,6 +17,7 @@
 #define PPLX_VOCAB_SIZE     151936
 #define PPLX_HEAD_DIM       128
 #define PPLX_MAX_LAYERS     64      /* upper bound for stack arrays */
+#define PPLX_CONTEXT_SEPARATOR_TOKEN_ID 151643 /* <|endoftext|> */
 
 /* ========================================================================
  * Model Configuration (populated from config.json at load time)

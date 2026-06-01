@@ -198,8 +198,7 @@ typedef struct {
     const model_info *info;
     char *path;
     qwen_tokenizer_t *tok;
-    int newline_n;
-    int *newline_ids;
+    int context_separator_id;
     pplx_model_t *cpu_model;
     pplx_workspace_t *cpu_ws;
 #ifdef USE_MLX
@@ -1552,8 +1551,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
                 xcalloc((size_t)n_chunks, sizeof(*chunk_tokens));
             doc->spans = xcalloc((size_t)n_chunks, sizeof(*doc->spans));
             doc->n_spans = n_chunks;
-            int64_t doc_tokens = n_chunks > 1
-                ? (int64_t)(n_chunks - 1) * m->newline_n : 0;
+            int64_t doc_tokens = n_chunks > 1 ? n_chunks - 1 : 0;
             int doc_valid = 1;
 
             cJSON *chunk;
@@ -1591,9 +1589,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
                            (size_t)chunk_tokens[ci].n_tokens * sizeof(*doc->ids));
                     pos += chunk_tokens[ci].n_tokens;
                     if (ci + 1 < n_chunks) {
-                        memcpy(doc->ids + pos, m->newline_ids,
-                               (size_t)m->newline_n * sizeof(*doc->ids));
-                        pos += m->newline_n;
+                        doc->ids[pos++] = m->context_separator_id;
                     }
                 }
             }
@@ -1848,11 +1844,7 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         server_log("pplx-serve: failed to load tokenizer: %s", vocab_path);
         return -1;
     }
-    m->newline_ids = qwen_tokenizer_encode(m->tok, "\n", &m->newline_n);
-    if (!m->newline_ids || m->newline_n <= 0) {
-        server_log("pplx-serve: failed to tokenize newline separator");
-        return -1;
-    }
+    m->context_separator_id = PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
 #ifdef USE_MLX
     if (s->use_mlx) {
         /* MLX streams are thread-local. The inference worker loads the MLX
@@ -1883,7 +1875,6 @@ static void free_models(http_server *s) {
     for (int i = 0; i < 4; i++) {
         loaded_model *m = &s->models[i];
         free(m->path);
-        free(m->newline_ids);
         if (m->tok) qwen_tokenizer_free(m->tok);
         if (m->cpu_ws) pplx_workspace_free(m->cpu_ws);
         if (m->cpu_model) pplx_model_free(m->cpu_model);
