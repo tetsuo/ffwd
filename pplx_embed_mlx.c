@@ -412,16 +412,16 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
 
     size_t elems = (size_t)batch * (size_t)max_seq;
     int *padded_ids = (int *)malloc(elems * sizeof(int));
-    float *pool_mask_data = (float *)malloc(elems * sizeof(float));
+    float *pool_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
     float *attn_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
-    float *len_data = (float *)malloc((size_t)batch * sizeof(float));
-    if (!padded_ids || !pool_mask_data || (has_padding && !attn_mask_data) || !len_data) {
+    float *len_data = has_padding ? (float *)malloc((size_t)batch * sizeof(float)) : NULL;
+    if (!padded_ids || (has_padding && (!pool_mask_data || !attn_mask_data || !len_data))) {
         free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
         return -1;
     }
 
     for (int b = 0; b < batch; b++) {
-        len_data[b] = (float)inputs[b].n_tokens;
+        if (has_padding) len_data[b] = (float)inputs[b].n_tokens;
         for (int t = 0; t < max_seq; t++) {
             size_t idx = (size_t)b * max_seq + t;
             if (t < inputs[b].n_tokens) {
@@ -434,12 +434,14 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                     return -1;
                 }
                 padded_ids[idx] = id;
-                pool_mask_data[idx] = 1.0f;
-                if (has_padding) attn_mask_data[idx] = 0.0f;
+                if (has_padding) {
+                    pool_mask_data[idx] = 1.0f;
+                    attn_mask_data[idx] = 0.0f;
+                }
             } else {
                 padded_ids[idx] = 0;
                 pool_mask_data[idx] = 0.0f;
-                if (has_padding) attn_mask_data[idx] = -1.0e9f;
+                attn_mask_data[idx] = -1.0e9f;
             }
         }
     }
@@ -450,15 +452,19 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     int len_shape[] = {batch, 1};
 
     mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
-    mlx_array pool_mask = mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32);
+    mlx_array pool_mask = has_padding
+        ? mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32)
+        : (mlx_array){0};
     mlx_array attn_mask = has_padding
         ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
         : (mlx_array){0};
-    mlx_array lengths = mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32);
+    mlx_array lengths = has_padding
+        ? mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32)
+        : (mlx_array){0};
     free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
 
-    if (!arr_ok(ids) || !arr_ok(pool_mask) || (has_padding && !arr_ok(attn_mask)) ||
-        !arr_ok(lengths)) {
+    if (!arr_ok(ids) || (has_padding && (!arr_ok(pool_mask) ||
+        !arr_ok(attn_mask) || !arr_ok(lengths)))) {
         mlx_array_free(ids); mlx_array_free(pool_mask);
         if (has_padding) mlx_array_free(attn_mask);
         mlx_array_free(lengths);
@@ -489,21 +495,26 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
     mlx_array_free(x);
 
-    /* 4. Masked mean pool over T. */
-    mlx_array masked = mlx_array_new();
-    mlx_multiply(&masked, x_normed, pool_mask, S);
-    mlx_array_free(x_normed);
-    mlx_array_free(pool_mask);
-
-    mlx_array emb_sum = mlx_array_new();
-    mlx_sum_axis(&emb_sum, masked, 1, false, S);
-    mlx_array_free(masked);
-
     mlx_array emb = mlx_array_new();
-    mlx_divide(&emb, emb_sum, lengths, S);
-    mlx_array_free(emb_sum); mlx_array_free(lengths);
+    if (has_padding) {
+        /* 4. Masked mean pool over T. */
+        mlx_array masked = mlx_array_new();
+        mlx_multiply(&masked, x_normed, pool_mask, S);
+        mlx_array_free(x_normed);
+        mlx_array_free(pool_mask);
 
-    if (has_padding) mlx_array_free(attn_mask);
+        mlx_array emb_sum = mlx_array_new();
+        mlx_sum_axis(&emb_sum, masked, 1, false, S);
+        mlx_array_free(masked);
+
+        mlx_divide(&emb, emb_sum, lengths, S);
+        mlx_array_free(emb_sum); mlx_array_free(lengths);
+        mlx_array_free(attn_mask);
+    } else {
+        /* Equal-length batches do not need masks or a separate divide. */
+        mlx_mean_axis(&emb, x_normed, 1, false, S);
+        mlx_array_free(x_normed);
+    }
 
     /* 5. Eval and copy [B, hidden] to CPU. Perplexity embeddings are
      * intentionally unnormalized; callers should use cosine similarity. */
