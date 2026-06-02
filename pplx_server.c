@@ -1005,6 +1005,26 @@ static int model_embed_spans_batch(loaded_model *m,
                                         out);
 }
 
+static int model_uses_dense_batches(const loaded_model *m) {
+#ifdef USE_MLX
+    return m->mlx_ctx != NULL;
+#else
+    (void)m;
+    return 0;
+#endif
+}
+
+/* Inputs are sorted by length before chunking. CPU packs real tokens while MLX
+ * pads each dense row to the longest input in the chunk. */
+static int inference_batch_accepts_input(const loaded_model *m, int batch,
+                                         int packed_tokens, int next_tokens,
+                                         int max_batch_tokens) {
+    if (batch == 0) return 1;
+    if (model_uses_dense_batches(m))
+        return next_tokens <= max_batch_tokens / (batch + 1);
+    return next_tokens <= max_batch_tokens - packed_tokens;
+}
+
 static void append_embedding_object(sbuf *b, int index, const char *embedding) {
     sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":\"", index);
     sbuf_puts(b, embedding);
@@ -1125,7 +1145,8 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
         int tokens = 0;
         while (start + cur < total_inputs && cur < max_batch) {
             int n_tokens = items[start + cur].input.n_tokens;
-            if (cur > 0 && n_tokens > max_batch_tokens - tokens)
+            if (!inference_batch_accepts_input(m, cur, tokens, n_tokens,
+                                               max_batch_tokens))
                 break;
             inputs[cur] = items[start + cur].input;
             tokens += n_tokens;
@@ -1277,7 +1298,9 @@ static void execute_contextual_request_list(contextual_request **reqs,
         int chunks = 0;
         while (start + cur < total_docs && cur < max_batch) {
             const pplx_context_input_t *input = &items[start + cur].input;
-            if (cur > 0 && input->input.n_tokens > max_batch_tokens - tokens)
+            if (!inference_batch_accepts_input(m, cur, tokens,
+                                               input->input.n_tokens,
+                                               max_batch_tokens))
                 break;
             inputs[cur] = *input;
             tokens += input->input.n_tokens;
