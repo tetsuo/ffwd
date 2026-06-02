@@ -38,9 +38,74 @@ struct pplx_mlx_ctx {
 
 static int arr_ok(mlx_array a) { return a.ctx != NULL; }
 
+static int mlx_mul_size(size_t a, size_t b, size_t *out)
+{
+    if (a != 0 && b > SIZE_MAX / a) return -1;
+    *out = a * b;
+    return 0;
+}
+
 static mlx_dtype mlx_weight_dtype(const pplx_mlx_ctx_t *ctx)
 {
     return mlx_array_dtype(ctx->layers[ctx->layer_start].wq);
+}
+
+static size_t safetensor_dtype_size(safetensor_dtype_t dtype)
+{
+    switch (dtype) {
+    case DTYPE_F32:  return sizeof(float);
+    case DTYPE_BF16: return sizeof(uint16_t);
+    default:         return 0;
+    }
+}
+
+static int mlx_tensor_has_supported_shape(const safetensors_file_t *sf,
+                                          const safetensor_t *t,
+                                          const char *name, const int *shape,
+                                          int ndim)
+{
+    size_t elem_size = safetensor_dtype_size(t->dtype);
+    if (elem_size == 0) {
+        fprintf(stderr, "mlx: expected F32 or BF16 for %s\n", name);
+        return 0;
+    }
+    if (t->ndim != ndim) {
+        fprintf(stderr, "mlx: bad rank for %s: got %d, expected %d\n",
+                name, t->ndim, ndim);
+        return 0;
+    }
+
+    size_t numel = 1;
+    for (int i = 0; i < ndim; i++) {
+        if (shape[i] <= 0 || t->shape[i] != shape[i]) {
+            fprintf(stderr, "mlx: bad shape for %s at dim %d: "
+                    "got %lld, expected %d\n",
+                    name, i, (long long)t->shape[i], shape[i]);
+            return 0;
+        }
+        if (mlx_mul_size(numel, (size_t)shape[i], &numel) != 0) {
+            fprintf(stderr, "mlx: shape too large for %s\n", name);
+            return 0;
+        }
+    }
+
+    size_t bytes;
+    if (mlx_mul_size(numel, elem_size, &bytes) != 0 ||
+        t->data_size != bytes) {
+        fprintf(stderr, "mlx: bad data size for %s: got %zu, expected %zu\n",
+                name, t->data_size, bytes);
+        return 0;
+    }
+
+    if (sf->header_size > SIZE_MAX - 8) return 0;
+    size_t data_start = 8 + sf->header_size;
+    if (data_start > sf->file_size ||
+        t->data_offset > sf->file_size - data_start ||
+        t->data_size > sf->file_size - data_start - t->data_offset) {
+        fprintf(stderr, "mlx: tensor data out of bounds for %s\n", name);
+        return 0;
+    }
+    return 1;
 }
 
 static mlx_array load_tensor(multi_safetensors_t *ms, const char *name,
@@ -52,6 +117,8 @@ static mlx_array load_tensor(multi_safetensors_t *ms, const char *name,
         fprintf(stderr, "mlx: tensor not found: %s\n", name);
         return (mlx_array){0};
     }
+    if (!mlx_tensor_has_supported_shape(sf, t, name, shape, ndim))
+        return (mlx_array){0};
     mlx_dtype dtype;
     if (t->dtype == DTYPE_F32) {
         dtype = MLX_FLOAT32;
@@ -113,38 +180,66 @@ static const char *json_find_m(const char *json, const char *key)
 static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
 {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    int path_len = snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+        fprintf(stderr, "mlx: model path too long\n");
+        return -1;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "mlx: cannot open %s\n", path); return -1; }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc(sz + 1);
-    if (!buf || fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); free(buf); return -1; }
+    if (sz < 0 || (size_t)sz == SIZE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f); free(buf); return -1;
+    }
     fclose(f);
     buf[sz] = '\0';
 
-#define GI(k, fb) do { const char *v = json_find_m(buf, k); cfg->fb = v ? atoi(v) : 0; } while(0)
+#define GI(k, fb, def) do { const char *v = json_find_m(buf, k); cfg->fb = v ? atoi(v) : def; } while(0)
 #define GF(k, fb, def) do { const char *v = json_find_m(buf, k); cfg->fb = v ? (float)atof(v) : def; } while(0)
-    GI("hidden_size",         hidden_size);
-    GI("num_hidden_layers",   n_layers);
-    GI("num_attention_heads",  n_heads);
-    GI("num_key_value_heads",  n_kv_heads);
-    GI("intermediate_size",   intermediate_size);
-    cfg->head_dim  = PPLX_HEAD_DIM;
-    cfg->vocab_size = PPLX_VOCAB_SIZE;
+    GI("hidden_size",         hidden_size, 0);
+    GI("num_hidden_layers",   n_layers, 0);
+    GI("num_attention_heads",  n_heads, 0);
+    GI("num_key_value_heads",  n_kv_heads, 0);
+    GI("head_dim",             head_dim, PPLX_HEAD_DIM);
+    GI("intermediate_size",   intermediate_size, 0);
+    GI("vocab_size",           vocab_size, PPLX_VOCAB_SIZE);
     GF("rms_norm_eps",  rms_norm_eps, 1e-6f);
     GF("rope_theta",    rope_theta, 1000000.0f);
 #undef GI
 #undef GF
 
-    cfg->q_dim  = cfg->n_heads    * cfg->head_dim;
-    cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
+    cfg->q_dim = 0;
+    cfg->kv_dim = 0;
+    if (cfg->n_heads > 0 && cfg->head_dim > 0 &&
+        cfg->n_heads <= INT_MAX / cfg->head_dim)
+        cfg->q_dim = cfg->n_heads * cfg->head_dim;
+    if (cfg->n_kv_heads > 0 && cfg->head_dim > 0 &&
+        cfg->n_kv_heads <= INT_MAX / cfg->head_dim)
+        cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
     free(buf);
 
-    if (cfg->hidden_size <= 0 || cfg->n_layers <= 0) {
-        fprintf(stderr, "mlx: bad config (hidden=%d layers=%d)\n",
-                cfg->hidden_size, cfg->n_layers);
+    if (cfg->hidden_size <= 0 || cfg->n_layers <= 0 ||
+        cfg->n_heads <= 0 || cfg->n_kv_heads <= 0 ||
+        cfg->head_dim <= 0 || cfg->intermediate_size <= 0 ||
+        cfg->vocab_size <= 0 || cfg->q_dim <= 0 || cfg->kv_dim <= 0 ||
+        (cfg->head_dim & 1) || cfg->n_heads % cfg->n_kv_heads != 0 ||
+        !isfinite(cfg->rms_norm_eps) || cfg->rms_norm_eps <= 0.0f ||
+        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f) {
+        fprintf(stderr, "mlx: invalid config in %s "
+                "(hidden=%d, layers=%d, heads=%d/%d, head_dim=%d, inter=%d)\n",
+                path, cfg->hidden_size, cfg->n_layers, cfg->n_heads,
+                cfg->n_kv_heads, cfg->head_dim, cfg->intermediate_size);
+        return -1;
+    }
+    if (cfg->n_layers > PPLX_MAX_LAYERS) {
+        fprintf(stderr, "mlx: too many layers (%d > %d)\n",
+                cfg->n_layers, PPLX_MAX_LAYERS);
         return -1;
     }
     return 0;
@@ -170,7 +265,6 @@ static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
     }
     ctx->layer_start = layer_start;
     ctx->layer_end = layer_end;
-    ctx->stream = mlx_default_gpu_stream_new();
 
     ctx->ms = multi_safetensors_open(model_dir);
     if (!ctx->ms) {
@@ -226,6 +320,8 @@ static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
         if (!arr_ok(ctx->norm)) goto fail;
     }
 
+    ctx->stream = mlx_default_gpu_stream_new();
+
     if (pplx_verbose >= 1)
         fprintf(stderr, "mlx: layers [%d, %d) loaded (%d-dim)\n",
                 layer_start, layer_end, h);
@@ -272,7 +368,7 @@ void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
         free(ctx->layers);
     }
     mlx_array_free(ctx->norm);
-    mlx_stream_free(ctx->stream);
+    if (ctx->stream.ctx) mlx_stream_free(ctx->stream);
     if (ctx->ms) multi_safetensors_close(ctx->ms);
     free(ctx);
 }
@@ -410,11 +506,18 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         if (inputs[b].n_tokens != max_seq) has_padding = 1;
     }
 
-    size_t elems = (size_t)batch * (size_t)max_seq;
-    int *padded_ids = (int *)malloc(elems * sizeof(int));
-    float *pool_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
-    float *attn_mask_data = has_padding ? (float *)malloc(elems * sizeof(float)) : NULL;
-    float *len_data = has_padding ? (float *)malloc((size_t)batch * sizeof(float)) : NULL;
+    size_t elems, ids_bytes, mask_bytes, len_bytes, out_values, out_bytes;
+    if (mlx_mul_size((size_t)batch, (size_t)max_seq, &elems) != 0 ||
+        mlx_mul_size(elems, sizeof(int), &ids_bytes) != 0 ||
+        mlx_mul_size(elems, sizeof(float), &mask_bytes) != 0 ||
+        mlx_mul_size((size_t)batch, sizeof(float), &len_bytes) != 0 ||
+        mlx_mul_size((size_t)batch, (size_t)hidden, &out_values) != 0 ||
+        mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0)
+        return -1;
+    int *padded_ids = (int *)malloc(ids_bytes);
+    float *pool_mask_data = has_padding ? (float *)malloc(mask_bytes) : NULL;
+    float *attn_mask_data = has_padding ? (float *)malloc(mask_bytes) : NULL;
+    float *len_data = has_padding ? (float *)malloc(len_bytes) : NULL;
     if (!padded_ids || (has_padding && (!pool_mask_data || !attn_mask_data || !len_data))) {
         free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
         return -1;
@@ -526,7 +629,7 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     const float *data = mlx_array_data_float32(emb_f32);
     int rc = -1;
     if (data) {
-        memcpy(out_embeddings, data, (size_t)batch * hidden * sizeof(float));
+        memcpy(out_embeddings, data, out_bytes);
         rc = 0;
     }
     mlx_array_free(emb_f32);
@@ -575,19 +678,21 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
         if (inputs[b].n_tokens != max_seq) has_padding = 1;
     }
 
-    if ((size_t)batch > SIZE_MAX / (size_t)max_seq) return -1;
-    size_t rows = (size_t)batch * (size_t)max_seq;
-    if (rows > SIZE_MAX / (size_t)hidden ||
-        rows * (size_t)hidden > SIZE_MAX / sizeof(float))
+    size_t rows, state_values, ids_bytes, mask_bytes, state_bytes, row_bytes;
+    if (mlx_mul_size((size_t)batch, (size_t)max_seq, &rows) != 0 ||
+        mlx_mul_size(rows, (size_t)hidden, &state_values) != 0 ||
+        mlx_mul_size(rows, sizeof(int), &ids_bytes) != 0 ||
+        mlx_mul_size(rows, sizeof(float), &mask_bytes) != 0 ||
+        mlx_mul_size(state_values, sizeof(float), &state_bytes) != 0 ||
+        mlx_mul_size((size_t)hidden, sizeof(float), &row_bytes) != 0)
         return -1;
-    size_t state_values = rows * (size_t)hidden;
 
     int *padded_ids = layer_start == 0
-        ? (int *)malloc(rows * sizeof(int)) : NULL;
+        ? (int *)malloc(ids_bytes) : NULL;
     float *padded_states = layer_start != 0
-        ? (float *)calloc(state_values, sizeof(float)) : NULL;
+        ? (float *)calloc(1, state_bytes) : NULL;
     float *attn_mask_data = has_padding
-        ? (float *)malloc(rows * sizeof(float)) : NULL;
+        ? (float *)malloc(mask_bytes) : NULL;
     if ((layer_start == 0 && !padded_ids) ||
         (layer_start != 0 && !padded_states) ||
         (has_padding && !attn_mask_data)) {
@@ -613,7 +718,7 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
                 } else {
                     memcpy(padded_states + dense_row * hidden,
                            input_states + (size_t)(packed_offset + t) * hidden,
-                           (size_t)hidden * sizeof(float));
+                           row_bytes);
                 }
                 if (has_padding) attn_mask_data[dense_row] = 0.0f;
             } else {
@@ -699,7 +804,7 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
     for (int b = 0; b < batch; b++) {
         memcpy(out_states + (size_t)packed_offset * hidden,
                data + (size_t)b * max_seq * hidden,
-               (size_t)inputs[b].n_tokens * hidden * sizeof(float));
+               (size_t)inputs[b].n_tokens * row_bytes);
         packed_offset += inputs[b].n_tokens;
     }
     mlx_array_free(x_f32);
@@ -749,14 +854,17 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     for (int b = 0; b < batch; b++)
         if (inputs[b].input.n_tokens != max_seq) has_padding = 1;
 
-    if ((size_t)batch > SIZE_MAX / (size_t)max_seq) return -1;
-    size_t rows = (size_t)batch * (size_t)max_seq;
-    if (rows > SIZE_MAX / sizeof(int) ||
-        (has_padding && rows > SIZE_MAX / sizeof(float)))
+    size_t rows, ids_bytes, mask_bytes, pooled_bytes, out_values, out_bytes;
+    if (mlx_mul_size((size_t)batch, (size_t)max_seq, &rows) != 0 ||
+        mlx_mul_size(rows, sizeof(int), &ids_bytes) != 0 ||
+        mlx_mul_size(rows, sizeof(float), &mask_bytes) != 0 ||
+        mlx_mul_size((size_t)total_spans, sizeof(mlx_array), &pooled_bytes) != 0 ||
+        mlx_mul_size((size_t)total_spans, (size_t)hidden, &out_values) != 0 ||
+        mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0)
         return -1;
-    int *padded_ids = (int *)malloc(rows * sizeof(*padded_ids));
+    int *padded_ids = (int *)malloc(ids_bytes);
     float *attn_mask_data = has_padding
-        ? (float *)malloc(rows * sizeof(*attn_mask_data)) : NULL;
+        ? (float *)malloc(mask_bytes) : NULL;
     if (!padded_ids || (has_padding && !attn_mask_data)) {
         free(padded_ids);
         free(attn_mask_data);
@@ -782,7 +890,7 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     mlx_array x_normed = (mlx_array){0};
     mlx_array embeddings = (mlx_array){0};
     mlx_array embeddings_f32 = (mlx_array){0};
-    mlx_array *pooled = (mlx_array *)calloc((size_t)total_spans, sizeof(*pooled));
+    mlx_array *pooled = (mlx_array *)calloc(1, pooled_bytes);
     mlx_vector_array pooled_vec = (mlx_vector_array){0};
     int rc = -1;
     if (!pooled) {
@@ -864,8 +972,7 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     mlx_array_eval(embeddings_f32);
     const float *data = mlx_array_data_float32(embeddings_f32);
     if (data) {
-        memcpy(out_embeddings, data,
-               (size_t)total_spans * hidden * sizeof(float));
+        memcpy(out_embeddings, data, out_bytes);
         rc = 0;
     }
 
@@ -899,7 +1006,10 @@ float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
     if (!ctx || !token_ids || n_tokens <= 0) return NULL;
 
     int hidden = ctx->config.hidden_size;
-    float *out = (float *)malloc((size_t)hidden * sizeof(float));
+    size_t out_bytes;
+    if (mlx_mul_size((size_t)hidden, sizeof(float), &out_bytes) != 0)
+        return NULL;
+    float *out = (float *)malloc(out_bytes);
     if (!out) return NULL;
 
     if (pplx_mlx_embed_into(ctx, token_ids, n_tokens, out) != 0) {
