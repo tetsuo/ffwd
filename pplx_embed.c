@@ -53,6 +53,8 @@ struct pplx_workspace {
     float *proj_out;            /* [seq, hidden]       */
     float *ffn_gate;            /* [seq, intermediate] */
     float *ffn_up;              /* [seq, intermediate] */
+    float *attn_scores;         /* reusable BLAS attention score tiles */
+    size_t attn_scores_bytes;
 
     int   *offsets;             /* [batch + 1] packed sequence offsets */
     int    offsets_cap;
@@ -497,6 +499,19 @@ static int ensure_buffers(pplx_workspace_t *ws, const pplx_config_t *c, int seq)
     return 0;
 }
 
+static void ensure_attention_scores(pplx_workspace_t *ws, const int *offsets,
+                                    int batch)
+{
+    size_t bytes =
+        qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+    if (bytes <= ws->attn_scores_bytes) return;
+
+    void *p = realloc(ws->attn_scores, bytes);
+    if (!p) return;
+    ws->attn_scores = (float *)p;
+    ws->attn_scores_bytes = bytes;
+}
+
 /* ========================================================================
  * RoPE cache
  * ======================================================================== */
@@ -722,6 +737,7 @@ void pplx_workspace_free(pplx_workspace_t *ws)
     free(ws->q);       free(ws->k);        free(ws->v);
     free(ws->attn_out); free(ws->proj_out);
     free(ws->ffn_gate); free(ws->ffn_up);
+    free(ws->attn_scores);
     free(ws->offsets);
     free(ws->rope_cos); free(ws->rope_sin);
     free(ws);
@@ -785,6 +801,8 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
         mul_size((size_t)ws->offsets_cap, sizeof(int), &offset_bytes) != 0)
         return SIZE_MAX;
     if (add_size(total, offset_bytes, &total) != 0)
+        return SIZE_MAX;
+    if (add_size(total, ws->attn_scores_bytes, &total) != 0)
         return SIZE_MAX;
 
     return total;
@@ -853,6 +871,7 @@ static int forward_packed_slice_inplace(const pplx_model_t *model,
 
     if (ensure_buffers(ws, cfg, total_seq) != 0) return -1;
     if (ensure_rope_cache(ws, cfg, max_seq) != 0) return -1;
+    ensure_attention_scores(ws, offsets, batch);
 
     const float *rope_cos = ws->rope_cos;
     const float *rope_sin = ws->rope_sin;
@@ -912,9 +931,10 @@ static int forward_packed_slice_inplace(const pplx_model_t *model,
                                  rope_cos, rope_sin, len, n_kv_heads, head_dim);
         }
 
-        qwen_bidirectional_gqa_attention_packed(attn_out, q_buf, k_buf, v_buf,
-                                                offsets, batch, n_heads,
-                                                n_kv_heads, head_dim, scale);
+        qwen_bidirectional_gqa_attention_packed_with_scratch(
+            attn_out, q_buf, k_buf, v_buf, offsets, batch, n_heads,
+            n_kv_heads, head_dim, scale, ws->attn_scores,
+            ws->attn_scores_bytes);
 
         linear_nobias_weight(proj_out, attn_out, &l->wo, total_seq, q_dim, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);

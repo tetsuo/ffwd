@@ -150,6 +150,14 @@ void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
                                              int n_heads, int n_kv_heads,
                                              int head_dim, float scale);
 
+/* Optional reusable scratch for the BLAS-tiled packed attention path. */
+size_t qwen_bidirectional_gqa_attention_packed_scratch_bytes(
+    const int *offsets, int batch);
+void qwen_bidirectional_gqa_attention_packed_with_scratch(
+    float *out, const float *Q, const float *K, const float *V,
+    const int *offsets, int batch, int n_heads, int n_kv_heads,
+    int head_dim, float scale, float *scratch, size_t scratch_bytes);
+
 /* ========================================================================
  * Position Embeddings
  * ======================================================================== */

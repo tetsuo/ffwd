@@ -1451,11 +1451,33 @@ static void packed_gqa_attn_worker(int tid, int n_threads, void *arg) {
     }
 }
 
-void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
-                                             const float *K, const float *V,
-                                             const int *offsets, int batch,
-                                             int n_heads, int n_kv_heads,
-                                             int head_dim, float scale) {
+size_t qwen_bidirectional_gqa_attention_packed_scratch_bytes(
+        const int *offsets, int batch) {
+#ifdef USE_BLAS
+    if (!offsets || batch <= 0) return 0;
+
+    int max_seq = 0;
+    for (int b = 0; b < batch; b++) {
+        int len = offsets[b + 1] - offsets[b];
+        if (len > max_seq) max_seq = len;
+    }
+    if (max_seq < QWEN_PACKED_ATTN_BLAS_MIN_SEQ) return 0;
+    if ((size_t)max_seq > SIZE_MAX / (sizeof(float) *
+            QWEN_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads))
+        return 0;
+    return (size_t)tp.n_threads * QWEN_PACKED_ATTN_QUERY_TILE *
+        (size_t)max_seq * sizeof(float);
+#else
+    (void)offsets;
+    (void)batch;
+    return 0;
+#endif
+}
+
+void qwen_bidirectional_gqa_attention_packed_with_scratch(
+        float *out, const float *Q, const float *K, const float *V,
+        const int *offsets, int batch, int n_heads, int n_kv_heads,
+        int head_dim, float scale, float *scratch, size_t scratch_bytes) {
     long long qk_work = 0;
     int max_seq = 0;
     for (int b = 0; b < batch; b++) {
@@ -1466,13 +1488,12 @@ void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
 
     float *scores = NULL;
 #ifdef USE_BLAS
-    /* Keep score scratch linear in sequence length; OOM falls back online. */
-    if (max_seq >= QWEN_PACKED_ATTN_BLAS_MIN_SEQ &&
-        (size_t)max_seq <= SIZE_MAX / (sizeof(float) *
-            QWEN_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads)) {
-        size_t n = (size_t)tp.n_threads * QWEN_PACKED_ATTN_QUERY_TILE * max_seq;
-        scores = malloc(n * sizeof(*scores));
-    }
+    size_t required = qwen_bidirectional_gqa_attention_packed_scratch_bytes(
+        offsets, batch);
+    if (required != 0 && scratch && scratch_bytes >= required) scores = scratch;
+#else
+    (void)scratch;
+    (void)scratch_bytes;
 #endif
     packed_gqa_attn_task_t task = {
         .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
@@ -1485,6 +1506,19 @@ void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
     } else {
         packed_gqa_attn_worker(0, 1, &task);
     }
+}
+
+void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
+                                             const float *K, const float *V,
+                                             const int *offsets, int batch,
+                                             int n_heads, int n_kv_heads,
+                                             int head_dim, float scale) {
+    size_t scratch_bytes =
+        qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+    float *scores = scratch_bytes ? malloc(scratch_bytes) : NULL;
+    qwen_bidirectional_gqa_attention_packed_with_scratch(
+        out, Q, K, V, offsets, batch, n_heads, n_kv_heads, head_dim, scale,
+        scores, scratch_bytes);
     free(scores);
 }
 
