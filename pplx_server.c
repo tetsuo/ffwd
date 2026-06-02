@@ -152,6 +152,11 @@ static void sbuf_append(sbuf *b, const void *p, size_t n) {
 static void sbuf_putc(sbuf *b, char c) { sbuf_append(b, &c, 1); }
 static void sbuf_puts(sbuf *b, const char *s) { sbuf_append(b, s, strlen(s)); }
 
+static void sbuf_clear(sbuf *b) {
+    b->len = 0;
+    if (b->ptr) b->ptr[0] = '\0';
+}
+
 static void sbuf_printf(sbuf *b, const char *fmt, ...) {
     va_list ap, ap2;
     va_start(ap, fmt);
@@ -251,6 +256,7 @@ typedef struct {
 typedef struct {
     char method[8];
     char path[PPLX_HTTP_MAX_PATH + 1];
+    char version[16];
     char *body;
     size_t body_len;
     char *auth;
@@ -269,6 +275,7 @@ struct client {
     int header_done;
     size_t header_len;
     size_t content_length;
+    int close_after_write;
     http_request req;
     client *prev;
     client *next;
@@ -288,6 +295,10 @@ struct job {
     size_t response_len;
     job *next;
 };
+
+static int queue_write(client *c);
+static void dispatch_request(client *c);
+static void read_cb(aeEventLoop *loop, int fd, void *clientData, int mask);
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_signal_wfd = -1;
@@ -378,8 +389,9 @@ static void append_http_response(client *c, int status, const char *ctype,
     sbuf_printf(&c->out,
                 "HTTP/1.1 %d %s\r\n"
                 "Content-Length: %zu\r\n"
-                "Connection: close\r\n",
-                status, reason, body_len);
+                "Connection: %s\r\n",
+                status, reason, body_len,
+                c->close_after_write ? "close" : "keep-alive");
     if (ctype)
         sbuf_printf(&c->out, "Content-Type: %s\r\n", ctype);
     if (c->srv->enable_cors) {
@@ -461,6 +473,22 @@ static char *header_value_dup(const char *h, size_t n, const char *name) {
     return NULL;
 }
 
+static int header_has_token(const char *value, const char *token) {
+    size_t token_len = strlen(token);
+    const char *p = value;
+    while (p && *p) {
+        while (*p == ',' || isspace((unsigned char)*p)) p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+        if ((size_t)(end - start) == token_len &&
+            !strncasecmp(start, token, token_len))
+            return 1;
+    }
+    return 0;
+}
+
 static int parse_request_headers(client *c) {
     char line[512];
     size_t i = 0;
@@ -469,10 +497,24 @@ static int parse_request_headers(client *c) {
         i++;
     }
     line[i] = '\0';
-    if (sscanf(line, "%7s %255s", c->req.method, c->req.path) != 2)
+    int fields = sscanf(line, "%7s %255s %15s",
+                        c->req.method, c->req.path, c->req.version);
+    if (fields < 2)
         return -1;
+    if (fields < 3)
+        snprintf(c->req.version, sizeof(c->req.version), "HTTP/1.0");
     char *q = strchr(c->req.path, '?');
     if (q) *q = '\0';
+
+    c->close_after_write = strcasecmp(c->req.version, "HTTP/1.1") != 0;
+    char *conn = header_value_dup(c->in.ptr, c->header_len, "Connection");
+    if (conn) {
+        if (header_has_token(conn, "close"))
+            c->close_after_write = 1;
+        else if (header_has_token(conn, "keep-alive"))
+            c->close_after_write = 0;
+        free(conn);
+    }
 
     char *cl = header_value_dup(c->in.ptr, c->header_len, "Content-Length");
     if (cl) {
@@ -510,6 +552,55 @@ static int complete_request(client *c) {
     return 1;
 }
 
+static void send_bad_http_request(client *c) {
+    size_t len;
+    char *body = json_error_body("bad HTTP request", "invalid_request_error",
+                                 &len);
+    c->close_after_write = 1;
+    append_http_response(c, 400, "application/json", body, len);
+    free(body);
+    aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
+    if (queue_write(c) != AE_OK) close_client(c);
+}
+
+static void reset_client_for_next_request(client *c) {
+    size_t consumed = c->header_len + c->content_length;
+    if (consumed > c->in.len) consumed = c->in.len;
+    size_t remain = c->in.len - consumed;
+    if (remain)
+        memmove(c->in.ptr, c->in.ptr + consumed, remain);
+    c->in.len = remain;
+    if (c->in.ptr) c->in.ptr[remain] = '\0';
+
+    http_request_free(&c->req);
+    sbuf_clear(&c->out);
+    c->sent = 0;
+    c->header_done = 0;
+    c->header_len = 0;
+    c->content_length = 0;
+    c->close_after_write = 0;
+}
+
+static void arm_next_request(client *c) {
+    reset_client_for_next_request(c);
+    if (c->cancelled || c->fd < 0) return;
+
+    if (c->in.len) {
+        int done = complete_request(c);
+        if (done < 0) {
+            send_bad_http_request(c);
+            return;
+        }
+        if (done > 0) {
+            dispatch_request(c);
+            return;
+        }
+    }
+
+    if (aeCreateFileEvent(c->srv->loop, c->fd, AE_READABLE, read_cb, c) != AE_OK)
+        close_client(c);
+}
+
 static void write_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
     (void)loop; (void)mask;
     client *c = clientData;
@@ -525,7 +616,9 @@ static void write_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
         close_client(c);
         return;
     }
-    close_client(c);
+    aeDeleteFileEvent(c->srv->loop, fd, AE_WRITABLE);
+    if (c->close_after_write) close_client(c);
+    else arm_next_request(c);
 }
 
 static int queue_write(client *c) {
@@ -680,13 +773,7 @@ static void read_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
             c->last_active_ms = mstime();
             int done = complete_request(c);
             if (done < 0) {
-                size_t len;
-                char *body = json_error_body("bad HTTP request",
-                                             "invalid_request_error", &len);
-                append_http_response(c, 400, "application/json", body, len);
-                free(body);
-                aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
-                if (queue_write(c) != AE_OK) close_client(c);
+                send_bad_http_request(c);
                 return;
             }
             if (done > 0) {
