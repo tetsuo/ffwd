@@ -310,12 +310,22 @@ static int connect_endpoint(const char *host, int port)
 }
 
 static int stage_load(dist_stage *stage, const char *model_dir,
-                      int layer_start, int layer_end, int use_mlx)
+                      int layer_start, int layer_end, int use_mlx,
+                      const pplx_dist_options_t *opts)
 {
     memset(stage, 0, sizeof(*stage));
+#ifndef USE_MLX
+    (void)opts;
+#endif
 #ifdef USE_MLX
     if (use_mlx) {
-        stage->mlx = pplx_mlx_load_slice(model_dir, layer_start, layer_end);
+        pplx_mlx_options_t mlx_opts = {0};
+        if (opts) {
+            mlx_opts.quantize_bits = opts->mlx_quantize_bits;
+            mlx_opts.quantize_group_size = opts->mlx_quantize_group_size;
+        }
+        stage->mlx = pplx_mlx_load_slice_with_options(
+            model_dir, layer_start, layer_end, &mlx_opts);
         if (!stage->mlx) return -1;
         stage->cfg = pplx_mlx_config(stage->mlx);
         return 0;
@@ -535,13 +545,24 @@ static int worker_serve_connection(int fd, dist_stage *stage,
 int pplx_dist_run_worker(const char *model_dir, const char *host, int port,
                          int layer_start, int layer_end, int use_mlx)
 {
+    return pplx_dist_run_worker_with_options(model_dir, host, port,
+                                             layer_start, layer_end, use_mlx,
+                                             NULL);
+}
+
+int pplx_dist_run_worker_with_options(
+    const char *model_dir, const char *host, int port,
+    int layer_start, int layer_end, int use_mlx,
+    const pplx_dist_options_t *opts)
+{
     if (!model_dir || !host || port <= 0 || port > 65535 ||
         !host_is_little_endian()) {
         fprintf(stderr, "pplx-dist: invalid worker configuration\n");
         return 1;
     }
     dist_stage stage;
-    if (stage_load(&stage, model_dir, layer_start, layer_end, use_mlx) != 0) {
+    if (stage_load(&stage, model_dir, layer_start, layer_end, use_mlx,
+                   opts) != 0) {
         fprintf(stderr, "pplx-dist: failed to load worker shard\n");
         return 1;
     }
@@ -582,6 +603,14 @@ pplx_dist_client_t *pplx_dist_client_open(const char *model_dir,
                                           const char *host, int port,
                                           int local_layer_end, int use_mlx)
 {
+    return pplx_dist_client_open_with_options(model_dir, host, port,
+                                              local_layer_end, use_mlx, NULL);
+}
+
+pplx_dist_client_t *pplx_dist_client_open_with_options(
+    const char *model_dir, const char *host, int port,
+    int local_layer_end, int use_mlx, const pplx_dist_options_t *opts)
+{
     if (!model_dir || !host || port <= 0 || port > 65535 ||
         local_layer_end <= 0 || !host_is_little_endian())
         return NULL;
@@ -589,7 +618,8 @@ pplx_dist_client_t *pplx_dist_client_open(const char *model_dir,
     pplx_dist_client_t *client = calloc(1, sizeof(*client));
     if (!client) return NULL;
     client->fd = -1;
-    if (stage_load(&client->local, model_dir, 0, local_layer_end, use_mlx) != 0)
+    if (stage_load(&client->local, model_dir, 0, local_layer_end, use_mlx,
+                   opts) != 0)
         goto fail;
     client->fd = connect_endpoint(host, port);
     if (client->fd < 0 ||

@@ -17,6 +17,8 @@ typedef struct {
     int max_batch_tokens;
     int batch_wait_us;
     int use_mlx;
+    int mlx_quantize_bits;
+    int mlx_quantize_group_size;
     int allow_memory_overcommit;
     int enable_cors;
     const char *api_key;

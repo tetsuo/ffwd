@@ -230,6 +230,8 @@ typedef struct {
     char *api_key;
     loaded_model models[4];
     int use_mlx;
+    int mlx_quantize_bits;
+    int mlx_quantize_group_size;
 
     pthread_t worker;
     pthread_mutex_t mu;
@@ -1777,7 +1779,11 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
-            m->mlx_ctx = pplx_mlx_load(m->path);
+            pplx_mlx_options_t mlx_opts = {
+                .quantize_bits = s->mlx_quantize_bits,
+                .quantize_group_size = s->mlx_quantize_group_size,
+            };
+            m->mlx_ctx = pplx_mlx_load_with_options(m->path, &mlx_opts);
             if (!m->mlx_ctx) {
                 server_log("pplx-serve: failed to load MLX model on worker: %s",
                            m->path);
@@ -1995,6 +2001,11 @@ static int mlx_memory_preflight(const pplx_server_config_t *cfg) {
                "%.1f GiB estimated resident, %.1f GiB safety budget",
                (double)payload / gib, (double)estimated / gib,
                (double)budget / gib);
+    if (cfg->mlx_quantize_bits) {
+        server_log("pplx-serve: MLX %d-bit quantization enabled; preflight "
+                   "uses source payload as a conservative peak estimate",
+                   cfg->mlx_quantize_bits);
+    }
     if (estimated <= budget) return 0;
     if (cfg->allow_memory_overcommit) {
         server_log("pplx-serve: warning: MLX memory estimate exceeds safety "
@@ -2028,6 +2039,9 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
         ? cfg->batch_wait_us : PPLX_SERVER_BATCH_WAIT_US;
     s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
+    s.mlx_quantize_bits = cfg->mlx_quantize_bits;
+    s.mlx_quantize_group_size = cfg->mlx_quantize_group_size > 0
+        ? cfg->mlx_quantize_group_size : 64;
     if (cfg->api_key && cfg->api_key[0])
         s.api_key = xstrdup(cfg->api_key);
     else {

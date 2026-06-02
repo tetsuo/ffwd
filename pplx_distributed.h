@@ -9,6 +9,11 @@
 
 typedef struct pplx_dist_client pplx_dist_client_t;
 
+typedef struct {
+    int mlx_quantize_bits;
+    int mlx_quantize_group_size;
+} pplx_dist_options_t;
+
 /*
  * Open a coordinator-side connection. The coordinator owns layers
  * [0, local_layer_end); the remote worker must own [local_layer_end, N).
@@ -16,6 +21,9 @@ typedef struct pplx_dist_client pplx_dist_client_t;
 pplx_dist_client_t *pplx_dist_client_open(const char *model_dir,
                                           const char *host, int port,
                                           int local_layer_end, int use_mlx);
+pplx_dist_client_t *pplx_dist_client_open_with_options(
+    const char *model_dir, const char *host, int port,
+    int local_layer_end, int use_mlx, const pplx_dist_options_t *opts);
 void pplx_dist_client_free(pplx_dist_client_t *client);
 
 const pplx_config_t *pplx_dist_client_config(const pplx_dist_client_t *client);
@@ -30,5 +38,9 @@ int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
  */
 int pplx_dist_run_worker(const char *model_dir, const char *host, int port,
                          int layer_start, int layer_end, int use_mlx);
+int pplx_dist_run_worker_with_options(
+    const char *model_dir, const char *host, int port,
+    int layer_start, int layer_end, int use_mlx,
+    const pplx_dist_options_t *opts);
 
 #endif /* PPLX_DISTRIBUTED_H */

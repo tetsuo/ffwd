@@ -42,6 +42,10 @@ static void print_usage(const char *prog)
         "               Load model ID from directory for --serve (repeatable)\n"
         "  --backend cpu|mlx\n"
         "               Backend for --serve (default: cpu)\n"
+        "  --mlx-quantize-bits N\n"
+        "               Quantize MLX linear weights to 8 bits at load time\n"
+        "  --mlx-quantize-group-size N\n"
+        "               MLX quantization group size (default: 64)\n"
         "  --allow-memory-overcommit\n"
         "               Allow an MLX server model set above the host-memory safety budget\n"
         "  --host HOST  Server bind host (default: 127.0.0.1)\n"
@@ -516,6 +520,8 @@ int main(int argc, char *argv[])
     int batch_size = 0;
     int max_batch_tokens = 0;
     int batch_wait_us = -1;
+    int mlx_quantize_bits = 0;
+    int mlx_quantize_group_size = 64;
     const char *backend = "cpu";
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
@@ -564,6 +570,22 @@ int main(int argc, char *argv[])
                 use_mlx = 0;
             } else {
                 fprintf(stderr, "invalid --backend: %s\n", backend);
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+        else if (!strcmp(f, "--mlx-quantize-bits")) {
+            mlx_quantize_bits = atoi(argv[++arg_start]);
+            if (mlx_quantize_bits != 0 && mlx_quantize_bits != 8) {
+                fprintf(stderr, "--mlx-quantize-bits must be 0 or 8\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+        else if (!strcmp(f, "--mlx-quantize-group-size")) {
+            mlx_quantize_group_size = atoi(argv[++arg_start]);
+            if (mlx_quantize_group_size <= 0) {
+                fprintf(stderr, "--mlx-quantize-group-size must be > 0\n");
                 free_model_specs(&model_specs);
                 return 1;
             }
@@ -623,6 +645,11 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
+        if (mlx_quantize_bits && !use_mlx) {
+            fprintf(stderr, "--mlx-quantize-bits requires --backend mlx\n");
+            free_model_specs(&model_specs);
+            return 1;
+        }
         if (!use_mlx) {
             if (n_threads <= 0) n_threads = qwen_get_num_cpus();
             qwen_set_threads(n_threads);
@@ -639,6 +666,8 @@ int main(int argc, char *argv[])
             .max_batch_tokens = max_batch_tokens,
             .batch_wait_us = batch_wait_us,
             .use_mlx = use_mlx,
+            .mlx_quantize_bits = mlx_quantize_bits,
+            .mlx_quantize_group_size = mlx_quantize_group_size,
             .allow_memory_overcommit = allow_memory_overcommit,
             .enable_cors = cors,
             .api_key = api_key,
@@ -684,9 +713,20 @@ int main(int argc, char *argv[])
         if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
     }
 
+    if (mlx_quantize_bits && !use_mlx) {
+        fprintf(stderr, "--mlx-quantize-bits requires --mlx or --backend mlx\n");
+        return 1;
+    }
+
+    pplx_dist_options_t dist_opts = {
+        .mlx_quantize_bits = mlx_quantize_bits,
+        .mlx_quantize_group_size = mlx_quantize_group_size,
+    };
+
     if (dist_worker_mode)
-        return pplx_dist_run_worker(model_dir, host, port, layer_start,
-                                    layer_end, use_mlx);
+        return pplx_dist_run_worker_with_options(
+            model_dir, host, port, layer_start, layer_end, use_mlx,
+            &dist_opts);
 
     /* Tokenizer */
     char vocab_path[1024];
@@ -711,8 +751,9 @@ int main(int argc, char *argv[])
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dist = pplx_dist_client_open(model_dir, remote_host, remote_port,
-                                       layer_end, use_mlx);
+        e.dist = pplx_dist_client_open_with_options(
+            model_dir, remote_host, remote_port, layer_end, use_mlx,
+            &dist_opts);
         if (!e.dist) {
             fprintf(stderr, "failed to connect distributed worker\n");
             qwen_tokenizer_free(tok);
@@ -720,7 +761,11 @@ int main(int argc, char *argv[])
         }
         e.dim = pplx_dist_client_config(e.dist)->hidden_size;
     } else if (use_mlx) {
-        e.mlx_ctx = pplx_mlx_load(model_dir);
+        pplx_mlx_options_t mlx_opts = {
+            .quantize_bits = mlx_quantize_bits,
+            .quantize_group_size = mlx_quantize_group_size,
+        };
+        e.mlx_ctx = pplx_mlx_load_with_options(model_dir, &mlx_opts);
         if (!e.mlx_ctx) {
             fprintf(stderr, "failed to load model\n");
             qwen_tokenizer_free(tok);
@@ -739,8 +784,9 @@ int main(int argc, char *argv[])
                 qwen_tokenizer_free(tok);
                 return 1;
             }
-            e.dist = pplx_dist_client_open(model_dir, remote_host, remote_port,
-                                           layer_end, use_mlx);
+            e.dist = pplx_dist_client_open_with_options(
+                model_dir, remote_host, remote_port, layer_end, use_mlx,
+                &dist_opts);
             if (!e.dist) {
                 fprintf(stderr, "failed to connect distributed worker\n");
                 qwen_tokenizer_free(tok);

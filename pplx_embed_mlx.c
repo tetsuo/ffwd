@@ -15,10 +15,19 @@
  * ======================================================================== */
 
 typedef struct {
-    mlx_array wq, wk, wv, wo;
+    mlx_array w;
+    mlx_array scales;
+    mlx_array biases;
+    int quantized;
+    int bits;
+    int group_size;
+} mlx_linear_t;
+
+typedef struct {
+    mlx_linear_t wq, wk, wv, wo;
     mlx_array q_norm, k_norm;
     mlx_array input_norm, post_attn_norm;
-    mlx_array gate_proj, up_proj, down_proj;
+    mlx_linear_t gate_proj, up_proj, down_proj;
 } mlx_layer_t;
 
 struct pplx_mlx_ctx {
@@ -30,6 +39,9 @@ struct pplx_mlx_ctx {
     multi_safetensors_t *ms;
     int layer_start;             /* loaded transformer range, inclusive */
     int layer_end;               /* loaded transformer range, exclusive */
+    int quantize_bits;
+    int quantize_group_size;
+    mlx_dtype weight_dtype;
 };
 
 /* ========================================================================
@@ -47,7 +59,7 @@ static int mlx_mul_size(size_t a, size_t b, size_t *out)
 
 static mlx_dtype mlx_weight_dtype(const pplx_mlx_ctx_t *ctx)
 {
-    return mlx_array_dtype(ctx->layers[ctx->layer_start].wq);
+    return ctx->weight_dtype;
 }
 
 static size_t safetensor_dtype_size(safetensor_dtype_t dtype)
@@ -131,11 +143,95 @@ static mlx_array load_tensor(multi_safetensors_t *ms, const char *name,
     return mlx_array_new_data(safetensors_data(sf, t), shape, ndim, dtype);
 }
 
-/* y = x @ W^T */
-static mlx_array linear(mlx_array x, mlx_array W, mlx_stream s)
+static mlx_linear_t load_linear_tensor(multi_safetensors_t *ms,
+                                       const char *name,
+                                       const int *shape, int ndim)
 {
+    mlx_linear_t l = {0};
+    l.w = load_tensor(ms, name, shape, ndim);
+    return l;
+}
+
+static int linear_ok(mlx_linear_t l)
+{
+    return arr_ok(l.w);
+}
+
+static void free_linear(mlx_linear_t *l)
+{
+    mlx_array_free(l->w);
+    mlx_array_free(l->scales);
+    mlx_array_free(l->biases);
+    memset(l, 0, sizeof(*l));
+}
+
+static int quantize_linear(mlx_linear_t *l, int bits, int group_size,
+                           mlx_stream s)
+{
+    if (!l || !arr_ok(l->w) || bits == 0) return 0;
+    if (bits != 8) {
+        fprintf(stderr, "mlx: quantized weights support only 8 bits\n");
+        return -1;
+    }
+    if (group_size <= 0) group_size = 64;
+
+    mlx_optional_int gs = {.value = group_size, .has_value = true};
+    mlx_optional_int qb = {.value = bits, .has_value = true};
+    mlx_array null_arr = (mlx_array){0};
+    mlx_vector_array q = mlx_vector_array_new();
+    mlx_quantize(&q, l->w, gs, qb, "affine", null_arr, s);
+    if (!q.ctx || mlx_vector_array_size(q) < 2) {
+        mlx_vector_array_free(q);
+        fprintf(stderr, "mlx: quantize failed\n");
+        return -1;
+    }
+
+    mlx_array qw = (mlx_array){0};
+    mlx_array scales = (mlx_array){0};
+    mlx_array biases = (mlx_array){0};
+    mlx_vector_array_get(&qw, q, 0);
+    mlx_vector_array_get(&scales, q, 1);
+    if (mlx_vector_array_size(q) >= 3)
+        mlx_vector_array_get(&biases, q, 2);
+    mlx_vector_array_free(q);
+
+    if (!arr_ok(qw) || !arr_ok(scales)) {
+        mlx_array_free(qw);
+        mlx_array_free(scales);
+        mlx_array_free(biases);
+        fprintf(stderr, "mlx: quantize returned invalid arrays\n");
+        return -1;
+    }
+    mlx_array_eval(qw);
+    mlx_array_eval(scales);
+    if (arr_ok(biases)) mlx_array_eval(biases);
+    mlx_synchronize(s);
+
+    mlx_array_free(l->w);
+    l->w = qw;
+    l->scales = scales;
+    l->biases = biases;
+    l->quantized = 1;
+    l->bits = bits;
+    l->group_size = group_size;
+    return 0;
+}
+
+/* y = x @ W^T */
+static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
+{
+    if (W->quantized) {
+        mlx_array res = mlx_array_new();
+        mlx_optional_int gs = {.value = W->group_size, .has_value = true};
+        mlx_optional_int bits = {.value = W->bits, .has_value = true};
+        mlx_array null_arr = (mlx_array){0};
+        mlx_quantized_matmul(&res, x, W->w, W->scales,
+                             arr_ok(W->biases) ? W->biases : null_arr,
+                             true, gs, bits, "affine", s);
+        return res;
+    }
     mlx_array Wt  = mlx_array_new();
-    mlx_transpose(&Wt, W, s);
+    mlx_transpose(&Wt, W->w, s);
     mlx_array res = mlx_array_new();
     mlx_matmul(&res, x, Wt, s);
     mlx_array_free(Wt);
@@ -245,11 +341,44 @@ static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
     return 0;
 }
 
-static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
-                                      int layer_start, int layer_end)
+static pplx_mlx_options_t normalize_mlx_options(const pplx_mlx_options_t *opts)
 {
+    pplx_mlx_options_t out = {0};
+    if (opts) out = *opts;
+    if (out.quantize_bits != 0 &&
+        out.quantize_bits != 8) {
+        fprintf(stderr, "mlx: --mlx-quantize-bits supports only 8\n");
+        out.quantize_bits = -1;
+    }
+    if (out.quantize_bits && out.quantize_group_size <= 0)
+        out.quantize_group_size = 64;
+    return out;
+}
+
+static int quantize_layer(mlx_layer_t *l, int bits, int group_size,
+                          mlx_stream s)
+{
+    if (bits == 0) return 0;
+    return quantize_linear(&l->wq, bits, group_size, s) ||
+           quantize_linear(&l->wk, bits, group_size, s) ||
+           quantize_linear(&l->wv, bits, group_size, s) ||
+           quantize_linear(&l->wo, bits, group_size, s) ||
+           quantize_linear(&l->gate_proj, bits, group_size, s) ||
+           quantize_linear(&l->up_proj, bits, group_size, s) ||
+           quantize_linear(&l->down_proj, bits, group_size, s);
+}
+
+static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
+                                      int layer_start, int layer_end,
+                                      const pplx_mlx_options_t *opts)
+{
+    pplx_mlx_options_t options = normalize_mlx_options(opts);
+    if (options.quantize_bits < 0) return NULL;
+
     pplx_mlx_ctx_t *ctx = calloc(1, sizeof(pplx_mlx_ctx_t));
     if (!ctx) return NULL;
+    ctx->quantize_bits = options.quantize_bits;
+    ctx->quantize_group_size = options.quantize_group_size;
 
     if (mlx_parse_config(&ctx->config, model_dir) != 0) { free(ctx); return NULL; }
 
@@ -294,18 +423,36 @@ static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
 #define LD(fld, fmt, ...) do {                                    \
     snprintf(name, sizeof(name), fmt, i);                         \
     int sh[] = {__VA_ARGS__};                                     \
-    l->fld = load_tensor(ctx->ms, name, sh, sizeof(sh)/sizeof(sh[0])); \
-    if (!arr_ok(l->fld)) goto fail;                               \
+    l->fld = load_linear_tensor(ctx->ms, name, sh, sizeof(sh)/sizeof(sh[0])); \
+    if (!linear_ok(l->fld)) goto fail;                            \
 } while (0)
 
         LD(wq,             "layers.%d.self_attn.q_proj.weight", qd,  h);
         LD(wk,             "layers.%d.self_attn.k_proj.weight", kvd, h);
         LD(wv,             "layers.%d.self_attn.v_proj.weight", kvd, h);
         LD(wo,             "layers.%d.self_attn.o_proj.weight", h,   qd);
+#undef LD
+
+#define LD(fld, fmt, ...) do {                                    \
+    snprintf(name, sizeof(name), fmt, i);                         \
+    int sh[] = {__VA_ARGS__};                                     \
+    l->fld = load_tensor(ctx->ms, name, sh, sizeof(sh)/sizeof(sh[0])); \
+    if (!arr_ok(l->fld)) goto fail;                               \
+} while (0)
+
         LD(q_norm,         "layers.%d.self_attn.q_norm.weight", hd);
         LD(k_norm,         "layers.%d.self_attn.k_norm.weight", hd);
         LD(input_norm,     "layers.%d.input_layernorm.weight", h);
         LD(post_attn_norm, "layers.%d.post_attention_layernorm.weight", h);
+#undef LD
+
+#define LD(fld, fmt, ...) do {                                    \
+    snprintf(name, sizeof(name), fmt, i);                         \
+    int sh[] = {__VA_ARGS__};                                     \
+    l->fld = load_linear_tensor(ctx->ms, name, sh, sizeof(sh)/sizeof(sh[0])); \
+    if (!linear_ok(l->fld)) goto fail;                            \
+} while (0)
+
         LD(gate_proj,      "layers.%d.mlp.gate_proj.weight", inter, h);
         LD(up_proj,        "layers.%d.mlp.up_proj.weight", inter, h);
         LD(down_proj,      "layers.%d.mlp.down_proj.weight", h, inter);
@@ -321,6 +468,31 @@ static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
     }
 
     ctx->stream = mlx_default_gpu_stream_new();
+    ctx->weight_dtype = mlx_array_dtype(ctx->layers[layer_start].wq.w);
+    if (ctx->quantize_bits) {
+        for (int i = layer_start; i < layer_end; i++) {
+            if (quantize_layer(&ctx->layers[i], ctx->quantize_bits,
+                               ctx->quantize_group_size, ctx->stream) != 0)
+                goto fail;
+        }
+        mlx_clear_cache();
+        if (pplx_verbose >= 1)
+            fprintf(stderr, "mlx: quantized linear weights to %d-bit "
+                    "(group_size=%d)\n",
+                    ctx->quantize_bits, ctx->quantize_group_size);
+    }
+
+    if (pplx_verbose >= 2) {
+        size_t active = 0, cache = 0, peak = 0;
+        mlx_get_active_memory(&active);
+        mlx_get_cache_memory(&cache);
+        mlx_get_peak_memory(&peak);
+        fprintf(stderr, "mlx: memory active=%.2f GiB cache=%.2f GiB "
+                "peak=%.2f GiB\n",
+                (double)active / (1024.0 * 1024.0 * 1024.0),
+                (double)cache / (1024.0 * 1024.0 * 1024.0),
+                (double)peak / (1024.0 * 1024.0 * 1024.0));
+    }
 
     if (pplx_verbose >= 1)
         fprintf(stderr, "mlx: layers [%d, %d) loaded (%d-dim)\n",
@@ -335,13 +507,26 @@ fail:
 
 pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
 {
-    return mlx_load_range(model_dir, 0, -1);
+    return mlx_load_range(model_dir, 0, -1, NULL);
+}
+
+pplx_mlx_ctx_t *pplx_mlx_load_with_options(const char *model_dir,
+                                           const pplx_mlx_options_t *opts)
+{
+    return mlx_load_range(model_dir, 0, -1, opts);
 }
 
 pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
                                     int layer_start, int layer_end)
 {
-    return mlx_load_range(model_dir, layer_start, layer_end);
+    return mlx_load_range(model_dir, layer_start, layer_end, NULL);
+}
+
+pplx_mlx_ctx_t *pplx_mlx_load_slice_with_options(
+    const char *model_dir, int layer_start, int layer_end,
+    const pplx_mlx_options_t *opts)
+{
+    return mlx_load_range(model_dir, layer_start, layer_end, opts);
 }
 
 /* ========================================================================
@@ -350,12 +535,12 @@ pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
 
 static void free_mlx_layer(mlx_layer_t *l)
 {
-    mlx_array_free(l->wq); mlx_array_free(l->wk);
-    mlx_array_free(l->wv); mlx_array_free(l->wo);
+    free_linear(&l->wq); free_linear(&l->wk);
+    free_linear(&l->wv); free_linear(&l->wo);
     mlx_array_free(l->q_norm); mlx_array_free(l->k_norm);
     mlx_array_free(l->input_norm); mlx_array_free(l->post_attn_norm);
-    mlx_array_free(l->gate_proj); mlx_array_free(l->up_proj);
-    mlx_array_free(l->down_proj);
+    free_linear(&l->gate_proj); free_linear(&l->up_proj);
+    free_linear(&l->down_proj);
 }
 
 void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
@@ -397,9 +582,9 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_array xn = mlx_array_new();
         mlx_fast_rms_norm(&xn, x, l->input_norm, c->rms_norm_eps, S);
 
-        mlx_array q_flat = linear(xn, l->wq, S);
-        mlx_array k_flat = linear(xn, l->wk, S);
-        mlx_array v_flat = linear(xn, l->wv, S);
+        mlx_array q_flat = linear(xn, &l->wq, S);
+        mlx_array k_flat = linear(xn, &l->wk, S);
+        mlx_array v_flat = linear(xn, &l->wv, S);
         mlx_array_free(xn);
 
         int q_shape[] = {batch, max_seq, n_heads,    head_dim};
@@ -447,7 +632,7 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_reshape(&attn_flat, attn_t, flat_shape, 3, S);
         mlx_array_free(attn_t);
 
-        mlx_array proj = linear(attn_flat, l->wo, S);
+        mlx_array proj = linear(attn_flat, &l->wo, S);
         mlx_array_free(attn_flat);
         mlx_array x2 = mlx_array_new();
         mlx_add(&x2, x, proj, S);
@@ -457,8 +642,8 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_array xn2 = mlx_array_new();
         mlx_fast_rms_norm(&xn2, x, l->post_attn_norm, c->rms_norm_eps, S);
 
-        mlx_array gate = linear(xn2, l->gate_proj, S);
-        mlx_array up   = linear(xn2, l->up_proj, S);
+        mlx_array gate = linear(xn2, &l->gate_proj, S);
+        mlx_array up   = linear(xn2, &l->up_proj, S);
         mlx_array_free(xn2);
 
         mlx_array gate_sig = mlx_array_new();
@@ -471,7 +656,7 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_multiply(&mid, silu_gate, up, S);
         mlx_array_free(silu_gate); mlx_array_free(up);
 
-        mlx_array ffn = linear(mid, l->down_proj, S);
+        mlx_array ffn = linear(mid, &l->down_proj, S);
         mlx_array_free(mid);
 
         mlx_array x3 = mlx_array_new();

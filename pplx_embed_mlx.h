@@ -14,11 +14,18 @@
 /* Opaque MLX model context */
 typedef struct pplx_mlx_ctx pplx_mlx_ctx_t;
 
+typedef struct {
+    int quantize_bits;       /* 0 disables; currently 8 */
+    int quantize_group_size; /* default 64 when quantize_bits is set */
+} pplx_mlx_options_t;
+
 /*
  * Load model into MLX arrays from safetensors + config.json.
  * Returns NULL on error.
  */
 pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir);
+pplx_mlx_ctx_t *pplx_mlx_load_with_options(const char *model_dir,
+                                           const pplx_mlx_options_t *opts);
 
 /*
  * Load one contiguous transformer layer range for distributed execution.
@@ -27,6 +34,9 @@ pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir);
  */
 pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
                                     int layer_start, int layer_end);
+pplx_mlx_ctx_t *pplx_mlx_load_slice_with_options(
+    const char *model_dir, int layer_start, int layer_end,
+    const pplx_mlx_options_t *opts);
 
 void pplx_mlx_free(pplx_mlx_ctx_t *ctx);
 
