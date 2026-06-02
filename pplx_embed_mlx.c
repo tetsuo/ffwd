@@ -769,8 +769,8 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     mlx_array attn_mask = (mlx_array){0};
     mlx_array x = (mlx_array){0};
     mlx_array x_normed = (mlx_array){0};
-    mlx_array x_f32 = (mlx_array){0};
     mlx_array embeddings = (mlx_array){0};
+    mlx_array embeddings_f32 = (mlx_array){0};
     mlx_array *pooled = (mlx_array *)calloc((size_t)total_spans, sizeof(*pooled));
     mlx_vector_array pooled_vec = (mlx_vector_array){0};
     int rc = -1;
@@ -818,12 +818,6 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     x = (mlx_array){0};
     if (!arr_ok(x_normed)) goto cleanup;
 
-    x_f32 = mlx_array_new();
-    mlx_astype(&x_f32, x_normed, MLX_FLOAT32, S);
-    mlx_array_free(x_normed);
-    x_normed = (mlx_array){0};
-    if (!arr_ok(x_f32)) goto cleanup;
-
     int pooled_count = 0;
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < inputs[b].n_spans; s++) {
@@ -832,7 +826,7 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
             int stop[] = {b + 1, span->start + span->n_tokens, hidden};
             int strides[] = {1, 1, 1};
             mlx_array slice = mlx_array_new();
-            mlx_slice(&slice, x_f32, start, 3, stop, 3, strides, 3, S);
+            mlx_slice(&slice, x_normed, start, 3, stop, 3, strides, 3, S);
             if (!arr_ok(slice)) {
                 mlx_array_free(slice);
                 goto cleanup;
@@ -852,8 +846,12 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     mlx_concatenate_axis(&embeddings, pooled_vec, 0, S);
     if (!arr_ok(embeddings)) goto cleanup;
 
-    mlx_array_eval(embeddings);
-    const float *data = mlx_array_data_float32(embeddings);
+    embeddings_f32 = mlx_array_new();
+    mlx_astype(&embeddings_f32, embeddings, MLX_FLOAT32, S);
+    if (!arr_ok(embeddings_f32)) goto cleanup;
+
+    mlx_array_eval(embeddings_f32);
+    const float *data = mlx_array_data_float32(embeddings_f32);
     if (data) {
         memcpy(out_embeddings, data,
                (size_t)total_spans * hidden * sizeof(float));
@@ -861,11 +859,11 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     }
 
 cleanup:
+    mlx_array_free(embeddings_f32);
     mlx_array_free(embeddings);
     if (pooled_vec.ctx) mlx_vector_array_free(pooled_vec);
     for (int s = 0; s < total_spans; s++) mlx_array_free(pooled[s]);
     free(pooled);
-    mlx_array_free(x_f32);
     mlx_array_free(x_normed);
     mlx_array_free(x);
     mlx_array_free(attn_mask);
