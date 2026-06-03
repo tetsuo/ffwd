@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <float.h>
 
 typedef struct {
     safetensor_dtype_t dtype;
@@ -63,6 +64,20 @@ struct pplx_workspace {
     float *rope_cos;
     float *rope_sin;
     int    rope_cache_cap;
+};
+
+struct pplx_late_model {
+    pplx_model_t *base;
+    safetensors_file_t *dense_sf;
+    pplx_weight_ref_t projection; /* [token_dim, hidden] */
+    int token_dim;
+};
+
+struct pplx_late_workspace {
+    const pplx_late_model_t *model;
+    pplx_workspace_t *base_ws;
+    float *states;
+    int states_seq_cap;
 };
 
 /* ========================================================================
@@ -159,6 +174,17 @@ static int realloc_floats_2d(float **ptr, int rows, int cols)
     size_t count;
     if (mul_size((size_t)rows, (size_t)cols, &count) != 0) return -1;
     return realloc_floats(ptr, count);
+}
+
+static int ensure_late_state_buffer(pplx_late_workspace_t *ws, int n_tokens)
+{
+    if (!ws || !ws->model || n_tokens <= 0) return -1;
+    if (n_tokens <= ws->states_seq_cap) return 0;
+    int hidden = ws->model->base->config.hidden_size;
+    if (realloc_floats_2d(&ws->states, n_tokens, hidden) != 0)
+        return -1;
+    ws->states_seq_cap = n_tokens;
+    return 0;
 }
 
 static int realloc_ints(int **ptr, size_t count)
@@ -590,10 +616,11 @@ static int ensure_offsets(pplx_workspace_t *ws, int batch)
  * Model / workspace load and free
  * ======================================================================== */
 
-static pplx_model_t *model_load_range(const char *model_dir,
-                                       int layer_start, int layer_end)
+static pplx_model_t *model_load_range_ex(const char *model_dir,
+                                          int layer_start, int layer_end,
+                                          int allow_late)
 {
-    if (model_dir_has_late_projection(model_dir)) {
+    if (!allow_late && model_dir_has_late_projection(model_dir)) {
         fprintf(stderr, "pplx_model_load: late-interaction models require "
                 "token-level MaxSim support and are not valid pooled "
                 "embedding models yet\n");
@@ -717,13 +744,13 @@ fail:
 
 pplx_model_t *pplx_model_load(const char *model_dir)
 {
-    return model_load_range(model_dir, 0, -1);
+    return model_load_range_ex(model_dir, 0, -1, 0);
 }
 
 pplx_model_t *pplx_model_load_slice(const char *model_dir,
                                     int layer_start, int layer_end)
 {
-    return model_load_range(model_dir, layer_start, layer_end);
+    return model_load_range_ex(model_dir, layer_start, layer_end, 0);
 }
 
 void pplx_model_free(pplx_model_t *model)
@@ -770,6 +797,162 @@ void pplx_workspace_free(pplx_workspace_t *ws)
 const pplx_config_t *pplx_model_config(const pplx_model_t *model)
 {
     return model ? &model->config : NULL;
+}
+
+static const safetensor_t *find_single_safetensor(const safetensors_file_t *sf,
+                                                  const char *name)
+{
+    if (!sf || !name) return NULL;
+    for (int i = 0; i < sf->num_tensors; i++) {
+        if (strcmp(sf->tensors[i].name, name) == 0)
+            return &sf->tensors[i];
+    }
+    return NULL;
+}
+
+pplx_late_model_t *pplx_late_model_load(const char *model_dir)
+{
+    if (!model_dir_has_late_projection(model_dir)) {
+        fprintf(stderr, "pplx_late_model_load: missing 1_Dense projection\n");
+        return NULL;
+    }
+
+    pplx_late_model_t *late = (pplx_late_model_t *)calloc(1, sizeof(*late));
+    if (!late) return NULL;
+
+    late->base = model_load_range_ex(model_dir, 0, -1, 1);
+    if (!late->base) goto fail;
+
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/1_Dense/model.safetensors",
+                     model_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "pplx_late_model_load: model path too long\n");
+        goto fail;
+    }
+
+    late->dense_sf = safetensors_open(path);
+    if (!late->dense_sf) {
+        fprintf(stderr, "pplx_late_model_load: cannot open %s\n", path);
+        goto fail;
+    }
+
+    const safetensor_t *t = find_single_safetensor(late->dense_sf,
+                                                   "linear.weight");
+    if (!t) {
+        fprintf(stderr, "pplx_late_model_load: missing linear.weight\n");
+        goto fail;
+    }
+    if (t->ndim != 2 || t->shape[0] <= 0 || t->shape[0] > INT_MAX) {
+        fprintf(stderr, "pplx_late_model_load: bad projection shape\n");
+        goto fail;
+    }
+
+    int64_t shape[2] = { t->shape[0], late->base->config.hidden_size };
+    if (!tensor_has_supported_shape(late->dense_sf, t, "linear.weight",
+                                    shape, 2, 1))
+        goto fail;
+
+    late->projection.dtype = t->dtype;
+    late->projection.data = safetensors_data(late->dense_sf, t);
+    late->token_dim = (int)t->shape[0];
+    return late;
+
+fail:
+    pplx_late_model_free(late);
+    return NULL;
+}
+
+void pplx_late_model_free(pplx_late_model_t *model)
+{
+    if (!model) return;
+    pplx_model_free(model->base);
+    safetensors_close(model->dense_sf);
+    free(model);
+}
+
+pplx_late_workspace_t *pplx_late_workspace_new(const pplx_late_model_t *model)
+{
+    if (!model || !model->base) return NULL;
+    pplx_late_workspace_t *ws = (pplx_late_workspace_t *)calloc(1, sizeof(*ws));
+    if (!ws) return NULL;
+    ws->model = model;
+    ws->base_ws = pplx_workspace_new(model->base);
+    if (!ws->base_ws) {
+        free(ws);
+        return NULL;
+    }
+    return ws;
+}
+
+void pplx_late_workspace_free(pplx_late_workspace_t *ws)
+{
+    if (!ws) return;
+    pplx_workspace_free(ws->base_ws);
+    free(ws->states);
+    free(ws);
+}
+
+const pplx_config_t *pplx_late_model_config(const pplx_late_model_t *model)
+{
+    return model && model->base ? &model->base->config : NULL;
+}
+
+int pplx_late_model_token_dim(const pplx_late_model_t *model)
+{
+    return model ? model->token_dim : 0;
+}
+
+int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
+                                  pplx_late_workspace_t *ws,
+                                  const int *token_ids, int n_tokens,
+                                  int normalize, float *out_vectors)
+{
+    if (!model || !ws || ws->model != model || !token_ids || n_tokens <= 0 ||
+        !out_vectors || model->token_dim <= 0)
+        return -1;
+
+    int hidden = model->base->config.hidden_size;
+    int dim = model->token_dim;
+    if (ensure_late_state_buffer(ws, n_tokens) != 0)
+        return -1;
+    if (pplx_model_forward_into(model->base, ws->base_ws, token_ids,
+                                n_tokens, ws->states) != 0)
+        return -1;
+
+    linear_nobias_weight(out_vectors, ws->states, &model->projection,
+                         n_tokens, hidden, dim);
+    if (normalize) {
+        for (int i = 0; i < n_tokens; i++) {
+            if (pplx_l2_normalize(out_vectors + (size_t)i * dim, dim) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+float pplx_late_maxsim(const float *query_vectors, int query_tokens,
+                       const float *doc_vectors, int doc_tokens,
+                       int dim)
+{
+    if (!query_vectors || !doc_vectors || query_tokens <= 0 ||
+        doc_tokens <= 0 || dim <= 0)
+        return 0.0f;
+
+    float score = 0.0f;
+    for (int qi = 0; qi < query_tokens; qi++) {
+        const float *q = query_vectors + (size_t)qi * dim;
+        float best = -FLT_MAX;
+        for (int di = 0; di < doc_tokens; di++) {
+            const float *d = doc_vectors + (size_t)di * dim;
+            float dot = 0.0f;
+            for (int k = 0; k < dim; k++)
+                dot += q[k] * d[k];
+            if (dot > best) best = dot;
+        }
+        score += best;
+    }
+    return score;
 }
 
 size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)

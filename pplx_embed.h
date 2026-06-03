@@ -43,6 +43,8 @@ typedef struct {
 
 typedef struct pplx_model pplx_model_t;
 typedef struct pplx_workspace pplx_workspace_t;
+typedef struct pplx_late_model pplx_late_model_t;
+typedef struct pplx_late_workspace pplx_late_workspace_t;
 
 typedef struct {
     const int *ids;
@@ -238,6 +240,39 @@ int pplx_l2_normalize(float *vec, int dim);
  * Returns 0 for invalid arguments or if either vector has zero length.
  */
 float pplx_cosine_similarity(const float *a, const float *b, int dim);
+
+/*
+ * Late-interaction model API.
+ *
+ * A late model produces one 128D vector per retained token. The vectors are
+ * projected by the snapshot's 1_Dense head and L2-normalized per token by
+ * default, matching ColBERT/MaxSim scoring semantics.
+ */
+pplx_late_model_t *pplx_late_model_load(const char *model_dir);
+void pplx_late_model_free(pplx_late_model_t *model);
+
+pplx_late_workspace_t *pplx_late_workspace_new(const pplx_late_model_t *model);
+void pplx_late_workspace_free(pplx_late_workspace_t *ws);
+
+const pplx_config_t *pplx_late_model_config(const pplx_late_model_t *model);
+int pplx_late_model_token_dim(const pplx_late_model_t *model);
+
+/*
+ * Encode token_ids into out_vectors[n_tokens, token_dim].
+ *
+ * If normalize is non-zero, every non-zero token vector is L2-normalized.
+ */
+int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
+                                  pplx_late_workspace_t *ws,
+                                  const int *token_ids, int n_tokens,
+                                  int normalize, float *out_vectors);
+
+/*
+ * Sum over query tokens of max dot product against document tokens.
+ */
+float pplx_late_maxsim(const float *query_vectors, int query_tokens,
+                       const float *doc_vectors, int doc_tokens,
+                       int dim);
 
 /* Verbose level: 0=quiet, 1=info, 2=debug */
 extern int pplx_verbose;
