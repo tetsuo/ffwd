@@ -115,6 +115,19 @@ static uint64_t mstime(void) {
     return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
 }
 
+static uint64_t nstime(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000000u + (uint64_t)tv.tv_usec * 1000u;
+}
+
+static double ns_to_ms(uint64_t ns) {
+    return (double)ns / 1000000.0;
+}
+
 static void server_log(const char *fmt, ...) {
     char ts[32];
     time_t now = time(NULL);
@@ -292,8 +305,15 @@ struct job {
     char *auth;
     int status;
     char *content_type;
+    char *extra_headers;
     char *response;
     size_t response_len;
+    uint64_t created_ns;
+    uint64_t started_ns;
+    uint64_t parse_ns;
+    uint64_t tokenize_ns;
+    uint64_t infer_ns;
+    uint64_t encode_ns;
     job *next;
 };
 
@@ -375,8 +395,9 @@ static void close_client(client *c) {
     client_decref(c);
 }
 
-static void append_http_response(client *c, int status, const char *ctype,
-                                 const char *body, size_t body_len) {
+static void append_http_response_ex(client *c, int status, const char *ctype,
+                                    const char *extra_headers,
+                                    const char *body, size_t body_len) {
     const char *reason = "OK";
     if (status == 204) reason = "No Content";
     else if (status == 400) reason = "Bad Request";
@@ -400,8 +421,15 @@ static void append_http_response(client *c, int status, const char *ctype,
         sbuf_puts(&c->out, "Access-Control-Allow-Headers: authorization, content-type\r\n");
         sbuf_puts(&c->out, "Access-Control-Allow-Methods: POST, OPTIONS\r\n");
     }
+    if (extra_headers)
+        sbuf_puts(&c->out, extra_headers);
     sbuf_puts(&c->out, "\r\n");
     if (body_len) sbuf_append(&c->out, body, body_len);
+}
+
+static void append_http_response(client *c, int status, const char *ctype,
+                                 const char *body, size_t body_len) {
+    append_http_response_ex(c, status, ctype, NULL, body, body_len);
 }
 
 static void append_json_error(sbuf *b, const char *message, const char *type) {
@@ -692,6 +720,7 @@ static void job_free(job *j) {
     if (!j) return;
     free(j->body);
     free(j->auth);
+    free(j->extra_headers);
     free(j->response);
     free(j);
 }
@@ -706,9 +735,10 @@ static void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask)
     while ((j = pop_done(s)) != NULL) {
         client *c = j->c;
         if (!c->cancelled) {
-            append_http_response(c, j->status, j->content_type,
-                                 j->response ? j->response : "",
-                                 j->response ? j->response_len : 0);
+            append_http_response_ex(c, j->status, j->content_type,
+                                    j->extra_headers,
+                                    j->response ? j->response : "",
+                                    j->response ? j->response_len : 0);
             if (queue_write(c) != AE_OK)
                 close_client(c);
         }
@@ -759,6 +789,7 @@ static void dispatch_request(client *c) {
     j->body = xstrndup(c->req.body ? c->req.body : "", c->req.body_len);
     j->body_len = c->req.body_len;
     j->auth = c->req.auth ? xstrdup(c->req.auth) : NULL;
+    j->created_ns = nstime();
     client_incref(c);
     enqueue_job(j);
 }
@@ -875,6 +906,26 @@ static void job_set_422(job *j, cJSON *detail) {
     j->response = xstrdup(s);
     j->response_len = strlen(j->response);
     cJSON_free(s);
+}
+
+static void job_set_timing_header(job *j) {
+    if (!j || j->extra_headers || !j->created_ns) return;
+    uint64_t done_ns = nstime();
+    uint64_t queue_ns = j->started_ns > j->created_ns
+        ? j->started_ns - j->created_ns : 0;
+    uint64_t worker_ns = j->started_ns && done_ns > j->started_ns
+        ? done_ns - j->started_ns : 0;
+
+    char buf[384];
+    int n = snprintf(buf, sizeof(buf),
+        "Server-Timing: queue;dur=%.3f, parse;dur=%.3f, "
+        "tokenize;dur=%.3f, infer;dur=%.3f, encode;dur=%.3f, "
+        "worker;dur=%.3f\r\n",
+        ns_to_ms(queue_ns), ns_to_ms(j->parse_ns),
+        ns_to_ms(j->tokenize_ns), ns_to_ms(j->infer_ns),
+        ns_to_ms(j->encode_ns), ns_to_ms(worker_ns));
+    if (n > 0 && (size_t)n < sizeof(buf))
+        j->extra_headers = xstrdup(buf);
 }
 
 static cJSON *parse_json_body(job *j, cJSON *detail) {
@@ -1064,10 +1115,13 @@ static void contextual_request_free(contextual_request *r) {
     memset(r, 0, sizeof(*r));
 }
 
-static int tokenize_one(loaded_model *m, const char *text, token_buf *out) {
+static int tokenize_one(loaded_model *m, job *j, const char *text,
+                        token_buf *out) {
     memset(out, 0, sizeof(*out));
+    uint64_t t0 = nstime();
     out->ids = qwen_tokenizer_encode_with_workspace(m->tok, m->tok_ws,
                                                     text, &out->n_tokens);
+    if (j) j->tokenize_ns += nstime() - t0;
     if (!out->ids || out->n_tokens <= 0) {
         free(out->ids);
         memset(out, 0, sizeof(*out));
@@ -1231,6 +1285,7 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
     float *batch_embs = xmalloc((size_t)max_batch * dim * sizeof(float));
 
     int failed = 0;
+    uint64_t infer_ns = 0;
     for (int start = 0; start < total_inputs;) {
         int cur = 0;
         int tokens = 0;
@@ -1243,7 +1298,10 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
             tokens += n_tokens;
             cur++;
         }
-        if (model_embed_batch(m, inputs, cur, batch_embs) != 0) {
+        uint64_t t0 = nstime();
+        int embed_rc = model_embed_batch(m, inputs, cur, batch_embs);
+        infer_ns += nstime() - t0;
+        if (embed_rc != 0) {
             failed = 1;
             break;
         }
@@ -1255,10 +1313,13 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
 
     pos = 0;
     for (int i = 0; i < n_reqs; i++) {
+        reqs[i]->j->infer_ns += infer_ns;
         if (failed) {
             job_set_error(reqs[i]->j, 500, "embedding failed", "server_error");
         } else {
+            uint64_t t0 = nstime();
             render_embedding_response(reqs[i], embs + (size_t)pos * dim);
+            reqs[i]->j->encode_ns += nstime() - t0;
         }
         pos += reqs[i]->n_inputs;
     }
@@ -1383,6 +1444,7 @@ static void execute_contextual_request_list(contextual_request **reqs,
     size_t batch_emb_cap = 0;
 
     int failed = 0;
+    uint64_t infer_ns = 0;
     for (int start = 0; start < total_docs;) {
         int cur = 0;
         int tokens = 0;
@@ -1403,7 +1465,10 @@ static void execute_contextual_request_list(contextual_request **reqs,
             batch_embs = xrealloc(batch_embs, needed * sizeof(*batch_embs));
             batch_emb_cap = needed;
         }
-        if (model_embed_spans_batch(m, inputs, cur, batch_embs) != 0) {
+        uint64_t t0 = nstime();
+        int embed_rc = model_embed_spans_batch(m, inputs, cur, batch_embs);
+        infer_ns += nstime() - t0;
+        if (embed_rc != 0) {
             failed = 1;
             break;
         }
@@ -1420,12 +1485,15 @@ static void execute_contextual_request_list(contextual_request **reqs,
 
     span_offset = 0;
     for (int i = 0; i < n_reqs; i++) {
+        reqs[i]->j->infer_ns += infer_ns;
         if (failed) {
             job_set_error(reqs[i]->j, 500, "contextual embedding failed",
                           "server_error");
         } else {
+            uint64_t t0 = nstime();
             render_contextual_response(reqs[i],
                                        embs + (size_t)span_offset * dim);
+            reqs[i]->j->encode_ns += nstime() - t0;
         }
         span_offset += reqs[i]->total_chunks;
     }
@@ -1533,7 +1601,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
 
         int idx = 0;
         if (cJSON_IsString(input)) {
-            if (tokenize_one(m, input->valuestring, &out->tokens[0]) != 0) {
+            if (tokenize_one(m, j, input->valuestring, &out->tokens[0]) != 0) {
                 ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
                        "value_error.tokenization");
             } else {
@@ -1550,7 +1618,8 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
             cJSON_ArrayForEach(item, input) {
                 char loc[64];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", idx);
-                if (tokenize_one(m, item->valuestring, &out->tokens[idx]) != 0) {
+                if (tokenize_one(m, j, item->valuestring,
+                                 &out->tokens[idx]) != 0) {
                     ve_add(detail, loc, "tokenization failed",
                            "value_error.tokenization");
                 } else {
@@ -1680,7 +1749,8 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
             cJSON_ArrayForEach(chunk, doc_arr) {
                 char loc[80];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", di, ci);
-                if (tokenize_one(m, chunk->valuestring, &chunk_tokens[ci]) != 0) {
+                if (tokenize_one(m, j, chunk->valuestring,
+                                 &chunk_tokens[ci]) != 0) {
                     ve_add(detail, loc, "tokenization failed",
                            "value_error.tokenization");
                     doc_valid = 0;
@@ -1754,7 +1824,11 @@ static int parse_job_root(job *j, cJSON **out_root) {
 
 static void process_unknown_job(job *j) {
     cJSON *root = NULL;
-    if (parse_job_root(j, &root) != 0)
+    if (!j->started_ns) j->started_ns = nstime();
+    uint64_t t0 = nstime();
+    int rc = parse_job_root(j, &root);
+    j->parse_ns += nstime() - t0;
+    if (rc != 0)
         return;
     job_set_error(j, 404, "unknown endpoint", "invalid_request_error");
     cJSON_Delete(root);
@@ -1770,6 +1844,7 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
 
     for (int i = 0; i < n_jobs; i++) {
         cJSON *root = NULL;
+        if (!jobs[i]->started_ns) jobs[i]->started_ns = nstime();
         if (!strcmp(jobs[i]->path, "/v1/embeddings")) {
             kind[i] = 1;
         } else if (!strcmp(jobs[i]->path, "/v1/contextualizedembeddings")) {
@@ -1777,7 +1852,10 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
         } else {
             continue;
         }
-        if (parse_job_root(jobs[i], &root) != 0)
+        uint64_t t0 = nstime();
+        int parse_rc = parse_job_root(jobs[i], &root);
+        jobs[i]->parse_ns += nstime() - t0;
+        if (parse_rc != 0)
             continue;
         if (kind[i] == 1)
             prepare_embedding_request(jobs[i], root, s, &std_reqs[i]);
@@ -1791,6 +1869,7 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
 
         if (!kind[i]) {
             process_unknown_job(jobs[i]);
+            job_set_timing_header(jobs[i]);
             enqueue_done(jobs[i]);
             done[i] = 1;
             continue;
@@ -1798,6 +1877,7 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
 
         if ((kind[i] == 1 && !std_reqs[i].ready) ||
             (kind[i] == 2 && !ctx_reqs[i].ready)) {
+            job_set_timing_header(jobs[i]);
             enqueue_done(jobs[i]);
             done[i] = 1;
             continue;
@@ -1821,6 +1901,7 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
             execute_embedding_request_list(std_group, group_n);
             for (int k = 0; k < group_n; k++) {
                 int idx = (int)(std_group[k] - std_reqs);
+                job_set_timing_header(jobs[idx]);
                 enqueue_done(jobs[idx]);
                 done[idx] = 1;
             }
@@ -1842,6 +1923,7 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
             execute_contextual_request_list(ctx_group, group_n);
             for (int k = 0; k < group_n; k++) {
                 int idx = (int)(ctx_group[k] - ctx_reqs);
+                job_set_timing_header(jobs[idx]);
                 enqueue_done(jobs[idx]);
                 done[idx] = 1;
             }
