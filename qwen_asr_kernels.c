@@ -8,6 +8,9 @@
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
@@ -1609,6 +1612,24 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
                 __m256 new2 = _mm256_fmadd_ps(x2, cc, _mm256_mul_ps(x1, ss));
                 _mm256_storeu_ps(vec + d, new1);
                 _mm256_storeu_ps(vec + half + d, new2);
+            }
+            for (; d < half; d++) {
+                float x1 = vec[d];
+                float x2 = vec[half + d];
+                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+            }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+            int d = 0;
+            for (; d + 4 <= half; d += 4) {
+                float32x4_t x1 = vld1q_f32(vec + d);
+                float32x4_t x2 = vld1q_f32(vec + half + d);
+                float32x4_t cc = vld1q_f32(c + d);
+                float32x4_t ss = vld1q_f32(sn + d);
+                float32x4_t new1 = vmlsq_f32(vmulq_f32(x1, cc), x2, ss);
+                float32x4_t new2 = vfmaq_f32(vmulq_f32(x2, cc), x1, ss);
+                vst1q_f32(vec + d, new1);
+                vst1q_f32(vec + half + d, new2);
             }
             for (; d < half; d++) {
                 float x1 = vec[d];
