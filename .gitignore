@@ -4,6 +4,7 @@ book/
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 pplx_server
 client
 tmp

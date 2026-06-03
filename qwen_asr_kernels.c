@@ -194,10 +194,16 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
 void qwen_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
 #ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                seq_len, out_dim, in_dim,
-                1.0f, x, in_dim, W, in_dim,
-                0.0f, y, out_dim);
+    if (seq_len == 1) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    out_dim, in_dim, 1.0f, W, in_dim, x, 1,
+                    0.0f, y, 1);
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    seq_len, out_dim, in_dim,
+                    1.0f, x, in_dim, W, in_dim,
+                    0.0f, y, out_dim);
+    }
     if (b != NULL) {
         for (int s = 0; s < seq_len; s++) {
             for (int o = 0; o < out_dim; o++) {
