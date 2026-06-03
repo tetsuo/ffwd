@@ -9,6 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <float.h>
 
 /* ========================================================================
  * Per-layer MLX weight arrays
@@ -49,6 +50,13 @@ struct pplx_mlx_late_ctx {
     multi_safetensors_t *dense_ms;
     mlx_linear_t projection;
     int token_dim;
+};
+
+struct pplx_mlx_late_vectors {
+    pplx_mlx_late_ctx_t *owner;
+    mlx_array vectors;          /* [tokens, dim] */
+    int tokens;
+    int dim;
 };
 
 /* ========================================================================
@@ -778,18 +786,18 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
     return x;
 }
 
-int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
-                                const int *token_ids, int n_tokens,
-                                int normalize, float *out_vectors)
+pplx_mlx_late_vectors_t *pplx_mlx_late_encode_tokens_device(
+    pplx_mlx_late_ctx_t *ctx, const int *token_ids, int n_tokens,
+    int normalize)
 {
-    if (!ctx || !ctx->base || !token_ids || n_tokens <= 0 || !out_vectors ||
+    if (!ctx || !ctx->base || !token_ids || n_tokens <= 0 ||
         ctx->token_dim <= 0 || !linear_ok(ctx->projection))
-        return -1;
+        return NULL;
 
     pplx_mlx_ctx_t *base = ctx->base;
     if (base->layer_start != 0 || base->layer_end != base->config.n_layers ||
         !arr_ok(base->embed_tokens) || !arr_ok(base->norm))
-        return -1;
+        return NULL;
 
     const pplx_config_t *c = &base->config;
     mlx_stream S = base->stream;
@@ -797,31 +805,28 @@ int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
         if (token_ids[i] < 0 || token_ids[i] >= c->vocab_size) {
             fprintf(stderr, "mlx late: invalid token id %d at position %d\n",
                     token_ids[i], i);
-            return -1;
+            return NULL;
         }
     }
 
-    size_t id_bytes, out_values, out_bytes;
-    if (mlx_mul_size((size_t)n_tokens, sizeof(int), &id_bytes) != 0 ||
-        mlx_mul_size((size_t)n_tokens, (size_t)ctx->token_dim,
-                     &out_values) != 0 ||
-        mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0)
-        return -1;
+    size_t id_bytes;
+    if (mlx_mul_size((size_t)n_tokens, sizeof(int), &id_bytes) != 0)
+        return NULL;
 
     int *ids_data = (int *)malloc(id_bytes);
-    if (!ids_data) return -1;
+    if (!ids_data) return NULL;
     memcpy(ids_data, token_ids, id_bytes);
 
     int ids_shape[] = {1, n_tokens};
     mlx_array ids = mlx_array_new_data(ids_data, ids_shape, 2, MLX_INT32);
     free(ids_data);
-    if (!arr_ok(ids)) return -1;
+    if (!arr_ok(ids)) return NULL;
 
-    int rc = -1;
+    pplx_mlx_late_vectors_t *result = NULL;
     mlx_array x = mlx_array_new();
     mlx_array x_normed = (mlx_array){0};
     mlx_array projected = (mlx_array){0};
-    mlx_array out_f32 = (mlx_array){0};
+    mlx_array reshaped = (mlx_array){0};
 
     mlx_take_axis(&x, base->embed_tokens, ids, 0, S);
     mlx_array_free(ids);
@@ -874,22 +879,370 @@ int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
         if (!arr_ok(projected)) goto cleanup;
     }
 
-    out_f32 = mlx_array_new();
-    mlx_astype(&out_f32, projected, MLX_FLOAT32, S);
-    if (!arr_ok(out_f32)) goto cleanup;
+    int vec_shape[] = {n_tokens, ctx->token_dim};
+    reshaped = mlx_array_new();
+    mlx_reshape(&reshaped, projected, vec_shape, 2, S);
+    if (!arr_ok(reshaped)) goto cleanup;
 
-    mlx_array_eval(out_f32);
-    const float *data = mlx_array_data_float32(out_f32);
-    if (data) {
-        memcpy(out_vectors, data, out_bytes);
-        rc = 0;
-    }
+    result = (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*result));
+    if (!result) goto cleanup;
+    result->owner = ctx;
+    result->vectors = reshaped;
+    result->tokens = n_tokens;
+    result->dim = ctx->token_dim;
+    reshaped = (mlx_array){0};
 
 cleanup:
-    mlx_array_free(out_f32);
+    mlx_array_free(reshaped);
     mlx_array_free(projected);
     mlx_array_free(x_normed);
     mlx_array_free(x);
+    return result;
+}
+
+void pplx_mlx_late_vectors_free(pplx_mlx_late_vectors_t *vecs)
+{
+    if (!vecs) return;
+    mlx_array_free(vecs->vectors);
+    free(vecs);
+}
+
+int pplx_mlx_late_vectors_token_count(const pplx_mlx_late_vectors_t *vecs)
+{
+    return vecs ? vecs->tokens : 0;
+}
+
+int pplx_mlx_late_vectors_dim(const pplx_mlx_late_vectors_t *vecs)
+{
+    return vecs ? vecs->dim : 0;
+}
+
+int pplx_mlx_late_vectors_copy(const pplx_mlx_late_vectors_t *vecs,
+                               float *out_vectors)
+{
+    if (!vecs || !out_vectors || !arr_ok(vecs->vectors) ||
+        vecs->tokens <= 0 || vecs->dim <= 0)
+        return -1;
+
+    size_t values, bytes;
+    if (mlx_mul_size((size_t)vecs->tokens, (size_t)vecs->dim, &values) != 0 ||
+        mlx_mul_size(values, sizeof(float), &bytes) != 0)
+        return -1;
+
+    mlx_stream S = vecs->owner->base->stream;
+    mlx_array out_f32 = mlx_array_new();
+    mlx_astype(&out_f32, vecs->vectors, MLX_FLOAT32, S);
+    if (!arr_ok(out_f32)) {
+        mlx_array_free(out_f32);
+        return -1;
+    }
+
+    int rc = -1;
+    mlx_array_eval(out_f32);
+    const float *data = mlx_array_data_float32(out_f32);
+    if (data) {
+        memcpy(out_vectors, data, bytes);
+        rc = 0;
+    }
+    mlx_array_free(out_f32);
+    return rc;
+}
+
+pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_concat(
+    pplx_mlx_late_ctx_t *ctx,
+    const pplx_mlx_late_vectors_t *const *items, int count)
+{
+    if (!ctx || !ctx->base || !items || count <= 0) return NULL;
+    int dim = 0;
+    int total = 0;
+    for (int i = 0; i < count; i++) {
+        const pplx_mlx_late_vectors_t *v = items[i];
+        if (!v || v->owner != ctx || !arr_ok(v->vectors) ||
+            v->tokens <= 0 || v->dim <= 0)
+            return NULL;
+        if (i == 0) dim = v->dim;
+        if (v->dim != dim || total > INT_MAX - v->tokens)
+            return NULL;
+        total += v->tokens;
+    }
+
+    mlx_array *parts = (mlx_array *)malloc((size_t)count * sizeof(*parts));
+    if (!parts) return NULL;
+    for (int i = 0; i < count; i++)
+        parts[i] = items[i]->vectors;
+
+    mlx_stream S = ctx->base->stream;
+    mlx_vector_array vec = mlx_vector_array_new_data(parts, (size_t)count);
+    free(parts);
+    if (!vec.ctx) return NULL;
+
+    mlx_array joined = mlx_array_new();
+    mlx_concatenate_axis(&joined, vec, 0, S);
+    mlx_vector_array_free(vec);
+    if (!arr_ok(joined)) {
+        mlx_array_free(joined);
+        return NULL;
+    }
+
+    pplx_mlx_late_vectors_t *out =
+        (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    if (!out) {
+        mlx_array_free(joined);
+        return NULL;
+    }
+    out->owner = ctx;
+    out->vectors = joined;
+    out->tokens = total;
+    out->dim = dim;
+    return out;
+}
+
+pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_select(
+    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *vecs,
+    const int *token_indices, int count)
+{
+    if (!ctx || !ctx->base || !vecs || vecs->owner != ctx ||
+        !arr_ok(vecs->vectors) || !token_indices || count <= 0 ||
+        vecs->tokens <= 0 || vecs->dim <= 0)
+        return NULL;
+
+    for (int i = 0; i < count; i++) {
+        if (token_indices[i] < 0 || token_indices[i] >= vecs->tokens)
+            return NULL;
+    }
+
+    size_t idx_bytes;
+    if (mlx_mul_size((size_t)count, sizeof(int), &idx_bytes) != 0)
+        return NULL;
+    int *idx_data = (int *)malloc(idx_bytes);
+    if (!idx_data) return NULL;
+    memcpy(idx_data, token_indices, idx_bytes);
+
+    int idx_shape[] = {count};
+    mlx_array idx = mlx_array_new_data(idx_data, idx_shape, 1, MLX_INT32);
+    free(idx_data);
+    if (!arr_ok(idx)) return NULL;
+
+    mlx_stream S = ctx->base->stream;
+    mlx_array selected = mlx_array_new();
+    mlx_take_axis(&selected, vecs->vectors, idx, 0, S);
+    mlx_array_free(idx);
+    if (!arr_ok(selected)) {
+        mlx_array_free(selected);
+        return NULL;
+    }
+
+    pplx_mlx_late_vectors_t *out =
+        (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    if (!out) {
+        mlx_array_free(selected);
+        return NULL;
+    }
+    out->owner = ctx;
+    out->vectors = selected;
+    out->tokens = count;
+    out->dim = vecs->dim;
+    return out;
+}
+
+int pplx_mlx_late_maxsim_batch_device(
+    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *query,
+    const pplx_mlx_late_vectors_t *docs, const int *doc_offsets,
+    int docs_count, float *scores)
+{
+    if (!ctx || !query || !docs || !doc_offsets || docs_count <= 0 ||
+        !scores || query->owner != ctx || docs->owner != ctx ||
+        query->dim <= 0 || query->dim != docs->dim ||
+        query->tokens <= 0 || docs->tokens <= 0 ||
+        !arr_ok(query->vectors) || !arr_ok(docs->vectors) ||
+        doc_offsets[0] != 0)
+        return -1;
+
+    int *lengths = (int *)malloc((size_t)docs_count * sizeof(*lengths));
+    if (!lengths) return -1;
+    int max_doc_tokens = 0;
+    for (int i = 0; i < docs_count; i++) {
+        if (doc_offsets[i] < 0 || doc_offsets[i] >= doc_offsets[i + 1] ||
+            doc_offsets[i + 1] > docs->tokens) {
+            free(lengths);
+            return -1;
+        }
+        int n = doc_offsets[i + 1] - doc_offsets[i];
+        lengths[i] = n;
+        if (n > max_doc_tokens) max_doc_tokens = n;
+    }
+    if (max_doc_tokens <= 0) {
+        free(lengths);
+        return -1;
+    }
+
+    mlx_stream S = ctx->base->stream;
+    int dim = query->dim;
+    int rc = -1;
+    mlx_array *doc_rows =
+        (mlx_array *)calloc((size_t)docs_count, sizeof(*doc_rows));
+    if (!doc_rows) {
+        free(lengths);
+        return -1;
+    }
+
+    mlx_vector_array doc_vec = (mlx_vector_array){0};
+    mlx_array pad_value = mlx_array_new_float32(0.0f);
+    mlx_array doc_batch = (mlx_array){0};
+    mlx_array query_3d = (mlx_array){0};
+    mlx_array query_batched = (mlx_array){0};
+    mlx_array docs_t = (mlx_array){0};
+    mlx_array sims = (mlx_array){0};
+    mlx_array lengths_arr = (mlx_array){0};
+    mlx_array positions = (mlx_array){0};
+    mlx_array lengths_2d = (mlx_array){0};
+    mlx_array positions_2d = (mlx_array){0};
+    mlx_array valid = (mlx_array){0};
+    mlx_array valid_3d = (mlx_array){0};
+    mlx_array invalid_value = mlx_array_new_float32(-FLT_MAX);
+    mlx_array masked_sims = (mlx_array){0};
+    mlx_array maxes = (mlx_array){0};
+    mlx_array sums = (mlx_array){0};
+    mlx_array sums_f32 = (mlx_array){0};
+
+    for (int i = 0; i < docs_count; i++) {
+        int n = lengths[i];
+        int start[] = {doc_offsets[i], 0};
+        int stop[] = {doc_offsets[i + 1], dim};
+        int strides[] = {1, 1};
+
+        mlx_array doc = mlx_array_new();
+        mlx_array padded = (mlx_array){0};
+
+        mlx_slice(&doc, docs->vectors, start, 2, stop, 2, strides, 2, S);
+        if (!arr_ok(doc)) goto cleanup;
+
+        if (n < max_doc_tokens) {
+            int axes[] = {0};
+            int low[] = {0};
+            int high[] = {max_doc_tokens - n};
+            padded = mlx_array_new();
+            mlx_pad(&padded, doc, axes, 1, low, 1, high, 1, pad_value,
+                    "constant", S);
+            mlx_array_free(doc);
+            doc = padded;
+            padded = (mlx_array){0};
+            if (!arr_ok(doc)) goto cleanup;
+        }
+
+        doc_rows[i] = mlx_array_new();
+        mlx_expand_dims(&doc_rows[i], doc, 0, S);
+        mlx_array_free(doc);
+        if (!arr_ok(doc_rows[i])) goto cleanup;
+    }
+
+    doc_vec = mlx_vector_array_new_data(doc_rows, (size_t)docs_count);
+    if (!doc_vec.ctx) goto cleanup;
+
+    doc_batch = mlx_array_new();
+    mlx_concatenate_axis(&doc_batch, doc_vec, 0, S);
+    if (!arr_ok(doc_batch)) goto cleanup;
+
+    query_3d = mlx_array_new();
+    mlx_expand_dims(&query_3d, query->vectors, 0, S);
+    if (!arr_ok(query_3d)) goto cleanup;
+
+    int q_shape[] = {docs_count, query->tokens, dim};
+    query_batched = mlx_array_new();
+    mlx_broadcast_to(&query_batched, query_3d, q_shape, 3, S);
+    if (!arr_ok(query_batched)) goto cleanup;
+
+    int perm[] = {0, 2, 1};
+    docs_t = mlx_array_new();
+    mlx_transpose_axes(&docs_t, doc_batch, perm, 3, S);
+    if (!arr_ok(docs_t)) goto cleanup;
+
+    sims = mlx_array_new();
+    mlx_matmul(&sims, query_batched, docs_t, S);
+    if (!arr_ok(sims)) goto cleanup;
+
+    int len_shape[] = {docs_count};
+    lengths_arr = mlx_array_new_data(lengths, len_shape, 1, MLX_INT32);
+    if (!arr_ok(lengths_arr)) goto cleanup;
+
+    positions = mlx_array_new();
+    mlx_arange(&positions, 0.0, (double)max_doc_tokens, 1.0, MLX_INT32, S);
+    if (!arr_ok(positions)) goto cleanup;
+
+    lengths_2d = mlx_array_new();
+    mlx_expand_dims(&lengths_2d, lengths_arr, 1, S);
+    if (!arr_ok(lengths_2d)) goto cleanup;
+
+    positions_2d = mlx_array_new();
+    mlx_expand_dims(&positions_2d, positions, 0, S);
+    if (!arr_ok(positions_2d)) goto cleanup;
+
+    valid = mlx_array_new();
+    mlx_less(&valid, positions_2d, lengths_2d, S);
+    if (!arr_ok(valid)) goto cleanup;
+
+    valid_3d = mlx_array_new();
+    mlx_expand_dims(&valid_3d, valid, 1, S);
+    if (!arr_ok(valid_3d)) goto cleanup;
+
+    masked_sims = mlx_array_new();
+    mlx_where(&masked_sims, valid_3d, sims, invalid_value, S);
+    if (!arr_ok(masked_sims)) goto cleanup;
+
+    maxes = mlx_array_new();
+    mlx_max_axis(&maxes, masked_sims, 2, false, S);
+    if (!arr_ok(maxes)) goto cleanup;
+
+    sums = mlx_array_new();
+    mlx_sum_axis(&sums, maxes, 1, false, S);
+    if (!arr_ok(sums)) goto cleanup;
+
+    sums_f32 = mlx_array_new();
+    mlx_astype(&sums_f32, sums, MLX_FLOAT32, S);
+    if (!arr_ok(sums_f32)) goto cleanup;
+
+    mlx_array_eval(sums_f32);
+    const float *data = mlx_array_data_float32(sums_f32);
+    if (!data) goto cleanup;
+    memcpy(scores, data, (size_t)docs_count * sizeof(float));
+    rc = 0;
+
+cleanup:
+    mlx_array_free(sums_f32);
+    mlx_array_free(sums);
+    mlx_array_free(maxes);
+    mlx_array_free(masked_sims);
+    mlx_array_free(invalid_value);
+    mlx_array_free(valid_3d);
+    mlx_array_free(valid);
+    mlx_array_free(positions_2d);
+    mlx_array_free(lengths_2d);
+    mlx_array_free(positions);
+    mlx_array_free(lengths_arr);
+    mlx_array_free(sims);
+    mlx_array_free(docs_t);
+    mlx_array_free(query_batched);
+    mlx_array_free(query_3d);
+    mlx_array_free(doc_batch);
+    if (doc_vec.ctx) mlx_vector_array_free(doc_vec);
+    mlx_array_free(pad_value);
+    for (int i = 0; i < docs_count; i++)
+        mlx_array_free(doc_rows[i]);
+    free(doc_rows);
+    free(lengths);
+    return rc;
+}
+
+int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
+                                const int *token_ids, int n_tokens,
+                                int normalize, float *out_vectors)
+{
+    pplx_mlx_late_vectors_t *vecs =
+        pplx_mlx_late_encode_tokens_device(ctx, token_ids, n_tokens,
+                                           normalize);
+    if (!vecs) return -1;
+    int rc = pplx_mlx_late_vectors_copy(vecs, out_vectors);
+    pplx_mlx_late_vectors_free(vecs);
     return rc;
 }
 

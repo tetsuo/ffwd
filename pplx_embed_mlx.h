@@ -14,6 +14,7 @@
 /* Opaque MLX model context */
 typedef struct pplx_mlx_ctx pplx_mlx_ctx_t;
 typedef struct pplx_mlx_late_ctx pplx_mlx_late_ctx_t;
+typedef struct pplx_mlx_late_vectors pplx_mlx_late_vectors_t;
 
 typedef struct {
     int quantize_bits;       /* 0 disables; currently 8 */
@@ -63,6 +64,32 @@ int pplx_mlx_late_token_dim(const pplx_mlx_late_ctx_t *ctx);
 int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
                                 const int *token_ids, int n_tokens,
                                 int normalize, float *out_vectors);
+
+/*
+ * Device-resident late-interaction token vectors.
+ *
+ * The model context owns the MLX stream; the returned vector handle must not
+ * outlive ctx. Copying is optional: MaxSim can consume these handles directly
+ * and copy back only final candidate scores.
+ */
+pplx_mlx_late_vectors_t *pplx_mlx_late_encode_tokens_device(
+    pplx_mlx_late_ctx_t *ctx, const int *token_ids, int n_tokens,
+    int normalize);
+void pplx_mlx_late_vectors_free(pplx_mlx_late_vectors_t *vecs);
+int pplx_mlx_late_vectors_token_count(const pplx_mlx_late_vectors_t *vecs);
+int pplx_mlx_late_vectors_dim(const pplx_mlx_late_vectors_t *vecs);
+int pplx_mlx_late_vectors_copy(const pplx_mlx_late_vectors_t *vecs,
+                               float *out_vectors);
+pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_concat(
+    pplx_mlx_late_ctx_t *ctx,
+    const pplx_mlx_late_vectors_t *const *items, int count);
+pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_select(
+    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *vecs,
+    const int *token_indices, int count);
+int pplx_mlx_late_maxsim_batch_device(
+    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *query,
+    const pplx_mlx_late_vectors_t *docs, const int *doc_offsets,
+    int docs_count, float *scores);
 
 /*
  * Compute embedding for token_ids[0..n_tokens-1].
