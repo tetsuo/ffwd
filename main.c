@@ -38,6 +38,8 @@ static void print_usage(const char *prog)
         "  --dist-remote HOST:PORT\n"
         "               Use one remote final shard for CLI or --stdin inference\n"
         "  --layers A:B Distributed half-open layer range, for example 0:14\n"
+        "  --dist-activation-bits N\n"
+        "               Distributed activation transport width: 32 or 16 (default: 32)\n"
         "  --model ID=DIR\n"
         "               Load model ID from directory for --serve (repeatable)\n"
         "  --backend cpu|mlx\n"
@@ -522,6 +524,7 @@ int main(int argc, char *argv[])
     int batch_wait_us = -1;
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
+    int dist_activation_bits = 32;
     const char *backend = "cpu";
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
@@ -602,6 +605,14 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
+        else if (!strcmp(f, "--dist-activation-bits")) {
+            dist_activation_bits = atoi(argv[++arg_start]);
+            if (dist_activation_bits != 32 && dist_activation_bits != 16) {
+                fprintf(stderr, "--dist-activation-bits must be 32 or 16\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
         else if (!strcmp(f, "--cors"))   { cors = 1; }
         else if (!strcmp(f, "--api-key")){ api_key = argv[++arg_start]; }
         else if (!strcmp(f, "-e"))      { print_embs = 1; }
@@ -642,6 +653,11 @@ int main(int argc, char *argv[])
         if (model_specs.n == 0) {
             fprintf(stderr, "--serve requires at least one --model MODEL_ID=DIR\n");
             print_usage(argv[0]);
+            free_model_specs(&model_specs);
+            return 1;
+        }
+        if (dist_activation_bits != 32) {
+            fprintf(stderr, "--dist-activation-bits is only valid with --dist-remote\n");
             free_model_specs(&model_specs);
             return 1;
         }
@@ -699,6 +715,10 @@ int main(int argc, char *argv[])
         fprintf(stderr, "distributed mode requires --layers START:END\n");
         return 1;
     }
+    if (dist_activation_bits != 32 && !dist_remote) {
+        fprintf(stderr, "--dist-activation-bits is only valid with --dist-remote\n");
+        return 1;
+    }
     if (dist_remote && layer_start != 0) {
         fprintf(stderr, "--dist-remote coordinator layers must start at zero\n");
         return 1;
@@ -721,6 +741,7 @@ int main(int argc, char *argv[])
     pplx_dist_options_t dist_opts = {
         .mlx_quantize_bits = mlx_quantize_bits,
         .mlx_quantize_group_size = mlx_quantize_group_size,
+        .activation_bits = dist_activation_bits,
     };
 
     if (dist_worker_mode)

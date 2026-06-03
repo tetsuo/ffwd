@@ -2,9 +2,9 @@
  * pplx_distributed.c - Stateless two-node layer-sharded inference.
  *
  * This first transport is deliberately synchronous: one coordinator sends a
- * packed fp32 hidden-state batch to one final worker and receives pooled
+ * packed hidden-state batch to one final worker and receives pooled
  * embeddings. The protocol is bounded and versioned so later route discovery,
- * retries, and fp16 transport can extend it without changing model math.
+ * retries, and richer transport can extend it without changing model math.
  */
 
 #include "pplx_distributed.h"
@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #define PPLX_DIST_MAGIC UINT32_C(0x504c5844) /* "PLXD" */
-#define PPLX_DIST_VERSION 1u
+#define PPLX_DIST_VERSION 2u
 
 #define PPLX_DIST_MSG_HELLO  1u
 #define PPLX_DIST_MSG_WORK   2u
@@ -38,6 +38,7 @@
 #define PPLX_DIST_MAX_TOKENS 120000u
 #define PPLX_DIST_MAX_ERROR_BYTES 1024u
 #define PPLX_DIST_SOCKET_TIMEOUT_SEC 60
+#define PPLX_DIST_ACTIVATION_BITS_DEFAULT 32u
 
 typedef struct {
     uint32_t magic;
@@ -68,6 +69,7 @@ typedef struct {
     uint32_t hidden_size;
     uint32_t lengths_bytes;
     uint32_t states_bytes;
+    uint32_t states_bits;
 } dist_work;
 
 typedef struct {
@@ -93,6 +95,7 @@ struct pplx_dist_client {
     int fd;
     int local_layer_end;
     uint64_t next_request_id;
+    uint32_t activation_bits;
 };
 
 static int host_is_little_endian(void)
@@ -143,6 +146,117 @@ static int mul_u32(uint32_t a, uint32_t b, uint32_t *out)
 {
     if (a != 0 && b > UINT32_MAX / a) return -1;
     *out = a * b;
+    return 0;
+}
+
+static uint32_t activation_bits_or_default(uint32_t bits)
+{
+    return bits ? bits : PPLX_DIST_ACTIVATION_BITS_DEFAULT;
+}
+
+static int activation_bits_valid(uint32_t bits)
+{
+    bits = activation_bits_or_default(bits);
+    return bits == 32u || bits == 16u;
+}
+
+static int activation_wire_bytes(uint32_t bits, uint64_t values, uint32_t *out)
+{
+    bits = activation_bits_or_default(bits);
+    if (!activation_bits_valid(bits)) return -1;
+    uint64_t bytes = values * (uint64_t)(bits / 8u);
+    if (bytes > UINT32_MAX) return -1;
+    if (out) *out = (uint32_t)bytes;
+    return 0;
+}
+
+static uint16_t f32_to_f16(float f)
+{
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = bits & 0x7fffffu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        uint32_t round_bit = (mant >> (shift - 1)) & 1u;
+        uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
+        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+
+    if (exp >= 31) {
+        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0)
+            return (uint16_t)(sign | 0x7e00u);
+        return (uint16_t)(sign | 0x7c00u);
+    }
+
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    uint32_t round = mant & 0x1fffu;
+    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
+    return (uint16_t)half;
+}
+
+static float f16_to_f32(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    int32_t exp = (int32_t)((h >> 10) & 0x1fu);
+    uint32_t mant = h & 0x03ffu;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static int encode_activations(void *dst, const float *src, uint64_t values,
+                              uint32_t bits)
+{
+    bits = activation_bits_or_default(bits);
+    if (!dst || !src || !activation_bits_valid(bits)) return -1;
+    if (bits == 32u) {
+        memcpy(dst, src, values * sizeof(float));
+        return 0;
+    }
+    uint16_t *out = dst;
+    for (uint64_t i = 0; i < values; i++) out[i] = f32_to_f16(src[i]);
+    return 0;
+}
+
+static int decode_activations(float *dst, const void *wire, uint64_t values,
+                              uint32_t bits)
+{
+    bits = activation_bits_or_default(bits);
+    if (!dst || !wire || !activation_bits_valid(bits)) return -1;
+    if (bits == 32u) {
+        memcpy(dst, wire, values * sizeof(float));
+        return 0;
+    }
+    const uint16_t *src = wire;
+    for (uint64_t i = 0; i < values; i++) dst[i] = f16_to_f32(src[i]);
     return 0;
 }
 
@@ -445,23 +559,33 @@ static int worker_process_work(int fd, dist_stage *stage,
     work_from_wire(&work);
     request_id = u64_from_halves(work.request_hi, work.request_lo);
 
-    uint32_t expected_lengths = 0, expected_states = 0;
+    uint32_t expected_lengths = 0, expected_state_values = 0;
+    uint32_t expected_state_f32_bytes = 0, expected_state_wire_bytes = 0;
+    uint32_t states_bits = activation_bits_or_default(work.states_bits);
     if (work.batch == 0 || work.batch > PPLX_DIST_MAX_BATCH ||
         work.total_tokens == 0 || work.total_tokens > PPLX_DIST_MAX_TOKENS ||
         work.hidden_size != (uint32_t)stage->cfg->hidden_size ||
+        !activation_bits_valid(states_bits) ||
         mul_u32(work.batch, sizeof(uint32_t), &expected_lengths) != 0 ||
-        mul_u32(work.total_tokens, work.hidden_size, &expected_states) != 0 ||
-        mul_u32(expected_states, sizeof(float), &expected_states) != 0 ||
+        mul_u32(work.total_tokens, work.hidden_size,
+                &expected_state_values) != 0 ||
+        mul_u32(expected_state_values, sizeof(float),
+                &expected_state_f32_bytes) != 0 ||
+        activation_wire_bytes(states_bits, expected_state_values,
+                              &expected_state_wire_bytes) != 0 ||
         work.lengths_bytes != expected_lengths ||
-        work.states_bytes != expected_states ||
-        body_bytes != sizeof(work) + expected_lengths + expected_states)
+        work.states_bytes != expected_state_wire_bytes)
+        return send_error_result(fd, request_id, "invalid WORK frame");
+    uint64_t expected_body = (uint64_t)sizeof(work) + expected_lengths +
+                             expected_state_wire_bytes;
+    if (expected_body > UINT32_MAX || body_bytes != (uint32_t)expected_body)
         return send_error_result(fd, request_id, "invalid WORK frame");
 
     const unsigned char *p = (const unsigned char *)body + sizeof(work);
     int *lengths = malloc((size_t)work.batch * sizeof(*lengths));
     pplx_input_t *inputs = calloc(work.batch, sizeof(*inputs));
-    float *states = malloc(expected_states);
-    float *out_states = malloc(expected_states);
+    float *states = malloc(expected_state_f32_bytes);
+    float *out_states = malloc(expected_state_f32_bytes);
     uint32_t emb_bytes = 0;
     if (mul_u32(work.batch, work.hidden_size, &emb_bytes) != 0 ||
         mul_u32(emb_bytes, sizeof(float), &emb_bytes) != 0) {
@@ -494,7 +618,12 @@ static int worker_process_work(int fd, dist_stage *stage,
         free(embeddings);
         return send_error_result(fd, request_id, "sequence lengths do not match token total");
     }
-    memcpy(states, p + expected_lengths, expected_states);
+    if (decode_activations(states, p + expected_lengths,
+                           expected_state_values, states_bits) != 0) {
+        free(lengths); free(inputs); free(states); free(out_states);
+        free(embeddings);
+        return send_error_result(fd, request_id, "invalid activation payload");
+    }
 
     int rc = stage_forward(stage, inputs, (int)work.batch, states,
                            layer_start, layer_end, 1, out_states);
@@ -621,6 +750,10 @@ pplx_dist_client_t *pplx_dist_client_open_with_options(
     if (stage_load(&client->local, model_dir, 0, local_layer_end, use_mlx,
                    opts) != 0)
         goto fail;
+    client->activation_bits = activation_bits_or_default(
+        opts ? (uint32_t)opts->activation_bits : 0);
+    if (!activation_bits_valid(client->activation_bits))
+        goto fail;
     client->fd = connect_endpoint(host, port);
     if (client->fd < 0 ||
         recv_hello(client->fd, client->local.cfg, local_layer_end) != 0)
@@ -672,22 +805,34 @@ int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
         total_tokens += (uint32_t)inputs[i].n_tokens;
     }
 
-    uint32_t state_bytes = 0, lengths_bytes = 0;
+    uint32_t state_values = 0, state_f32_bytes = 0, state_wire_bytes = 0;
+    uint32_t lengths_bytes = 0;
     uint32_t hidden = (uint32_t)client->local.cfg->hidden_size;
-    if (mul_u32(total_tokens, hidden, &state_bytes) != 0 ||
-        mul_u32(state_bytes, sizeof(float), &state_bytes) != 0 ||
+    uint32_t states_bits = activation_bits_or_default(client->activation_bits);
+    if (mul_u32(total_tokens, hidden, &state_values) != 0 ||
+        mul_u32(state_values, sizeof(float), &state_f32_bytes) != 0 ||
+        activation_wire_bytes(states_bits, state_values, &state_wire_bytes) != 0 ||
         mul_u32((uint32_t)batch, sizeof(uint32_t), &lengths_bytes) != 0)
         return -1;
-    uint32_t body_bytes = (uint32_t)sizeof(dist_work) + lengths_bytes +
-                          state_bytes;
-    if (body_bytes > PPLX_DIST_MAX_FRAME_BYTES)
+    uint64_t body_bytes64 = (uint64_t)sizeof(dist_work) + lengths_bytes +
+                            state_wire_bytes;
+    if (body_bytes64 > PPLX_DIST_MAX_FRAME_BYTES)
         return -1;
-    float *states = malloc(state_bytes);
-    if (!states) return -1;
+    uint32_t body_bytes = (uint32_t)body_bytes64;
+    float *states = malloc(state_f32_bytes);
+    void *wire_states = malloc(state_wire_bytes);
+    if (!states || !wire_states) {
+        free(states); free(wire_states);
+        return -1;
+    }
     int rc = stage_forward(&client->local, inputs, batch, NULL, 0,
                            client->local_layer_end, 0, states);
     if (rc != 0) {
-        free(states);
+        free(states); free(wire_states);
+        return -1;
+    }
+    if (encode_activations(wire_states, states, state_values, states_bits) != 0) {
+        free(states); free(wire_states);
         return -1;
     }
 
@@ -698,7 +843,8 @@ int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
     work.total_tokens = total_tokens;
     work.hidden_size = hidden;
     work.lengths_bytes = lengths_bytes;
-    work.states_bytes = state_bytes;
+    work.states_bytes = state_wire_bytes;
+    work.states_bits = states_bits;
     dist_work wire = work;
     work_to_wire(&wire);
     rc = write_frame_header(client->fd, PPLX_DIST_MSG_WORK, body_bytes);
@@ -707,8 +853,8 @@ int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
         uint32_t n = htonl((uint32_t)inputs[i].n_tokens);
         rc = write_full(client->fd, &n, sizeof(n));
     }
-    if (rc == 0) rc = write_full(client->fd, states, state_bytes);
-    free(states);
+    if (rc == 0) rc = write_full(client->fd, wire_states, state_wire_bytes);
+    free(states); free(wire_states);
     if (rc != 0) return client_transport_error(client);
 
     uint32_t type = 0, bytes = 0;

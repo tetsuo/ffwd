@@ -12,6 +12,7 @@ typedef struct pplx_dist_client pplx_dist_client_t;
 typedef struct {
     int mlx_quantize_bits;
     int mlx_quantize_group_size;
+    int activation_bits; /* 0 defaults to fp32; supported: 32, 16 */
 } pplx_dist_options_t;
 
 /*
