@@ -234,9 +234,23 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
 
 /* Convert bf16 buffer to f32 buffer */
 static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    size_t i = 0;
+    uint32_t *d = (uint32_t *)(void *)dst;
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t v = vld1q_u16(src + i);
+        uint32x4_t lo = vshlq_n_u32(vmovl_u16(vget_low_u16(v)), 16);
+        uint32x4_t hi = vshlq_n_u32(vmovl_u16(vget_high_u16(v)), 16);
+        vst1q_u32(d + i, lo);
+        vst1q_u32(d + i + 4, hi);
+    }
+    for (; i < n; i++)
+        d[i] = ((uint32_t)src[i]) << 16;
+#else
     uint32_t *d = (uint32_t *)(void *)dst;
     for (size_t i = 0; i < n; i++)
         d[i] = ((uint32_t)src[i]) << 16;
+#endif
 }
 
 /* Reusable scratch buffer for bf16->f32 conversion */
