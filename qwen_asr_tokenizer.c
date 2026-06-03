@@ -825,6 +825,365 @@ static int encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int 
     return 0;
 }
 
+typedef struct {
+    size_t off;
+} bpe_sym_ref_t;
+
+struct qwen_tokenizer_workspace {
+    char *normalized;
+    size_t normalized_cap;
+    char *mapped;
+    size_t mapped_cap;
+    char *arena;
+    size_t arena_cap;
+    size_t arena_len;
+    bpe_sym_ref_t *syms;
+    int syms_cap;
+    int *ids;
+    int ids_cap;
+};
+
+static int reserve_bytes(char **buf, size_t *cap, size_t need) {
+    if (*cap >= need) return 0;
+    size_t new_cap = *cap ? *cap : 256;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+    char *p = (char *)realloc(*buf, new_cap);
+    if (!p) return -1;
+    *buf = p;
+    *cap = new_cap;
+    return 0;
+}
+
+static int reserve_ints(int **buf, int *cap, int need) {
+    if (*cap >= need) return 0;
+    int new_cap = *cap ? *cap : 64;
+    while (new_cap < need) {
+        if (new_cap > INT_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+    int *p = (int *)realloc(*buf, (size_t)new_cap * sizeof(int));
+    if (!p) return -1;
+    *buf = p;
+    *cap = new_cap;
+    return 0;
+}
+
+static int reserve_syms(qwen_tokenizer_workspace_t *ws, int need) {
+    if (ws->syms_cap >= need) return 0;
+    int new_cap = ws->syms_cap ? ws->syms_cap : 64;
+    while (new_cap < need) {
+        if (new_cap > INT_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+    bpe_sym_ref_t *p =
+        (bpe_sym_ref_t *)realloc(ws->syms,
+                                 (size_t)new_cap * sizeof(*ws->syms));
+    if (!p) return -1;
+    ws->syms = p;
+    ws->syms_cap = new_cap;
+    return 0;
+}
+
+static int arena_append(qwen_tokenizer_workspace_t *ws, const char *s,
+                        size_t len, size_t *off) {
+    if (ws->arena_len > SIZE_MAX - len - 1) return -1;
+    size_t need = ws->arena_len + len + 1;
+    if (reserve_bytes(&ws->arena, &ws->arena_cap, need) != 0) return -1;
+    *off = ws->arena_len;
+    memcpy(ws->arena + ws->arena_len, s, len);
+    ws->arena_len += len;
+    ws->arena[ws->arena_len++] = '\0';
+    return 0;
+}
+
+static const char *arena_str(const qwen_tokenizer_workspace_t *ws,
+                             bpe_sym_ref_t sym) {
+    return ws->arena + sym.off;
+}
+
+static int normalize_nfc_latin_into(qwen_tokenizer_workspace_t *ws,
+                                    const char *text, const char **out) {
+    const unsigned char *p = (const unsigned char *)text;
+    const unsigned char *end = p + strlen(text);
+    size_t in_len = (size_t)(end - p);
+    if (in_len > (SIZE_MAX - 1) / 2) return -1;
+    if (reserve_bytes(&ws->normalized, &ws->normalized_cap,
+                      in_len * 2 + 1) != 0)
+        return -1;
+
+    size_t w = 0;
+    while (p < end) {
+        const unsigned char *cur = p;
+        int cp = 0, len = 0;
+        if (!utf8_decode_cp_len(p, end, &cp, &len)) break;
+        p += len;
+
+        if (p < end) {
+            int mark = 0, mark_len = 0;
+            utf8_decode_cp_len(p, end, &mark, &mark_len);
+            int composed = compose_latin_mark(cp, mark);
+            if (composed) {
+                char tmp[4];
+                int n = utf8_encode_full_cp(composed, tmp);
+                memcpy(ws->normalized + w, tmp, (size_t)n);
+                w += (size_t)n;
+                p += mark_len;
+                continue;
+            }
+        }
+
+        memcpy(ws->normalized + w, cur, (size_t)len);
+        w += (size_t)len;
+    }
+
+    ws->normalized[w] = '\0';
+    *out = ws->normalized;
+    return 0;
+}
+
+static int text_to_bpe_unicode_into(qwen_tokenizer_workspace_t *ws,
+                                    const char *text, size_t len,
+                                    const char **out) {
+    init_gpt2_mapping();
+    if (len > (SIZE_MAX - 1) / 3) return -1;
+    if (reserve_bytes(&ws->mapped, &ws->mapped_cap, len * 3 + 1) != 0)
+        return -1;
+
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        int cp = gpt2_byte_to_unicode[(unsigned char)text[i]];
+        char tmp[4];
+        int n = utf8_encode_cp(cp, tmp);
+        memcpy(ws->mapped + w, tmp, (size_t)n);
+        w += (size_t)n;
+    }
+    ws->mapped[w] = '\0';
+    *out = ws->mapped;
+    return 0;
+}
+
+static int output_append_id(int *out_ids, int out_cap, int *n_ids,
+                            int *overflow, int id) {
+    if (*n_ids < out_cap && out_ids)
+        out_ids[*n_ids] = id;
+    else
+        *overflow = 1;
+    (*n_ids)++;
+    return 0;
+}
+
+static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
+                                qwen_tokenizer_workspace_t *ws,
+                                const char *mapped,
+                                int *out_ids, int out_cap,
+                                int *n_ids, int *overflow) {
+    if (!mapped || !*mapped) return 0;
+
+    int n_syms = 0;
+    for (const unsigned char *p = (const unsigned char *)mapped; *p; ) {
+        int l = utf8_char_len(*p);
+        p += l;
+        n_syms++;
+    }
+    if (n_syms <= 0) return 0;
+    if (reserve_syms(ws, n_syms) != 0) return -1;
+
+    ws->arena_len = 0;
+    int i = 0;
+    for (const unsigned char *p = (const unsigned char *)mapped; *p; ) {
+        int l = utf8_char_len(*p);
+        size_t off = 0;
+        if (arena_append(ws, (const char *)p, (size_t)l, &off) != 0)
+            return -1;
+        ws->syms[i++].off = off;
+        p += l;
+    }
+
+    while (n_syms > 1) {
+        int best_rank = INT_MAX;
+        int best_i = -1;
+        for (int j = 0; j < n_syms - 1; j++) {
+            int r = merge_rank(tok, arena_str(ws, ws->syms[j]),
+                               arena_str(ws, ws->syms[j + 1]));
+            if (r < best_rank) {
+                best_rank = r;
+                best_i = j;
+            }
+        }
+        if (best_i < 0 || best_rank == INT_MAX) break;
+
+        const char *a = arena_str(ws, ws->syms[best_i]);
+        const char *b = arena_str(ws, ws->syms[best_i + 1]);
+        size_t la = strlen(a), lb = strlen(b);
+        if (la > SIZE_MAX - lb) return -1;
+        if (reserve_bytes(&ws->arena, &ws->arena_cap,
+                          ws->arena_len + la + lb + 1) != 0)
+            return -1;
+
+        a = arena_str(ws, ws->syms[best_i]);
+        b = arena_str(ws, ws->syms[best_i + 1]);
+        size_t off = ws->arena_len;
+        memcpy(ws->arena + ws->arena_len, a, la);
+        ws->arena_len += la;
+        memcpy(ws->arena + ws->arena_len, b, lb);
+        ws->arena_len += lb;
+        ws->arena[ws->arena_len++] = '\0';
+        ws->syms[best_i].off = off;
+        for (int j = best_i + 1; j < n_syms - 1; j++)
+            ws->syms[j] = ws->syms[j + 1];
+        n_syms--;
+    }
+
+    for (int j = 0; j < n_syms; j++) {
+        int id = map_get((const str_int_entry_t *)tok->vocab_map,
+                         tok->vocab_map_cap, arena_str(ws, ws->syms[j]));
+        if (id < 0) return -1;
+        output_append_id(out_ids, out_cap, n_ids, overflow, id);
+    }
+    return 0;
+}
+
+static int append_encoded_piece_into(const qwen_tokenizer_t *tok,
+                                     qwen_tokenizer_workspace_t *ws,
+                                     const char *piece, size_t piece_len,
+                                     int *out_ids, int out_cap,
+                                     int *n_ids, int *overflow) {
+    if (piece_len == 0) return 0;
+
+    const char *mapped = NULL;
+    if (text_to_bpe_unicode_into(ws, piece, piece_len, &mapped) != 0)
+        return -1;
+    return encode_bpe_word_into(tok, ws, mapped, out_ids, out_cap, n_ids,
+                                overflow);
+}
+
+static int encode_pretokenized_into(const qwen_tokenizer_t *tok,
+                                    qwen_tokenizer_workspace_t *ws,
+                                    const char *text,
+                                    int *out_ids, int out_cap,
+                                    int *out_n) {
+    const unsigned char *start = (const unsigned char *)text;
+    const unsigned char *p = start;
+    const unsigned char *end = start + strlen(text);
+    int n_ids = 0;
+    int overflow = 0;
+
+    while (p < end) {
+        const unsigned char *piece = p;
+        int cp = 0, len = 0;
+        if (!utf8_decode_cp_len(p, end, &cp, &len)) break;
+
+        int clen = match_contraction(p, end);
+        if (clen > 0) {
+            p += clen;
+        } else {
+            const unsigned char *next = p + len;
+            int next_cp = 0, next_len = 0;
+            int has_next = utf8_decode_cp_len(next, end, &next_cp, &next_len);
+
+            if (!is_newline_cp(cp) && !is_word_cp(cp) &&
+                has_next && is_letter_cp(next_cp)) {
+                p = next + next_len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_letter_cp(c)) break;
+                    p += l;
+                }
+            } else if (is_letter_cp(cp)) {
+                p += len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_letter_cp(c)) break;
+                    p += l;
+                }
+            } else if (is_number_cp(cp)) {
+                p += len;
+            } else if (is_space_cp(cp)) {
+                const unsigned char *q = p;
+                int saw_newline = 0;
+                while (q < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(q, end, &c, &l);
+                    if (!is_space_cp(c)) break;
+                    if (is_newline_cp(c)) saw_newline = 1;
+                    q += l;
+                    if (saw_newline) {
+                        while (q < end) {
+                            int c2 = 0, l2 = 0;
+                            utf8_decode_cp_len(q, end, &c2, &l2);
+                            if (!is_newline_cp(c2)) break;
+                            q += l2;
+                        }
+                        break;
+                    }
+                }
+
+                if (saw_newline) {
+                    p = q;
+                } else if (cp == ' ' && has_next && !is_space_cp(next_cp) &&
+                           !is_word_cp(next_cp)) {
+                    p = next + next_len;
+                    while (p < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(p, end, &c, &l);
+                        if (is_space_cp(c) || is_word_cp(c)) break;
+                        p += l;
+                    }
+                    while (p < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(p, end, &c, &l);
+                        if (!is_newline_cp(c)) break;
+                        p += l;
+                    }
+                } else {
+                    const unsigned char *last = p;
+                    const unsigned char *q2 = p;
+                    int count = 0;
+                    while (q2 < end) {
+                        int c = 0, l = 0;
+                        utf8_decode_cp_len(q2, end, &c, &l);
+                        if (!is_space_cp(c)) break;
+                        last = q2;
+                        q2 += l;
+                        count++;
+                    }
+                    if (q2 < end && count > 1)
+                        p = last;
+                    else
+                        p = q2;
+                }
+            } else {
+                p += len;
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (is_space_cp(c) || is_word_cp(c)) break;
+                    p += l;
+                }
+                while (p < end) {
+                    int c = 0, l = 0;
+                    utf8_decode_cp_len(p, end, &c, &l);
+                    if (!is_newline_cp(c)) break;
+                    p += l;
+                }
+            }
+        }
+
+        if (append_encoded_piece_into(tok, ws, (const char *)piece,
+                                      (size_t)(p - piece), out_ids, out_cap,
+                                      &n_ids, &overflow) != 0)
+            return -1;
+    }
+
+    *out_n = n_ids;
+    return overflow ? -2 : 0;
+}
+
 static int derive_merges_path(const char *vocab_path, char *out_path, size_t out_cap) {
     const char *slash = strrchr(vocab_path, '/');
     if (!slash) {
@@ -1039,6 +1398,74 @@ int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *o
     }
     free(normalized);
 
+    if (out_n_tokens) *out_n_tokens = n_ids;
+    return ids;
+}
+
+qwen_tokenizer_workspace_t *qwen_tokenizer_workspace_new(void) {
+    return (qwen_tokenizer_workspace_t *)calloc(1,
+                                               sizeof(qwen_tokenizer_workspace_t));
+}
+
+void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws) {
+    if (!ws) return;
+    free(ws->normalized);
+    free(ws->mapped);
+    free(ws->arena);
+    free(ws->syms);
+    free(ws->ids);
+    free(ws);
+}
+
+int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
+                               qwen_tokenizer_workspace_t *ws,
+                               const char *text,
+                               int *out_ids, int out_cap,
+                               int *out_n_tokens) {
+    if (out_n_tokens) *out_n_tokens = 0;
+    if (!tok || !ws || !text || out_cap < 0) return -1;
+    if (text[0] == '\0') return 0;
+
+    const char *normalized = NULL;
+    if (normalize_nfc_latin_into(ws, text, &normalized) != 0)
+        return -1;
+
+    int n_ids = 0;
+    int rc = encode_pretokenized_into(tok, ws, normalized, out_ids, out_cap,
+                                      &n_ids);
+    if (out_n_tokens) *out_n_tokens = n_ids;
+    return rc;
+}
+
+int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
+                                          qwen_tokenizer_workspace_t *ws,
+                                          const char *text,
+                                          int *out_n_tokens) {
+    if (out_n_tokens) *out_n_tokens = 0;
+    if (!tok || !ws || !text || text[0] == '\0') return NULL;
+
+    size_t len = strlen(text);
+    size_t cap_sz = len > (SIZE_MAX - 8) / 2 ? SIZE_MAX : len * 2 + 8;
+    if (cap_sz > (size_t)INT_MAX) return NULL;
+    int cap = (int)cap_sz;
+
+    if (reserve_ints(&ws->ids, &ws->ids_cap, cap) != 0)
+        return NULL;
+
+    int n_ids = 0;
+    int rc = qwen_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap,
+                                        &n_ids);
+    if (rc == -2) {
+        if (reserve_ints(&ws->ids, &ws->ids_cap, n_ids) != 0)
+            return NULL;
+        rc = qwen_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap,
+                                        &n_ids);
+    }
+    if (rc != 0 || n_ids <= 0) return NULL;
+
+    int *ids = (int *)malloc((size_t)n_ids * sizeof(int));
+    if (!ids) return NULL;
+    memcpy(ids, ws->ids, (size_t)n_ids * sizeof(int));
     if (out_n_tokens) *out_n_tokens = n_ids;
     return ids;
 }

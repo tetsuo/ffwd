@@ -210,6 +210,7 @@ typedef struct {
     const model_info *info;
     char *path;
     qwen_tokenizer_t *tok;
+    qwen_tokenizer_workspace_t *tok_ws;
     int context_separator_id;
     pplx_model_t *cpu_model;
     pplx_workspace_t *cpu_ws;
@@ -1065,7 +1066,8 @@ static void contextual_request_free(contextual_request *r) {
 
 static int tokenize_one(loaded_model *m, const char *text, token_buf *out) {
     memset(out, 0, sizeof(*out));
-    out->ids = qwen_tokenizer_encode(m->tok, text, &out->n_tokens);
+    out->ids = qwen_tokenizer_encode_with_workspace(m->tok, m->tok_ws,
+                                                    text, &out->n_tokens);
     if (!out->ids || out->n_tokens <= 0) {
         free(out->ids);
         memset(out, 0, sizeof(*out));
@@ -1967,6 +1969,12 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         server_log("pplx-serve: failed to load tokenizer: %s", vocab_path);
         return -1;
     }
+    m->tok_ws = qwen_tokenizer_workspace_new();
+    if (!m->tok_ws) {
+        server_log("pplx-serve: failed to allocate tokenizer workspace: %s",
+                   path);
+        return -1;
+    }
     m->context_separator_id = PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
 #ifdef USE_MLX
     if (s->use_mlx) {
@@ -1998,6 +2006,7 @@ static void free_models(http_server *s) {
     for (int i = 0; i < 4; i++) {
         loaded_model *m = &s->models[i];
         free(m->path);
+        if (m->tok_ws) qwen_tokenizer_workspace_free(m->tok_ws);
         if (m->tok) qwen_tokenizer_free(m->tok);
         if (m->cpu_ws) pplx_workspace_free(m->cpu_ws);
         if (m->cpu_model) pplx_model_free(m->cpu_model);

@@ -93,6 +93,7 @@ typedef struct {
     pplx_mlx_ctx_t   *mlx_ctx;
 #endif
     qwen_tokenizer_t *tok;
+    qwen_tokenizer_workspace_t *tok_ws;
     int               dim;
 } engine_t;
 
@@ -149,7 +150,8 @@ static int parse_endpoint(const char *arg, char *host, size_t hostlen, int *port
 static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
 {
     memset(out, 0, sizeof(*out));
-    out->ids = qwen_tokenizer_encode(e->tok, text, &out->n_tokens);
+    out->ids = qwen_tokenizer_encode_with_workspace(e->tok, e->tok_ws,
+                                                    text, &out->n_tokens);
     if (!out->ids || out->n_tokens == 0) {
         fprintf(stderr, "tokenization failed: %s\n", text);
         free(out->ids);
@@ -835,6 +837,20 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
                 e.dim, now_ms() - t0, use_mlx ? " (MLX)" : "");
 
+    e.tok_ws = qwen_tokenizer_workspace_new();
+    if (!e.tok_ws) {
+        fprintf(stderr, "failed to allocate tokenizer workspace\n");
+        if (e.workspace) pplx_workspace_free(e.workspace);
+        if (e.model) pplx_model_free(e.model);
+        if (e.dist) pplx_dist_client_free(e.dist);
+#ifdef USE_MLX
+        if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
+#endif
+        qwen_tokenizer_free(tok);
+        free_model_specs(&model_specs);
+        return 1;
+    }
+
     /* Run */
     int rc;
     if (stdin_mode)
@@ -849,6 +865,7 @@ int main(int argc, char *argv[])
 #ifdef USE_MLX
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif
+    qwen_tokenizer_workspace_free(e.tok_ws);
     qwen_tokenizer_free(tok);
     free_model_specs(&model_specs);
     return rc;
