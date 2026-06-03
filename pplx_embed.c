@@ -135,6 +135,23 @@ static float *malloc_floats(size_t count)
     return (float *)malloc(bytes);
 }
 
+static int model_dir_has_file(const char *model_dir, const char *rel)
+{
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", model_dir, rel);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int model_dir_has_late_projection(const char *model_dir)
+{
+    return model_dir_has_file(model_dir, "1_Dense/config.json") &&
+           model_dir_has_file(model_dir, "1_Dense/model.safetensors");
+}
+
 static int realloc_floats_2d(float **ptr, int rows, int cols)
 {
     if (rows < 0 || cols < 0) return -1;
@@ -574,8 +591,15 @@ static int ensure_offsets(pplx_workspace_t *ws, int batch)
  * ======================================================================== */
 
 static pplx_model_t *model_load_range(const char *model_dir,
-                                      int layer_start, int layer_end)
+                                       int layer_start, int layer_end)
 {
+    if (model_dir_has_late_projection(model_dir)) {
+        fprintf(stderr, "pplx_model_load: late-interaction models require "
+                "token-level MaxSim support and are not valid pooled "
+                "embedding models yet\n");
+        return NULL;
+    }
+
     pplx_model_t *model = (pplx_model_t *)calloc(1, sizeof(pplx_model_t));
     if (!model) return NULL;
 

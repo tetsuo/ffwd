@@ -341,6 +341,23 @@ static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
     return 0;
 }
 
+static int mlx_model_dir_has_file(const char *model_dir, const char *rel)
+{
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", model_dir, rel);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int mlx_model_dir_has_late_projection(const char *model_dir)
+{
+    return mlx_model_dir_has_file(model_dir, "1_Dense/config.json") &&
+           mlx_model_dir_has_file(model_dir, "1_Dense/model.safetensors");
+}
+
 static pplx_mlx_options_t normalize_mlx_options(const pplx_mlx_options_t *opts)
 {
     pplx_mlx_options_t out = {0};
@@ -374,6 +391,12 @@ static pplx_mlx_ctx_t *mlx_load_range(const char *model_dir,
 {
     pplx_mlx_options_t options = normalize_mlx_options(opts);
     if (options.quantize_bits < 0) return NULL;
+    if (mlx_model_dir_has_late_projection(model_dir)) {
+        fprintf(stderr, "mlx: late-interaction models require token-level "
+                "MaxSim support and are not valid pooled embedding models "
+                "yet\n");
+        return NULL;
+    }
 
     pplx_mlx_ctx_t *ctx = calloc(1, sizeof(pplx_mlx_ctx_t));
     if (!ctx) return NULL;
