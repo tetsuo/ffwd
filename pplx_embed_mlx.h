@@ -13,6 +13,7 @@
 
 /* Opaque MLX model context */
 typedef struct pplx_mlx_ctx pplx_mlx_ctx_t;
+typedef struct pplx_mlx_late_ctx pplx_mlx_late_ctx_t;
 
 typedef struct {
     int quantize_bits;       /* 0 disables; currently 8 */
@@ -39,6 +40,29 @@ pplx_mlx_ctx_t *pplx_mlx_load_slice_with_options(
     const pplx_mlx_options_t *opts);
 
 void pplx_mlx_free(pplx_mlx_ctx_t *ctx);
+
+/*
+ * Late-interaction MLX path. This is separate from pooled embeddings because
+ * late snapshots produce one projected token vector per input token for MaxSim
+ * scoring, not one pooled document vector.
+ */
+pplx_mlx_late_ctx_t *pplx_mlx_late_load(const char *model_dir);
+pplx_mlx_late_ctx_t *pplx_mlx_late_load_with_options(
+    const char *model_dir, const pplx_mlx_options_t *opts);
+void pplx_mlx_late_free(pplx_mlx_late_ctx_t *ctx);
+
+const pplx_config_t *pplx_mlx_late_config(const pplx_mlx_late_ctx_t *ctx);
+int pplx_mlx_late_token_dim(const pplx_mlx_late_ctx_t *ctx);
+
+/*
+ * Encode token_ids into out_vectors[n_tokens, token_dim].
+ *
+ * If normalize is non-zero, every token vector is L2-normalized on device
+ * before copying back to CPU memory.
+ */
+int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
+                                const int *token_ids, int n_tokens,
+                                int normalize, float *out_vectors);
 
 /*
  * Compute embedding for token_ids[0..n_tokens-1].
