@@ -1195,7 +1195,11 @@ void qwen_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
-static inline float qwen_dot_f32(const float *a, const float *b, int n) {
+float qwen_dot_f32(const float *a, const float *b, int n) {
+    return qwen_dot_f32_impl(a, b, n);
+}
+
+static inline float qwen_dot_f32_fast(const float *a, const float *b, int n) {
     return qwen_dot_f32_impl(a, b, n);
 }
 
@@ -1238,7 +1242,7 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
                     const float *k_row = K + j * hidden + h * head_dim;
                     const float *v_row = V + j * hidden + h * head_dim;
 
-                    float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
+                    float score = qwen_dot_f32_fast(q_row, k_row, head_dim) * scale;
 
                     if (score > max_score) {
                         float correction = expf(max_score - score);
@@ -1288,7 +1292,7 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
                 const float *k_row = K + j * kv_hidden + kv_h * head_dim;
                 const float *v_row = V + j * kv_hidden + kv_h * head_dim;
 
-                float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
+                float score = qwen_dot_f32_fast(q_row, k_row, head_dim) * scale;
 
                 if (score > max_score) {
                     float correction = expf(max_score - score);
@@ -1378,7 +1382,7 @@ static void qwen_bidirectional_gqa_attention_packed_online_rows(
             const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
             const float *v_row = V + (size_t)j * kv_hidden + kv_h * head_dim;
 
-            float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
+            float score = qwen_dot_f32_fast(q_row, k_row, head_dim) * scale;
 
             if (score > max_score) {
                 float correction = expf(max_score - score);

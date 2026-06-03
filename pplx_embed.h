@@ -274,6 +274,18 @@ float pplx_late_maxsim(const float *query_vectors, int query_tokens,
                        const float *doc_vectors, int doc_tokens,
                        int dim);
 
+/*
+ * Score one query against a packed/ragged batch of documents.
+ *
+ * doc_offsets has docs + 1 entries. Document i is stored in
+ * doc_vectors[doc_offsets[i] * dim .. doc_offsets[i + 1] * dim).
+ * scores is caller-provided [docs].
+ */
+int pplx_late_maxsim_batch(const float *query_vectors, int query_tokens,
+                           const float *doc_vectors,
+                           const int *doc_offsets, int docs,
+                           int dim, float *scores);
+
 /* Verbose level: 0=quiet, 1=info, 2=debug */
 extern int pplx_verbose;
 extern int qwen_verbose;

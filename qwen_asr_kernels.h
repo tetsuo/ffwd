@@ -59,6 +59,9 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
 
+/* Dot product using the best available local SIMD implementation. */
+float qwen_dot_f32(const float *a, const float *b, int n);
+
 /* ========================================================================
  * 2D Convolution (for audio encoder conv stem)
  * ======================================================================== */

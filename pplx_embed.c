@@ -945,14 +945,33 @@ float pplx_late_maxsim(const float *query_vectors, int query_tokens,
         float best = -FLT_MAX;
         for (int di = 0; di < doc_tokens; di++) {
             const float *d = doc_vectors + (size_t)di * dim;
-            float dot = 0.0f;
-            for (int k = 0; k < dim; k++)
-                dot += q[k] * d[k];
+            float dot = qwen_dot_f32(q, d, dim);
             if (dot > best) best = dot;
         }
         score += best;
     }
     return score;
+}
+
+int pplx_late_maxsim_batch(const float *query_vectors, int query_tokens,
+                           const float *doc_vectors,
+                           const int *doc_offsets, int docs,
+                           int dim, float *scores)
+{
+    if (!query_vectors || !doc_vectors || !doc_offsets || !scores ||
+        query_tokens <= 0 || docs <= 0 || dim <= 0 || doc_offsets[0] != 0)
+        return -1;
+
+    for (int i = 0; i < docs; i++) {
+        int start = doc_offsets[i];
+        int end = doc_offsets[i + 1];
+        if (start < 0 || end <= start)
+            return -1;
+        scores[i] = pplx_late_maxsim(query_vectors, query_tokens,
+                                     doc_vectors + (size_t)start * dim,
+                                     end - start, dim);
+    }
+    return 0;
 }
 
 size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
