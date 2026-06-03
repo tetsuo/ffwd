@@ -17,6 +17,7 @@
 
 typedef struct {
     mlx_array w;
+    mlx_array wt;
     mlx_array scales;
     mlx_array biases;
     int quantized;
@@ -175,9 +176,26 @@ static int linear_ok(mlx_linear_t l)
 static void free_linear(mlx_linear_t *l)
 {
     mlx_array_free(l->w);
+    mlx_array_free(l->wt);
     mlx_array_free(l->scales);
     mlx_array_free(l->biases);
     memset(l, 0, sizeof(*l));
+}
+
+static int prepare_linear_transpose(mlx_linear_t *l, mlx_stream s)
+{
+    if (!l || l->quantized || !arr_ok(l->w) || arr_ok(l->wt))
+        return 0;
+
+    l->wt = mlx_array_new();
+    mlx_transpose(&l->wt, l->w, s);
+    if (!arr_ok(l->wt)) {
+        mlx_array_free(l->wt);
+        l->wt = (mlx_array){0};
+        fprintf(stderr, "mlx: failed to prepare transposed linear weight\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int quantize_linear(mlx_linear_t *l, int bits, int group_size,
@@ -223,7 +241,9 @@ static int quantize_linear(mlx_linear_t *l, int bits, int group_size,
     mlx_synchronize(s);
 
     mlx_array_free(l->w);
+    mlx_array_free(l->wt);
     l->w = qw;
+    l->wt = (mlx_array){0};
     l->scales = scales;
     l->biases = biases;
     l->quantized = 1;
@@ -245,11 +265,15 @@ static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
                              true, gs, bits, "affine", s);
         return res;
     }
-    mlx_array Wt  = mlx_array_new();
-    mlx_transpose(&Wt, W->w, s);
     mlx_array res = mlx_array_new();
-    mlx_matmul(&res, x, Wt, s);
-    mlx_array_free(Wt);
+    if (arr_ok(W->wt)) {
+        mlx_matmul(&res, x, W->wt, s);
+    } else {
+        mlx_array Wt = mlx_array_new();
+        mlx_transpose(&Wt, W->w, s);
+        mlx_matmul(&res, x, Wt, s);
+        mlx_array_free(Wt);
+    }
     return res;
 }
 
@@ -400,6 +424,17 @@ static int quantize_layer(mlx_layer_t *l, int bits, int group_size,
            quantize_linear(&l->down_proj, bits, group_size, s);
 }
 
+static int prepare_layer_transposes(mlx_layer_t *l, mlx_stream s)
+{
+    return prepare_linear_transpose(&l->wq, s) ||
+           prepare_linear_transpose(&l->wk, s) ||
+           prepare_linear_transpose(&l->wv, s) ||
+           prepare_linear_transpose(&l->wo, s) ||
+           prepare_linear_transpose(&l->gate_proj, s) ||
+           prepare_linear_transpose(&l->up_proj, s) ||
+           prepare_linear_transpose(&l->down_proj, s);
+}
+
 static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
                                          int layer_start, int layer_end,
                                          const pplx_mlx_options_t *opts,
@@ -519,6 +554,11 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
             fprintf(stderr, "mlx: quantized linear weights to %d-bit "
                     "(group_size=%d)\n",
                     ctx->quantize_bits, ctx->quantize_group_size);
+    } else {
+        for (int i = layer_start; i < layer_end; i++) {
+            if (prepare_layer_transposes(&ctx->layers[i], ctx->stream) != 0)
+                goto fail;
+        }
     }
 
     if (pplx_verbose >= 2) {
@@ -641,6 +681,8 @@ pplx_mlx_late_ctx_t *pplx_mlx_late_load_with_options(
     late->projection = load_linear_tensor(late->dense_ms, "linear.weight",
                                           shape, 2);
     if (!linear_ok(late->projection)) goto fail;
+    if (prepare_linear_transpose(&late->projection, late->base->stream) != 0)
+        goto fail;
     late->token_dim = shape[0];
 
     if (pplx_verbose >= 1)
