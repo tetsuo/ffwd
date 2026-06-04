@@ -1291,8 +1291,9 @@ int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
     return rc;
 }
 
-int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
-                         int batch, float *out_embeddings)
+static int pplx_mlx_embed_batch_dense(pplx_mlx_ctx_t *ctx,
+                                      const pplx_input_t *inputs, int batch,
+                                      float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings ||
         ctx->layer_start != 0 || ctx->layer_end != ctx->config.n_layers)
@@ -1442,6 +1443,117 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         rc = 0;
     }
     mlx_array_free(emb_f32);
+    return rc;
+}
+
+typedef struct {
+    int index;
+    const pplx_input_t *input;
+} mlx_batch_item_t;
+
+static int mlx_batch_item_cmp(const void *a, const void *b)
+{
+    const mlx_batch_item_t *ia = (const mlx_batch_item_t *)a;
+    const mlx_batch_item_t *ib = (const mlx_batch_item_t *)b;
+    int da = ia->input->n_tokens;
+    int db = ib->input->n_tokens;
+    return (da > db) - (da < db);
+}
+
+static int mlx_batch_should_split(const pplx_input_t *inputs, int batch,
+                                  int *out_total_tokens, int *out_max_seq)
+{
+    int max_seq = 0;
+    int total_tokens = 0;
+    for (int b = 0; b < batch; b++) {
+        if (!inputs[b].ids || inputs[b].n_tokens <= 0) return 0;
+        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
+        if (total_tokens > INT_MAX - inputs[b].n_tokens) return 0;
+        total_tokens += inputs[b].n_tokens;
+    }
+    if (out_total_tokens) *out_total_tokens = total_tokens;
+    if (out_max_seq) *out_max_seq = max_seq;
+    if (batch < 4 || max_seq < 64 || total_tokens <= 0) return 0;
+
+    size_t padded;
+    if (mlx_mul_size((size_t)batch, (size_t)max_seq, &padded) != 0)
+        return 0;
+    if (padded > SIZE_MAX / 5 || (size_t)total_tokens > SIZE_MAX / 11)
+        return 0;
+    return padded * 5 > (size_t)total_tokens * 11;
+}
+
+int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
+                         int batch, float *out_embeddings)
+{
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings)
+        return -1;
+
+    if (!mlx_batch_should_split(inputs, batch, NULL, NULL))
+        return pplx_mlx_embed_batch_dense(ctx, inputs, batch, out_embeddings);
+
+    const int hidden = ctx->config.hidden_size;
+    mlx_batch_item_t *items = (mlx_batch_item_t *)malloc(
+        (size_t)batch * sizeof(*items));
+    pplx_input_t *group_inputs = (pplx_input_t *)malloc(
+        (size_t)batch * sizeof(*group_inputs));
+    size_t group_values, group_bytes;
+    if (mlx_mul_size((size_t)batch, (size_t)hidden, &group_values) != 0 ||
+        mlx_mul_size(group_values, sizeof(float), &group_bytes) != 0) {
+        free(items); free(group_inputs);
+        return -1;
+    }
+    float *group_out = (float *)malloc(group_bytes);
+    if (!items || !group_inputs || !group_out) {
+        free(items); free(group_inputs); free(group_out);
+        return -1;
+    }
+    for (int i = 0; i < batch; i++) {
+        items[i].index = i;
+        items[i].input = &inputs[i];
+    }
+    qsort(items, (size_t)batch, sizeof(*items), mlx_batch_item_cmp);
+
+    int rc = 0;
+    for (int start = 0; start < batch && rc == 0; ) {
+        int group_max = 0;
+        int group_tokens = 0;
+        int end = start;
+        while (end < batch) {
+            int next_tokens = items[end].input->n_tokens;
+            int next_count = end - start + 1;
+            int next_max = next_tokens > group_max ? next_tokens : group_max;
+            int next_total = group_tokens + next_tokens;
+            if (end > start) {
+                size_t next_padded;
+                if (mlx_mul_size((size_t)next_count, (size_t)next_max,
+                                 &next_padded) != 0 ||
+                    next_padded > SIZE_MAX / 5 ||
+                    (size_t)next_total > SIZE_MAX / 11 ||
+                    next_padded * 5 > (size_t)next_total * 11)
+                    break;
+            }
+            group_max = next_max;
+            group_tokens = next_total;
+            end++;
+        }
+
+        int group_count = end - start;
+        for (int i = 0; i < group_count; i++)
+            group_inputs[i] = *items[start + i].input;
+        rc = pplx_mlx_embed_batch_dense(ctx, group_inputs, group_count,
+                                        group_out);
+        if (rc != 0) break;
+        for (int i = 0; i < group_count; i++) {
+            int dst = items[start + i].index;
+            memcpy(out_embeddings + (size_t)dst * hidden,
+                   group_out + (size_t)i * hidden,
+                   (size_t)hidden * sizeof(float));
+        }
+        start = end;
+    }
+
+    free(items); free(group_inputs); free(group_out);
     return rc;
 }
 
