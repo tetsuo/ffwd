@@ -173,7 +173,7 @@ static mlx_linear_t load_linear_tensor(multi_safetensors_t *ms,
 
 static int linear_ok(mlx_linear_t l)
 {
-    return arr_ok(l.w);
+    return arr_ok(l.w) || arr_ok(l.wt);
 }
 
 static void free_linear(mlx_linear_t *l)
@@ -190,14 +190,27 @@ static int prepare_linear_transpose(mlx_linear_t *l, mlx_stream s)
     if (!l || l->quantized || !arr_ok(l->w) || arr_ok(l->wt))
         return 0;
 
-    l->wt = mlx_array_new();
-    mlx_transpose(&l->wt, l->w, s);
-    if (!arr_ok(l->wt)) {
-        mlx_array_free(l->wt);
-        l->wt = (mlx_array){0};
+    mlx_array transposed = mlx_array_new();
+    mlx_transpose(&transposed, l->w, s);
+    if (!arr_ok(transposed)) {
+        mlx_array_free(transposed);
         fprintf(stderr, "mlx: failed to prepare transposed linear weight\n");
         return -1;
     }
+
+    l->wt = mlx_array_new();
+    mlx_contiguous(&l->wt, transposed, false, s);
+    mlx_array_free(transposed);
+    if (!arr_ok(l->wt)) {
+        mlx_array_free(l->wt);
+        l->wt = (mlx_array){0};
+        fprintf(stderr, "mlx: failed to materialize transposed linear weight\n");
+        return -1;
+    }
+    mlx_array_eval(l->wt);
+    mlx_synchronize(s);
+    mlx_array_free(l->w);
+    l->w = (mlx_array){0};
     return 0;
 }
 
@@ -259,6 +272,7 @@ static int quantize_linear(mlx_linear_t *l, int bits, int group_size,
 static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
 {
     if (W->quantized) {
+        if (!arr_ok(W->w)) return (mlx_array){0};
         mlx_array res = mlx_array_new();
         mlx_optional_int gs = {.value = W->group_size, .has_value = true};
         mlx_optional_int bits = {.value = W->bits, .has_value = true};
@@ -271,11 +285,14 @@ static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
     mlx_array res = mlx_array_new();
     if (arr_ok(W->wt)) {
         mlx_matmul(&res, x, W->wt, s);
-    } else {
+    } else if (arr_ok(W->w)) {
         mlx_array Wt = mlx_array_new();
         mlx_transpose(&Wt, W->w, s);
         mlx_matmul(&res, x, Wt, s);
         mlx_array_free(Wt);
+    } else {
+        mlx_array_free(res);
+        return (mlx_array){0};
     }
     return res;
 }
