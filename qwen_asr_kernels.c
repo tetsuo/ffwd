@@ -935,11 +935,14 @@ void qwen_layer_norm(float *out, const float *x, const float *weight, const floa
     }
 }
 
-void qwen_rms_norm(float *out, const float *x, const float *weight,
-                   int seq_len, int hidden, float eps) {
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * hidden;
-        float *out_row = out + s * hidden;
+#define QWEN_RMS_NORM_PARALLEL_ELEMS 262144
+
+static void qwen_rms_norm_range(float *out, const float *x,
+                                const float *weight, int start, int end,
+                                int hidden, float eps) {
+    for (int s = start; s < end; s++) {
+        const float *x_row = x + (size_t)s * hidden;
+        float *out_row = out + (size_t)s * hidden;
 
 #if defined(__AVX512F__) && defined(__FMA__)
         __m512 accv = _mm512_setzero_ps();
@@ -993,6 +996,46 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
             out_row[i] = x_row[i] * rms_inv * weight[i];
         }
 #endif
+    }
+}
+
+typedef struct {
+    float *out;
+    const float *x;
+    const float *weight;
+    int seq_len;
+    int hidden;
+    float eps;
+} rms_norm_task_t;
+
+static void rms_norm_worker(int tid, int n_threads, void *arg) {
+    rms_norm_task_t *t = (rms_norm_task_t *)arg;
+    int chunk = (t->seq_len + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->seq_len) end = t->seq_len;
+    if (start >= end) return;
+    qwen_rms_norm_range(t->out, t->x, t->weight, start, end, t->hidden,
+                        t->eps);
+}
+
+void qwen_rms_norm(float *out, const float *x, const float *weight,
+                   int seq_len, int hidden, float eps) {
+    if (seq_len <= 0 || hidden <= 0) return;
+
+    long long elems = (long long)seq_len * hidden;
+    if (tp.n_threads > 1 && elems >= QWEN_RMS_NORM_PARALLEL_ELEMS) {
+        rms_norm_task_t task = {
+            .out = out,
+            .x = x,
+            .weight = weight,
+            .seq_len = seq_len,
+            .hidden = hidden,
+            .eps = eps,
+        };
+        parallel_for(rms_norm_worker, &task);
+    } else {
+        qwen_rms_norm_range(out, x, weight, 0, seq_len, hidden, eps);
     }
 }
 
