@@ -388,8 +388,11 @@ static int tensor_has_supported_shape(const safetensors_file_t *sf,
     }
 
     size_t bytes;
-    if (mul_size(numel, elem_size, &bytes) != 0 ||
-        t->data_size != bytes) {
+    if (mul_size(numel, elem_size, &bytes) != 0) {
+        fprintf(stderr, "pplx: tensor data too large for %s\n", name);
+        return 0;
+    }
+    if (t->data_size != bytes) {
         fprintf(stderr, "pplx: bad data size for %s: got %zu, expected %zu\n",
                 name, t->data_size, bytes);
         return 0;

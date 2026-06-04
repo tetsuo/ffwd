@@ -82,8 +82,8 @@ static char *decode_gpt2_token(const char *token_str) {
     const unsigned char *end = p + len;
 
     while (p < end) {
-        int cp;
-        int nbytes;
+        int cp = 0;
+        int nbytes = 1;
 
         if ((*p & 0x80) == 0) {
             cp = *p;
@@ -246,6 +246,28 @@ static int map_insert(str_int_entry_t *map, int cap, char *key, int value) {
         if (!map[idx].key) {
             map[idx].key = key;
             map[idx].value = value;
+            return 0;
+        }
+        if (strcmp(map[idx].key, key) == 0) {
+            map[idx].value = value;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int map_insert_owned(str_int_entry_t *map, int cap, char **keyp, int value) {
+    if (!keyp) return -1;
+    char *key = *keyp;
+    if (!map || cap <= 0 || !key) return -1;
+    int mask = cap - 1;
+    int pos = (int)(fnv1a_hash(key) & (uint64_t)mask);
+    for (int i = 0; i < cap; i++) {
+        int idx = (pos + i) & mask;
+        if (!map[idx].key) {
+            map[idx].key = key;
+            map[idx].value = value;
+            *keyp = NULL;
             return 0;
         }
         if (strcmp(map[idx].key, key) == 0) {
@@ -1244,7 +1266,10 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
         return -1;
     }
 
-    rewind(f);
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
     int rank = 0;
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
@@ -1258,9 +1283,9 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
         memcpy(key + la + 1, b, lb);
         key[la + 1 + lb] = '\0';
 
-        if (map_insert((str_int_entry_t *)tok->merge_map, tok->merge_map_cap, key, rank) != 0) {
-            free(key);
-        }
+        (void)map_insert_owned((str_int_entry_t *)tok->merge_map,
+                               tok->merge_map_cap, &key, rank);
+        free(key);
         rank++;
     }
     fclose(f);
@@ -1278,9 +1303,15 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
         return NULL;
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
     long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (file_size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
 
     char *json = (char *)malloc((size_t)file_size + 1);
     if (!json || fread(json, 1, (size_t)file_size, f) != (size_t)file_size) {
@@ -1306,7 +1337,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
         if (*p == ',') { p++; continue; }
         if (*p == '}') break;
 
-        char key[4096];
+        char key[4096] = {0};
         if (parse_json_string(&p, key, sizeof(key)) != 0) break;
         skip_ws(&p);
         if (*p != ':') break;
@@ -1336,7 +1367,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
         if (*p == ',') { p++; continue; }
         if (*p == '}') break;
 
-        char key[4096];
+        char key[4096] = {0};
         if (parse_json_string(&p, key, sizeof(key)) != 0) break;
         skip_ws(&p);
         if (*p != ':') break;

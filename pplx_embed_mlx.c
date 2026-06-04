@@ -118,8 +118,11 @@ static int mlx_tensor_has_supported_shape(const safetensors_file_t *sf,
     }
 
     size_t bytes;
-    if (mlx_mul_size(numel, elem_size, &bytes) != 0 ||
-        t->data_size != bytes) {
+    if (mlx_mul_size(numel, elem_size, &bytes) != 0) {
+        fprintf(stderr, "mlx: tensor data too large for %s\n", name);
+        return 0;
+    }
+    if (t->data_size != bytes) {
         fprintf(stderr, "mlx: bad data size for %s: got %zu, expected %zu\n",
                 name, t->data_size, bytes);
         return 0;
@@ -1484,14 +1487,19 @@ int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
         if (inputs[b].n_tokens != max_seq) has_padding = 1;
     }
 
-    size_t rows, state_values, ids_bytes, mask_bytes, state_bytes, row_bytes;
+    size_t rows, ids_bytes, mask_bytes, state_bytes, row_bytes;
     if (mlx_mul_size((size_t)batch, (size_t)max_seq, &rows) != 0 ||
-        mlx_mul_size(rows, (size_t)hidden, &state_values) != 0 ||
         mlx_mul_size(rows, sizeof(int), &ids_bytes) != 0 ||
         mlx_mul_size(rows, sizeof(float), &mask_bytes) != 0 ||
-        mlx_mul_size(state_values, sizeof(float), &state_bytes) != 0 ||
         mlx_mul_size((size_t)hidden, sizeof(float), &row_bytes) != 0)
         return -1;
+    if (rows == 0 || row_bytes == 0 || (has_padding && mask_bytes == 0))
+        return -1;
+    if (layer_start != 0 &&
+        mlx_mul_size(rows, (size_t)hidden, &state_bytes) != 0)
+        return -1;
+    if (layer_start == 0)
+        state_bytes = 0;
 
     int *padded_ids = layer_start == 0
         ? (int *)malloc(ids_bytes) : NULL;

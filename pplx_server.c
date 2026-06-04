@@ -371,6 +371,16 @@ static void client_decref(client *c) {
     if (free_now) client_free(c);
 }
 
+static void client_decref_n(client *c, int n) {
+    int free_now = 0;
+    if (n <= 0) return;
+    pthread_mutex_lock(&c->srv->mu);
+    c->refcount -= n;
+    if (c->refcount <= 0) free_now = 1;
+    pthread_mutex_unlock(&c->srv->mu);
+    if (free_now) client_free(c);
+}
+
 static void client_unlink(client *c) {
     http_server *s = c->srv;
     if (!c->linked) return;
@@ -382,8 +392,8 @@ static void client_unlink(client *c) {
     if (s->n_clients > 0) s->n_clients--;
 }
 
-static void close_client(client *c) {
-    if (!c || c->cancelled) return;
+static int close_client_unlink(client *c) {
+    if (!c || c->cancelled) return 0;
     c->cancelled = 1;
     if (c->fd >= 0) {
         aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
@@ -392,6 +402,11 @@ static void close_client(client *c) {
         c->fd = -1;
     }
     client_unlink(c);
+    return 1;
+}
+
+static void close_client(client *c) {
+    if (!close_client_unlink(c)) return;
     client_decref(c);
 }
 
@@ -734,15 +749,16 @@ static void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask)
     job *j;
     while ((j = pop_done(s)) != NULL) {
         client *c = j->c;
+        int refs_to_drop = 1; /* job reference */
         if (!c->cancelled) {
             append_http_response_ex(c, j->status, j->content_type,
                                     j->extra_headers,
                                     j->response ? j->response : "",
                                     j->response ? j->response_len : 0);
             if (queue_write(c) != AE_OK)
-                close_client(c);
+                refs_to_drop += close_client_unlink(c);
         }
-        client_decref(c);
+        client_decref_n(c, refs_to_drop);
         job_free(j);
     }
 }
@@ -1594,13 +1610,13 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
         return;
     }
 
-    if (cJSON_GetArraySize(detail) == 0 && m) {
+    if (cJSON_GetArraySize(detail) == 0 && m && input) {
         out->n_inputs = n_inputs;
         out->tokens = xcalloc((size_t)n_inputs, sizeof(*out->tokens));
         out->inputs = xmalloc((size_t)n_inputs * sizeof(*out->inputs));
 
         int idx = 0;
-        if (cJSON_IsString(input)) {
+        if (input && cJSON_IsString(input) && input->valuestring) {
             if (tokenize_one(m, j, input->valuestring, &out->tokens[0]) != 0) {
                 ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
                        "value_error.tokenization");
@@ -1618,6 +1634,12 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
             cJSON_ArrayForEach(item, input) {
                 char loc[64];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", idx);
+                if (!cJSON_IsString(item) || !item->valuestring) {
+                    ve_add(detail, loc, "input item must be a string",
+                           "type_error.string");
+                    idx++;
+                    continue;
+                }
                 if (tokenize_one(m, j, item->valuestring,
                                  &out->tokens[idx]) != 0) {
                     ve_add(detail, loc, "tokenization failed",

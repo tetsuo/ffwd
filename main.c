@@ -527,7 +527,6 @@ int main(int argc, char *argv[])
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
     int dist_activation_bits = 32;
-    const char *backend = "cpu";
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
     int port = 8000;
@@ -559,10 +558,13 @@ int main(int argc, char *argv[])
             }
         }
         else if (!strcmp(f, "--model")) {
-            if (append_model_spec(&model_specs, argv[++arg_start]) != 0) return 1;
+            if (append_model_spec(&model_specs, argv[++arg_start]) != 0) {
+                free_model_specs(&model_specs);
+                return 1;
+            }
         }
         else if (!strcmp(f, "--backend")) {
-            backend = argv[++arg_start];
+            const char *backend = argv[++arg_start];
             if (!strcmp(backend, "mlx")) {
 #ifdef USE_MLX
                 use_mlx = 1;
@@ -627,7 +629,6 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
-            backend = "mlx";
 #else
             fprintf(stderr, "--mlx not available (build with: make mlx)\n");
             free_model_specs(&model_specs);
