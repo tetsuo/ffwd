@@ -1477,6 +1477,13 @@ static int mlx_batch_item_cmp(const void *a, const void *b)
     return (da > db) - (da < db);
 }
 
+static int mlx_padding_exceeds_limit(size_t padded, size_t tokens)
+{
+    if (tokens > SIZE_MAX / 11 || padded > SIZE_MAX / 5)
+        return 1;
+    return padded * 5 > tokens * 11;
+}
+
 static int mlx_batch_should_split(const pplx_input_t *inputs, int batch,
                                   int *out_total_tokens, int *out_max_seq)
 {
@@ -1495,9 +1502,30 @@ static int mlx_batch_should_split(const pplx_input_t *inputs, int batch,
     size_t padded;
     if (mlx_mul_size((size_t)batch, (size_t)max_seq, &padded) != 0)
         return 0;
-    if (padded > SIZE_MAX / 5 || (size_t)total_tokens > SIZE_MAX / 11)
+
+    return mlx_padding_exceeds_limit(padded, (size_t)total_tokens);
+}
+
+static int mlx_should_add_to_group(const pplx_mlx_ctx_t *ctx,
+                                   int group_count, int group_max,
+                                   int next_tokens)
+{
+    if (!ctx || ctx->config.hidden_size < 2048 || group_count <= 0)
+        return 1;
+
+    int next_count = group_count + 1;
+    int next_max = next_tokens > group_max ? next_tokens : group_max;
+    size_t merged, split_left, split_total;
+    if (mlx_mul_size((size_t)next_count, (size_t)next_max, &merged) != 0 ||
+        mlx_mul_size((size_t)group_count, (size_t)group_max, &split_left) != 0)
         return 0;
-    return padded * 5 > (size_t)total_tokens * 11;
+    /* Treat one extra MLX launch as roughly 256 padded token rows for 4B.
+     * This preserves small mixed groups while splitting larger padded tails. */
+    if (split_left > SIZE_MAX - (size_t)next_tokens ||
+        split_left + (size_t)next_tokens > SIZE_MAX - 256)
+        return 0;
+    split_total = split_left + (size_t)next_tokens + 256;
+    return merged <= split_total;
 }
 
 int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
@@ -1545,9 +1573,10 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                 size_t next_padded;
                 if (mlx_mul_size((size_t)next_count, (size_t)next_max,
                                  &next_padded) != 0 ||
-                    next_padded > SIZE_MAX / 5 ||
-                    (size_t)next_total > SIZE_MAX / 11 ||
-                    next_padded * 5 > (size_t)next_total * 11)
+                    mlx_padding_exceeds_limit(next_padded,
+                                              (size_t)next_total) ||
+                    !mlx_should_add_to_group(ctx, end - start,
+                                             group_max, next_tokens))
                     break;
             }
             group_max = next_max;
