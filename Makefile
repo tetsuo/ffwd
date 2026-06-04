@@ -90,8 +90,10 @@ mlx:
 # =============================================================================
 # Debug build
 # =============================================================================
-debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
-debug: LDFLAGS += -fsanitize=address
+SANITIZE ?= address,undefined
+
+debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=$(SANITIZE)
+debug: LDFLAGS += -fsanitize=$(SANITIZE)
 debug:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
