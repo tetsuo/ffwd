@@ -49,8 +49,11 @@ struct pplx_cuda_ctx {
     float *rope_sin;
     int *token_ids;
     int *offsets;
-    int *attn_tiles;
+    int *offsets_host;
     int *positions;
+    float *kexp;
+    float *vexp;
+    float *attn_scores;
     int *span_starts;
     int *span_lens;
     int pooled_rows_cap;
@@ -395,124 +398,61 @@ __global__ static void gqa_attention_kernel(float *out, const float *qkv,
         out[((size_t)row * n_heads + head) * head_dim + tid] = acc / sum_s;
 }
 
-// Warp-per-query attention. One warp (32 lanes) owns one query row; each lane
-// holds head_dim/32 dims of Q/acc in registers, computes a partial dot per key,
-// and a butterfly __shfl reduction yields the full score on every lane. No
-// shared memory and no __syncthreads, so warps (query rows) run independently.
-// Requires head_dim % 32 == 0 and head_dim <= 32 * ATTN_WARP_MAX_VEC; callers
-// fall back to gqa_attention_kernel otherwise. Blocks launch 128 threads
-// (4 warps = 4 query rows). vec = head_dim/32 (= 4 for head_dim 128).
-#define ATTN_WARP_MAX_VEC 8
-
-__device__ __forceinline__ float warp_dot_reduce(float partial)
+// Expand K and V from the n_kv_heads layout to a contiguous [total x q_dim]
+// per-query-head layout (GQA: each kv head repeated n_heads/n_kv_heads times)
+// so the attention GEMMs can stride uniformly over query heads.
+__global__ static void attn_expand_kv_kernel(
+    float *kexp, float *vexp, const float *qkv, int total, int n_heads,
+    int n_kv_heads, int head_dim, int qkv_dim, int k_offset, int v_offset)
 {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        partial += __shfl_xor_sync(0xffffffffu, partial, o);
-    return partial;
+    int q_dim = n_heads * head_dim;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)total * q_dim;
+    if (idx >= count) return;
+    int t = (int)(idx / q_dim);
+    int rem = (int)(idx - (size_t)t * q_dim);
+    int h = rem / head_dim;
+    int e = rem - h * head_dim;
+    int kv = h / (n_heads / n_kv_heads);
+    const float *base = qkv + (size_t)t * qkv_dim;
+    kexp[idx] = base[k_offset + kv * head_dim + e];
+    vexp[idx] = base[v_offset + kv * head_dim + e];
 }
 
-// Single-sequence variant (batch == 1): the packed buffer is one sequence
-// [0, total), so bounds are compile-time and no tile descriptor is needed.
-__global__ static void gqa_attention_warp_single_kernel(
-    float *out, const float *qkv, int total, int n_heads, int n_kv_heads,
-    int head_dim, int qkv_dim, int q_offset, int k_offset, int v_offset,
-    float scale)
+// Row softmax over the key dimension for one sequence's score tensor laid out
+// as scores[head * L * L + i * L + j]; normalizes across j for each (head, i).
+// One block per (head, query) row; scores are pre-scaled by the QK^T GEMM.
+__global__ static void attn_softmax_kernel(float *scores, int L)
 {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= total) return;
-    int head = blockIdx.y;
-    int kv_head = head / (n_heads / n_kv_heads);
-    int vec = head_dim >> 5;
+    float *s = scores + (size_t)blockIdx.x * L;
+    int tid = threadIdx.x;
+    __shared__ float red[256];
 
-    const float *qv = qkv + (size_t)row * qkv_dim + q_offset + head * head_dim;
-    float qreg[ATTN_WARP_MAX_VEC];
-    float acc[ATTN_WARP_MAX_VEC];
-#pragma unroll
-    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++) {
-        if (e < vec) qreg[e] = qv[e * 32 + lane];
-        acc[e] = 0.0f;
+    float m = -3.402823466e+38F;
+    for (int j = tid; j < L; j += blockDim.x) m = fmaxf(m, s[j]);
+    red[tid] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+        __syncthreads();
     }
-    float m = -3.402823466e+38F, l = 0.0f;
+    m = red[0];
+    __syncthreads();
 
-    for (int j = 0; j < total; j++) {
-        const float *kk = qkv + (size_t)j * qkv_dim + k_offset + kv_head * head_dim;
-        float partial = 0.0f;
-#pragma unroll
-        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-            if (e < vec) partial += qreg[e] * kk[e * 32 + lane];
-        float score = warp_dot_reduce(partial) * scale;
-        float nm = fmaxf(m, score);
-        float os = expf(m - nm);
-        float w = expf(score - nm);
-        const float *vv = qkv + (size_t)j * qkv_dim + v_offset + kv_head * head_dim;
-#pragma unroll
-        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-            if (e < vec) acc[e] = acc[e] * os + w * vv[e * 32 + lane];
-        l = l * os + w;
-        m = nm;
+    float sum = 0.0f;
+    for (int j = tid; j < L; j += blockDim.x) {
+        float e = __expf(s[j] - m);
+        s[j] = e;
+        sum += e;
     }
-
-    float *o = out + ((size_t)row * n_heads + head) * head_dim;
-#pragma unroll
-    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-        if (e < vec) o[e * 32 + lane] = acc[e] / l;
-}
-
-// Sequence-aware variant for micro-batches (batch > 1): the tile descriptor
-// (seq, row0) maps each block's 4 warps to 4 consecutive query rows within one
-// sequence; the j-loop runs over that sequence's [start, end).
-__global__ static void gqa_attention_warp_ragged_kernel(
-    float *out, const float *qkv, const int *offsets, const int *tiles,
-    int n_heads, int n_kv_heads, int head_dim, int qkv_dim,
-    int q_offset, int k_offset, int v_offset, float scale)
-{
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int tile = blockIdx.x;
-    int seq = tiles[tile * 2 + 0];
-    int row = tiles[tile * 2 + 1] + warp;
-    int start = offsets[seq];
-    int end = offsets[seq + 1];
-    if (row >= end) return;
-    int head = blockIdx.y;
-    int kv_head = head / (n_heads / n_kv_heads);
-    int vec = head_dim >> 5;
-
-    const float *qv = qkv + (size_t)row * qkv_dim + q_offset + head * head_dim;
-    float qreg[ATTN_WARP_MAX_VEC];
-    float acc[ATTN_WARP_MAX_VEC];
-#pragma unroll
-    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++) {
-        if (e < vec) qreg[e] = qv[e * 32 + lane];
-        acc[e] = 0.0f;
+    red[tid] = sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] += red[tid + o];
+        __syncthreads();
     }
-    float m = -3.402823466e+38F, l = 0.0f;
-
-    for (int j = start; j < end; j++) {
-        const float *kk = qkv + (size_t)j * qkv_dim + k_offset + kv_head * head_dim;
-        float partial = 0.0f;
-#pragma unroll
-        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-            if (e < vec) partial += qreg[e] * kk[e * 32 + lane];
-        float score = warp_dot_reduce(partial) * scale;
-        float nm = fmaxf(m, score);
-        float os = expf(m - nm);
-        float w = expf(score - nm);
-        const float *vv = qkv + (size_t)j * qkv_dim + v_offset + kv_head * head_dim;
-#pragma unroll
-        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-            if (e < vec) acc[e] = acc[e] * os + w * vv[e * 32 + lane];
-        l = l * os + w;
-        m = nm;
-    }
-
-    float *o = out + ((size_t)row * n_heads + head) * head_dim;
-#pragma unroll
-    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
-        if (e < vec) o[e * 32 + lane] = acc[e] / l;
+    float inv = 1.0f / red[0];
+    for (int j = tid; j < L; j += blockDim.x) s[j] *= inv;
 }
 
 __global__ static void mean_pool_kernel(float *out, const float *x,
@@ -596,6 +536,56 @@ static int linear_accum_strided(cublasHandle_t blas, const cuda_matrix_t *w,
     return 0;
 }
 
+// GEMM-based attention for one micro-batch. Expands K/V to the per-query-head
+// layout, then for each sequence runs batched-over-heads Q@K^T (scaled) ->
+// row softmax -> @V via cuBLAS. Scales far better than the streaming warp
+// kernel for long sequences because scores are dense matmuls. Requires
+// ctx->kexp, ctx->vexp ([total x q_dim]) and ctx->attn_scores
+// ([n_heads x max_seq x max_seq]) to be allocated. h_offsets is the host copy
+// of the packed sequence boundaries.
+static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
+                               int batch, int q_offset, int k_offset,
+                               int v_offset, int qkv_dim, float scale)
+{
+    const pplx_config_t *c = &ctx->config;
+    int q_dim = c->q_dim;
+    int hd = c->head_dim;
+    int H = c->n_heads;
+    int total = h_offsets[batch];
+    const float alpha = scale, beta = 0.0f, one = 1.0f;
+
+    int threads = 256;
+    size_t exp_count = (size_t)total * q_dim;
+    attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads,
+                            0, ctx->stream>>>(
+        ctx->kexp, ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim,
+        k_offset, v_offset);
+    if (launch_check() != 0) return -1;
+
+    for (int b = 0; b < batch; b++) {
+        int start = h_offsets[b];
+        int L = h_offsets[b + 1] - start;
+        const float *Q = ctx->qkv + (size_t)start * qkv_dim + q_offset;
+        const float *K = ctx->kexp + (size_t)start * q_dim;
+        const float *V = ctx->vexp + (size_t)start * q_dim;
+        float *O = ctx->attn_out + (size_t)start * q_dim;
+        /* scores[h] = scale * Q[h] @ K[h]^T  (row-major C = A @ B^T) */
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
+            &alpha, K, q_dim, hd, Q, qkv_dim, hd,
+            &beta, ctx->attn_scores, L, (long long)L * L, H));
+        attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+            ctx->attn_scores, L);
+        if (launch_check() != 0) return -1;
+        /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
+            &one, V, q_dim, hd, ctx->attn_scores, L, (long long)L * L,
+            &beta, O, q_dim, hd, H));
+    }
+    return 0;
+}
+
 static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_seq)
 {
     const pplx_config_t *c = &ctx->config;
@@ -606,11 +596,13 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->attn_out);
         cudaFree(ctx->ffn_gate_up);
         cudaFree(ctx->token_ids);
-        cudaFree(ctx->attn_tiles);
         cudaFree(ctx->positions);
+        cudaFree(ctx->kexp);
+        cudaFree(ctx->vexp);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
-        ctx->token_ids = ctx->attn_tiles = ctx->positions = NULL;
+        ctx->token_ids = ctx->positions = NULL;
+        ctx->kexp = ctx->vexp = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,      (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
@@ -618,18 +610,26 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate_up,
                               (size_t)total * 2 * c->intermediate_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_tiles, (size_t)total * 2 * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
         ctx->seq_cap = total;
     }
     if (batch + 1 > ctx->batch_cap) {
         cudaFree(ctx->offsets);
+        free(ctx->offsets_host);
         CUDA_CHECK(cudaMalloc((void **)&ctx->offsets, (size_t)(batch + 1) * sizeof(int)));
+        ctx->offsets_host = (int *)malloc((size_t)(batch + 1) * sizeof(int));
+        if (!ctx->offsets_host) return -1;
         ctx->batch_cap = batch + 1;
     }
     if (max_seq > ctx->max_seq_cap) {
         cudaFree(ctx->rope_cos);
         cudaFree(ctx->rope_sin);
+        cudaFree(ctx->attn_scores);
+        ctx->attn_scores = NULL;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
+                              (size_t)c->n_heads * max_seq * max_seq * sizeof(float)));
         float *hcos = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
         float *hsin = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
         if (!hcos || !hsin) {
@@ -785,8 +785,11 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->rope_sin);
     cudaFree(ctx->token_ids);
     cudaFree(ctx->offsets);
-    cudaFree(ctx->attn_tiles);
+    free(ctx->offsets_host);
     cudaFree(ctx->positions);
+    cudaFree(ctx->kexp);
+    cudaFree(ctx->vexp);
+    cudaFree(ctx->attn_scores);
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
     if (ctx->blas) cublasDestroy(ctx->blas);
@@ -825,33 +828,6 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         return -1;
     }
 
-    // The warp-per-query attention kernels need head_dim a multiple of 32 and
-    // small enough for the per-lane register arrays; otherwise fall back to the
-    // proven per-row gqa_attention_kernel for every batch shape.
-    int warp_ok = (c->head_dim % 32 == 0) &&
-                  (c->head_dim <= 32 * ATTN_WARP_MAX_VEC);
-
-    // Tile descriptors for the ragged warp attention path. One (seq, row0) entry
-    // per quad of query rows within each sequence (4 warps per block); only built
-    // when the dispatch below will use it. batch == 1 uses the single-sequence
-    // warp kernel instead (compile-time bounds, no descriptor or extra host copy).
-    int use_tiles = warp_ok && batch > 1 && max_seq >= 64;
-    int n_tiles = 0;
-    int *h_tiles = NULL;
-    if (use_tiles) {
-        h_tiles = (int *)malloc((size_t)total * 2 * sizeof(int));
-        if (!h_tiles) {
-            free(h_offsets); free(h_ids); free(h_pos);
-            return -1;
-        }
-        for (int b = 0; b < batch; b++) {
-            for (int r = h_offsets[b]; r < h_offsets[b + 1]; r += 4) {
-                h_tiles[n_tiles * 2 + 0] = b;
-                h_tiles[n_tiles * 2 + 1] = r;
-                n_tiles++;
-            }
-        }
-    }
     for (int b = 0; b < batch; b++) {
         int off = h_offsets[b];
         memcpy(h_ids + off, inputs[b].ids,
@@ -863,6 +839,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         free(h_offsets); free(h_ids); free(h_pos);
         return -1;
     }
+    memcpy(ctx->offsets_host, h_offsets, (size_t)(batch + 1) * sizeof(int));
     cudaError_t ce = cudaMemcpyAsync(ctx->token_ids, h_ids,
                                      (size_t)total * sizeof(int),
                                      cudaMemcpyHostToDevice, ctx->stream);
@@ -874,11 +851,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         ce = cudaMemcpyAsync(ctx->offsets, h_offsets,
                              (size_t)(batch + 1) * sizeof(int),
                              cudaMemcpyHostToDevice, ctx->stream);
-    if (ce == cudaSuccess && use_tiles)
-        ce = cudaMemcpyAsync(ctx->attn_tiles, h_tiles,
-                             (size_t)n_tiles * 2 * sizeof(int),
-                             cudaMemcpyHostToDevice, ctx->stream);
-    free(h_offsets); free(h_ids); free(h_pos); free(h_tiles);
+    free(h_offsets); free(h_ids); free(h_pos);
     if (ce != cudaSuccess) {
         fprintf(stderr, "cuda input copy failed: %s\n", cudaGetErrorString(ce));
         return -1;
@@ -917,24 +890,17 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (use_tiles) {
-            dim3 grid(n_tiles, c->n_heads);
-            gqa_attention_warp_ragged_kernel<<<grid, 128, 0, ctx->stream>>>(
-                ctx->attn_out, ctx->qkv, ctx->offsets, ctx->attn_tiles,
-                c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim,
-                q_offset, k_offset, v_offset, scale);
-        } else if (warp_ok && batch == 1 && total >= 64) {
-            dim3 grid((total + 3) / 4, c->n_heads);
-            gqa_attention_warp_single_kernel<<<grid, 128, 0, ctx->stream>>>(
-                ctx->attn_out, ctx->qkv, total, c->n_heads, c->n_kv_heads,
-                c->head_dim, qkv_dim, q_offset, k_offset, v_offset, scale);
+        if (max_seq >= 64) {
+            if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset,
+                                    k_offset, v_offset, qkv_dim, scale) != 0)
+                return -1;
         } else {
             gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
                 ctx->attn_out, ctx->qkv, ctx->offsets, batch,
                 total, c->n_heads, c->n_kv_heads, c->head_dim,
                 qkv_dim, q_offset, k_offset, v_offset, scale);
+            if (launch_check() != 0) return -1;
         }
-        if (launch_check() != 0) return -1;
 
         if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
                          total, c->q_dim, c->hidden_size) != 0)
