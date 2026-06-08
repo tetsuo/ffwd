@@ -697,11 +697,6 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
-        if (use_cuda) {
-            fprintf(stderr, "--backend cuda is not available in --serve mode yet\n");
-            free_model_specs(&model_specs);
-            return 1;
-        }
         if (mlx_quantize_bits && !use_mlx) {
             fprintf(stderr, "--mlx-quantize-bits requires --backend mlx\n");
             free_model_specs(&model_specs);
@@ -712,7 +707,7 @@ int main(int argc, char *argv[])
             qwen_set_threads(n_threads);
             if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
         } else if (verbose >= 1) {
-            fprintf(stderr, "Using MLX GPU backend\n");
+            fprintf(stderr, "Using %s GPU backend\n", use_mlx ? "MLX" : "CUDA");
         }
         pplx_server_config_t scfg = {
             .models = model_specs.v,
@@ -723,6 +718,7 @@ int main(int argc, char *argv[])
             .max_batch_tokens = max_batch_tokens,
             .batch_wait_us = batch_wait_us,
             .use_mlx = use_mlx,
+            .use_cuda = use_cuda,
             .mlx_quantize_bits = mlx_quantize_bits,
             .mlx_quantize_group_size = mlx_quantize_group_size,
             .allow_memory_overcommit = allow_memory_overcommit,

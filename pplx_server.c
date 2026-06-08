@@ -10,6 +10,9 @@
 #ifdef USE_MLX
 #include "pplx_embed_mlx.h"
 #endif
+#ifdef USE_CUDA
+#include "pplx_embed_cuda.h"
+#endif
 
 #include "deps/ae/ae.h"
 #include "deps/ae/anet.h"
@@ -230,6 +233,9 @@ typedef struct {
 #ifdef USE_MLX
     pplx_mlx_ctx_t *mlx_ctx;
 #endif
+#ifdef USE_CUDA
+    pplx_cuda_ctx_t *cuda_ctx;
+#endif
 } loaded_model;
 
 typedef struct client client;
@@ -249,6 +255,7 @@ typedef struct {
     char *api_key;
     loaded_model models[4];
     int use_mlx;
+    int use_cuda;
     int mlx_quantize_bits;
     int mlx_quantize_group_size;
 
@@ -1152,6 +1159,10 @@ static int model_embed_batch(loaded_model *m, const pplx_input_t *inputs,
     if (m->mlx_ctx)
         return pplx_mlx_embed_batch(m->mlx_ctx, inputs, batch, out);
 #endif
+#ifdef USE_CUDA
+    if (m->cuda_ctx)
+        return pplx_cuda_embed_batch(m->cuda_ctx, inputs, batch, out);
+#endif
     return pplx_model_embed_batch(m->cpu_model, m->cpu_ws, inputs, batch, out);
 }
 
@@ -1161,6 +1172,10 @@ static int model_embed_spans_batch(loaded_model *m,
 #ifdef USE_MLX
     if (m->mlx_ctx)
         return pplx_mlx_embed_spans_batch(m->mlx_ctx, inputs, batch, out);
+#endif
+#ifdef USE_CUDA
+    if (m->cuda_ctx)
+        return pplx_cuda_embed_spans_batch(m->cuda_ctx, inputs, batch, out);
 #endif
     return pplx_model_embed_spans_batch(m->cpu_model, m->cpu_ws, inputs, batch,
                                         out);
@@ -1966,9 +1981,9 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
 
 static void *worker_main(void *arg) {
     http_server *s = arg;
+    int rc = 0;
 #ifdef USE_MLX
     if (s->use_mlx) {
-        int rc = 0;
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
@@ -2009,6 +2024,44 @@ static void *worker_main(void *arg) {
         }
     } else
 #endif
+#ifdef USE_CUDA
+    if (s->use_cuda) {
+        for (int i = 0; i < 4; i++) {
+            loaded_model *m = &s->models[i];
+            if (!m->info) continue;
+            m->cuda_ctx = pplx_cuda_load(m->path);
+            if (!m->cuda_ctx) {
+                server_log("pplx-serve: failed to load CUDA model on worker: %s",
+                           m->path);
+                rc = 1;
+                break;
+            }
+            if (pplx_cuda_config(m->cuda_ctx)->hidden_size != m->info->dim) {
+                server_log("pplx-serve: model %s has unexpected dimension %d",
+                           m->info->id,
+                           pplx_cuda_config(m->cuda_ctx)->hidden_size);
+                rc = 1;
+                break;
+            }
+        }
+        pthread_mutex_lock(&s->mu);
+        s->worker_init_rc = rc;
+        s->worker_ready = 1;
+        if (rc) s->stopping = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        if (rc) {
+            for (int i = 0; i < 4; i++) {
+                loaded_model *m = &s->models[i];
+                if (m->cuda_ctx) {
+                    pplx_cuda_free(m->cuda_ctx);
+                    m->cuda_ctx = NULL;
+                }
+            }
+            return NULL;
+        }
+    } else
+#endif
     {
         pthread_mutex_lock(&s->mu);
         s->worker_ready = 1;
@@ -2041,6 +2094,17 @@ static void *worker_main(void *arg) {
             if (m->mlx_ctx) {
                 pplx_mlx_free(m->mlx_ctx);
                 m->mlx_ctx = NULL;
+            }
+        }
+    }
+#endif
+#ifdef USE_CUDA
+    if (s->use_cuda) {
+        for (int i = 0; i < 4; i++) {
+            loaded_model *m = &s->models[i];
+            if (m->cuda_ctx) {
+                pplx_cuda_free(m->cuda_ctx);
+                m->cuda_ctx = NULL;
             }
         }
     }
@@ -2088,6 +2152,11 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         return 0;
     }
 #endif
+#ifdef USE_CUDA
+    if (s->use_cuda) {
+        return 0;
+    }
+#endif
     m->cpu_model = pplx_model_load(path);
     if (!m->cpu_model) {
         server_log("pplx-serve: failed to load model: %s", path);
@@ -2116,6 +2185,9 @@ static void free_models(http_server *s) {
         if (m->cpu_model) pplx_model_free(m->cpu_model);
 #ifdef USE_MLX
         if (m->mlx_ctx) pplx_mlx_free(m->mlx_ctx);
+#endif
+#ifdef USE_CUDA
+        if (m->cuda_ctx) pplx_cuda_free(m->cuda_ctx);
 #endif
     }
 }
@@ -2239,6 +2311,7 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
         ? cfg->batch_wait_us : PPLX_SERVER_BATCH_WAIT_US;
     s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
+    s.use_cuda = cfg->use_cuda;
     s.mlx_quantize_bits = cfg->mlx_quantize_bits;
     s.mlx_quantize_group_size = cfg->mlx_quantize_group_size > 0
         ? cfg->mlx_quantize_group_size : 64;

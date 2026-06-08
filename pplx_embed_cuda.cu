@@ -6,6 +6,7 @@ extern "C" {
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +50,10 @@ struct pplx_cuda_ctx {
     int *token_ids;
     int *offsets;
     int *positions;
-    int pooled_batch_cap;
+    int *span_starts;
+    int *span_lens;
+    int pooled_rows_cap;
+    int span_cap;
 };
 
 #define CUDA_CHECK(expr) do {                                      \
@@ -412,6 +416,22 @@ __global__ static void mean_pool_kernel(float *out, const float *x,
     }
 }
 
+__global__ static void span_pool_kernel(float *out, const float *x,
+                                        const int *starts, const int *lens,
+                                        int n_spans, int hidden)
+{
+    int s = blockIdx.x;
+    int tid = threadIdx.x;
+    int start = starts[s];
+    int len = lens[s];
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float sum = 0.0f;
+        for (int t = 0; t < len; t++)
+            sum += x[(size_t)(start + t) * hidden + d];
+        out[(size_t)s * hidden + d] = sum / (float)len;
+    }
+}
+
 static int launch_check(void)
 {
     cudaError_t e = cudaGetLastError();
@@ -489,13 +509,6 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->offsets, (size_t)(batch + 1) * sizeof(int)));
         ctx->batch_cap = batch + 1;
     }
-    if (batch > ctx->pooled_batch_cap) {
-        cudaFree(ctx->pooled_out);
-        ctx->pooled_out = NULL;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->pooled_out,
-                              (size_t)batch * c->hidden_size * sizeof(float)));
-        ctx->pooled_batch_cap = batch;
-    }
     if (max_seq > ctx->max_seq_cap) {
         cudaFree(ctx->rope_cos);
         cudaFree(ctx->rope_sin);
@@ -534,6 +547,33 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         free(hsin);
         ctx->max_seq_cap = max_seq;
     }
+    return 0;
+}
+
+static int ensure_pooled_rows(pplx_cuda_ctx_t *ctx, int rows)
+{
+    if (rows <= ctx->pooled_rows_cap) return 0;
+    const pplx_config_t *c = &ctx->config;
+    cudaFree(ctx->pooled_out);
+    ctx->pooled_out = NULL;
+    CUDA_CHECK(cudaMalloc((void **)&ctx->pooled_out,
+                          (size_t)rows * c->hidden_size * sizeof(float)));
+    ctx->pooled_rows_cap = rows;
+    return 0;
+}
+
+static int ensure_span_buffers(pplx_cuda_ctx_t *ctx, int n_spans)
+{
+    if (n_spans <= ctx->span_cap) return 0;
+    cudaFree(ctx->span_starts);
+    cudaFree(ctx->span_lens);
+    ctx->span_starts = NULL;
+    ctx->span_lens = NULL;
+    CUDA_CHECK(cudaMalloc((void **)&ctx->span_starts,
+                          (size_t)n_spans * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void **)&ctx->span_lens,
+                          (size_t)n_spans * sizeof(int)));
+    ctx->span_cap = n_spans;
     return 0;
 }
 
@@ -628,6 +668,8 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->token_ids);
     cudaFree(ctx->offsets);
     cudaFree(ctx->positions);
+    cudaFree(ctx->span_starts);
+    cudaFree(ctx->span_lens);
     if (ctx->blas) cublasDestroy(ctx->blas);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
     pplx_model_free(ctx->cpu);
@@ -639,10 +681,10 @@ const pplx_config_t *pplx_cuda_config(const pplx_cuda_ctx_t *ctx)
     return ctx ? &ctx->config : NULL;
 }
 
-int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
-                          int batch, float *out_embeddings)
+static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+                              int batch)
 {
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+    if (!ctx || !inputs || batch <= 0) return -1;
     const pplx_config_t *c = &ctx->config;
     int *h_offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
     if (!h_offsets) return -1;
@@ -759,12 +801,24 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         ctx->x, ctx->x, ctx->norm, total, c->hidden_size, c->rms_norm_eps);
     if (launch_check() != 0) return -1;
 
+    return 0;
+}
+
+int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+                          int batch, float *out_embeddings)
+{
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+    const pplx_config_t *c = &ctx->config;
+    if (cuda_forward_batch(ctx, inputs, batch) != 0)
+        return -1;
+    if (ensure_pooled_rows(ctx, batch) != 0)
+        return -1;
     mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
         ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
     if (launch_check() != 0) return -1;
-    ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
-                         (size_t)batch * c->hidden_size * sizeof(float),
-                         cudaMemcpyDeviceToHost, ctx->stream);
+    cudaError_t ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
+                                     (size_t)batch * c->hidden_size * sizeof(float),
+                                     cudaMemcpyDeviceToHost, ctx->stream);
     if (ce == cudaSuccess)
         ce = cudaStreamSynchronize(ctx->stream);
     if (ce != cudaSuccess) {
@@ -772,6 +826,97 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         return -1;
     }
     return 0;
+}
+
+int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
+                                const pplx_context_input_t *inputs,
+                                int batch, float *out_embeddings)
+{
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+    const pplx_config_t *c = &ctx->config;
+    int total_spans = 0;
+    int total_tokens = 0;
+    for (int b = 0; b < batch; b++) {
+        const pplx_context_input_t *input = &inputs[b];
+        int n_tokens = input->input.n_tokens;
+        if (!input->input.ids || n_tokens <= 0 || !input->spans ||
+            input->n_spans <= 0 || total_spans > INT_MAX - input->n_spans ||
+            total_tokens > INT_MAX - n_tokens)
+            return -1;
+        for (int s = 0; s < input->n_spans; s++) {
+            int start = input->spans[s].start;
+            int len = input->spans[s].n_tokens;
+            if (start < 0 || len <= 0 || start > n_tokens ||
+                len > n_tokens - start)
+                return -1;
+        }
+        total_spans += input->n_spans;
+        total_tokens += n_tokens;
+    }
+
+    pplx_input_t *packed = (pplx_input_t *)malloc((size_t)batch * sizeof(*packed));
+    int *h_starts = (int *)malloc((size_t)total_spans * sizeof(int));
+    int *h_lens = (int *)malloc((size_t)total_spans * sizeof(int));
+    if (!packed || !h_starts || !h_lens) {
+        free(packed);
+        free(h_starts);
+        free(h_lens);
+        return -1;
+    }
+
+    int token_offset = 0;
+    int span_offset = 0;
+    for (int b = 0; b < batch; b++) {
+        const pplx_context_input_t *input = &inputs[b];
+        packed[b] = input->input;
+        for (int s = 0; s < input->n_spans; s++) {
+            h_starts[span_offset] = token_offset + input->spans[s].start;
+            h_lens[span_offset] = input->spans[s].n_tokens;
+            span_offset++;
+        }
+        token_offset += input->input.n_tokens;
+    }
+
+    int rc = -1;
+    cudaError_t ce;
+    if (cuda_forward_batch(ctx, packed, batch) != 0)
+        goto cleanup;
+    if (ensure_pooled_rows(ctx, total_spans) != 0 ||
+        ensure_span_buffers(ctx, total_spans) != 0)
+        goto cleanup;
+    ce = cudaMemcpyAsync(ctx->span_starts, h_starts,
+                         (size_t)total_spans * sizeof(int),
+                         cudaMemcpyHostToDevice, ctx->stream);
+    if (ce == cudaSuccess)
+        ce = cudaMemcpyAsync(ctx->span_lens, h_lens,
+                             (size_t)total_spans * sizeof(int),
+                             cudaMemcpyHostToDevice, ctx->stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "cuda span copy failed: %s\n", cudaGetErrorString(ce));
+        goto cleanup;
+    }
+    span_pool_kernel<<<total_spans, 256, 0, ctx->stream>>>(
+        ctx->pooled_out, ctx->x, ctx->span_starts, ctx->span_lens,
+        total_spans, c->hidden_size);
+    if (launch_check() != 0)
+        goto cleanup;
+    ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
+                         (size_t)total_spans * c->hidden_size * sizeof(float),
+                         cudaMemcpyDeviceToHost, ctx->stream);
+    if (ce == cudaSuccess)
+        ce = cudaStreamSynchronize(ctx->stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "cuda span output copy failed: %s\n",
+                cudaGetErrorString(ce));
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    free(h_lens);
+    free(h_starts);
+    free(packed);
+    return rc;
 }
 
 int pplx_cuda_embed_into(pplx_cuda_ctx_t *ctx, const int *token_ids,
