@@ -9,6 +9,8 @@
 
 typedef struct pplx_cuda_ctx pplx_cuda_ctx_t;
 
+int pplx_cuda_set_fast_gemm(const char *mode);
+
 pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir);
 void pplx_cuda_free(pplx_cuda_ctx_t *ctx);
 

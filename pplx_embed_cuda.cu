@@ -78,6 +78,40 @@ struct pplx_cuda_ctx {
     }                                                             \
 } while (0)
 
+static int parse_gemm_compute(const char *mode, cublasComputeType_t *out)
+{
+    if (!mode || !mode[0] || !strcmp(mode, "f32")) {
+        *out = CUBLAS_COMPUTE_32F;
+        return 0;
+    }
+    if (!strcmp(mode, "tf32")) {
+        *out = CUBLAS_COMPUTE_32F_FAST_TF32;
+        return 0;
+    }
+    if (!strcmp(mode, "bf16")) {
+        *out = CUBLAS_COMPUTE_32F_FAST_16BF;
+        return 0;
+    }
+    if (!strcmp(mode, "16f")) {
+        *out = CUBLAS_COMPUTE_32F_FAST_16F;
+        return 0;
+    }
+    return -1;
+}
+
+static cublasComputeType_t g_gemm_compute = CUBLAS_COMPUTE_32F;
+static int g_gemm_compute_set = 0;
+
+int pplx_cuda_set_fast_gemm(const char *mode)
+{
+    cublasComputeType_t ct;
+    if (parse_gemm_compute(mode, &ct) != 0)
+        return -1;
+    g_gemm_compute = ct;
+    g_gemm_compute_set = 1;
+    return 0;
+}
+
 static void cuda_matrix_free(cuda_matrix_t *m)
 {
     if (!m) return;
@@ -498,22 +532,20 @@ static int launch_check(void)
     return 0;
 }
 
-// Compute type for the projection GEMMs. Default is exact F32 (== cublasSgemm).
+// Compute type for CUDA GEMMs. Default is exact F32 (== cublasSgemm).
 // PPLX_CUDA_FAST_GEMM={bf16,tf32,16f} selects a reduced-precision tensor-core
 // matmul that keeps F32 inputs/outputs and F32 accumulation but rounds operands
 // internally.
 static cublasComputeType_t gemm_compute(void)
 {
-    static int init = 0;
-    static cublasComputeType_t ct = CUBLAS_COMPUTE_32F;
-    if (!init) {
+    static int env_init = 0;
+    if (!g_gemm_compute_set && !env_init) {
         const char *e = getenv("PPLX_CUDA_FAST_GEMM");
-        if (e && !strcmp(e, "bf16")) ct = CUBLAS_COMPUTE_32F_FAST_16BF;
-        else if (e && !strcmp(e, "tf32")) ct = CUBLAS_COMPUTE_32F_FAST_TF32;
-        else if (e && !strcmp(e, "16f")) ct = CUBLAS_COMPUTE_32F_FAST_16F;
-        init = 1;
+        if (e && parse_gemm_compute(e, &g_gemm_compute) == 0)
+            g_gemm_compute_set = 1;
+        env_init = 1;
     }
-    return ct;
+    return g_gemm_compute;
 }
 
 static int linear_ex(cublasHandle_t blas, const float *w, const float *x,
@@ -550,6 +582,30 @@ static int linear_accum_strided(cublasHandle_t blas, const cuda_matrix_t *w,
     return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, x_stride, 1.0f);
 }
 
+static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
+                                cublasOperation_t transb, int m, int n, int k,
+                                const float *alpha, const float *A, int lda,
+                                long long strideA, const float *B, int ldb,
+                                long long strideB, const float *beta,
+                                float *C, int ldc, long long strideC,
+                                int batch_count)
+{
+    cublasComputeType_t ct = gemm_compute();
+    if (ct == CUBLAS_COMPUTE_32F) {
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            blas, transa, transb, m, n, k, alpha, A, lda, strideA, B, ldb,
+            strideB, beta, C, ldc, strideC, batch_count));
+    } else {
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            blas, transa, transb, m, n, k,
+            alpha, A, CUDA_R_32F, lda, strideA,
+            B, CUDA_R_32F, ldb, strideB,
+            beta, C, CUDA_R_32F, ldc, strideC,
+            batch_count, ct, CUBLAS_GEMM_DEFAULT));
+    }
+    return 0;
+}
+
 // GEMM-based attention for one micro-batch. Expands K/V to the per-query-head
 // layout, then for each sequence runs batched-over-heads Q@K^T (scaled) ->
 // row softmax -> @V via cuBLAS. Scales far better than the streaming warp
@@ -584,18 +640,20 @@ static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
         const float *V = ctx->vexp + (size_t)start * q_dim;
         float *O = ctx->attn_out + (size_t)start * q_dim;
         /* scores[h] = scale * Q[h] @ K[h]^T  (row-major C = A @ B^T) */
-        CUBLAS_CHECK(cublasSgemmStridedBatched(
-            ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
-            &alpha, K, q_dim, hd, Q, qkv_dim, hd,
-            &beta, ctx->attn_scores, L, (long long)L * L, H));
+        if (gemm_strided_batched(
+                ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
+                &alpha, K, q_dim, hd, Q, qkv_dim, hd,
+                &beta, ctx->attn_scores, L, (long long)L * L, H) != 0)
+            return -1;
         attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
             ctx->attn_scores, L);
         if (launch_check() != 0) return -1;
         /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
-        CUBLAS_CHECK(cublasSgemmStridedBatched(
-            ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
-            &one, V, q_dim, hd, ctx->attn_scores, L, (long long)L * L,
-            &beta, O, q_dim, hd, H));
+        if (gemm_strided_batched(
+                ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
+                &one, V, q_dim, hd, ctx->attn_scores, L, (long long)L * L,
+                &beta, O, q_dim, hd, H) != 0)
+            return -1;
     }
     return 0;
 }
