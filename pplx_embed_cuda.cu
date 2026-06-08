@@ -395,123 +395,124 @@ __global__ static void gqa_attention_kernel(float *out, const float *qkv,
         out[((size_t)row * n_heads + head) * head_dim + tid] = acc / sum_s;
 }
 
-// Single-sequence tile-4 attention (batch == 1): the whole packed buffer is one
-// sequence [0, total), so bounds are compile-time and no tile descriptor or
-// extra host copy is needed. Each block reuses each K/V row across 4 query rows.
-__global__ static void gqa_attention_tile4_single_kernel(
+// Warp-per-query attention. One warp (32 lanes) owns one query row; each lane
+// holds head_dim/32 dims of Q/acc in registers, computes a partial dot per key,
+// and a butterfly __shfl reduction yields the full score on every lane. No
+// shared memory and no __syncthreads, so warps (query rows) run independently.
+// Requires head_dim % 32 == 0 and head_dim <= 32 * ATTN_WARP_MAX_VEC; callers
+// fall back to gqa_attention_kernel otherwise. Blocks launch 128 threads
+// (4 warps = 4 query rows). vec = head_dim/32 (= 4 for head_dim 128).
+#define ATTN_WARP_MAX_VEC 8
+
+__device__ __forceinline__ float warp_dot_reduce(float partial)
+{
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        partial += __shfl_xor_sync(0xffffffffu, partial, o);
+    return partial;
+}
+
+// Single-sequence variant (batch == 1): the packed buffer is one sequence
+// [0, total), so bounds are compile-time and no tile descriptor is needed.
+__global__ static void gqa_attention_warp_single_kernel(
     float *out, const float *qkv, int total, int n_heads, int n_kv_heads,
     int head_dim, int qkv_dim, int q_offset, int k_offset, int v_offset,
     float scale)
 {
-    int row0 = blockIdx.x * 4;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= total) return;
     int head = blockIdx.y;
-    int tid = threadIdx.x;
     int kv_head = head / (n_heads / n_kv_heads);
+    int vec = head_dim >> 5;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float max_s[4] = {
-        -3.402823466e+38F, -3.402823466e+38F,
-        -3.402823466e+38F, -3.402823466e+38F
-    };
-    float sum_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float *qv = qkv + (size_t)row * qkv_dim + q_offset + head * head_dim;
+    float qreg[ATTN_WARP_MAX_VEC];
+    float acc[ATTN_WARP_MAX_VEC];
+#pragma unroll
+    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++) {
+        if (e < vec) qreg[e] = qv[e * 32 + lane];
+        acc[e] = 0.0f;
+    }
+    float m = -3.402823466e+38F, l = 0.0f;
 
     for (int j = 0; j < total; j++) {
-        const float *kk = qkv + (size_t)j * qkv_dim +
-                          k_offset + kv_head * head_dim;
-        const float *vv = qkv + (size_t)j * qkv_dim +
-                          v_offset + kv_head * head_dim;
-        float k = tid < head_dim ? kk[tid] : 0.0f;
-        float v = tid < head_dim ? vv[tid] : 0.0f;
-
-        for (int q = 0; q < 4; q++) {
-            int row = row0 + q;
-            int valid = row < total;
-            const float *qv = qkv + (size_t)row * qkv_dim +
-                              q_offset + head * head_dim;
-            float part = valid && tid < head_dim ? qv[tid] * k : 0.0f;
-            float dot = block_sum(part);
-            if (valid) {
-                float score = dot * scale;
-                float next_max = fmaxf(max_s[q], score);
-                float old_scale = expf(max_s[q] - next_max);
-                float weight = expf(score - next_max);
-                if (tid < head_dim)
-                    acc[q] = acc[q] * old_scale + weight * v;
-                sum_s[q] = sum_s[q] * old_scale + weight;
-                max_s[q] = next_max;
-            }
-        }
+        const float *kk = qkv + (size_t)j * qkv_dim + k_offset + kv_head * head_dim;
+        float partial = 0.0f;
+#pragma unroll
+        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+            if (e < vec) partial += qreg[e] * kk[e * 32 + lane];
+        float score = warp_dot_reduce(partial) * scale;
+        float nm = fmaxf(m, score);
+        float os = expf(m - nm);
+        float w = expf(score - nm);
+        const float *vv = qkv + (size_t)j * qkv_dim + v_offset + kv_head * head_dim;
+#pragma unroll
+        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+            if (e < vec) acc[e] = acc[e] * os + w * vv[e * 32 + lane];
+        l = l * os + w;
+        m = nm;
     }
 
-    for (int q = 0; q < 4; q++) {
-        int row = row0 + q;
-        if (row < total && tid < head_dim)
-            out[((size_t)row * n_heads + head) * head_dim + tid] =
-                acc[q] / sum_s[q];
-    }
+    float *o = out + ((size_t)row * n_heads + head) * head_dim;
+#pragma unroll
+    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+        if (e < vec) o[e * 32 + lane] = acc[e] / l;
 }
 
-// Sequence-aware tile-4 attention for micro-batches (batch > 1): each block owns
-// up to 4 consecutive query rows within one sequence (tile descriptor =
-// (seq, row0)) and reuses each K/V row of that sequence across the 4 query rows.
-// block_sum is called for all 4 q before the validity guard so __syncthreads
-// stays block-uniform on partial tiles. Assumes head_dim <= 128 (the launch
-// block size); shared with gqa_attention_kernel.
-__global__ static void gqa_attention_tile4_ragged_kernel(
+// Sequence-aware variant for micro-batches (batch > 1): the tile descriptor
+// (seq, row0) maps each block's 4 warps to 4 consecutive query rows within one
+// sequence; the j-loop runs over that sequence's [start, end).
+__global__ static void gqa_attention_warp_ragged_kernel(
     float *out, const float *qkv, const int *offsets, const int *tiles,
     int n_heads, int n_kv_heads, int head_dim, int qkv_dim,
     int q_offset, int k_offset, int v_offset, float scale)
 {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
     int tile = blockIdx.x;
-    int head = blockIdx.y;
-    int tid = threadIdx.x;
     int seq = tiles[tile * 2 + 0];
-    int row0 = tiles[tile * 2 + 1];
+    int row = tiles[tile * 2 + 1] + warp;
     int start = offsets[seq];
     int end = offsets[seq + 1];
+    if (row >= end) return;
+    int head = blockIdx.y;
     int kv_head = head / (n_heads / n_kv_heads);
+    int vec = head_dim >> 5;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float max_s[4] = {
-        -3.402823466e+38F, -3.402823466e+38F,
-        -3.402823466e+38F, -3.402823466e+38F
-    };
-    float sum_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float *qv = qkv + (size_t)row * qkv_dim + q_offset + head * head_dim;
+    float qreg[ATTN_WARP_MAX_VEC];
+    float acc[ATTN_WARP_MAX_VEC];
+#pragma unroll
+    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++) {
+        if (e < vec) qreg[e] = qv[e * 32 + lane];
+        acc[e] = 0.0f;
+    }
+    float m = -3.402823466e+38F, l = 0.0f;
 
     for (int j = start; j < end; j++) {
-        const float *kk = qkv + (size_t)j * qkv_dim +
-                          k_offset + kv_head * head_dim;
-        const float *vv = qkv + (size_t)j * qkv_dim +
-                          v_offset + kv_head * head_dim;
-        float k = tid < head_dim ? kk[tid] : 0.0f;
-        float v = tid < head_dim ? vv[tid] : 0.0f;
-
-        for (int q = 0; q < 4; q++) {
-            int row = row0 + q;
-            int valid = row < end;
-            const float *qv = qkv + (size_t)row * qkv_dim +
-                              q_offset + head * head_dim;
-            float part = valid && tid < head_dim ? qv[tid] * k : 0.0f;
-            float dot = block_sum(part);
-            if (valid) {
-                float score = dot * scale;
-                float next_max = fmaxf(max_s[q], score);
-                float old_scale = expf(max_s[q] - next_max);
-                float weight = expf(score - next_max);
-                if (tid < head_dim)
-                    acc[q] = acc[q] * old_scale + weight * v;
-                sum_s[q] = sum_s[q] * old_scale + weight;
-                max_s[q] = next_max;
-            }
-        }
+        const float *kk = qkv + (size_t)j * qkv_dim + k_offset + kv_head * head_dim;
+        float partial = 0.0f;
+#pragma unroll
+        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+            if (e < vec) partial += qreg[e] * kk[e * 32 + lane];
+        float score = warp_dot_reduce(partial) * scale;
+        float nm = fmaxf(m, score);
+        float os = expf(m - nm);
+        float w = expf(score - nm);
+        const float *vv = qkv + (size_t)j * qkv_dim + v_offset + kv_head * head_dim;
+#pragma unroll
+        for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+            if (e < vec) acc[e] = acc[e] * os + w * vv[e * 32 + lane];
+        l = l * os + w;
+        m = nm;
     }
 
-    for (int q = 0; q < 4; q++) {
-        int row = row0 + q;
-        if (row < end && tid < head_dim)
-            out[((size_t)row * n_heads + head) * head_dim + tid] =
-                acc[q] / sum_s[q];
-    }
+    float *o = out + ((size_t)row * n_heads + head) * head_dim;
+#pragma unroll
+    for (int e = 0; e < ATTN_WARP_MAX_VEC; e++)
+        if (e < vec) o[e * 32 + lane] = acc[e] / l;
 }
 
 __global__ static void mean_pool_kernel(float *out, const float *x,
@@ -824,11 +825,17 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         return -1;
     }
 
-    // Tile descriptors for the ragged tile-4 attention path. One (seq, row0)
-    // entry per quad of query rows within each sequence; only built when the
-    // dispatch below will use it. batch == 1 uses the single-sequence tile
-    // kernel instead (compile-time bounds, no descriptor or extra host copy).
-    int use_tiles = batch > 1 && max_seq >= 64;
+    // The warp-per-query attention kernels need head_dim a multiple of 32 and
+    // small enough for the per-lane register arrays; otherwise fall back to the
+    // proven per-row gqa_attention_kernel for every batch shape.
+    int warp_ok = (c->head_dim % 32 == 0) &&
+                  (c->head_dim <= 32 * ATTN_WARP_MAX_VEC);
+
+    // Tile descriptors for the ragged warp attention path. One (seq, row0) entry
+    // per quad of query rows within each sequence (4 warps per block); only built
+    // when the dispatch below will use it. batch == 1 uses the single-sequence
+    // warp kernel instead (compile-time bounds, no descriptor or extra host copy).
+    int use_tiles = warp_ok && batch > 1 && max_seq >= 64;
     int n_tiles = 0;
     int *h_tiles = NULL;
     if (use_tiles) {
@@ -912,13 +919,13 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
 
         if (use_tiles) {
             dim3 grid(n_tiles, c->n_heads);
-            gqa_attention_tile4_ragged_kernel<<<grid, 128, 0, ctx->stream>>>(
+            gqa_attention_warp_ragged_kernel<<<grid, 128, 0, ctx->stream>>>(
                 ctx->attn_out, ctx->qkv, ctx->offsets, ctx->attn_tiles,
                 c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim,
                 q_offset, k_offset, v_offset, scale);
-        } else if (batch == 1 && total >= 64) {
+        } else if (warp_ok && batch == 1 && total >= 64) {
             dim3 grid((total + 3) / 4, c->n_heads);
-            gqa_attention_tile4_single_kernel<<<grid, 128, 0, ctx->stream>>>(
+            gqa_attention_warp_single_kernel<<<grid, 128, 0, ctx->stream>>>(
                 ctx->attn_out, ctx->qkv, total, c->n_heads, c->n_kv_heads,
                 c->head_dim, qkv_dim, q_offset, k_offset, v_offset, scale);
         } else {
