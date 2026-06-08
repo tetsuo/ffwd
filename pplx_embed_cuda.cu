@@ -44,7 +44,6 @@ struct pplx_cuda_ctx {
     float *k;
     float *v;
     float *attn_out;
-    float *proj_out;
     float *ffn_gate;
     float *ffn_up;
     float *rope_cos;
@@ -239,12 +238,6 @@ __global__ static void rope_kernel(float *x, const int *positions,
     x[idx] = a * c + sign * b * s;
 }
 
-__global__ static void add_kernel(float *x, const float *y, int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] += y[i];
-}
-
 __global__ static void silu_mul_kernel(float *gate, const float *up, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -366,6 +359,19 @@ static int linear(cublasHandle_t blas, const cuda_matrix_t *w,
     return 0;
 }
 
+static int linear_accum(cublasHandle_t blas, const cuda_matrix_t *w,
+                        const float *x, float *y,
+                        int rows, int in_dim, int out_dim)
+{
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    CUBLAS_CHECK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             out_dim, rows, in_dim,
+                             &alpha, w->d, in_dim, x, in_dim,
+                             &beta, y, out_dim));
+    return 0;
+}
+
 static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_seq)
 {
     const pplx_config_t *c = &ctx->config;
@@ -376,13 +382,12 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->k);
         cudaFree(ctx->v);
         cudaFree(ctx->attn_out);
-        cudaFree(ctx->proj_out);
         cudaFree(ctx->ffn_gate);
         cudaFree(ctx->ffn_up);
         cudaFree(ctx->token_ids);
         cudaFree(ctx->positions);
         ctx->x = ctx->x_norm = ctx->q = ctx->k = ctx->v = NULL;
-        ctx->attn_out = ctx->proj_out = ctx->ffn_gate = ctx->ffn_up = NULL;
+        ctx->attn_out = ctx->ffn_gate = ctx->ffn_up = NULL;
         ctx->token_ids = ctx->positions = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
@@ -390,7 +395,6 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->k,        (size_t)total * c->kv_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->v,        (size_t)total * c->kv_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->proj_out, (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate, (size_t)total * c->intermediate_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_up,   (size_t)total * c->intermediate_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
@@ -537,7 +541,6 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->k);
     cudaFree(ctx->v);
     cudaFree(ctx->attn_out);
-    cudaFree(ctx->proj_out);
     cudaFree(ctx->ffn_gate);
     cudaFree(ctx->ffn_up);
     cudaFree(ctx->rope_cos);
@@ -653,12 +656,9 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             total, c->n_heads, c->n_kv_heads, c->head_dim, scale);
         if (launch_check() != 0) return -1;
 
-        if (linear(ctx->blas, &l->wo, ctx->attn_out, ctx->proj_out,
-                   total, c->q_dim, c->hidden_size) != 0)
+        if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
+                         total, c->q_dim, c->hidden_size) != 0)
             return -1;
-        add_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-            ctx->x, ctx->proj_out, total * c->hidden_size);
-        if (launch_check() != 0) return -1;
 
         rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
             ctx->x_norm, ctx->x, l->post_attn_norm, total,
@@ -674,12 +674,9 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         silu_mul_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
                           ctx->stream>>>(ctx->ffn_gate, ctx->ffn_up, inter_count);
         if (launch_check() != 0) return -1;
-        if (linear(ctx->blas, &l->down_proj, ctx->ffn_gate, ctx->proj_out,
-                   total, c->intermediate_size, c->hidden_size) != 0)
+        if (linear_accum(ctx->blas, &l->down_proj, ctx->ffn_gate, ctx->x,
+                         total, c->intermediate_size, c->hidden_size) != 0)
             return -1;
-        add_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-            ctx->x, ctx->proj_out, total * c->hidden_size);
-        if (launch_check() != 0) return -1;
     }
 
     rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
