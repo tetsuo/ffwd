@@ -18,7 +18,7 @@ typedef struct {
 } cuda_matrix_t;
 
 typedef struct {
-    cuda_matrix_t wq, wk, wv, wo;
+    cuda_matrix_t qkv, wo;
     float *q_norm;
     float *k_norm;
     float *input_norm;
@@ -40,9 +40,7 @@ struct pplx_cuda_ctx {
     int max_seq_cap;
     float *x;
     float *x_norm;
-    float *q;
-    float *k;
-    float *v;
+    float *qkv;
     float *attn_out;
     float *ffn_gate;
     float *ffn_up;
@@ -132,6 +130,41 @@ static int load_matrix(cuda_matrix_t *m, const pplx_weight_ref_t *w,
     return 0;
 }
 
+static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
+                           const pplx_config_t *c)
+{
+    if (!m || !src || !c) return -1;
+    int rows = c->q_dim + 2 * c->kv_dim;
+    int cols = c->hidden_size;
+    size_t q_count = (size_t)c->q_dim * cols;
+    size_t kv_count = (size_t)c->kv_dim * cols;
+    size_t total = q_count + 2 * kv_count;
+    float *tmp = (float *)malloc(total * sizeof(float));
+    if (!tmp) return -1;
+    if (copy_weight_host_f32(tmp, &src->wq, q_count) != 0 ||
+        copy_weight_host_f32(tmp + q_count, &src->wk, kv_count) != 0 ||
+        copy_weight_host_f32(tmp + q_count + kv_count, &src->wv, kv_count) != 0) {
+        free(tmp);
+        return -1;
+    }
+    cudaError_t e = cudaMalloc((void **)&m->d, total * sizeof(float));
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc qkv weight failed: %s\n", cudaGetErrorString(e));
+        free(tmp);
+        return -1;
+    }
+    e = cudaMemcpy(m->d, tmp, total * sizeof(float), cudaMemcpyHostToDevice);
+    free(tmp);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy qkv weight failed: %s\n", cudaGetErrorString(e));
+        cuda_matrix_free(m);
+        return -1;
+    }
+    m->rows = rows;
+    m->cols = cols;
+    return 0;
+}
+
 static int load_vector(float **out, const float *src, int n)
 {
     if (!out || !src || n <= 0) return -1;
@@ -188,6 +221,7 @@ __global__ static void rms_norm_kernel(float *out, const float *x,
 
 __global__ static void rms_norm_head_kernel(float *x, const float *weight,
                                             int rows, int heads, int head_dim,
+                                            int row_stride, int base_offset,
                                             float eps)
 {
     __shared__ float partial[4];
@@ -197,7 +231,7 @@ __global__ static void rms_norm_head_kernel(float *x, const float *weight,
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
-    size_t base = ((size_t)row * heads + head) * head_dim;
+    size_t base = (size_t)row * row_stride + base_offset + head * head_dim;
     float v = tid < head_dim ? x[base + tid] : 0.0f;
     float sum = v * v;
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -219,7 +253,8 @@ __global__ static void rms_norm_head_kernel(float *x, const float *weight,
 
 __global__ static void rope_kernel(float *x, const int *positions,
                                    const float *cosv, const float *sinv,
-                                   int total, int heads, int head_dim)
+                                   int total, int heads, int head_dim,
+                                   int row_stride, int base_offset)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int count = total * heads * head_dim;
@@ -233,9 +268,11 @@ __global__ static void rope_kernel(float *x, const int *positions,
     int pos = positions[tok];
     float c = cosv[(size_t)pos * head_dim + d];
     float s = sinv[(size_t)pos * head_dim + d];
-    float a = x[idx];
-    float b = x[((size_t)tok * heads + (htmp % heads)) * head_dim + pair_d];
-    x[idx] = a * c + sign * b * s;
+    size_t base = (size_t)tok * row_stride + base_offset +
+                  (htmp % heads) * head_dim;
+    float a = x[base + d];
+    float b = x[base + pair_d];
+    x[base + d] = a * c + sign * b * s;
 }
 
 __global__ static void silu_mul_kernel(float *gate, const float *up, int n)
@@ -281,11 +318,12 @@ __device__ static float block_sum_128(float v)
     return total;
 }
 
-__global__ static void gqa_attention_kernel(float *out, const float *q,
-                                            const float *k, const float *v,
+__global__ static void gqa_attention_kernel(float *out, const float *qkv,
                                             const int *offsets, int batch,
                                             int total, int n_heads,
                                             int n_kv_heads, int head_dim,
+                                            int qkv_dim, int q_offset,
+                                            int k_offset, int v_offset,
                                             float scale)
 {
     int row = blockIdx.x;
@@ -296,13 +334,15 @@ __global__ static void gqa_attention_kernel(float *out, const float *q,
     int end = offsets[seq + 1];
     int kv_head = head / (n_heads / n_kv_heads);
 
-    const float *qv = q + ((size_t)row * n_heads + head) * head_dim;
+    const float *qv = qkv + (size_t)row * qkv_dim +
+                      q_offset + head * head_dim;
     float acc = 0.0f;
     float max_s = -3.402823466e+38F;
     float sum_s = 0.0f;
 
     for (int j = start; j < end; j++) {
-        const float *kk = k + ((size_t)j * n_kv_heads + kv_head) * head_dim;
+        const float *kk = qkv + (size_t)j * qkv_dim +
+                          k_offset + kv_head * head_dim;
         float part = tid < head_dim ? qv[tid] * kk[tid] : 0.0f;
         float dot = block_sum_128(part);
         float score = dot * scale;
@@ -310,7 +350,8 @@ __global__ static void gqa_attention_kernel(float *out, const float *q,
         float old_scale = expf(max_s - next_max);
         float weight = expf(score - next_max);
         if (tid < head_dim) {
-            const float *vv = v + ((size_t)j * n_kv_heads + kv_head) * head_dim;
+            const float *vv = qkv + (size_t)j * qkv_dim +
+                              v_offset + kv_head * head_dim;
             acc = acc * old_scale + weight * vv[tid];
         }
         sum_s = sum_s * old_scale + weight;
@@ -378,22 +419,18 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
     if (total > ctx->seq_cap) {
         cudaFree(ctx->x);
         cudaFree(ctx->x_norm);
-        cudaFree(ctx->q);
-        cudaFree(ctx->k);
-        cudaFree(ctx->v);
+        cudaFree(ctx->qkv);
         cudaFree(ctx->attn_out);
         cudaFree(ctx->ffn_gate);
         cudaFree(ctx->ffn_up);
         cudaFree(ctx->token_ids);
         cudaFree(ctx->positions);
-        ctx->x = ctx->x_norm = ctx->q = ctx->k = ctx->v = NULL;
+        ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate = ctx->ffn_up = NULL;
         ctx->token_ids = ctx->positions = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->q,        (size_t)total * c->q_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->k,        (size_t)total * c->kv_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->v,        (size_t)total * c->kv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,      (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate, (size_t)total * c->intermediate_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_up,   (size_t)total * c->intermediate_size * sizeof(float)));
@@ -451,9 +488,7 @@ static int load_layer(cuda_layer_t *dst, const pplx_layer_t *src,
                       const pplx_config_t *c)
 {
     return
-        load_matrix(&dst->wq, &src->wq, c->q_dim, c->hidden_size) ||
-        load_matrix(&dst->wk, &src->wk, c->kv_dim, c->hidden_size) ||
-        load_matrix(&dst->wv, &src->wv, c->kv_dim, c->hidden_size) ||
+        load_qkv_matrix(&dst->qkv, src, c) ||
         load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
         load_vector(&dst->q_norm, src->q_norm, c->head_dim) ||
         load_vector(&dst->k_norm, src->k_norm, c->head_dim) ||
@@ -469,9 +504,7 @@ static int load_layer(cuda_layer_t *dst, const pplx_layer_t *src,
 
 static void free_layer(cuda_layer_t *l)
 {
-    cuda_matrix_free(&l->wq);
-    cuda_matrix_free(&l->wk);
-    cuda_matrix_free(&l->wv);
+    cuda_matrix_free(&l->qkv);
     cuda_matrix_free(&l->wo);
     cudaFree(l->q_norm);
     cudaFree(l->k_norm);
@@ -537,9 +570,7 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->norm);
     cudaFree(ctx->x);
     cudaFree(ctx->x_norm);
-    cudaFree(ctx->q);
-    cudaFree(ctx->k);
-    cudaFree(ctx->v);
+    cudaFree(ctx->qkv);
     cudaFree(ctx->attn_out);
     cudaFree(ctx->ffn_gate);
     cudaFree(ctx->ffn_up);
@@ -619,6 +650,10 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     if (launch_check() != 0) return -1;
 
     float scale = 1.0f / sqrtf((float)c->head_dim);
+    int q_offset = 0;
+    int k_offset = c->q_dim;
+    int v_offset = c->q_dim + c->kv_dim;
+    int qkv_dim = c->q_dim + 2 * c->kv_dim;
     dim3 q_grid;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
@@ -627,33 +662,32 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (linear(ctx->blas, &l->wq, ctx->x_norm, ctx->q,
-                   total, c->hidden_size, c->q_dim) != 0 ||
-            linear(ctx->blas, &l->wk, ctx->x_norm, ctx->k,
-                   total, c->hidden_size, c->kv_dim) != 0 ||
-            linear(ctx->blas, &l->wv, ctx->x_norm, ctx->v,
-                   total, c->hidden_size, c->kv_dim) != 0)
+        if (linear(ctx->blas, &l->qkv, ctx->x_norm, ctx->qkv,
+                   total, c->hidden_size, qkv_dim) != 0)
             return -1;
 
         rms_norm_head_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
-            ctx->q, l->q_norm, total, c->n_heads, c->head_dim, c->rms_norm_eps);
+            ctx->qkv, l->q_norm, total, c->n_heads, c->head_dim,
+            qkv_dim, q_offset, c->rms_norm_eps);
         rms_norm_head_kernel<<<dim3(total, c->n_kv_heads), 128, 0, ctx->stream>>>(
-            ctx->k, l->k_norm, total, c->n_kv_heads, c->head_dim, c->rms_norm_eps);
+            ctx->qkv, l->k_norm, total, c->n_kv_heads, c->head_dim,
+            qkv_dim, k_offset, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
         q_grid = dim3((total * c->q_dim + threads - 1) / threads);
         rope_kernel<<<q_grid, threads, 0, ctx->stream>>>(
-            ctx->q, ctx->positions, ctx->rope_cos, ctx->rope_sin,
-            total, c->n_heads, c->head_dim);
+            ctx->qkv, ctx->positions, ctx->rope_cos, ctx->rope_sin,
+            total, c->n_heads, c->head_dim, qkv_dim, q_offset);
         dim3 k_grid((total * c->kv_dim + threads - 1) / threads);
         rope_kernel<<<k_grid, threads, 0, ctx->stream>>>(
-            ctx->k, ctx->positions, ctx->rope_cos, ctx->rope_sin,
-            total, c->n_kv_heads, c->head_dim);
+            ctx->qkv, ctx->positions, ctx->rope_cos, ctx->rope_sin,
+            total, c->n_kv_heads, c->head_dim, qkv_dim, k_offset);
         if (launch_check() != 0) return -1;
 
         gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
-            ctx->attn_out, ctx->q, ctx->k, ctx->v, ctx->offsets, batch,
-            total, c->n_heads, c->n_kv_heads, c->head_dim, scale);
+            ctx->attn_out, ctx->qkv, ctx->offsets, batch,
+            total, c->n_heads, c->n_kv_heads, c->head_dim,
+            qkv_dim, q_offset, k_offset, v_offset, scale);
         if (launch_check() != 0) return -1;
 
         if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
