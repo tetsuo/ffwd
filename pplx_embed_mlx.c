@@ -282,24 +282,50 @@ static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
                              true, gs, bits, "affine", s);
         return res;
     }
-    mlx_array res = mlx_array_new();
+    mlx_array Wt;
+    int free_wt = 0;
     if (arr_ok(W->wt)) {
-        mlx_matmul(&res, x, W->wt, s);
+        Wt = W->wt;
     } else if (arr_ok(W->w)) {
-        mlx_array Wt = mlx_array_new();
+        Wt = mlx_array_new();
         mlx_transpose(&Wt, W->w, s);
-        mlx_matmul(&res, x, Wt, s);
-        mlx_array_free(Wt);
+        free_wt = 1;
     } else {
-        mlx_array_free(res);
         return (mlx_array){0};
     }
+    mlx_array res = mlx_array_new();
+    if (mlx_array_dtype(Wt) == MLX_BFLOAT16 &&
+        mlx_array_dtype(x) == MLX_FLOAT32) {
+        /* F32 activations with BF16 weights: upcast the weight operand and run
+         * the matmul in F32 (so accumulation is F32). Only the weights are
+         * BF16-rounded; the residual stream stays F32 (see mlx_forward_layers),
+         * matching the CPU/CUDA accuracy while keeping BF16 weight storage. */
+        mlx_array Wf = mlx_array_new();
+        mlx_astype(&Wf, Wt, MLX_FLOAT32, s);
+        mlx_matmul(&res, x, Wf, s);
+        mlx_array_free(Wf);
+    } else {
+        mlx_matmul(&res, x, Wt, s);
+    }
+    if (free_wt) mlx_array_free(Wt);
     return res;
 }
 
 const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx)
 {
     return ctx ? &ctx->config : NULL;
+}
+
+/* Upcast a tensor to F32 in place (no-op if already F32 or empty). Used for the
+ * tiny RMSNorm vectors so non-quantized BF16 models can run norms and the
+ * residual stream in F32 while keeping the large matmul weights in BF16. */
+static void upcast_f32_inplace(mlx_array *a, mlx_stream s)
+{
+    if (!a || !arr_ok(*a) || mlx_array_dtype(*a) == MLX_FLOAT32) return;
+    mlx_array f = mlx_array_new();
+    mlx_astype(&f, *a, MLX_FLOAT32, s);
+    mlx_array_free(*a);
+    *a = f;
 }
 
 /* ========================================================================
@@ -563,6 +589,19 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
 
     ctx->stream = mlx_default_gpu_stream_new();
     ctx->weight_dtype = mlx_array_dtype(ctx->layers[layer_start].wq.w);
+    /* Non-quantized BF16: run RMSNorm and the residual stream in F32. Upcast the
+     * tiny norm vectors so they match the F32 activations in mlx_forward_layers;
+     * the large matmul weights stay BF16. Q8 keeps its existing BF16 norms. */
+    if (ctx->weight_dtype == MLX_BFLOAT16 && !ctx->quantize_bits) {
+        for (int i = layer_start; i < layer_end; i++) {
+            mlx_layer_t *l = &ctx->layers[i];
+            upcast_f32_inplace(&l->q_norm, ctx->stream);
+            upcast_f32_inplace(&l->k_norm, ctx->stream);
+            upcast_f32_inplace(&l->input_norm, ctx->stream);
+            upcast_f32_inplace(&l->post_attn_norm, ctx->stream);
+        }
+        upcast_f32_inplace(&ctx->norm, ctx->stream);
+    }
     if (ctx->quantize_bits) {
         for (int i = layer_start; i < layer_end; i++) {
             if (quantize_layer(&ctx->layers[i], ctx->quantize_bits,
@@ -757,6 +796,30 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
     float scale = 1.0f / sqrtf((float)head_dim);
     mlx_array null_arr = (mlx_array){0};
 
+    /* For non-quantized BF16 weights, run the residual stream, norms, and
+     * attention in F32; matmuls downcast their operands to BF16 internally
+     * (see linear). This keeps weight storage at BF16 while avoiding the
+     * cross-layer accumulation error of a fully BF16 forward. F32 and quantized
+     * models are unaffected. */
+    mlx_array local_mask = attn_mask;
+    int free_mask = 0;
+    int mixed_bf16 = mlx_weight_dtype(ctx) == MLX_BFLOAT16 &&
+                     !ctx->layers[layer_start].wq.quantized;
+    if (mixed_bf16) {
+        if (mlx_array_dtype(x) != MLX_FLOAT32) {
+            mlx_array xf = mlx_array_new();
+            mlx_astype(&xf, x, MLX_FLOAT32, S);
+            mlx_array_free(x);
+            x = xf;
+        }
+        if (has_padding && arr_ok(attn_mask) &&
+            mlx_array_dtype(attn_mask) != MLX_FLOAT32) {
+            local_mask = mlx_array_new();
+            mlx_astype(&local_mask, attn_mask, MLX_FLOAT32, S);
+            free_mask = 1;
+        }
+    }
+
     for (int layer = layer_start; layer < layer_end; layer++) {
         mlx_layer_t *l = &ctx->layers[layer];
 
@@ -801,7 +864,7 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_array attn = mlx_array_new();
         mlx_fast_scaled_dot_product_attention(
             &attn, qr, kr, vt, scale, "",
-            has_padding ? attn_mask : null_arr, null_arr, S);
+            has_padding ? local_mask : null_arr, null_arr, S);
         mlx_array_free(qr); mlx_array_free(kr); mlx_array_free(vt);
 
         mlx_array attn_t = mlx_array_new();
@@ -845,6 +908,7 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
         mlx_array_free(x); mlx_array_free(ffn);
         x = x3;
     }
+    if (free_mask) mlx_array_free(local_mask);
     return x;
 }
 
