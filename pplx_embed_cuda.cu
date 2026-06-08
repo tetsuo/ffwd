@@ -394,6 +394,59 @@ __global__ static void gqa_attention_kernel(float *out, const float *qkv,
         out[((size_t)row * n_heads + head) * head_dim + tid] = acc / sum_s;
 }
 
+__global__ static void gqa_attention_tile4_single_kernel(
+    float *out, const float *qkv, int total, int n_heads, int n_kv_heads,
+    int head_dim, int qkv_dim, int q_offset, int k_offset, int v_offset,
+    float scale)
+{
+    int row0 = blockIdx.x * 4;
+    int head = blockIdx.y;
+    int tid = threadIdx.x;
+    int kv_head = head / (n_heads / n_kv_heads);
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float max_s[4] = {
+        -3.402823466e+38F, -3.402823466e+38F,
+        -3.402823466e+38F, -3.402823466e+38F
+    };
+    float sum_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int j = 0; j < total; j++) {
+        const float *kk = qkv + (size_t)j * qkv_dim +
+                          k_offset + kv_head * head_dim;
+        const float *vv = qkv + (size_t)j * qkv_dim +
+                          v_offset + kv_head * head_dim;
+        float k = tid < head_dim ? kk[tid] : 0.0f;
+        float v = tid < head_dim ? vv[tid] : 0.0f;
+
+        for (int q = 0; q < 4; q++) {
+            int row = row0 + q;
+            int valid = row < total;
+            const float *qv = qkv + (size_t)row * qkv_dim +
+                              q_offset + head * head_dim;
+            float part = valid && tid < head_dim ? qv[tid] * k : 0.0f;
+            float dot = block_sum(part);
+            if (valid) {
+                float score = dot * scale;
+                float next_max = fmaxf(max_s[q], score);
+                float old_scale = expf(max_s[q] - next_max);
+                float weight = expf(score - next_max);
+                if (tid < head_dim)
+                    acc[q] = acc[q] * old_scale + weight * v;
+                sum_s[q] = sum_s[q] * old_scale + weight;
+                max_s[q] = next_max;
+            }
+        }
+    }
+
+    for (int q = 0; q < 4; q++) {
+        int row = row0 + q;
+        if (row < total && tid < head_dim)
+            out[((size_t)row * n_heads + head) * head_dim + tid] =
+                acc[q] / sum_s[q];
+    }
+}
+
 __global__ static void mean_pool_kernel(float *out, const float *x,
                                         const int *offsets, int batch,
                                         int hidden)
@@ -761,10 +814,17 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
-            ctx->attn_out, ctx->qkv, ctx->offsets, batch,
-            total, c->n_heads, c->n_kv_heads, c->head_dim,
-            qkv_dim, q_offset, k_offset, v_offset, scale);
+        if (batch == 1 && total >= 64) {
+            dim3 grid((total + 3) / 4, c->n_heads);
+            gqa_attention_tile4_single_kernel<<<grid, 128, 0, ctx->stream>>>(
+                ctx->attn_out, ctx->qkv, total, c->n_heads, c->n_kv_heads,
+                c->head_dim, qkv_dim, q_offset, k_offset, v_offset, scale);
+        } else {
+            gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
+                ctx->attn_out, ctx->qkv, ctx->offsets, batch,
+                total, c->n_heads, c->n_kv_heads, c->head_dim,
+                qkv_dim, q_offset, k_offset, v_offset, scale);
+        }
         if (launch_check() != 0) return -1;
 
         if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
