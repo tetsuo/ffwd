@@ -498,42 +498,55 @@ static int launch_check(void)
     return 0;
 }
 
+// Compute type for the projection GEMMs. Default is exact F32 (== cublasSgemm).
+// PPLX_CUDA_FAST_GEMM={bf16,tf32,16f} opts into tensor-core matmul that keeps
+// F32 inputs/outputs and F32 accumulation but rounds operands internally.
+static cublasComputeType_t gemm_compute(void)
+{
+    static int init = 0;
+    static cublasComputeType_t ct = CUBLAS_COMPUTE_32F;
+    if (!init) {
+        const char *e = getenv("PPLX_CUDA_FAST_GEMM");
+        if (e && !strcmp(e, "bf16")) ct = CUBLAS_COMPUTE_32F_FAST_16BF;
+        else if (e && !strcmp(e, "tf32")) ct = CUBLAS_COMPUTE_32F_FAST_TF32;
+        else if (e && !strcmp(e, "16f")) ct = CUBLAS_COMPUTE_32F_FAST_16F;
+        init = 1;
+    }
+    return ct;
+}
+
+static int linear_ex(cublasHandle_t blas, const float *w, const float *x,
+                     float *y, int rows, int in_dim, int out_dim, int x_stride,
+                     float beta)
+{
+    const float alpha = 1.0f;
+    CUBLAS_CHECK(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                              out_dim, rows, in_dim,
+                              &alpha, w, CUDA_R_32F, in_dim,
+                              x, CUDA_R_32F, x_stride,
+                              &beta, y, CUDA_R_32F, out_dim,
+                              gemm_compute(), CUBLAS_GEMM_DEFAULT));
+    return 0;
+}
+
 static int linear(cublasHandle_t blas, const cuda_matrix_t *w,
                   const float *x, float *y, int rows, int in_dim, int out_dim)
 {
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                             out_dim, rows, in_dim,
-                             &alpha, w->d, in_dim, x, in_dim,
-                             &beta, y, out_dim));
-    return 0;
+    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, in_dim, 0.0f);
 }
 
 static int linear_accum(cublasHandle_t blas, const cuda_matrix_t *w,
                         const float *x, float *y,
                         int rows, int in_dim, int out_dim)
 {
-    const float alpha = 1.0f;
-    const float beta = 1.0f;
-    CUBLAS_CHECK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                             out_dim, rows, in_dim,
-                             &alpha, w->d, in_dim, x, in_dim,
-                             &beta, y, out_dim));
-    return 0;
+    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
 static int linear_accum_strided(cublasHandle_t blas, const cuda_matrix_t *w,
                                 const float *x, int x_stride, float *y,
                                 int rows, int in_dim, int out_dim)
 {
-    const float alpha = 1.0f;
-    const float beta = 1.0f;
-    CUBLAS_CHECK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                             out_dim, rows, in_dim,
-                             &alpha, w->d, in_dim, x, x_stride,
-                             &beta, y, out_dim));
-    return 0;
+    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, x_stride, 1.0f);
 }
 
 // GEMM-based attention for one micro-batch. Expands K/V to the per-query-head
