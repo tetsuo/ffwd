@@ -236,11 +236,33 @@ __global__ static void embed_lookup_kernel(float *x, const int *ids,
     x[idx] = (id >= 0 && id < vocab) ? emb[(size_t)id * hidden + d] : 0.0f;
 }
 
+__device__ static float block_sum(float v)
+{
+    __shared__ float partial[8];
+    __shared__ float total;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    if (lane == 0) partial[warp] = v;
+    __syncthreads();
+
+    if (warp == 0) {
+        v = lane < warps ? partial[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (lane == 0) total = v;
+    }
+    __syncthreads();
+    return total;
+}
+
 __global__ static void rms_norm_kernel(float *out, const float *x,
                                        const float *weight, int rows,
                                        int dim, float eps)
 {
-    extern __shared__ float sh[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -248,13 +270,8 @@ __global__ static void rms_norm_kernel(float *out, const float *x,
         float v = x[(size_t)row * dim + d];
         sum += v * v;
     }
-    sh[tid] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) sh[tid] += sh[tid + stride];
-        __syncthreads();
-    }
-    float inv = rsqrtf(sh[0] / (float)dim + eps);
+    float total = block_sum(sum);
+    float inv = rsqrtf(total / (float)dim + eps);
     for (int d = tid; d < dim; d += blockDim.x)
         out[(size_t)row * dim + d] = x[(size_t)row * dim + d] * inv * weight[d];
 }
@@ -334,28 +351,6 @@ __device__ static int find_seq_for_token(const int *offsets, int batch, int tok)
     return 0;
 }
 
-__device__ static float block_sum_128(float v)
-{
-    __shared__ float partial[4];
-    __shared__ float total;
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-
-    for (int offset = 16; offset > 0; offset >>= 1)
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    if (lane == 0) partial[warp] = v;
-    __syncthreads();
-
-    if (warp == 0) {
-        v = lane < 4 ? partial[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_down_sync(0xffffffff, v, offset);
-        if (lane == 0) total = v;
-    }
-    __syncthreads();
-    return total;
-}
-
 __global__ static void gqa_attention_kernel(float *out, const float *qkv,
                                             const int *offsets, int batch,
                                             int total, int n_heads,
@@ -382,7 +377,7 @@ __global__ static void gqa_attention_kernel(float *out, const float *qkv,
         const float *kk = qkv + (size_t)j * qkv_dim +
                           k_offset + kv_head * head_dim;
         float part = tid < head_dim ? qv[tid] * kk[tid] : 0.0f;
-        float dot = block_sum_128(part);
+        float dot = block_sum(part);
         float score = dot * scale;
         float next_max = fmaxf(max_s, score);
         float old_scale = expf(max_s - next_max);
@@ -747,7 +742,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     int qkv_dim = c->q_dim + 2 * c->kv_dim;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
-        rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
+        rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
             ctx->x_norm, ctx->x, l->input_norm, total,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
@@ -776,7 +771,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                          total, c->q_dim, c->hidden_size) != 0)
             return -1;
 
-        rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
+        rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
             ctx->x_norm, ctx->x, l->post_attn_norm, total,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
@@ -797,7 +792,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             return -1;
     }
 
-    rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
+    rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
         ctx->x, ctx->x, ctx->norm, total, c->hidden_size, c->rms_norm_eps);
     if (launch_check() != 0) return -1;
 
