@@ -191,20 +191,29 @@ __global__ static void rms_norm_head_kernel(float *x, const float *weight,
                                             int rows, int heads, int head_dim,
                                             float eps)
 {
-    __shared__ float sh[128];
+    __shared__ float partial[4];
+    __shared__ float total;
     int row = blockIdx.x;
     int head = blockIdx.y;
     int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
     size_t base = ((size_t)row * heads + head) * head_dim;
     float v = tid < head_dim ? x[base + tid] : 0.0f;
-    sh[tid] = v * v;
+    float sum = v * v;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) partial[warp] = sum;
     __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) sh[tid] += sh[tid + stride];
-        __syncthreads();
+    if (warp == 0) {
+        sum = lane < 4 ? partial[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) total = sum;
     }
+    __syncthreads();
     if (tid < head_dim) {
-        float inv = rsqrtf(sh[0] / (float)head_dim + eps);
+        float inv = rsqrtf(total / (float)head_dim + eps);
         x[base + tid] = v * inv * weight[tid];
     }
 }
@@ -257,6 +266,28 @@ __device__ static int find_seq_for_token(const int *offsets, int batch, int tok)
     return 0;
 }
 
+__device__ static float block_sum_128(float v)
+{
+    __shared__ float partial[4];
+    __shared__ float total;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    if (lane == 0) partial[warp] = v;
+    __syncthreads();
+
+    if (warp == 0) {
+        v = lane < 4 ? partial[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (lane == 0) total = v;
+    }
+    __syncthreads();
+    return total;
+}
+
 __global__ static void gqa_attention_kernel(float *out, const float *q,
                                             const float *k, const float *v,
                                             const int *offsets, int batch,
@@ -264,11 +295,6 @@ __global__ static void gqa_attention_kernel(float *out, const float *q,
                                             int n_kv_heads, int head_dim,
                                             float scale)
 {
-    __shared__ float red[128];
-    __shared__ float score_s;
-    __shared__ float max_s;
-    __shared__ float sum_s;
-
     int row = blockIdx.x;
     int head = blockIdx.y;
     int tid = threadIdx.x;
@@ -279,46 +305,23 @@ __global__ static void gqa_attention_kernel(float *out, const float *q,
 
     const float *qv = q + ((size_t)row * n_heads + head) * head_dim;
     float acc = 0.0f;
+    float max_s = -3.402823466e+38F;
+    float sum_s = 0.0f;
 
-    if (tid == 0) max_s = -3.402823466e+38F;
-    __syncthreads();
     for (int j = start; j < end; j++) {
         const float *kk = k + ((size_t)j * n_kv_heads + kv_head) * head_dim;
         float part = tid < head_dim ? qv[tid] * kk[tid] : 0.0f;
-        red[tid] = part;
-        __syncthreads();
-        for (int stride = 64; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0) {
-            score_s = red[0] * scale;
-            if (score_s > max_s) max_s = score_s;
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) sum_s = 0.0f;
-    __syncthreads();
-    for (int j = start; j < end; j++) {
-        const float *kk = k + ((size_t)j * n_kv_heads + kv_head) * head_dim;
-        float part = tid < head_dim ? qv[tid] * kk[tid] : 0.0f;
-        red[tid] = part;
-        __syncthreads();
-        for (int stride = 64; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0) {
-            score_s = expf(red[0] * scale - max_s);
-            sum_s += score_s;
-        }
-        __syncthreads();
+        float dot = block_sum_128(part);
+        float score = dot * scale;
+        float next_max = fmaxf(max_s, score);
+        float old_scale = expf(max_s - next_max);
+        float weight = expf(score - next_max);
         if (tid < head_dim) {
             const float *vv = v + ((size_t)j * n_kv_heads + kv_head) * head_dim;
-            acc += score_s * vv[tid];
+            acc = acc * old_scale + weight * vv[tid];
         }
-        __syncthreads();
+        sum_s = sum_s * old_scale + weight;
+        max_s = next_max;
     }
     if (tid < head_dim)
         out[((size_t)row * n_heads + head) * head_dim + tid] = acc / sum_s;
