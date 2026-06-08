@@ -23,7 +23,7 @@ typedef struct {
     float *k_norm;
     float *input_norm;
     float *post_attn_norm;
-    cuda_matrix_t gate_proj, up_proj, down_proj;
+    cuda_matrix_t gate_up_proj, down_proj;
 } cuda_layer_t;
 
 struct pplx_cuda_ctx {
@@ -42,13 +42,14 @@ struct pplx_cuda_ctx {
     float *x_norm;
     float *qkv;
     float *attn_out;
-    float *ffn_gate;
-    float *ffn_up;
+    float *ffn_gate_up;
+    float *pooled_out;
     float *rope_cos;
     float *rope_sin;
     int *token_ids;
     int *offsets;
     int *positions;
+    int pooled_batch_cap;
 };
 
 #define CUDA_CHECK(expr) do {                                      \
@@ -165,6 +166,41 @@ static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
     return 0;
 }
 
+static int load_gate_up_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
+                               const pplx_config_t *c)
+{
+    if (!m || !src || !c) return -1;
+    int rows = 2 * c->intermediate_size;
+    int cols = c->hidden_size;
+    size_t proj_count = (size_t)c->intermediate_size * cols;
+    size_t total = 2 * proj_count;
+    float *tmp = (float *)malloc(total * sizeof(float));
+    if (!tmp) return -1;
+    if (copy_weight_host_f32(tmp, &src->gate_proj, proj_count) != 0 ||
+        copy_weight_host_f32(tmp + proj_count, &src->up_proj, proj_count) != 0) {
+        free(tmp);
+        return -1;
+    }
+    cudaError_t e = cudaMalloc((void **)&m->d, total * sizeof(float));
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc gate/up weight failed: %s\n",
+                cudaGetErrorString(e));
+        free(tmp);
+        return -1;
+    }
+    e = cudaMemcpy(m->d, tmp, total * sizeof(float), cudaMemcpyHostToDevice);
+    free(tmp);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy gate/up weight failed: %s\n",
+                cudaGetErrorString(e));
+        cuda_matrix_free(m);
+        return -1;
+    }
+    m->rows = rows;
+    m->cols = cols;
+    return 0;
+}
+
 static int load_vector(float **out, const float *src, int n)
 {
     if (!out || !src || n <= 0) return -1;
@@ -219,10 +255,15 @@ __global__ static void rms_norm_kernel(float *out, const float *x,
         out[(size_t)row * dim + d] = x[(size_t)row * dim + d] * inv * weight[d];
 }
 
-__global__ static void rms_norm_head_kernel(float *x, const float *weight,
-                                            int rows, int heads, int head_dim,
-                                            int row_stride, int base_offset,
-                                            float eps)
+__global__ static void rms_norm_rope_head_kernel(float *x, const float *weight,
+                                                 const int *positions,
+                                                 const float *cosv,
+                                                 const float *sinv,
+                                                 int rows, int heads,
+                                                 int head_dim,
+                                                 int row_stride,
+                                                 int base_offset,
+                                                 float eps)
 {
     __shared__ float partial[4];
     __shared__ float total;
@@ -231,9 +272,14 @@ __global__ static void rms_norm_head_kernel(float *x, const float *weight,
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
+    int half = head_dim / 2;
+    int pair_d = tid < half ? tid + half : tid - half;
+    float sign = tid < half ? -1.0f : 1.0f;
     size_t base = (size_t)row * row_stride + base_offset + head * head_dim;
     float v = tid < head_dim ? x[base + tid] : 0.0f;
+    float pair_v = tid < head_dim ? x[base + pair_d] : 0.0f;
     float sum = v * v;
+
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
     if (lane == 0) partial[warp] = sum;
@@ -245,42 +291,30 @@ __global__ static void rms_norm_head_kernel(float *x, const float *weight,
         if (lane == 0) total = sum;
     }
     __syncthreads();
+
     if (tid < head_dim) {
         float inv = rsqrtf(total / (float)head_dim + eps);
-        x[base + tid] = v * inv * weight[tid];
+        int pos = positions[row];
+        float c = cosv[(size_t)pos * head_dim + tid];
+        float s = sinv[(size_t)pos * head_dim + tid];
+        float a = v * inv * weight[tid];
+        float b = pair_v * inv * weight[pair_d];
+        x[base + tid] = a * c + sign * b * s;
     }
 }
 
-__global__ static void rope_kernel(float *x, const int *positions,
-                                   const float *cosv, const float *sinv,
-                                   int total, int heads, int head_dim,
-                                   int row_stride, int base_offset)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int count = total * heads * head_dim;
-    if (idx >= count) return;
-    int d = idx % head_dim;
-    int htmp = idx / head_dim;
-    int tok = htmp / heads;
-    int half = head_dim / 2;
-    int pair_d = d < half ? d + half : d - half;
-    float sign = d < half ? -1.0f : 1.0f;
-    int pos = positions[tok];
-    float c = cosv[(size_t)pos * head_dim + d];
-    float s = sinv[(size_t)pos * head_dim + d];
-    size_t base = (size_t)tok * row_stride + base_offset +
-                  (htmp % heads) * head_dim;
-    float a = x[base + d];
-    float b = x[base + pair_d];
-    x[base + d] = a * c + sign * b * s;
-}
-
-__global__ static void silu_mul_kernel(float *gate, const float *up, int n)
+__global__ static void silu_mul_packed_kernel(float *gate_up, int rows,
+                                              int intermediate)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = rows * intermediate;
     if (i < n) {
-        float g = gate[i];
-        gate[i] = (g / (1.0f + expf(-g))) * up[i];
+        int row = i / intermediate;
+        int d = i - row * intermediate;
+        size_t base = (size_t)row * (2 * intermediate);
+        float g = gate_up[base + d];
+        float u = gate_up[base + intermediate + d];
+        gate_up[base + d] = (g / (1.0f + expf(-g))) * u;
     }
 }
 
@@ -413,6 +447,19 @@ static int linear_accum(cublasHandle_t blas, const cuda_matrix_t *w,
     return 0;
 }
 
+static int linear_accum_strided(cublasHandle_t blas, const cuda_matrix_t *w,
+                                const float *x, int x_stride, float *y,
+                                int rows, int in_dim, int out_dim)
+{
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    CUBLAS_CHECK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             out_dim, rows, in_dim,
+                             &alpha, w->d, in_dim, x, x_stride,
+                             &beta, y, out_dim));
+    return 0;
+}
+
 static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_seq)
 {
     const pplx_config_t *c = &ctx->config;
@@ -421,19 +468,18 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->x_norm);
         cudaFree(ctx->qkv);
         cudaFree(ctx->attn_out);
-        cudaFree(ctx->ffn_gate);
-        cudaFree(ctx->ffn_up);
+        cudaFree(ctx->ffn_gate_up);
         cudaFree(ctx->token_ids);
         cudaFree(ctx->positions);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
-        ctx->attn_out = ctx->ffn_gate = ctx->ffn_up = NULL;
+        ctx->attn_out = ctx->ffn_gate_up = NULL;
         ctx->token_ids = ctx->positions = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,      (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate, (size_t)total * c->intermediate_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_up,   (size_t)total * c->intermediate_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate_up,
+                              (size_t)total * 2 * c->intermediate_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         ctx->seq_cap = total;
@@ -442,6 +488,13 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->offsets);
         CUDA_CHECK(cudaMalloc((void **)&ctx->offsets, (size_t)(batch + 1) * sizeof(int)));
         ctx->batch_cap = batch + 1;
+    }
+    if (batch > ctx->pooled_batch_cap) {
+        cudaFree(ctx->pooled_out);
+        ctx->pooled_out = NULL;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->pooled_out,
+                              (size_t)batch * c->hidden_size * sizeof(float)));
+        ctx->pooled_batch_cap = batch;
     }
     if (max_seq > ctx->max_seq_cap) {
         cudaFree(ctx->rope_cos);
@@ -494,10 +547,7 @@ static int load_layer(cuda_layer_t *dst, const pplx_layer_t *src,
         load_vector(&dst->k_norm, src->k_norm, c->head_dim) ||
         load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
         load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
-        load_matrix(&dst->gate_proj, &src->gate_proj,
-                    c->intermediate_size, c->hidden_size) ||
-        load_matrix(&dst->up_proj, &src->up_proj,
-                    c->intermediate_size, c->hidden_size) ||
+        load_gate_up_matrix(&dst->gate_up_proj, src, c) ||
         load_matrix(&dst->down_proj, &src->down_proj,
                     c->hidden_size, c->intermediate_size);
 }
@@ -510,8 +560,7 @@ static void free_layer(cuda_layer_t *l)
     cudaFree(l->k_norm);
     cudaFree(l->input_norm);
     cudaFree(l->post_attn_norm);
-    cuda_matrix_free(&l->gate_proj);
-    cuda_matrix_free(&l->up_proj);
+    cuda_matrix_free(&l->gate_up_proj);
     cuda_matrix_free(&l->down_proj);
 }
 
@@ -572,8 +621,8 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->x_norm);
     cudaFree(ctx->qkv);
     cudaFree(ctx->attn_out);
-    cudaFree(ctx->ffn_gate);
-    cudaFree(ctx->ffn_up);
+    cudaFree(ctx->ffn_gate_up);
+    cudaFree(ctx->pooled_out);
     cudaFree(ctx->rope_cos);
     cudaFree(ctx->rope_sin);
     cudaFree(ctx->token_ids);
@@ -654,7 +703,6 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     int k_offset = c->q_dim;
     int v_offset = c->q_dim + c->kv_dim;
     int qkv_dim = c->q_dim + 2 * c->kv_dim;
-    dim3 q_grid;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
         rms_norm_kernel<<<total, 256, 256 * sizeof(float), ctx->stream>>>(
@@ -666,22 +714,14 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                    total, c->hidden_size, qkv_dim) != 0)
             return -1;
 
-        rms_norm_head_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
-            ctx->qkv, l->q_norm, total, c->n_heads, c->head_dim,
-            qkv_dim, q_offset, c->rms_norm_eps);
-        rms_norm_head_kernel<<<dim3(total, c->n_kv_heads), 128, 0, ctx->stream>>>(
-            ctx->qkv, l->k_norm, total, c->n_kv_heads, c->head_dim,
-            qkv_dim, k_offset, c->rms_norm_eps);
-        if (launch_check() != 0) return -1;
-
-        q_grid = dim3((total * c->q_dim + threads - 1) / threads);
-        rope_kernel<<<q_grid, threads, 0, ctx->stream>>>(
-            ctx->qkv, ctx->positions, ctx->rope_cos, ctx->rope_sin,
-            total, c->n_heads, c->head_dim, qkv_dim, q_offset);
-        dim3 k_grid((total * c->kv_dim + threads - 1) / threads);
-        rope_kernel<<<k_grid, threads, 0, ctx->stream>>>(
-            ctx->qkv, ctx->positions, ctx->rope_cos, ctx->rope_sin,
-            total, c->n_kv_heads, c->head_dim, qkv_dim, k_offset);
+        rms_norm_rope_head_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
+            ctx->qkv, l->q_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin,
+            total, c->n_heads, c->head_dim, qkv_dim, q_offset,
+            c->rms_norm_eps);
+        rms_norm_rope_head_kernel<<<dim3(total, c->n_kv_heads), 128, 0, ctx->stream>>>(
+            ctx->qkv, l->k_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin,
+            total, c->n_kv_heads, c->head_dim, qkv_dim, k_offset,
+            c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
         gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
@@ -699,17 +739,19 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (linear(ctx->blas, &l->gate_proj, ctx->x_norm, ctx->ffn_gate,
-                   total, c->hidden_size, c->intermediate_size) != 0 ||
-            linear(ctx->blas, &l->up_proj, ctx->x_norm, ctx->ffn_up,
-                   total, c->hidden_size, c->intermediate_size) != 0)
+        if (linear(ctx->blas, &l->gate_up_proj, ctx->x_norm,
+                   ctx->ffn_gate_up, total, c->hidden_size,
+                   2 * c->intermediate_size) != 0)
             return -1;
         int inter_count = total * c->intermediate_size;
-        silu_mul_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                          ctx->stream>>>(ctx->ffn_gate, ctx->ffn_up, inter_count);
+        silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads, threads,
+                                 0, ctx->stream>>>(
+            ctx->ffn_gate_up, total, c->intermediate_size);
         if (launch_check() != 0) return -1;
-        if (linear_accum(ctx->blas, &l->down_proj, ctx->ffn_gate, ctx->x,
-                         total, c->intermediate_size, c->hidden_size) != 0)
+        if (linear_accum_strided(ctx->blas, &l->down_proj, ctx->ffn_gate_up,
+                                 2 * c->intermediate_size, ctx->x,
+                                 total, c->intermediate_size,
+                                 c->hidden_size) != 0)
             return -1;
     }
 
@@ -717,25 +759,14 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
         ctx->x, ctx->x, ctx->norm, total, c->hidden_size, c->rms_norm_eps);
     if (launch_check() != 0) return -1;
 
-    float *d_out = NULL;
-    ce = cudaMalloc((void **)&d_out, (size_t)batch * c->hidden_size * sizeof(float));
-    if (ce != cudaSuccess) {
-        fprintf(stderr, "cuda output allocation failed: %s\n",
-                cudaGetErrorString(ce));
-        return -1;
-    }
     mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
-        d_out, ctx->x, ctx->offsets, batch, c->hidden_size);
-    if (launch_check() != 0) {
-        cudaFree(d_out);
-        return -1;
-    }
-    ce = cudaMemcpyAsync(out_embeddings, d_out,
+        ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
+    if (launch_check() != 0) return -1;
+    ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
                          (size_t)batch * c->hidden_size * sizeof(float),
                          cudaMemcpyDeviceToHost, ctx->stream);
     if (ce == cudaSuccess)
         ce = cudaStreamSynchronize(ctx->stream);
-    cudaFree(d_out);
     if (ce != cudaSuccess) {
         fprintf(stderr, "cuda output copy failed: %s\n", cudaGetErrorString(ce));
         return -1;
