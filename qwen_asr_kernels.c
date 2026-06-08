@@ -25,6 +25,10 @@
 #endif
 #endif
 
+#if defined(USE_OPENBLAS)
+void openblas_set_num_threads(int num_threads);
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -91,6 +95,14 @@ void qwen_set_threads(int n) {
     if (n < 1) n = 1;
     if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
 
+#if defined(USE_OPENBLAS)
+    /* OpenBLAS owns the heavy F32 GEMM parallelism on Linux. Keep the
+     * auxiliary pool serial to avoid nested thread contention. */
+    int blas_threads = n;
+    openblas_set_num_threads(blas_threads);
+    n = 1;
+#endif
+
     /* Shutdown existing workers */
     if (tp.n_threads > 1) {
         pthread_mutex_lock(&tp.mutex);
@@ -104,15 +116,31 @@ void qwen_set_threads(int n) {
     }
 
     tp.n_threads = n;
-    if (n <= 1) return;
+    if (n <= 1) {
+        if (qwen_verbose >= 2) {
+#if defined(USE_OPENBLAS)
+            fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n",
+                    n, blas_threads);
+#else
+            fprintf(stderr, "Thread pool: %d threads\n", n);
+#endif
+        }
+        return;
+    }
 
     for (int i = 0; i < n - 1; i++) {
         tp.tids[i] = i + 1;
         pthread_create(&tp.threads[i], NULL, worker_loop, &tp.tids[i]);
     }
 
-    if (qwen_verbose >= 2)
+    if (qwen_verbose >= 2) {
+#if defined(USE_OPENBLAS)
+        fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n",
+                n, blas_threads);
+#else
         fprintf(stderr, "Thread pool: %d threads\n", n);
+#endif
+    }
 }
 
 int qwen_get_num_cpus(void) {

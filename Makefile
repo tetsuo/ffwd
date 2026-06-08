@@ -1,5 +1,7 @@
 CC          = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+# Keep IEEE math semantics by default. Some GCC/OpenBLAS Linux builds produced
+# NaN embeddings with -ffast-math.
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native
 LDFLAGS     = -lm -lpthread
 CJSON_CFLAGS ?= $(shell sh -c 'pkg-config --cflags libcjson 2>/dev/null')
 CJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs libcjson 2>/dev/null')
