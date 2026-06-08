@@ -377,61 +377,6 @@ __global__ static void silu_mul_packed_kernel(float *gate_up, int rows,
     }
 }
 
-__device__ static int find_seq_for_token(const int *offsets, int batch, int tok)
-{
-    int lo = 0, hi = batch - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) >> 1;
-        if (tok < offsets[mid]) hi = mid - 1;
-        else if (tok >= offsets[mid + 1]) lo = mid + 1;
-        else return mid;
-    }
-    return 0;
-}
-
-__global__ static void gqa_attention_kernel(float *out, const float *qkv,
-                                            const int *offsets, int batch,
-                                            int total, int n_heads,
-                                            int n_kv_heads, int head_dim,
-                                            int qkv_dim, int q_offset,
-                                            int k_offset, int v_offset,
-                                            float scale)
-{
-    int row = blockIdx.x;
-    int head = blockIdx.y;
-    int tid = threadIdx.x;
-    int seq = find_seq_for_token(offsets, batch, row);
-    int start = offsets[seq];
-    int end = offsets[seq + 1];
-    int kv_head = head / (n_heads / n_kv_heads);
-
-    const float *qv = qkv + (size_t)row * qkv_dim +
-                      q_offset + head * head_dim;
-    float acc = 0.0f;
-    float max_s = -3.402823466e+38F;
-    float sum_s = 0.0f;
-
-    for (int j = start; j < end; j++) {
-        const float *kk = qkv + (size_t)j * qkv_dim +
-                          k_offset + kv_head * head_dim;
-        float part = tid < head_dim ? qv[tid] * kk[tid] : 0.0f;
-        float dot = block_sum(part);
-        float score = dot * scale;
-        float next_max = fmaxf(max_s, score);
-        float old_scale = expf(max_s - next_max);
-        float weight = expf(score - next_max);
-        if (tid < head_dim) {
-            const float *vv = qkv + (size_t)j * qkv_dim +
-                              v_offset + kv_head * head_dim;
-            acc = acc * old_scale + weight * vv[tid];
-        }
-        sum_s = sum_s * old_scale + weight;
-        max_s = next_max;
-    }
-    if (tid < head_dim)
-        out[((size_t)row * n_heads + head) * head_dim + tid] = acc / sum_s;
-}
-
 // Expand K and V from the n_kv_heads layout to a contiguous [total x q_dim]
 // per-query-head layout (GQA: each kv head repeated n_heads/n_kv_heads times)
 // so the attention GEMMs can stride uniformly over query heads.
@@ -606,13 +551,11 @@ static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
     return 0;
 }
 
-// GEMM-based attention for one micro-batch. Expands K/V to the per-query-head
-// layout, then for each sequence runs batched-over-heads Q@K^T (scaled) ->
-// row softmax -> @V via cuBLAS. Scales far better than the streaming warp
-// kernel for long sequences because scores are dense matmuls. Requires
-// ctx->kexp, ctx->vexp ([total x q_dim]) and ctx->attn_scores
-// ([n_heads x max_seq x max_seq]) to be allocated. h_offsets is the host copy
-// of the packed sequence boundaries.
+// Attention for one micro-batch. Expands K/V to the per-query-head layout,
+// then for each sequence runs batched-over-heads Q@K^T (scaled) -> row softmax
+// -> @V via cuBLAS. Requires ctx->kexp, ctx->vexp ([total x q_dim]) and
+// ctx->attn_scores ([n_heads x max_seq x max_seq]) to be allocated. h_offsets
+// is the host copy of the packed sequence boundaries.
 static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
                                int batch, int q_offset, int k_offset,
                                int v_offset, int qkv_dim, float scale)
@@ -962,17 +905,9 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (max_seq >= 64) {
-            if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset,
-                                    k_offset, v_offset, qkv_dim, scale) != 0)
-                return -1;
-        } else {
-            gqa_attention_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
-                ctx->attn_out, ctx->qkv, ctx->offsets, batch,
-                total, c->n_heads, c->n_kv_heads, c->head_dim,
-                qkv_dim, q_offset, k_offset, v_offset, scale);
-            if (launch_check() != 0) return -1;
-        }
+        if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset,
+                                k_offset, v_offset, qkv_dim, scale) != 0)
+            return -1;
 
         if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
                          total, c->q_dim, c->hidden_size) != 0)
