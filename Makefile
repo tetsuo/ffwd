@@ -26,12 +26,13 @@ SRCS = pplx_embed.c \
        deps/ae/monotonic.c
 
 MLX_SRCS = pplx_embed_mlx.c
+CUDA_SRCS = pplx_embed_cuda.cu
 
 OBJS     = $(SRCS:.c=.o)
 MLX_OBJS = $(MLX_SRCS:.c=.o)
 TARGET   = pplx_embed
 
-.PHONY: all blas mlx debug clean help
+.PHONY: all blas mlx cuda debug clean help
 
 all: help
 
@@ -41,6 +42,7 @@ help:
 	@echo "Build targets:"
 	@echo "  make blas     Build with BLAS acceleration (CPU)"
 	@echo "  make mlx      Build with Apple MLX GPU backend (recommended on Apple Silicon)"
+	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
@@ -88,6 +90,22 @@ endif
 mlx:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_mlx.o"
+
+# =============================================================================
+# CUDA build (Linux NVIDIA GPU - uses CUDA Runtime + cuBLAS)
+# =============================================================================
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+
+cuda: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
+cuda: LDFLAGS += -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
+cuda:
+	$(MAKE) clean
+	$(MAKE) pplx_embed_cuda.o
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_cuda.o"
+
+pplx_embed_cuda.o: pplx_embed_cuda.cu pplx_embed_cuda.h pplx_embed_internal.h pplx_embed.h
+	$(NVCC) -O3 -std=c++17 -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
 # Debug build
@@ -147,4 +165,4 @@ deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
 
 # =============================================================================
 clean:
-	rm -f $(OBJS) pplx_embed_mlx.o main.o $(TARGET)
+	rm -f $(OBJS) pplx_embed_mlx.o pplx_embed_cuda.o main.o $(TARGET)

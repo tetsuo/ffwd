@@ -9,6 +9,9 @@
 #ifdef USE_MLX
 #include "pplx_embed_mlx.h"
 #endif
+#ifdef USE_CUDA
+#include "pplx_embed_cuda.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +34,7 @@ static void print_usage(const char *prog)
         "Options:\n"
         "  -d <dir>     Model directory (required)\n"
         "  --mlx        Use Apple MLX GPU backend\n"
+        "  --cuda       Use CUDA/cuBLAS GPU backend\n"
         "  --stdin      Read lines from stdin, write JSON embeddings to stdout\n"
         "  --serve      Serve the Perplexity-compatible HTTP API\n"
         "  --dist-worker\n"
@@ -42,7 +46,7 @@ static void print_usage(const char *prog)
         "               Distributed activation transport width: 32 or 16 (default: 32)\n"
         "  --model ID=DIR\n"
         "               Load model ID from directory for --serve (repeatable)\n"
-        "  --backend cpu|mlx\n"
+        "  --backend cpu|mlx|cuda\n"
         "               Backend for --serve (default: cpu)\n"
         "  --mlx-quantize-bits N\n"
         "               Quantize MLX linear weights to 8 bits at load time\n"
@@ -92,6 +96,9 @@ typedef struct {
 #ifdef USE_MLX
     pplx_mlx_ctx_t   *mlx_ctx;
 #endif
+#ifdef USE_CUDA
+    pplx_cuda_ctx_t  *cuda_ctx;
+#endif
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
     int               dim;
@@ -117,10 +124,13 @@ static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
 #ifdef USE_MLX
     if (e->mlx_ctx)
         return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
-    else
 #endif
-        return pplx_model_embed_batch(e->model, e->workspace,
-                                      inputs, batch, out_embeddings);
+#ifdef USE_CUDA
+    if (e->cuda_ctx)
+        return pplx_cuda_embed_batch(e->cuda_ctx, inputs, batch, out_embeddings);
+#endif
+    return pplx_model_embed_batch(e->model, e->workspace,
+                                  inputs, batch, out_embeddings);
 }
 
 static int parse_layers(const char *arg, int *start, int *end)
@@ -514,6 +524,7 @@ int main(int argc, char *argv[])
     int print_embs = 0;
     int verbose    = 0;
     int use_mlx    = 0;
+    int use_cuda   = 0;
     int stdin_mode = 0;
     int serve_mode = 0;
     int dist_worker_mode = 0;
@@ -568,13 +579,24 @@ int main(int argc, char *argv[])
             if (!strcmp(backend, "mlx")) {
 #ifdef USE_MLX
                 use_mlx = 1;
+                use_cuda = 0;
 #else
                 fprintf(stderr, "mlx backend not available (build with: make mlx)\n");
                 free_model_specs(&model_specs);
                 return 1;
 #endif
+            } else if (!strcmp(backend, "cuda")) {
+#ifdef USE_CUDA
+                use_cuda = 1;
+                use_mlx = 0;
+#else
+                fprintf(stderr, "cuda backend not available (build with: make cuda)\n");
+                free_model_specs(&model_specs);
+                return 1;
+#endif
             } else if (!strcmp(backend, "cpu")) {
                 use_mlx = 0;
+                use_cuda = 0;
             } else {
                 fprintf(stderr, "invalid --backend: %s\n", backend);
                 free_model_specs(&model_specs);
@@ -629,8 +651,19 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
+            use_cuda = 0;
 #else
             fprintf(stderr, "--mlx not available (build with: make mlx)\n");
+            free_model_specs(&model_specs);
+            return 1;
+#endif
+        }
+        else if (!strcmp(f, "--cuda"))   {
+#ifdef USE_CUDA
+            use_cuda = 1;
+            use_mlx = 0;
+#else
+            fprintf(stderr, "--cuda not available (build with: make cuda)\n");
             free_model_specs(&model_specs);
             return 1;
 #endif
@@ -664,12 +697,17 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
+        if (use_cuda) {
+            fprintf(stderr, "--backend cuda is not available in --serve mode yet\n");
+            free_model_specs(&model_specs);
+            return 1;
+        }
         if (mlx_quantize_bits && !use_mlx) {
             fprintf(stderr, "--mlx-quantize-bits requires --backend mlx\n");
             free_model_specs(&model_specs);
             return 1;
         }
-        if (!use_mlx) {
+        if (!use_mlx && !use_cuda) {
             if (n_threads <= 0) n_threads = qwen_get_num_cpus();
             qwen_set_threads(n_threads);
             if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
@@ -726,14 +764,19 @@ int main(int argc, char *argv[])
         fprintf(stderr, "--dist-remote coordinator layers must start at zero\n");
         return 1;
     }
+    if ((dist_worker_mode || dist_remote) && use_cuda) {
+        fprintf(stderr, "distributed mode is not available with --cuda yet\n");
+        return 1;
+    }
 
     /* Threads (CPU backend) */
-    if (!use_mlx) {
+    if (!use_mlx && !use_cuda) {
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
         qwen_set_threads(n_threads);
         if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
     } else {
-        if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
+        if (verbose >= 1)
+            fprintf(stderr, "Using %s GPU backend\n", use_mlx ? "MLX" : "CUDA");
     }
 
     if (mlx_quantize_bits && !use_mlx) {
@@ -798,6 +841,17 @@ int main(int argc, char *argv[])
         e.dim = pplx_mlx_config(e.mlx_ctx)->hidden_size;
     } else
 #endif
+#ifdef USE_CUDA
+    if (use_cuda) {
+        e.cuda_ctx = pplx_cuda_load(model_dir);
+        if (!e.cuda_ctx) {
+            fprintf(stderr, "failed to load CUDA model\n");
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.dim = pplx_cuda_config(e.cuda_ctx)->hidden_size;
+    } else
+#endif
     {
         if (dist_remote) {
             char remote_host[1024];
@@ -835,8 +889,10 @@ int main(int argc, char *argv[])
         }
     }
     if (verbose >= 1)
-        fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
-                e.dim, now_ms() - t0, use_mlx ? " (MLX)" : "");
+        fprintf(stderr, "Model: %d-dim, %.0f ms%s%s\n",
+                e.dim, now_ms() - t0,
+                use_mlx ? " (MLX)" : "",
+                use_cuda ? " (CUDA)" : "");
 
     e.tok_ws = qwen_tokenizer_workspace_new();
     if (!e.tok_ws) {
@@ -846,6 +902,9 @@ int main(int argc, char *argv[])
         if (e.dist) pplx_dist_client_free(e.dist);
 #ifdef USE_MLX
         if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
+#endif
+#ifdef USE_CUDA
+        if (e.cuda_ctx) pplx_cuda_free(e.cuda_ctx);
 #endif
         qwen_tokenizer_free(tok);
         free_model_specs(&model_specs);
@@ -865,6 +924,9 @@ int main(int argc, char *argv[])
     if (e.dist) pplx_dist_client_free(e.dist);
 #ifdef USE_MLX
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
+#endif
+#ifdef USE_CUDA
+    if (e.cuda_ctx) pplx_cuda_free(e.cuda_ctx);
 #endif
     qwen_tokenizer_workspace_free(e.tok_ws);
     qwen_tokenizer_free(tok);
