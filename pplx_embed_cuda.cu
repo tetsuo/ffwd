@@ -4,18 +4,21 @@ extern "C" {
 }
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef struct {
-    float *d;
+    float *d;       // device buffer; holds __nv_bfloat16 elements when bf16
     int rows;
     int cols;
+    int bf16;       // 1 if d holds __nv_bfloat16, 0 if F32
 } cuda_matrix_t;
 
 typedef struct {
@@ -44,6 +47,7 @@ struct pplx_cuda_ctx {
     float *qkv;
     float *attn_out;
     float *ffn_gate_up;
+    void *act_bf16;     // BF16 cast of a GEMM activation operand (bf16 weights)
     float *pooled_out;
     float *rope_cos;
     float *rope_sin;
@@ -127,6 +131,28 @@ static float bf16_to_f32(uint16_t v)
     return f;
 }
 
+// Round F32 to BF16 (truncate the low 16 bits, round to nearest even). NaNs are
+// preserved. BF16 shares F32's 8-bit exponent, so this never overflows.
+static uint16_t f32_to_bf16(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    if ((x & 0x7fffffffu) > 0x7f800000u)        // NaN
+        return (uint16_t)((x >> 16) | 0x0040u);
+    x += 0x7fffu + ((x >> 16) & 1u);            // round to nearest even
+    return (uint16_t)(x >> 16);
+}
+
+// Store weights as native BF16 on the device when set (halves weight memory and
+// feeds BF16 tensor cores); default keeps exact F32. Read at load time.
+static int g_weights_bf16 = 0;
+
+int pplx_cuda_set_weights_bf16(int on)
+{
+    g_weights_bf16 = on ? 1 : 0;
+    return 0;
+}
+
 static int copy_weight_host_f32(float *dst, const pplx_weight_ref_t *w,
                                 size_t count)
 {
@@ -144,6 +170,46 @@ static int copy_weight_host_f32(float *dst, const pplx_weight_ref_t *w,
     return -1;
 }
 
+// Upload a host F32 weight buffer to the device, as BF16 when g_weights_bf16 is
+// set (rounding each value) or as F32 otherwise. Sets m->d, rows, cols, bf16.
+static int upload_weight(cuda_matrix_t *m, const float *src, size_t count,
+                         int rows, int cols)
+{
+    cudaError_t e;
+    if (g_weights_bf16) {
+        uint16_t *tmp16 = (uint16_t *)malloc(count * sizeof(uint16_t));
+        if (!tmp16) return -1;
+        for (size_t i = 0; i < count; i++)
+            tmp16[i] = f32_to_bf16(src[i]);
+        e = cudaMalloc((void **)&m->d, count * sizeof(__nv_bfloat16));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc weight failed: %s\n", cudaGetErrorString(e));
+            free(tmp16);
+            return -1;
+        }
+        e = cudaMemcpy(m->d, tmp16, count * sizeof(__nv_bfloat16),
+                       cudaMemcpyHostToDevice);
+        free(tmp16);
+        m->bf16 = 1;
+    } else {
+        e = cudaMalloc((void **)&m->d, count * sizeof(float));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc weight failed: %s\n", cudaGetErrorString(e));
+            return -1;
+        }
+        e = cudaMemcpy(m->d, src, count * sizeof(float), cudaMemcpyHostToDevice);
+        m->bf16 = 0;
+    }
+    if (e != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy weight failed: %s\n", cudaGetErrorString(e));
+        cuda_matrix_free(m);
+        return -1;
+    }
+    m->rows = rows;
+    m->cols = cols;
+    return 0;
+}
+
 static int load_matrix(cuda_matrix_t *m, const pplx_weight_ref_t *w,
                        int rows, int cols)
 {
@@ -155,22 +221,9 @@ static int load_matrix(cuda_matrix_t *m, const pplx_weight_ref_t *w,
         free(tmp);
         return -1;
     }
-    cudaError_t e = cudaMalloc((void **)&m->d, count * sizeof(float));
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc weight failed: %s\n", cudaGetErrorString(e));
-        free(tmp);
-        return -1;
-    }
-    e = cudaMemcpy(m->d, tmp, count * sizeof(float), cudaMemcpyHostToDevice);
+    int r = upload_weight(m, tmp, count, rows, cols);
     free(tmp);
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy weight failed: %s\n", cudaGetErrorString(e));
-        cuda_matrix_free(m);
-        return -1;
-    }
-    m->rows = rows;
-    m->cols = cols;
-    return 0;
+    return r;
 }
 
 static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
@@ -190,22 +243,9 @@ static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
         free(tmp);
         return -1;
     }
-    cudaError_t e = cudaMalloc((void **)&m->d, total * sizeof(float));
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc qkv weight failed: %s\n", cudaGetErrorString(e));
-        free(tmp);
-        return -1;
-    }
-    e = cudaMemcpy(m->d, tmp, total * sizeof(float), cudaMemcpyHostToDevice);
+    int r = upload_weight(m, tmp, total, rows, cols);
     free(tmp);
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy qkv weight failed: %s\n", cudaGetErrorString(e));
-        cuda_matrix_free(m);
-        return -1;
-    }
-    m->rows = rows;
-    m->cols = cols;
-    return 0;
+    return r;
 }
 
 static int load_gate_up_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
@@ -223,24 +263,9 @@ static int load_gate_up_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
         free(tmp);
         return -1;
     }
-    cudaError_t e = cudaMalloc((void **)&m->d, total * sizeof(float));
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc gate/up weight failed: %s\n",
-                cudaGetErrorString(e));
-        free(tmp);
-        return -1;
-    }
-    e = cudaMemcpy(m->d, tmp, total * sizeof(float), cudaMemcpyHostToDevice);
+    int r = upload_weight(m, tmp, total, rows, cols);
     free(tmp);
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy gate/up weight failed: %s\n",
-                cudaGetErrorString(e));
-        cuda_matrix_free(m);
-        return -1;
-    }
-    m->rows = rows;
-    m->cols = cols;
-    return 0;
+    return r;
 }
 
 static int load_vector(float **out, const float *src, int n)
@@ -262,8 +287,8 @@ static int load_vector(float **out, const float *src, int n)
 }
 
 __global__ static void embed_lookup_kernel(float *x, const int *ids,
-                                           const float *emb, int total,
-                                           int hidden, int vocab)
+                                           const void *emb, int emb_bf16,
+                                           int total, int hidden, int vocab)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int count = total * hidden;
@@ -271,7 +296,21 @@ __global__ static void embed_lookup_kernel(float *x, const int *ids,
     int tok = idx / hidden;
     int d = idx - tok * hidden;
     int id = ids[tok];
-    x[idx] = (id >= 0 && id < vocab) ? emb[(size_t)id * hidden + d] : 0.0f;
+    if (id < 0 || id >= vocab) {
+        x[idx] = 0.0f;
+        return;
+    }
+    size_t off = (size_t)id * hidden + d;
+    x[idx] = emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[off])
+                      : ((const float *)emb)[off];
+}
+
+// Cast n F32 values to BF16 (used to feed BF16-weight projection GEMMs).
+__global__ static void cast_f32_to_bf16_kernel(__nv_bfloat16 *out,
+                                               const float *in, size_t n)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(in[i]);
 }
 
 __device__ static float block_sum(float v)
@@ -493,38 +532,56 @@ static cublasComputeType_t gemm_compute(void)
     return g_gemm_compute;
 }
 
-static int linear_ex(cublasHandle_t blas, const float *w, const float *x,
-                     float *y, int rows, int in_dim, int out_dim, int x_stride,
-                     float beta)
+// y = w @ x (+ beta*y). With BF16 weights the F32 activation operand is cast to
+// BF16 (ctx->act_bf16) so both GEMM inputs are BF16; accumulation and output
+// stay F32. With F32 weights this is the exact path, honoring gemm_compute().
+static int linear_ex(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+                     const float *x, float *y, int rows, int in_dim,
+                     int out_dim, int x_stride, float beta)
 {
     const float alpha = 1.0f;
-    CUBLAS_CHECK(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N,
+    if (w->bf16) {
+        size_t n = (size_t)rows * (size_t)x_stride;
+        int threads = 256;
+        cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0,
+                                  ctx->stream>>>(
+            (__nv_bfloat16 *)ctx->act_bf16, x, n);
+        if (launch_check() != 0) return -1;
+        CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                  out_dim, rows, in_dim,
+                                  &alpha, w->d, CUDA_R_16BF, in_dim,
+                                  ctx->act_bf16, CUDA_R_16BF, x_stride,
+                                  &beta, y, CUDA_R_32F, out_dim,
+                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        return 0;
+    }
+    CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N,
                               out_dim, rows, in_dim,
-                              &alpha, w, CUDA_R_32F, in_dim,
+                              &alpha, w->d, CUDA_R_32F, in_dim,
                               x, CUDA_R_32F, x_stride,
                               &beta, y, CUDA_R_32F, out_dim,
                               gemm_compute(), CUBLAS_GEMM_DEFAULT));
     return 0;
 }
 
-static int linear(cublasHandle_t blas, const cuda_matrix_t *w,
+static int linear(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                   const float *x, float *y, int rows, int in_dim, int out_dim)
 {
-    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, in_dim, 0.0f);
+    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, in_dim, 0.0f);
 }
 
-static int linear_accum(cublasHandle_t blas, const cuda_matrix_t *w,
+static int linear_accum(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                         const float *x, float *y,
                         int rows, int in_dim, int out_dim)
 {
-    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, in_dim, 1.0f);
+    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
-static int linear_accum_strided(cublasHandle_t blas, const cuda_matrix_t *w,
+static int linear_accum_strided(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                                 const float *x, int x_stride, float *y,
                                 int rows, int in_dim, int out_dim)
 {
-    return linear_ex(blas, w->d, x, y, rows, in_dim, out_dim, x_stride, 1.0f);
+    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, x_stride, 1.0f);
 }
 
 static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
@@ -614,10 +671,12 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->positions);
         cudaFree(ctx->kexp);
         cudaFree(ctx->vexp);
+        cudaFree(ctx->act_bf16);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
         ctx->token_ids = ctx->positions = NULL;
         ctx->kexp = ctx->vexp = NULL;
+        ctx->act_bf16 = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,      (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
@@ -628,6 +687,9 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
+        if (g_weights_bf16)
+            CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
+                                  (size_t)total * 2 * c->intermediate_size * sizeof(__nv_bfloat16)));
         ctx->seq_cap = total;
     }
     if (batch + 1 > ctx->batch_cap) {
@@ -804,6 +866,7 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->positions);
     cudaFree(ctx->kexp);
     cudaFree(ctx->vexp);
+    cudaFree(ctx->act_bf16);
     cudaFree(ctx->attn_scores);
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
@@ -875,8 +938,8 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
     embed_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->embed_tokens.d, total,
-        c->hidden_size, c->vocab_size);
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16,
+        total, c->hidden_size, c->vocab_size);
     if (launch_check() != 0) return -1;
 
     float scale = 1.0f / sqrtf((float)c->head_dim);
@@ -891,7 +954,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (linear(ctx->blas, &l->qkv, ctx->x_norm, ctx->qkv,
+        if (linear(ctx, &l->qkv, ctx->x_norm, ctx->qkv,
                    total, c->hidden_size, qkv_dim) != 0)
             return -1;
 
@@ -909,7 +972,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                                 k_offset, v_offset, qkv_dim, scale) != 0)
             return -1;
 
-        if (linear_accum(ctx->blas, &l->wo, ctx->attn_out, ctx->x,
+        if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x,
                          total, c->q_dim, c->hidden_size) != 0)
             return -1;
 
@@ -918,7 +981,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
             c->hidden_size, c->rms_norm_eps);
         if (launch_check() != 0) return -1;
 
-        if (linear(ctx->blas, &l->gate_up_proj, ctx->x_norm,
+        if (linear(ctx, &l->gate_up_proj, ctx->x_norm,
                    ctx->ffn_gate_up, total, c->hidden_size,
                    2 * c->intermediate_size) != 0)
             return -1;
@@ -927,7 +990,7 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                                  0, ctx->stream>>>(
             ctx->ffn_gate_up, total, c->intermediate_size);
         if (launch_check() != 0) return -1;
-        if (linear_accum_strided(ctx->blas, &l->down_proj, ctx->ffn_gate_up,
+        if (linear_accum_strided(ctx, &l->down_proj, ctx->ffn_gate_up,
                                  2 * c->intermediate_size, ctx->x,
                                  total, c->intermediate_size,
                                  c->hidden_size) != 0)

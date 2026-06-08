@@ -54,6 +54,9 @@ static void print_usage(const char *prog)
         "               MLX quantization group size (default: 64)\n"
         "  --cuda-fast-gemm MODE\n"
         "               CUDA GEMM compute mode: f32, tf32, bf16, or 16f (default: f32)\n"
+        "  --cuda-weights DTYPE\n"
+        "               CUDA weight storage: f32 or bf16 (default: f32). bf16 halves\n"
+        "               weight memory and uses BF16 tensor cores\n"
         "  --allow-memory-overcommit\n"
         "               Allow an MLX server model set above the host-memory safety budget\n"
         "  --host HOST  Server bind host (default: 127.0.0.1)\n"
@@ -540,6 +543,7 @@ int main(int argc, char *argv[])
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
     const char *cuda_fast_gemm = NULL;
+    const char *cuda_weights = NULL;
     int dist_activation_bits = 32;
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
@@ -625,6 +629,9 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--cuda-fast-gemm")) {
             cuda_fast_gemm = argv[++arg_start];
         }
+        else if (!strcmp(f, "--cuda-weights")) {
+            cuda_weights = argv[++arg_start];
+        }
         else if (!strcmp(f, "--host"))   { host = argv[++arg_start]; }
         else if (!strcmp(f, "--port"))   { port = atoi(argv[++arg_start]); }
         else if (!strcmp(f, "--allow-memory-overcommit")) {
@@ -700,6 +707,29 @@ int main(int argc, char *argv[])
         }
 #else
         fprintf(stderr, "--cuda-fast-gemm requires a CUDA build\n");
+        free_model_specs(&model_specs);
+        return 1;
+#endif
+    }
+
+    if (cuda_weights) {
+#ifdef USE_CUDA
+        if (!use_cuda) {
+            fprintf(stderr, "--cuda-weights requires --cuda or --backend cuda\n");
+            free_model_specs(&model_specs);
+            return 1;
+        }
+        if (!strcmp(cuda_weights, "bf16")) {
+            pplx_cuda_set_weights_bf16(1);
+        } else if (!strcmp(cuda_weights, "f32")) {
+            pplx_cuda_set_weights_bf16(0);
+        } else {
+            fprintf(stderr, "--cuda-weights must be f32 or bf16\n");
+            free_model_specs(&model_specs);
+            return 1;
+        }
+#else
+        fprintf(stderr, "--cuda-weights requires a CUDA build\n");
         free_model_specs(&model_specs);
         return 1;
 #endif
