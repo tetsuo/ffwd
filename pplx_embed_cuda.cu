@@ -499,8 +499,9 @@ static int launch_check(void)
 }
 
 // Compute type for the projection GEMMs. Default is exact F32 (== cublasSgemm).
-// PPLX_CUDA_FAST_GEMM={bf16,tf32,16f} opts into tensor-core matmul that keeps
-// F32 inputs/outputs and F32 accumulation but rounds operands internally.
+// PPLX_CUDA_FAST_GEMM={bf16,tf32,16f} selects a reduced-precision tensor-core
+// matmul that keeps F32 inputs/outputs and F32 accumulation but rounds operands
+// internally.
 static cublasComputeType_t gemm_compute(void)
 {
     static int init = 0;
