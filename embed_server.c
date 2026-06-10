@@ -884,7 +884,10 @@ static int timeout_cb(aeEventLoop *loop, long long id, void *clientData) {
     client *c = s->clients;
     while (c) {
         client *next = c->next;
-        if (!c->cancelled &&
+        /* refcount > 1 means a request from this client is queued or being
+         * processed by the worker; long batch queues (e.g. 4B long-document
+         * batches) must not be reaped as idle. */
+        if (!c->cancelled && c->refcount <= 1 &&
             now - c->last_active_ms > PPLX_HTTP_CLIENT_TIMEOUT_MS)
             close_client(c);
         c = next;
