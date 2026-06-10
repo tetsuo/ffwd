@@ -336,7 +336,20 @@ __device__ static float block_sum(float v)
     return total;
 }
 
-__global__ static void rms_norm_kernel(float *out, const float *x,
+__device__ static inline void store_act(float *out, size_t i, float v)
+{
+    out[i] = v;
+}
+
+__device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v)
+{
+    out[i] = __float2bfloat16(v);
+}
+
+// OUT_T is float, or __nv_bfloat16 when the result feeds a BF16-weight
+// projection GEMM directly (same rounding as a separate cast kernel).
+template <typename OUT_T>
+__global__ static void rms_norm_kernel(OUT_T *out, const float *x,
                                        const float *weight, int rows,
                                        int dim, float eps)
 {
@@ -350,7 +363,8 @@ __global__ static void rms_norm_kernel(float *out, const float *x,
     float total = block_sum(sum);
     float inv = rsqrtf(total / (float)dim + eps);
     for (int d = tid; d < dim; d += blockDim.x)
-        out[(size_t)row * dim + d] = x[(size_t)row * dim + d] * inv * weight[d];
+        store_act(out, (size_t)row * dim + d,
+                  x[(size_t)row * dim + d] * inv * weight[d]);
 }
 
 __global__ static void rms_norm_rope_head_kernel(float *x, const float *weight,
@@ -401,7 +415,12 @@ __global__ static void rms_norm_rope_head_kernel(float *x, const float *weight,
     }
 }
 
-__global__ static void silu_mul_packed_kernel(float *gate_up, int rows,
+// Writes SiLU(gate)*up to out with out_stride. The F32 path writes in place
+// over the gate half (out = gate_up, out_stride = 2*intermediate); the BF16
+// path writes a packed [rows x intermediate] BF16 matrix for the down GEMM.
+template <typename OUT_T>
+__global__ static void silu_mul_packed_kernel(OUT_T *out, int out_stride,
+                                              const float *gate_up, int rows,
                                               int intermediate)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -412,7 +431,8 @@ __global__ static void silu_mul_packed_kernel(float *gate_up, int rows,
         size_t base = (size_t)row * (2 * intermediate);
         float g = gate_up[base + d];
         float u = gate_up[base + intermediate + d];
-        gate_up[base + d] = (g / (1.0f + expf(-g))) * u;
+        store_act(out, (size_t)row * out_stride + d,
+                  (g / (1.0f + expf(-g))) * u);
     }
 }
 
@@ -532,25 +552,31 @@ static cublasComputeType_t gemm_compute(void)
     return g_gemm_compute;
 }
 
-// y = w @ x (+ beta*y). With BF16 weights the F32 activation operand is cast to
-// BF16 (ctx->act_bf16) so both GEMM inputs are BF16; accumulation and output
-// stay F32. With F32 weights this is the exact path, honoring gemm_compute().
+// y = w @ x (+ beta*y). With BF16 weights both GEMM inputs are BF16 and
+// accumulation/output stay F32: when x_is_bf16 the activation operand was
+// already produced in BF16 by the upstream kernel, otherwise the F32 operand
+// is cast into ctx->act_bf16 first. With F32 weights this is the exact path,
+// honoring gemm_compute().
 static int linear_ex(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                     const float *x, float *y, int rows, int in_dim,
-                     int out_dim, int x_stride, float beta)
+                     const void *x, int x_is_bf16, float *y, int rows,
+                     int in_dim, int out_dim, int x_stride, float beta)
 {
     const float alpha = 1.0f;
     if (w->bf16) {
-        size_t n = (size_t)rows * (size_t)x_stride;
-        int threads = 256;
-        cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0,
-                                  ctx->stream>>>(
-            (__nv_bfloat16 *)ctx->act_bf16, x, n);
-        if (launch_check() != 0) return -1;
+        const void *xb = x;
+        if (!x_is_bf16) {
+            size_t n = (size_t)rows * (size_t)x_stride;
+            int threads = 256;
+            cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0,
+                                      ctx->stream>>>(
+                (__nv_bfloat16 *)ctx->act_bf16, (const float *)x, n);
+            if (launch_check() != 0) return -1;
+            xb = ctx->act_bf16;
+        }
         CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N,
                                   out_dim, rows, in_dim,
                                   &alpha, w->d, CUDA_R_16BF, in_dim,
-                                  ctx->act_bf16, CUDA_R_16BF, x_stride,
+                                  xb, CUDA_R_16BF, x_stride,
                                   &beta, y, CUDA_R_32F, out_dim,
                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         return 0;
@@ -567,21 +593,22 @@ static int linear_ex(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
 static int linear(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                   const float *x, float *y, int rows, int in_dim, int out_dim)
 {
-    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, in_dim, 0.0f);
+    return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 0.0f);
+}
+
+// x points at activations already stored as BF16 (e.g. ctx->act_bf16).
+static int linear_bf16x(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+                        const void *x, float *y, int rows, int in_dim,
+                        int out_dim, int x_stride, float beta)
+{
+    return linear_ex(ctx, w, x, 1, y, rows, in_dim, out_dim, x_stride, beta);
 }
 
 static int linear_accum(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                         const float *x, float *y,
                         int rows, int in_dim, int out_dim)
 {
-    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, in_dim, 1.0f);
-}
-
-static int linear_accum_strided(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                                const float *x, int x_stride, float *y,
-                                int rows, int in_dim, int out_dim)
-{
-    return linear_ex(ctx, w, x, y, rows, in_dim, out_dim, x_stride, 1.0f);
+    return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
 static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
@@ -947,16 +974,33 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     int k_offset = c->q_dim;
     int v_offset = c->q_dim + c->kv_dim;
     int qkv_dim = c->q_dim + 2 * c->kv_dim;
+    // With BF16 weights the norm and SiLU kernels store their results as BF16
+    // directly into ctx->act_bf16, which the next projection GEMM consumes
+    // before any later producer reuses the buffer (single stream). This
+    // removes three cast launches per layer; only the attention output still
+    // needs a cast because cuBLAS cannot emit a BF16 C from F32 A/B operands.
+    __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
-        rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-            ctx->x_norm, ctx->x, l->input_norm, total,
-            c->hidden_size, c->rms_norm_eps);
-        if (launch_check() != 0) return -1;
-
-        if (linear(ctx, &l->qkv, ctx->x_norm, ctx->qkv,
-                   total, c->hidden_size, qkv_dim) != 0)
-            return -1;
+        int wbf16 = l->qkv.bf16;
+        if (wbf16) {
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
+                act, ctx->x, l->input_norm, total,
+                c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0) return -1;
+            if (linear_bf16x(ctx, &l->qkv, act, ctx->qkv,
+                             total, c->hidden_size, qkv_dim,
+                             c->hidden_size, 0.0f) != 0)
+                return -1;
+        } else {
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
+                ctx->x_norm, ctx->x, l->input_norm, total,
+                c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0) return -1;
+            if (linear(ctx, &l->qkv, ctx->x_norm, ctx->qkv,
+                       total, c->hidden_size, qkv_dim) != 0)
+                return -1;
+        }
 
         rms_norm_rope_head_kernel<<<dim3(total, c->n_heads), 128, 0, ctx->stream>>>(
             ctx->qkv, l->q_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin,
@@ -976,25 +1020,44 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                          total, c->q_dim, c->hidden_size) != 0)
             return -1;
 
-        rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-            ctx->x_norm, ctx->x, l->post_attn_norm, total,
-            c->hidden_size, c->rms_norm_eps);
-        if (launch_check() != 0) return -1;
-
-        if (linear(ctx, &l->gate_up_proj, ctx->x_norm,
-                   ctx->ffn_gate_up, total, c->hidden_size,
-                   2 * c->intermediate_size) != 0)
-            return -1;
         int inter_count = total * c->intermediate_size;
-        silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads, threads,
-                                 0, ctx->stream>>>(
-            ctx->ffn_gate_up, total, c->intermediate_size);
-        if (launch_check() != 0) return -1;
-        if (linear_accum_strided(ctx, &l->down_proj, ctx->ffn_gate_up,
-                                 2 * c->intermediate_size, ctx->x,
-                                 total, c->intermediate_size,
-                                 c->hidden_size) != 0)
-            return -1;
+        if (wbf16) {
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
+                act, ctx->x, l->post_attn_norm, total,
+                c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0) return -1;
+            if (linear_bf16x(ctx, &l->gate_up_proj, act, ctx->ffn_gate_up,
+                             total, c->hidden_size, 2 * c->intermediate_size,
+                             c->hidden_size, 0.0f) != 0)
+                return -1;
+            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads,
+                                     threads, 0, ctx->stream>>>(
+                act, c->intermediate_size, ctx->ffn_gate_up, total,
+                c->intermediate_size);
+            if (launch_check() != 0) return -1;
+            if (linear_bf16x(ctx, &l->down_proj, act, ctx->x,
+                             total, c->intermediate_size, c->hidden_size,
+                             c->intermediate_size, 1.0f) != 0)
+                return -1;
+        } else {
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
+                ctx->x_norm, ctx->x, l->post_attn_norm, total,
+                c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0) return -1;
+            if (linear(ctx, &l->gate_up_proj, ctx->x_norm,
+                       ctx->ffn_gate_up, total, c->hidden_size,
+                       2 * c->intermediate_size) != 0)
+                return -1;
+            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads,
+                                     threads, 0, ctx->stream>>>(
+                ctx->ffn_gate_up, 2 * c->intermediate_size, ctx->ffn_gate_up,
+                total, c->intermediate_size);
+            if (launch_check() != 0) return -1;
+            if (linear_ex(ctx, &l->down_proj, ctx->ffn_gate_up, 0, ctx->x,
+                          total, c->intermediate_size, c->hidden_size,
+                          2 * c->intermediate_size, 1.0f) != 0)
+                return -1;
+        }
     }
 
     rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
