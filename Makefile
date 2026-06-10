@@ -3,7 +3,7 @@ CC          = gcc
 # not assume finite math or approximate libm calls: full -ffast-math produced
 # NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
 # -fapprox-func are the unsafe parts and stay off).
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native \
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -fPIC \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
 LDFLAGS     = -lm -lpthread
@@ -48,7 +48,7 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda lib test coverage bench-tokenizer debug clean help
+.PHONY: all cpu metal cuda test coverage bench-tokenizer debug clean help
 
 all: help
 
@@ -59,14 +59,14 @@ help:
 	@echo "  make cpu      Build the CPU backend (BLAS: Accelerate on macOS, OpenBLAS on Linux)"
 	@echo "  make metal    Build the Apple GPU backend via MLX (recommended on Apple Silicon)"
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
-	@echo "  make lib      Build the shared library ($(SHARED_LIB), CPU backend)"
 	@echo "  make test     Build and run the C test suite (no model files needed)"
 	@echo "  make coverage Test-suite line coverage report (clang/llvm-cov)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
 	@echo "Each backend target builds ./$(TARGET) (CLI), ./$(SERVER_TARGET)"
-	@echo "(HTTP API), and the static library $(LIB)."
+	@echo "(HTTP API), the static library $(LIB), and the shared library"
+	@echo "$(SHARED_LIB) for that backend."
 	@echo ""
 	@echo "Usage:"
 	@echo "  ./pplx-embed -d /path/to/model-dir \"text1\" \"text2\""
@@ -90,7 +90,7 @@ cpu: LDFLAGS += -lopenblas
 endif
 cpu:
 	$(MAKE) clean
-	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
 # Metal build (Apple Silicon GPU via MLX - uses the mlx-c pure C API)
@@ -111,7 +111,7 @@ metal: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
 endif
 metal:
 	$(MAKE) clean
-	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_mlx.o"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_mlx.o"
 
 # =============================================================================
 # CUDA build (Linux NVIDIA GPU - uses CUDA Runtime + cuBLAS)
@@ -124,25 +124,15 @@ cuda: LDFLAGS += -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
 cuda:
 	$(MAKE) clean
 	$(MAKE) embed_cuda.o
-	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_cuda.o"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_cuda.o"
 
+# -fPIC so the same object links into both binaries and the shared library.
 embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
-	$(NVCC) -O3 -std=c++17 -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+	$(NVCC) -O3 -std=c++17 -Xcompiler -fPIC -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
-# Shared library (CPU backend; override CFLAGS/LDFLAGS for other backends)
+# Shared library (built by every backend target from the same objects)
 # =============================================================================
-ifeq ($(UNAME_S),Darwin)
-lib: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-lib: LDFLAGS += -framework Accelerate
-else
-lib: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-lib: LDFLAGS += -lopenblas
-endif
-lib:
-	$(MAKE) clean
-	$(MAKE) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
-
 $(SHARED_LIB): $(OBJS) $(EXTRA_OBJS)
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
 
