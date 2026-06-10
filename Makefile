@@ -197,16 +197,20 @@ test:
 # =============================================================================
 # Test-suite line coverage (requires clang + llvm-cov/llvm-profdata; this is
 # the default toolchain on macOS. Writes a per-file text summary to stdout
-# and a browsable HTML report to coverage/coverage.html.)
+# and a browsable HTML report to coverage/html/index.html.)
 # =============================================================================
 COV_DIR   = coverage
 # Source-based coverage; -O0 so no line is folded away by the optimizer.
-COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0
+# The "." compilation dir keeps report paths relative to the repo root
+# (run llvm-cov from the repo root so sources resolve).
+COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
+            -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
             tests/test_tokenizer tests/test_safetensors \
             tests/test_bf16_model tests/test_workspace tests/test_server
-# Report on project sources only, not the harnesses or vendored deps.
-COV_IGNORE = -ignore-filename-regex='deps/|tests/'
+# Report on project sources only - not the harnesses, vendored deps, or
+# system headers (cJSON lands under /opt or /usr otherwise).
+COV_IGNORE = -ignore-filename-regex='deps/|tests/|/opt/|/usr/'
 
 ifeq ($(UNAME_S),Darwin)
 LLVM_PROFDATA = xcrun llvm-profdata
@@ -242,9 +246,17 @@ coverage:
 	$(LLVM_PROFDATA) merge -sparse $(COV_DIR)/*.profraw -o $(COV_DIR)/tests.profdata
 	$(LLVM_COV) report -instr-profile=$(COV_DIR)/tests.profdata $(COV_IGNORE) \
 	    $(addprefix -object ,$(COV_BINS))
-	$(LLVM_COV) show -format=html -instr-profile=$(COV_DIR)/tests.profdata \
-	    $(COV_IGNORE) $(addprefix -object ,$(COV_BINS)) > $(COV_DIR)/coverage.html
-	@echo "HTML report: $(COV_DIR)/coverage.html"
+	$(LLVM_COV) show \
+			-format=html \
+			-output-dir=$(COV_DIR)/html \
+			-instr-profile=$(COV_DIR)/tests.profdata \
+			-show-line-counts-or-regions \
+			-show-branches=count \
+			-show-expansions \
+			-show-instantiations \
+			$(COV_IGNORE) \
+			$(addprefix -object ,$(COV_BINS))
+	@echo "HTML report: $(COV_DIR)/html/index.html"
 
 bench-tokenizer:
 	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
