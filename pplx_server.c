@@ -1981,9 +1981,9 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
 
 static void *worker_main(void *arg) {
     http_server *s = arg;
-    int rc = 0;
 #ifdef USE_MLX
     if (s->use_mlx) {
+        int rc = 0;
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
@@ -2026,6 +2026,7 @@ static void *worker_main(void *arg) {
 #endif
 #ifdef USE_CUDA
     if (s->use_cuda) {
+        int rc = 0;
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
