@@ -133,8 +133,10 @@ cuda:
 	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_cuda.o"
 
 # -fPIC so the same object links into both binaries and the shared library.
+# -arch=native targets the GPU present at build time (we always build CUDA
+# on the machine that runs it), avoiding first-load PTX JIT.
 embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
-	$(NVCC) -O3 -std=c++17 -Xcompiler -fPIC -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
 # Shared library (built by every backend target from the same objects)
