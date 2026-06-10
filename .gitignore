@@ -3,6 +3,7 @@ pplx-embed
 pplx-embed-server
 libpplxembed.*
 tests/test_kernels_*
+bench/bench_tokenizer
 book/
 .venv/
 __pycache__/
