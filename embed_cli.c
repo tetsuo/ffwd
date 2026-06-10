@@ -70,8 +70,6 @@ static void print_usage(const char *prog)
         "  --stream        Streaming: read stdin lines, write JSON per line\n"
         "  --dist-worker   Final layer-shard worker\n"
         "\n"
-        "The HTTP API is served by the separate pplx-embed-server binary.\n"
-        "\n"
         "Examples:\n"
         "  %s -d ./model \"query: what is AI?\"\n"
         "  %s -d ./model --mlx --stream < texts.txt\n"
