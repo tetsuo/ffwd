@@ -3,6 +3,7 @@
  * scripts/check_kernel_golden.py. No model files required. */
 
 #include "qwen_kernels.h"
+#include "qwen_kernels_impl.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -322,6 +323,79 @@ static void test_bf16_pair(void) {
     qwen_set_threads(1);
 }
 
+/* The dispatch macros in qwen_kernels_impl.h pick the SIMD variant at
+ * compile time, so on arm64/x86 the generic C kernels are linked but never
+ * called. Run them directly against the selected implementation on
+ * remainder-lane-hostile sizes; on a plain build impl == generic and the
+ * comparison is trivially exact. */
+static void test_generic_vs_impl(void) {
+    enum { IN = 67, OUT = 9, NMAX = 1027 };
+    static float x[IN], bias[OUT], a[NMAX], b[NMAX], d0[NMAX], d1[NMAX];
+    static uint16_t W[(size_t)OUT * IN];
+    uint32_t s = 0x12345678u;
+    for (int i = 0; i < NMAX; i++) {
+        s = s * 1664525u + 1013904223u;
+        a[i] = (float)(int32_t)s * 1e-9f;
+        s = s * 1664525u + 1013904223u;
+        b[i] = (float)(int32_t)s * 1e-9f;
+    }
+    for (int i = 0; i < IN; i++) x[i] = a[i];
+    for (int o = 0; o < OUT; o++) bias[o] = b[o];
+    for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++) {
+        s = s * 1664525u + 1013904223u;
+        W[i] = f32_to_bf16((float)(int32_t)s * 1e-9f);
+    }
+
+    float yg[OUT], yi[OUT];
+    qwen_bf16_matvec_fused_generic(yg, x, W, bias, IN, OUT);
+    qwen_bf16_matvec_fused_impl(yi, x, W, bias, IN, OUT);
+    for (int o = 0; o < OUT; o++)
+        expect_close("matvec_fused generic-vs-impl", yg[o], yi[o], 1e-5f);
+    qwen_bf16_matvec_fused_generic(yg, x, W, NULL, IN, OUT);
+    qwen_bf16_matvec_fused_impl(yi, x, W, NULL, IN, OUT);
+    for (int o = 0; o < OUT; o++)
+        expect_close("matvec_fused nobias generic-vs-impl", yg[o], yi[o], 1e-5f);
+
+    int bg = -1, bi = -1;
+    float vg = 0.0f, vi = 0.0f;
+    qwen_argmax_bf16_range_generic(x, W, IN, 1, OUT, &bg, &vg);
+    qwen_argmax_bf16_range_impl(x, W, IN, 1, OUT, &bi, &vi);
+    if (bg != bi) {
+        fprintf(stderr, "argmax generic-vs-impl: got %d want %d\n", bi, bg);
+        failures++;
+    }
+    expect_close("argmax val generic-vs-impl", vg, vi, 1e-5f);
+
+    const int sizes[] = {1, 7, 64, NMAX};
+    for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
+        int n = sizes[t];
+        expect_close("dot generic-vs-impl",
+                     qwen_dot_f32_generic(a, b, n),
+                     qwen_dot_f32_impl(a, b, n), 1e-5f);
+
+        memcpy(d0, a, (size_t)n * sizeof(float));
+        memcpy(d1, a, (size_t)n * sizeof(float));
+        qwen_vec_scale_inplace_generic(d0, 1.37f, n);
+        qwen_vec_scale_inplace_impl(d1, 1.37f, n);
+        for (int i = 0; i < n; i++)
+            expect_close("scale generic-vs-impl", d0[i], d1[i], 1e-6f);
+
+        memcpy(d0, a, (size_t)n * sizeof(float));
+        memcpy(d1, a, (size_t)n * sizeof(float));
+        qwen_vec_axpy_inplace_generic(d0, b, -0.61f, n);
+        qwen_vec_axpy_inplace_impl(d1, b, -0.61f, n);
+        for (int i = 0; i < n; i++)
+            expect_close("axpy generic-vs-impl", d0[i], d1[i], 1e-6f);
+
+        memcpy(d0, a, (size_t)n * sizeof(float));
+        memcpy(d1, a, (size_t)n * sizeof(float));
+        qwen_vec_scale_add_generic(d0, b, 0.83f, n);
+        qwen_vec_scale_add_impl(d1, b, 0.83f, n);
+        for (int i = 0; i < n; i++)
+            expect_close("scale_add generic-vs-impl", d0[i], d1[i], 1e-6f);
+    }
+}
+
 int main(void) {
     qwen_set_threads(1);
     test_rms_norm();
@@ -331,6 +405,7 @@ int main(void) {
     test_bf16_linear();
     test_bf16_qkv();
     test_bf16_pair();
+    test_generic_vs_impl();
     if (failures != 0) return 1;
     puts("ok: kernel golden tests passed");
     return 0;
