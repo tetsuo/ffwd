@@ -496,12 +496,23 @@ static int utf8_decode_cp_len(const unsigned char *p, const unsigned char *end,
     return 1;
 }
 
-static int is_ascii_alpha_cp(int cp) {
-    return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z');
-}
+/* The pretokenizer classifies every codepoint, several times each, and the
+ * input is overwhelmingly ASCII; one table lookup replaces the range chains
+ * for cp < 0x80. Non-ASCII codepoints fall through to the full checks.
+ * ASCII has no symbolish codepoints, so that class needs no bit. */
+#define CPC_SPACE  1
+#define CPC_NUMBER 2
+#define CPC_LETTER 4
+
+static const unsigned char ascii_cp_class[128] = {
+    ['\t'] = CPC_SPACE, ['\n'] = CPC_SPACE, ['\v'] = CPC_SPACE,
+    ['\f'] = CPC_SPACE, ['\r'] = CPC_SPACE, [' '] = CPC_SPACE,
+    ['0' ... '9'] = CPC_NUMBER,
+    ['A' ... 'Z'] = CPC_LETTER, ['a' ... 'z'] = CPC_LETTER,
+};
 
 static int is_number_cp(int cp) {
-    if (cp >= '0' && cp <= '9') return 1;
+    if ((unsigned)cp < 0x80) return ascii_cp_class[cp] & CPC_NUMBER;
     if (cp >= 0x0660 && cp <= 0x0669) return 1;
     if (cp >= 0x06F0 && cp <= 0x06F9) return 1;
     if (cp >= 0x0966 && cp <= 0x096F) return 1;
@@ -510,8 +521,8 @@ static int is_number_cp(int cp) {
 }
 
 static int is_space_cp(int cp) {
-    return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' ||
-           cp == '\f' || cp == '\v' || cp == 0x85 || cp == 0xA0 ||
+    if ((unsigned)cp < 0x80) return ascii_cp_class[cp] & CPC_SPACE;
+    return cp == 0x85 || cp == 0xA0 ||
            cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
            cp == 0x2028 || cp == 0x2029 || cp == 0x202F ||
            cp == 0x205F || cp == 0x3000;
@@ -640,9 +651,8 @@ static char *normalize_nfc_latin(const char *text) {
 }
 
 static int is_letter_cp(int cp) {
-    if (is_ascii_alpha_cp(cp)) return 1;
-    if (cp < 0x80 || is_space_cp(cp) || is_number_cp(cp) ||
-        is_symbolish_cp(cp))
+    if ((unsigned)cp < 0x80) return ascii_cp_class[cp] & CPC_LETTER;
+    if (is_space_cp(cp) || is_number_cp(cp) || is_symbolish_cp(cp))
         return 0;
     return 1;
 }

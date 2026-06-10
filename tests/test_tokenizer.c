@@ -138,6 +138,38 @@ static void run_cases(const qwen_tokenizer_t *tok,
     /* No applicable merges: raw byte tokens. */
     const int dr[] = {'d', 'r'};
     check_ids(tok, ws, "dr", dr, 2, label);
+
+    /* Pretokenizer codepoint classes (the ASCII class-table paths). */
+
+    /* A letter run stops at a digit; digits split one per piece. */
+    const int x123[] = {'x', '1', '2', '3'};
+    check_ids(tok, ws, "x123", x123, 4, label);
+
+    /* Punctuation is its own piece; " world" joins as one piece
+     * (Gworld -> Gwor, ld); trailing "!" is a symbol piece. */
+    const int punct[] = {259, ',', 263, 262, '!'};
+    check_ids(tok, ws, "hello, world!", punct, 5, label);
+
+    /* Tab and newline are spaces; each stays a piece between letters. */
+    const int tab[] = {'a', '\t', 'b'};
+    check_ids(tok, ws, "a\tb", tab, 3, label);
+    const int nl[] = {'a', '\n', 'b'};
+    check_ids(tok, ws, "a\nb", nl, 3, label);
+
+    /* A space is not absorbed into a digit piece (digits are not letters). */
+    const int sp_digit[] = {'7', ' ', '8'};
+    check_ids(tok, ws, "7 8", sp_digit, 3, label);
+
+    /* Contraction suffix splits off. */
+    const int its[] = {'i', 't', '\'', 's'};
+    check_ids(tok, ws, "it's", its, 4, label);
+
+    /* Non-ASCII falls through the table: U+00E9 is a letter (byte pair);
+     * U+2026 is symbolish, so it prefixes the following letter run. */
+    const int eacute[] = {0xC3, 0xA9};
+    check_ids(tok, ws, "\xC3\xA9", eacute, 2, label);
+    const int ellipsis[] = {'a', 0xE2, 0x80, 0xA6, 'b'};
+    check_ids(tok, ws, "a\xE2\x80\xA6" "b", ellipsis, 5, label);
 }
 
 int main(void)
