@@ -46,35 +46,46 @@ typedef struct {
     int rows, cols;     /* cols == 0 means a 1-D tensor of `rows` values */
 } tm_spec_t;
 
-static const tm_spec_t TM_SPECS[] = {
-    {"embed_tokens.weight", 16, 4},
-    {"layers.0.self_attn.q_proj.weight", 4, 4},
-    {"layers.0.self_attn.k_proj.weight", 2, 4},
-    {"layers.0.self_attn.v_proj.weight", 2, 4},
-    {"layers.0.self_attn.o_proj.weight", 4, 4},
-    {"layers.0.self_attn.q_norm.weight", 2, 0},
-    {"layers.0.self_attn.k_norm.weight", 2, 0},
-    {"layers.0.input_layernorm.weight", 4, 0},
-    {"layers.0.post_attention_layernorm.weight", 4, 0},
-    {"layers.0.mlp.gate_proj.weight", 8, 4},
-    {"layers.0.mlp.up_proj.weight", 8, 4},
-    {"layers.0.mlp.down_proj.weight", 4, 8},
-    {"norm.weight", 4, 0},
-};
-enum { TM_N_SPECS = sizeof(TM_SPECS) / sizeof(TM_SPECS[0]) };
+/* Always one layer; everything else is free so a test can match a real
+ * model family's dimensions (e.g. hidden 1024 for the 0.6B server slot). */
+typedef struct {
+    int hidden, heads, kv_heads, head_dim, intermediate, vocab;
+} tm_dims_t;
 
-/* Write config.json + model.safetensors into dir. dtype: "F32" or "BF16".
- * Returns 0 on success. */
-static int tm_write_model(const char *dir, const char *dtype)
+enum { TM_N_SPECS = 13 };
+
+/* Write config.json + model.safetensors with the given dimensions into dir.
+ * dtype: "F32" or "BF16". Returns 0 on success. */
+static int tm_write_model_dims(const char *dir, const char *dtype,
+                               const tm_dims_t *d)
 {
+    int q = d->heads * d->head_dim, kv = d->kv_heads * d->head_dim;
+    const tm_spec_t specs[TM_N_SPECS] = {
+        {"embed_tokens.weight", d->vocab, d->hidden},
+        {"layers.0.self_attn.q_proj.weight", q, d->hidden},
+        {"layers.0.self_attn.k_proj.weight", kv, d->hidden},
+        {"layers.0.self_attn.v_proj.weight", kv, d->hidden},
+        {"layers.0.self_attn.o_proj.weight", d->hidden, q},
+        {"layers.0.self_attn.q_norm.weight", d->head_dim, 0},
+        {"layers.0.self_attn.k_norm.weight", d->head_dim, 0},
+        {"layers.0.input_layernorm.weight", d->hidden, 0},
+        {"layers.0.post_attention_layernorm.weight", d->hidden, 0},
+        {"layers.0.mlp.gate_proj.weight", d->intermediate, d->hidden},
+        {"layers.0.mlp.up_proj.weight", d->intermediate, d->hidden},
+        {"layers.0.mlp.down_proj.weight", d->hidden, d->intermediate},
+        {"norm.weight", d->hidden, 0},
+    };
+
     char path[2048];
     snprintf(path, sizeof(path), "%s/config.json", dir);
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    fputs("{\"hidden_size\":4,\"num_hidden_layers\":1,"
-          "\"num_attention_heads\":2,\"num_key_value_heads\":1,"
-          "\"head_dim\":2,\"intermediate_size\":8,\"vocab_size\":16,"
-          "\"rms_norm_eps\":1e-6,\"rope_theta\":10000.0}", f);
+    fprintf(f, "{\"hidden_size\":%d,\"num_hidden_layers\":1,"
+            "\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
+            "\"head_dim\":%d,\"intermediate_size\":%d,\"vocab_size\":%d,"
+            "\"rms_norm_eps\":1e-6,\"rope_theta\":10000.0}",
+            d->hidden, d->heads, d->kv_heads, d->head_dim,
+            d->intermediate, d->vocab);
     fclose(f);
 
     int bf16 = strcmp(dtype, "BF16") == 0;
@@ -84,7 +95,7 @@ static int tm_write_model(const char *dir, const char *dtype)
     size_t hoff = 0, doff = 0;
     hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "{");
     for (int t = 0; t < TM_N_SPECS; t++) {
-        const tm_spec_t *s = &TM_SPECS[t];
+        const tm_spec_t *s = &specs[t];
         size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
         size_t end = doff + n * esize;
         if (s->cols)
@@ -110,7 +121,7 @@ static int tm_write_model(const char *dir, const char *dtype)
     fwrite(len8, 1, 8, f);
     fwrite(header, 1, hoff, f);
     for (int t = 0; t < TM_N_SPECS; t++) {
-        const tm_spec_t *s = &TM_SPECS[t];
+        const tm_spec_t *s = &specs[t];
         size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
         for (size_t i = 0; i < n; i++) {
             float v = tm_value(s->name, i);
@@ -124,6 +135,13 @@ static int tm_write_model(const char *dir, const char *dtype)
     }
     fclose(f);
     return 0;
+}
+
+/* The historical default fixture: 4-dim hidden, 16-token vocab. */
+static inline int tm_write_model(const char *dir, const char *dtype)
+{
+    static const tm_dims_t d = {4, 2, 1, 2, 8, 16};
+    return tm_write_model_dims(dir, dtype, &d);
 }
 
 #endif /* TINY_MODEL_H */

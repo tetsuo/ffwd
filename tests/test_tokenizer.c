@@ -5,6 +5,7 @@
  * string-based fallback) produces identical ids. Runs via `make test`. */
 
 #include "qwen_tokenizer.h"
+#include "tok_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,80 +21,6 @@ int qwen_verbose = 0;
         failures++;                                                     \
     }                                                                   \
 } while (0)
-
-/* GPT-2 byte -> unicode codepoint mapping (mirrors the tokenizer's rules). */
-static int byte_to_cp(int b)
-{
-    static int table[256];
-    static int init = 0;
-    if (!init) {
-        int n = 0;
-        for (int i = 0; i < 256; i++) {
-            int normal = (i >= 33 && i <= 126) || (i >= 161 && i <= 172) ||
-                         (i >= 174 && i <= 255);
-            table[i] = normal ? i : 256 + n++;
-        }
-        init = 1;
-    }
-    return table[b];
-}
-
-static int cp_to_utf8(int cp, char *out)
-{
-    if (cp < 0x80) { out[0] = (char)cp; out[1] = '\0'; return 1; }
-    out[0] = (char)(0xC0 | (cp >> 6));
-    out[1] = (char)(0x80 | (cp & 0x3F));
-    out[2] = '\0';
-    return 2;
-}
-
-/* JSON-escape a byte-unicode token (the byte alphabet needs only \" and \\). */
-static const char *json_escape(const char *s, char *buf, size_t cap)
-{
-    size_t o = 0;
-    for (; *s && o + 2 < cap; s++) {
-        if (*s == '"' || *s == '\\') buf[o++] = '\\';
-        buf[o++] = *s;
-    }
-    buf[o] = '\0';
-    return buf;
-}
-
-/* Merged tokens (ids 256+) and the merge list that produces them. */
-static const char *MERGED[] = {
-    "he", "ll", "hell", "hello", "\xC4\xA0w", "or", "ld", "\xC4\xA0wor",
-};
-static const char *MERGES[] = {
-    "h e", "l l", "he ll", "hell o", "\xC4\xA0 w", "o r", "l d",
-    "\xC4\xA0w or",
-};
-enum { N_MERGED = sizeof(MERGED) / sizeof(MERGED[0]) };
-
-static int write_fixture(const char *dir)
-{
-    char path[2048], tok[4], esc[16];
-    snprintf(path, sizeof(path), "%s/vocab.json", dir);
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    fputs("{", f);
-    for (int b = 0; b < 256; b++) {
-        cp_to_utf8(byte_to_cp(b), tok);
-        fprintf(f, "%s\"%s\": %d", b ? ", " : "",
-                json_escape(tok, esc, sizeof(esc)), b);
-    }
-    for (int i = 0; i < N_MERGED; i++)
-        fprintf(f, ", \"%s\": %d", MERGED[i], 256 + i);
-    fputs("}", f);
-    fclose(f);
-
-    snprintf(path, sizeof(path), "%s/merges.txt", dir);
-    f = fopen(path, "w");
-    if (!f) return -1;
-    for (size_t i = 0; i < sizeof(MERGES) / sizeof(MERGES[0]); i++)
-        fprintf(f, "%s\n", MERGES[i]);
-    fclose(f);
-    return 0;
-}
 
 static void check_ids(const qwen_tokenizer_t *tok,
                       qwen_tokenizer_workspace_t *ws, const char *text,
@@ -177,7 +104,7 @@ int main(void)
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s/pplx-tok-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(dir) || write_fixture(dir) != 0) {
+    if (!mkdtemp(dir) || tf_write_vocab(dir) != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
