@@ -282,7 +282,9 @@ bench-tokenizer:
 # a JSON sample set under bench/results/, keyed by commit; compare two
 # records with scripts/benchstat.py to see if a change helped or hurt.
 # =============================================================================
-BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
+# Dirtiness ignores .gitignore so local-only ignore entries do not mark
+# every record as -dirty.
+BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet -- ':!.gitignore' 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
 BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -I.
 
 bench:

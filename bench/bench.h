@@ -163,16 +163,22 @@ static int bench_main(const bench_opts_t *o,
         }
         iters[c] = n;
         ran++;
+        fprintf(stderr, "calibrated %-44s n=%ld\n", cases[c].name, n);
     }
 
     /* Sample round-robin so slow machine drift (thermals, scheduling)
      * lands inside every benchmark's sample spread instead of shifting
-     * whole benchmarks against each other. */
-    for (int s = 0; s < o->count; s++)
+     * whole benchmarks against each other. Results print after the
+     * last pass; the pass lines are the progress indicator. */
+    double sample_t0 = bench_now_ns();
+    for (int s = 0; s < o->count; s++) {
         for (int c = 0; c < n_cases; c++)
             if (iters[c])
                 all[(size_t)c * o->count + s] =
                     bench_run_once(cases[c].fn, iters[c]);
+        fprintf(stderr, "pass %d/%d (%.0fs elapsed)\n", s + 1, o->count,
+                (bench_now_ns() - sample_t0) / 1e9);
+    }
 
     int emitted = 0;
     for (int c = 0; c < n_cases; c++) {
