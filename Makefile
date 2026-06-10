@@ -48,7 +48,7 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all blas mlx cuda shared test bench-tokenizer debug clean help
+.PHONY: all cpu metal cuda lib test bench-tokenizer debug clean help
 
 all: help
 
@@ -56,10 +56,10 @@ help:
 	@echo "pplx-embed - Inference for pplx-embed-v1 and pplx-embed-context-v1 embedding models"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  make blas     Build with BLAS acceleration (CPU)"
-	@echo "  make mlx      Build with Apple MLX GPU backend (recommended on Apple Silicon)"
+	@echo "  make cpu      Build the CPU backend (BLAS: Accelerate on macOS, OpenBLAS on Linux)"
+	@echo "  make metal    Build the Apple GPU backend via MLX (recommended on Apple Silicon)"
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
-	@echo "  make shared   Build the shared library ($(SHARED_LIB), BLAS backend)"
+	@echo "  make lib      Build the shared library ($(SHARED_LIB), CPU backend)"
 	@echo "  make test     Build and run the C test suite (no model files needed)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
@@ -72,7 +72,7 @@ help:
 	@echo "  ./pplx-embed-server --model pplx-embed-v1-0.6b=/path/to/model-dir"
 
 # =============================================================================
-# BLAS build (Apple Accelerate on macOS, OpenBLAS on Linux)
+# CPU build (BLAS: Apple Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(strip $(CJSON_CFLAGS)),)
@@ -81,34 +81,34 @@ endif
 ifeq ($(strip $(CJSON_LDFLAGS)),-lcjson)
     CJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lcjson
 endif
-blas: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-blas: LDFLAGS += -framework Accelerate
+cpu: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+cpu: LDFLAGS += -framework Accelerate
 else
-blas: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-blas: LDFLAGS += -lopenblas
+cpu: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+cpu: LDFLAGS += -lopenblas
 endif
-blas:
+cpu:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
-# MLX build (Apple Silicon GPU - uses mlx-c pure C API)
+# Metal build (Apple Silicon GPU via MLX - uses the mlx-c pure C API)
 # Requires: brew install mlx mlx-c
 # =============================================================================
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
 MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
 
-mlx: SRCS += embed_mlx.c
-mlx: OBJS  = $(SRCS:.c=.o) embed_mlx.o
+metal: SRCS += embed_mlx.c
+metal: OBJS  = $(SRCS:.c=.o) embed_mlx.o
 ifeq ($(UNAME_S),Darwin)
-mlx: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX \
+metal: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX \
                -I$(MLXC_PREFIX)/include
-mlx: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
+metal: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
                 -L$(MLXC_PREFIX)/lib -lmlxc \
                 -L$(MLX_PREFIX)/lib -lmlx \
                 -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
 endif
-mlx:
+metal:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_mlx.o"
 
@@ -129,16 +129,16 @@ embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
 	$(NVCC) -O3 -std=c++17 -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
-# Shared library (BLAS backend; override CFLAGS/LDFLAGS for other backends)
+# Shared library (CPU backend; override CFLAGS/LDFLAGS for other backends)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
-shared: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-shared: LDFLAGS += -framework Accelerate
+lib: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+lib: LDFLAGS += -framework Accelerate
 else
-shared: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-shared: LDFLAGS += -lopenblas
+lib: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+lib: LDFLAGS += -lopenblas
 endif
-shared:
+lib:
 	$(MAKE) clean
 	$(MAKE) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 

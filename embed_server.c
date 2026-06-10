@@ -2563,7 +2563,7 @@ int main(int argc, char *argv[])
                 use_mlx = 1;
                 use_cuda = 0;
 #else
-                fprintf(stderr, "mlx backend not available (build with: make mlx)\n");
+                fprintf(stderr, "mlx backend not available (build with: make metal)\n");
                 free_model_specs(&model_specs);
                 return 1;
 #endif
@@ -2590,7 +2590,7 @@ int main(int argc, char *argv[])
             use_mlx = 1;
             use_cuda = 0;
 #else
-            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
+            fprintf(stderr, "--mlx not available (build with: make metal)\n");
             free_model_specs(&model_specs);
             return 1;
 #endif

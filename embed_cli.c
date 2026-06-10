@@ -504,7 +504,7 @@ int main(int argc, char *argv[])
                 use_mlx = 1;
                 use_cuda = 0;
 #else
-                fprintf(stderr, "mlx backend not available (build with: make mlx)\n");
+                fprintf(stderr, "mlx backend not available (build with: make metal)\n");
                 return 1;
 #endif
             } else if (!strcmp(backend, "cuda")) {
@@ -571,7 +571,7 @@ int main(int argc, char *argv[])
             use_mlx = 1;
             use_cuda = 0;
 #else
-            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
+            fprintf(stderr, "--mlx not available (build with: make metal)\n");
             return 1;
 #endif
         }
