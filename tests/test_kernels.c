@@ -453,16 +453,6 @@ static void test_generic_vs_impl(void) {
     for (int o = 0; o < OUT; o++)
         expect_close("matvec_fused nobias generic-vs-impl", yg[o], yi[o], 1e-5f);
 
-    int bg = -1, bi = -1;
-    float vg = 0.0f, vi = 0.0f;
-    qwen_argmax_bf16_range_generic(x, W, IN, 1, OUT, &bg, &vg);
-    qwen_argmax_bf16_range_impl(x, W, IN, 1, OUT, &bi, &vi);
-    if (bg != bi) {
-        fprintf(stderr, "argmax generic-vs-impl: got %d want %d\n", bi, bg);
-        failures++;
-    }
-    expect_close("argmax val generic-vs-impl", vg, vi, 1e-5f);
-
     const int sizes[] = {1, 7, 64, NMAX};
     for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
         int n = sizes[t];

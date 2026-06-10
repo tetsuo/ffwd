@@ -68,12 +68,6 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
 /* Get tensor data as float32 (allocates, caller must free) */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get direct pointer to bf16 data in mmap'd region (no copy) */
-uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t);
-
-int safetensor_is_bf16(const safetensor_t *t);
 int64_t safetensor_numel(const safetensor_t *t);
-void safetensor_print(const safetensor_t *t);
-void safetensors_print_all(const safetensors_file_t *sf);
 
 #endif /* QWEN_SAFETENSORS_H */

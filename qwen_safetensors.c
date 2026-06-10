@@ -290,31 +290,6 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     return out;
 }
 
-int safetensor_is_bf16(const safetensor_t *t) {
-    return t && t->dtype == DTYPE_BF16;
-}
-
-uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t) {
-    if (!sf || !t || t->dtype != DTYPE_BF16) return NULL;
-    return (uint16_t *)safetensors_data(sf, t);
-}
-
-void safetensor_print(const safetensor_t *t) {
-    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
-    const char *dtype_name = t->dtype >= 0 && t->dtype <= 5 ?
-                             dtype_names[t->dtype] : "UNKNOWN";
-    printf("%s: dtype=%s, shape=[", t->name, dtype_name);
-    for (int i = 0; i < t->ndim; i++) {
-        printf("%ld%s", (long)t->shape[i], i < t->ndim - 1 ? ", " : "");
-    }
-    printf("]\n");
-}
-
-void safetensors_print_all(const safetensors_file_t *sf) {
-    printf("File: %s (%d tensors)\n", sf->path, sf->num_tensors);
-    for (int i = 0; i < sf->num_tensors; i++) safetensor_print(&sf->tensors[i]);
-}
-
 /* ========================================================================
  * Multi-shard operations
  * ======================================================================== */

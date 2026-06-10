@@ -2,7 +2,7 @@
  * qwen_kernels_avx.c - x86 SIMD hot kernels (AVX2+FMA, with AVX-512 when available)
  *
  * bf16 to f32 conversion: load 16 uint16, zero-extend to 32-bit, shift left 16.
- * Uses AVX-512F+BW for 16-wide bf16 matvec/argmax (dominant for seq_len==1), and
+ * Uses AVX-512F+BW for 16-wide bf16 matvec (dominant for seq_len==1), and
  * AVX2+FMA / AVX-512F for f32 attention helpers (which operate on cache-resident data).
  *
  * The bf16 matvec processes 4 output rows simultaneously to reduce instruction
@@ -154,100 +154,6 @@ void qwen_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16
     }
 }
 
-void qwen_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
-                                 int in_dim, int start, int end,
-                                 int *best_out, float *best_val_out) {
-    int best = start;
-    float best_val = -1e30f;
-    int o = start;
-
-    /* Process 4 rows at a time */
-    for (; o + 3 < end; o += 4) {
-        const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
-        const uint16_t *w1 = w0 + in_dim;
-        const uint16_t *w2 = w1 + in_dim;
-        const uint16_t *w3 = w2 + in_dim;
-
-        __m512 a0=_mm512_setzero_ps(), a1=_mm512_setzero_ps();
-        __m512 a2=_mm512_setzero_ps(), a3=_mm512_setzero_ps();
-        __m512 a4=_mm512_setzero_ps(), a5=_mm512_setzero_ps();
-        __m512 a6=_mm512_setzero_ps(), a7=_mm512_setzero_ps();
-        int k = 0;
-
-        for (; k + 32 <= in_dim; k += 32) {
-            __m512 xv0 = _mm512_loadu_ps(x + k);
-            __m512 xv1 = _mm512_loadu_ps(x + k + 16);
-            __m256i r0a=_mm256_loadu_si256((const __m256i*)(w0+k));
-            __m256i r0b=_mm256_loadu_si256((const __m256i*)(w0+k+16));
-            a0=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r0a),16)),xv0,a0);
-            a1=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r0b),16)),xv1,a1);
-            __m256i r1a=_mm256_loadu_si256((const __m256i*)(w1+k));
-            __m256i r1b=_mm256_loadu_si256((const __m256i*)(w1+k+16));
-            a2=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r1a),16)),xv0,a2);
-            a3=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r1b),16)),xv1,a3);
-            __m256i r2a=_mm256_loadu_si256((const __m256i*)(w2+k));
-            __m256i r2b=_mm256_loadu_si256((const __m256i*)(w2+k+16));
-            a4=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r2a),16)),xv0,a4);
-            a5=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r2b),16)),xv1,a5);
-            __m256i r3a=_mm256_loadu_si256((const __m256i*)(w3+k));
-            __m256i r3b=_mm256_loadu_si256((const __m256i*)(w3+k+16));
-            a6=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3a),16)),xv0,a6);
-            a7=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3b),16)),xv1,a7);
-        }
-        for (; k + 16 <= in_dim; k += 16) {
-            __m512 xv = _mm512_loadu_ps(x + k);
-            __m256i r0=_mm256_loadu_si256((const __m256i*)(w0+k));
-            __m256i r1=_mm256_loadu_si256((const __m256i*)(w1+k));
-            __m256i r2=_mm256_loadu_si256((const __m256i*)(w2+k));
-            __m256i r3=_mm256_loadu_si256((const __m256i*)(w3+k));
-            a0=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r0),16)),xv,a0);
-            a2=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r1),16)),xv,a2);
-            a4=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r2),16)),xv,a4);
-            a6=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3),16)),xv,a6);
-        }
-
-        float s0=_mm512_reduce_add_ps(_mm512_add_ps(a0,a1));
-        float s1=_mm512_reduce_add_ps(_mm512_add_ps(a2,a3));
-        float s2=_mm512_reduce_add_ps(_mm512_add_ps(a4,a5));
-        float s3=_mm512_reduce_add_ps(_mm512_add_ps(a6,a7));
-
-        for (; k < in_dim; k++) {
-            float xk=x[k];
-            uint32_t b0=((uint32_t)w0[k])<<16, b1=((uint32_t)w1[k])<<16;
-            uint32_t b2=((uint32_t)w2[k])<<16, b3=((uint32_t)w3[k])<<16;
-            float v0,v1,v2,v3;
-            memcpy(&v0,&b0,4); memcpy(&v1,&b1,4); memcpy(&v2,&b2,4); memcpy(&v3,&b3,4);
-            s0+=v0*xk; s1+=v1*xk; s2+=v2*xk; s3+=v3*xk;
-        }
-
-        if (s0>best_val){best_val=s0;best=o;}
-        if (s1>best_val){best_val=s1;best=o+1;}
-        if (s2>best_val){best_val=s2;best=o+2;}
-        if (s3>best_val){best_val=s3;best=o+3;}
-    }
-
-    /* Remaining 1-3 rows */
-    for (; o < end; o++) {
-        const uint16_t *w = W_bf16 + (size_t)o * in_dim;
-        __m512 acc = _mm512_setzero_ps();
-        int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
-            __m256i raw = _mm256_loadu_si256((const __m256i *)(w + k));
-            acc = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16)),
-                                  _mm512_loadu_ps(x + k), acc);
-        }
-        float sum = _mm512_reduce_add_ps(acc);
-        for (; k < in_dim; k++) {
-            uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
-            sum += wv*x[k];
-        }
-        if (sum > best_val) { best_val = sum; best = o; }
-    }
-
-    *best_out = best;
-    *best_val_out = best_val;
-}
-
 #else /* AVX2 only (or AVX-512F without BW) */
 
 /* Helper: bf16 to f32 for 8 elements */
@@ -315,36 +221,6 @@ void qwen_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16
         }
         y[o] = sum;
     }
-}
-
-void qwen_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
-                                 int in_dim, int start, int end,
-                                 int *best_out, float *best_val_out) {
-    int best = start;
-    float best_val = -1e30f;
-
-    for (int o = start; o < end; o++) {
-        const uint16_t *w = W_bf16 + (size_t)o * in_dim;
-        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
-        int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
-            __m256 wlo, whi;
-            bf16x16_to_f32(w + k, &wlo, &whi);
-            a0 = _mm256_fmadd_ps(wlo, _mm256_loadu_ps(x+k), a0);
-            a1 = _mm256_fmadd_ps(whi, _mm256_loadu_ps(x+k+8), a1);
-        }
-        a0 = _mm256_add_ps(a0, a1);
-        __m128 r = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
-        r = _mm_hadd_ps(r, r); r = _mm_hadd_ps(r, r);
-        float sum = _mm_cvtss_f32(r);
-        for (; k < in_dim; k++) {
-            uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
-            sum+=wv*x[k];
-        }
-        if (sum > best_val) { best_val = sum; best = o; }
-    }
-    *best_out = best;
-    *best_val_out = best_val;
 }
 
 #endif /* AVX-512F+BW vs AVX2 for bf16 */
