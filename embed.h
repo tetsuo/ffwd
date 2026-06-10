@@ -7,6 +7,17 @@
 #ifndef PPLX_EMBED_H
 #define PPLX_EMBED_H
 
+/* Public-API export annotation. The libraries are built with
+ * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * from the shared library; everything else stays internal. */
+#ifndef PPLX_API
+#if defined(__GNUC__)
+#define PPLX_API __attribute__((visibility("default")))
+#else
+#define PPLX_API
+#endif
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -75,7 +86,7 @@ typedef struct {
  * Reads config.json to determine model size (0.6B vs 4B).
  * Returns NULL on error.
  */
-pplx_model_t *pplx_model_load(const char *model_dir);
+PPLX_API pplx_model_t *pplx_model_load(const char *model_dir);
 
 /*
  * Load one contiguous transformer layer range for distributed execution.
@@ -85,20 +96,20 @@ pplx_model_t *pplx_model_load(const char *model_dir);
  * loads the final RMSNorm. Safetensors remain mmap-backed, so unselected
  * weights are not touched.
  */
-pplx_model_t *pplx_model_load_slice(const char *model_dir,
+PPLX_API pplx_model_t *pplx_model_load_slice(const char *model_dir,
                                     int layer_start, int layer_end);
 
-void pplx_model_free(pplx_model_t *model);
+PPLX_API void pplx_model_free(pplx_model_t *model);
 
 /*
  * Allocate/free mutable scratch buffers for a model. The model must outlive
  * workspaces created from it.
  */
-pplx_workspace_t *pplx_workspace_new(const pplx_model_t *model);
-void pplx_workspace_free(pplx_workspace_t *ws);
+PPLX_API pplx_workspace_t *pplx_workspace_new(const pplx_model_t *model);
+PPLX_API void pplx_workspace_free(pplx_workspace_t *ws);
 
 /* Config accessor for opaque model ownership. */
-const pplx_config_t *pplx_model_config(const pplx_model_t *model);
+PPLX_API const pplx_config_t *pplx_model_config(const pplx_model_t *model);
 
 /*
  * Current mutable workspace memory owned by this workspace, in bytes.
@@ -106,7 +117,7 @@ const pplx_config_t *pplx_model_config(const pplx_model_t *model);
  * This includes the workspace struct, scratch buffers, and RoPE cache capacity.
  * It does not include immutable mmap'd model weights.
  */
-size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
+PPLX_API size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
 
 /*
  * Compute embedding for a token sequence.
@@ -122,14 +133,14 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
  *
  * Returns malloc'd float[hidden_size] (caller frees). NULL on error.
  */
-float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API float *pplx_model_embed(const pplx_model_t *model, pplx_workspace_t *ws,
                         const int *token_ids, int n_tokens);
 
 /*
  * Compute one embedding into caller-provided out[hidden_size].
  * Returns 0 on success, -1 on error.
  */
-int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
                           const int *token_ids, int n_tokens,
                           float *out_embedding);
 
@@ -142,7 +153,7 @@ int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *ws,
  *
  * Returns 0 on success, -1 on error.
  */
-int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
                            const pplx_input_t *inputs, int batch,
                            float *out_embeddings);
 
@@ -159,7 +170,7 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
  *
  * This is the core execution boundary used by layer-sharded inference.
  */
-int pplx_model_forward_slice_batch(const pplx_model_t *model,
+PPLX_API int pplx_model_forward_slice_batch(const pplx_model_t *model,
                                    pplx_workspace_t *ws,
                                    const pplx_input_t *inputs, int batch,
                                    const float *input_states,
@@ -173,7 +184,7 @@ int pplx_model_forward_slice_batch(const pplx_model_t *model,
  * states is [sum(n_tokens), hidden_size]. seq_lengths contains one positive
  * token count per sequence. The states must already include final RMSNorm.
  */
-int pplx_pool_batch(const pplx_config_t *cfg, const float *states,
+PPLX_API int pplx_pool_batch(const pplx_config_t *cfg, const float *states,
                     const int *seq_lengths, int batch,
                     float *out_embeddings);
 
@@ -185,14 +196,14 @@ int pplx_pool_batch(const pplx_config_t *cfg, const float *states,
  * Useful for contextual (late-chunking) models where you need
  * per-token embeddings before splitting by separator positions.
  */
-float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API float *pplx_model_forward(const pplx_model_t *model, pplx_workspace_t *ws,
                           const int *token_ids, int n_tokens);
 
 /*
  * Run the transformer forward pass into caller-provided
  * out_states[n_tokens * hidden_size]. Returns 0 on success, -1 on error.
  */
-int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
                             const int *token_ids, int n_tokens,
                             float *out_states);
 
@@ -203,7 +214,7 @@ int pplx_model_forward_into(const pplx_model_t *model, pplx_workspace_t *ws,
  * pplx_model_forward_into(). Each span is mean pooled into
  * out_embeddings[n_spans, hidden_size] without L2 normalization.
  */
-int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
+PPLX_API int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
                     const pplx_span_t *spans, int n_spans,
                     float *out_embeddings);
 
@@ -211,7 +222,7 @@ int pplx_pool_spans(const pplx_config_t *cfg, const float *states, int n_tokens,
  * Run one contextual sequence and pool selected token spans.
  * Returns 0 on success, -1 on error.
  */
-int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
+PPLX_API int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
                            const int *token_ids, int n_tokens,
                            const pplx_span_t *spans, int n_spans,
                            float *out_embeddings);
@@ -222,7 +233,7 @@ int pplx_model_embed_spans(const pplx_model_t *model, pplx_workspace_t *ws,
  * Documents attend independently, RoPE positions restart for each document,
  * and out_embeddings contains spans in document order.
  */
-int pplx_model_embed_spans_batch(const pplx_model_t *model,
+PPLX_API int pplx_model_embed_spans_batch(const pplx_model_t *model,
                                  pplx_workspace_t *ws,
                                  const pplx_context_input_t *inputs, int batch,
                                  float *out_embeddings);
@@ -233,13 +244,13 @@ int pplx_model_embed_spans_batch(const pplx_model_t *model,
  * Returns 0 on success. Returns -1 for invalid arguments or a zero-length
  * vector, which cannot be normalized.
  */
-int pplx_l2_normalize(float *vec, int dim);
+PPLX_API int pplx_l2_normalize(float *vec, int dim);
 
 /*
  * Cosine similarity between two vectors.
  * Returns 0 for invalid arguments or if either vector has zero length.
  */
-float pplx_cosine_similarity(const float *a, const float *b, int dim);
+PPLX_API float pplx_cosine_similarity(const float *a, const float *b, int dim);
 
 /*
  * Late-interaction model API.
@@ -248,21 +259,21 @@ float pplx_cosine_similarity(const float *a, const float *b, int dim);
  * projected by the snapshot's 1_Dense head and L2-normalized per token by
  * default, matching ColBERT/MaxSim scoring semantics.
  */
-pplx_late_model_t *pplx_late_model_load(const char *model_dir);
-void pplx_late_model_free(pplx_late_model_t *model);
+PPLX_API pplx_late_model_t *pplx_late_model_load(const char *model_dir);
+PPLX_API void pplx_late_model_free(pplx_late_model_t *model);
 
-pplx_late_workspace_t *pplx_late_workspace_new(const pplx_late_model_t *model);
-void pplx_late_workspace_free(pplx_late_workspace_t *ws);
+PPLX_API pplx_late_workspace_t *pplx_late_workspace_new(const pplx_late_model_t *model);
+PPLX_API void pplx_late_workspace_free(pplx_late_workspace_t *ws);
 
-const pplx_config_t *pplx_late_model_config(const pplx_late_model_t *model);
-int pplx_late_model_token_dim(const pplx_late_model_t *model);
+PPLX_API const pplx_config_t *pplx_late_model_config(const pplx_late_model_t *model);
+PPLX_API int pplx_late_model_token_dim(const pplx_late_model_t *model);
 
 /*
  * Encode token_ids into out_vectors[n_tokens, token_dim].
  *
  * If normalize is non-zero, every non-zero token vector is L2-normalized.
  */
-int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
+PPLX_API int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
                                   pplx_late_workspace_t *ws,
                                   const int *token_ids, int n_tokens,
                                   int normalize, float *out_vectors);
@@ -270,7 +281,7 @@ int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
 /*
  * Sum over query tokens of max dot product against document tokens.
  */
-float pplx_late_maxsim(const float *query_vectors, int query_tokens,
+PPLX_API float pplx_late_maxsim(const float *query_vectors, int query_tokens,
                        const float *doc_vectors, int doc_tokens,
                        int dim);
 
@@ -281,13 +292,13 @@ float pplx_late_maxsim(const float *query_vectors, int query_tokens,
  * doc_vectors[doc_offsets[i] * dim .. doc_offsets[i + 1] * dim).
  * scores is caller-provided [docs].
  */
-int pplx_late_maxsim_batch(const float *query_vectors, int query_tokens,
+PPLX_API int pplx_late_maxsim_batch(const float *query_vectors, int query_tokens,
                            const float *doc_vectors,
                            const int *doc_offsets, int docs,
                            int dim, float *scores);
 
 /* Verbose level: 0=quiet, 1=info, 2=debug */
-extern int pplx_verbose;
-extern int qwen_verbose;
+PPLX_API extern int pplx_verbose;
+PPLX_API extern int qwen_verbose;
 
 #endif /* PPLX_EMBED_H */

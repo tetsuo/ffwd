@@ -3,7 +3,9 @@ CC          = gcc
 # not assume finite math or approximate libm calls: full -ffast-math produced
 # NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
 # -fapprox-func are the unsafe parts and stay off).
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -fPIC \
+# -fvisibility=hidden pairs with PPLX_API in the public headers: a new
+# public function without the annotation will be missing from the shared lib.
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -fPIC -fvisibility=hidden \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
 LDFLAGS     = -lm -lpthread

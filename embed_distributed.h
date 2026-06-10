@@ -5,6 +5,17 @@
 #ifndef PPLX_DISTRIBUTED_H
 #define PPLX_DISTRIBUTED_H
 
+/* Public-API export annotation. The libraries are built with
+ * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * from the shared library; everything else stays internal. */
+#ifndef PPLX_API
+#if defined(__GNUC__)
+#define PPLX_API __attribute__((visibility("default")))
+#else
+#define PPLX_API
+#endif
+#endif
+
 #include "embed.h"
 
 typedef struct pplx_dist_client pplx_dist_client_t;
@@ -19,17 +30,17 @@ typedef struct {
  * Open a coordinator-side connection. The coordinator owns layers
  * [0, local_layer_end); the remote worker must own [local_layer_end, N).
  */
-pplx_dist_client_t *pplx_dist_client_open(const char *model_dir,
+PPLX_API pplx_dist_client_t *pplx_dist_client_open(const char *model_dir,
                                           const char *host, int port,
                                           int local_layer_end, int use_mlx);
-pplx_dist_client_t *pplx_dist_client_open_with_options(
+PPLX_API pplx_dist_client_t *pplx_dist_client_open_with_options(
     const char *model_dir, const char *host, int port,
     int local_layer_end, int use_mlx, const pplx_dist_options_t *opts);
-void pplx_dist_client_free(pplx_dist_client_t *client);
+PPLX_API void pplx_dist_client_free(pplx_dist_client_t *client);
 
-const pplx_config_t *pplx_dist_client_config(const pplx_dist_client_t *client);
+PPLX_API const pplx_config_t *pplx_dist_client_config(const pplx_dist_client_t *client);
 
-int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
+PPLX_API int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
                                  const pplx_input_t *inputs, int batch,
                                  float *out_embeddings);
 
@@ -37,9 +48,9 @@ int pplx_dist_client_embed_batch(pplx_dist_client_t *client,
  * Run a final-stage worker until the process is terminated. The worker owns
  * [layer_start, layer_end), and layer_end must be the model's final layer.
  */
-int pplx_dist_run_worker(const char *model_dir, const char *host, int port,
+PPLX_API int pplx_dist_run_worker(const char *model_dir, const char *host, int port,
                          int layer_start, int layer_end, int use_mlx);
-int pplx_dist_run_worker_with_options(
+PPLX_API int pplx_dist_run_worker_with_options(
     const char *model_dir, const char *host, int port,
     int layer_start, int layer_end, int use_mlx,
     const pplx_dist_options_t *opts);

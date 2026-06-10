@@ -1,6 +1,17 @@
 #ifndef PPLX_SERVER_H
 #define PPLX_SERVER_H
 
+/* Public-API export annotation. The libraries are built with
+ * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * from the shared library; everything else stays internal. */
+#ifndef PPLX_API
+#if defined(__GNUC__)
+#define PPLX_API __attribute__((visibility("default")))
+#else
+#define PPLX_API
+#endif
+#endif
+
 #include <stdbool.h>
 
 typedef struct {
@@ -27,6 +38,6 @@ typedef struct {
     const char *api_key;
 } pplx_server_config_t;
 
-int pplx_run_server(const pplx_server_config_t *cfg);
+PPLX_API int pplx_run_server(const pplx_server_config_t *cfg);
 
 #endif
