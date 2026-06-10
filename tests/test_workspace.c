@@ -104,6 +104,66 @@ done:
     return rc;
 }
 
+/* A multi-document contextual batch must match per-document runs.
+ * doc0 is chunks 0 and 1 joined by a separator token; doc1 is chunk 2. */
+static int check_spans_batch_parity(const pplx_model_t *model,
+                                    pplx_workspace_t *ws,
+                                    int *const ids[], const int *ntok,
+                                    int separator_id,
+                                    const pplx_config_t *cfg)
+{
+    int rc = 1;
+    int dim = cfg->hidden_size;
+    int n0 = ntok[0] + 1 + ntok[1];
+    int *doc0 = (int *)malloc((size_t)n0 * sizeof(int));
+    float *expected = (float *)calloc((size_t)3 * dim, sizeof(float));
+    float *actual = (float *)calloc((size_t)3 * dim, sizeof(float));
+    if (!doc0 || !expected || !actual) {
+        fprintf(stderr, "spans-batch allocation failure\n");
+        goto done;
+    }
+    memcpy(doc0, ids[0], (size_t)ntok[0] * sizeof(int));
+    doc0[ntok[0]] = separator_id;
+    memcpy(doc0 + ntok[0] + 1, ids[1], (size_t)ntok[1] * sizeof(int));
+
+    pplx_span_t spans0[2] = {{0, ntok[0]}, {ntok[0] + 1, ntok[1]}};
+    pplx_span_t span1 = {0, ntok[2]};
+    if (pplx_model_embed_spans(model, ws, doc0, n0, spans0, 2,
+                               expected) != 0 ||
+        pplx_model_embed_spans(model, ws, ids[2], ntok[2], &span1, 1,
+                               expected + (size_t)2 * dim) != 0) {
+        fprintf(stderr, "singleton contextual embedding failed\n");
+        goto done;
+    }
+
+    pplx_context_input_t inputs[2] = {
+        {{doc0, n0}, spans0, 2},
+        {{ids[2], ntok[2]}, &span1, 1},
+    };
+    if (pplx_model_embed_spans_batch(model, ws, inputs, 2, actual) != 0) {
+        fprintf(stderr, "batched contextual embedding failed\n");
+        goto done;
+    }
+    if (pplx_model_embed_spans_batch(model, ws, NULL, 2, actual) == 0 ||
+        pplx_model_embed_spans_batch(model, ws, inputs, 0, actual) == 0) {
+        fprintf(stderr, "spans batch accepted invalid arguments\n");
+        goto done;
+    }
+
+    if (max_abs_diff(expected, actual, 3 * dim) > 0.00005f) {
+        fprintf(stderr, "contextual batch disagrees with singletons: %g\n",
+                max_abs_diff(expected, actual, 3 * dim));
+        goto done;
+    }
+
+    rc = 0;
+done:
+    free(actual);
+    free(expected);
+    free(doc0);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     char fixture_dir[1024];
@@ -268,6 +328,19 @@ int main(int argc, char **argv)
 
     if (check_alloc_and_pooling_variants(model, batch_ws, ids[0], ntok[0],
                                          states, batched, cfg) != 0) {
+        free(states);
+        free(normalized);
+        free(single);
+        free(batched);
+        goto fail;
+    }
+
+    /* Same separator resolution as the server: the fixture vocab defines
+     * <|endoftext|>, real snapshots use the reserved id. */
+    int sep_id = qwen_tokenizer_token_id(tok, "<|endoftext|>");
+    if (sep_id < 0) sep_id = PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
+    if (check_spans_batch_parity(model, batch_ws, ids, ntok, sep_id,
+                                 cfg) != 0) {
         free(states);
         free(normalized);
         free(single);
