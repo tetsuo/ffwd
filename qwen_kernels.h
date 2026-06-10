@@ -35,9 +35,8 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim);
 
 /* bf16 weight variants */
-void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
-                      const float *b, int seq_len, int in_dim, int out_dim);
 
+void qwen_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n);
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
@@ -56,8 +55,6 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  int seq_len, int in_dim, int q_dim,
                                  int kv_dim);
 
-void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
-                         int M, int K, int N);
 
 /* Dot product using the best available local SIMD implementation. */
 float qwen_dot_f32(const float *a, const float *b, int n);

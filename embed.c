@@ -405,20 +405,42 @@ static void copy_weight_row(float *dst, const pplx_weight_ref_t *w,
     }
 }
 
-static void linear_nobias_weight(float *y, const float *x,
-                                 const pplx_weight_ref_t *w,
+static int ensure_bf16_widen(pplx_workspace_t *ws, size_t count)
+{
+    if (ws->bf16_widen_count >= count) return 0;
+    float *p = (float *)realloc(ws->bf16_widen, count * sizeof(float));
+    if (!p) return -1;
+    ws->bf16_widen = p;
+    ws->bf16_widen_count = count;
+    return 0;
+}
+
+static void linear_nobias_weight(pplx_workspace_t *ws, float *y,
+                                 const float *x, const pplx_weight_ref_t *w,
                                  int seq_len, int in_dim, int out_dim)
 {
     if (w->dtype == DTYPE_F32) {
         qwen_linear_nobias(y, x, (const float *)w->data,
                            seq_len, in_dim, out_dim);
-    } else {
-        qwen_linear_nobias_bf16(y, x, (const uint16_t *)w->data,
-                                seq_len, in_dim, out_dim);
+        return;
     }
+    if (seq_len > 16) {
+        /* Widen the weight matrix once into workspace scratch and use the
+         * BLAS-backed F32 path; below that the fused BF16 row kernels win. */
+        size_t count = (size_t)out_dim * (size_t)in_dim;
+        if (ensure_bf16_widen(ws, count) == 0) {
+            qwen_bf16_to_f32_buf(ws->bf16_widen, (const uint16_t *)w->data,
+                                 count);
+            qwen_linear_nobias(y, x, ws->bf16_widen, seq_len, in_dim, out_dim);
+            return;
+        }
+    }
+    qwen_linear_nobias_bf16(y, x, (const uint16_t *)w->data,
+                            seq_len, in_dim, out_dim);
 }
 
-static void linear_qkv_weight(float *q, float *k, float *v, const float *x,
+static void linear_qkv_weight(pplx_workspace_t *ws, float *q, float *k,
+                              float *v, const float *x,
                               const pplx_weight_ref_t *wq,
                               const pplx_weight_ref_t *wk,
                               const pplx_weight_ref_t *wv,
@@ -435,12 +457,13 @@ static void linear_qkv_weight(float *q, float *k, float *v, const float *x,
         return;
     }
 
-    linear_nobias_weight(q, x, wq, seq_len, in_dim, q_dim);
-    linear_nobias_weight(k, x, wk, seq_len, in_dim, kv_dim);
-    linear_nobias_weight(v, x, wv, seq_len, in_dim, kv_dim);
+    linear_nobias_weight(ws, q, x, wq, seq_len, in_dim, q_dim);
+    linear_nobias_weight(ws, k, x, wk, seq_len, in_dim, kv_dim);
+    linear_nobias_weight(ws, v, x, wv, seq_len, in_dim, kv_dim);
 }
 
-static void linear_pair_weight(float *a, float *b, const float *x,
+static void linear_pair_weight(pplx_workspace_t *ws, float *a, float *b,
+                               const float *x,
                                const pplx_weight_ref_t *wa,
                                const pplx_weight_ref_t *wb,
                                int seq_len, int in_dim, int a_dim, int b_dim)
@@ -454,8 +477,8 @@ static void linear_pair_weight(float *a, float *b, const float *x,
         return;
     }
 
-    linear_nobias_weight(a, x, wa, seq_len, in_dim, a_dim);
-    linear_nobias_weight(b, x, wb, seq_len, in_dim, b_dim);
+    linear_nobias_weight(ws, a, x, wa, seq_len, in_dim, a_dim);
+    linear_nobias_weight(ws, b, x, wb, seq_len, in_dim, b_dim);
 }
 
 /* ========================================================================
@@ -738,6 +761,7 @@ void pplx_workspace_free(pplx_workspace_t *ws)
     free(ws->attn_scores);
     free(ws->offsets);
     free(ws->rope_cos); free(ws->rope_sin);
+    free(ws->bf16_widen);
     free(ws);
 }
 
@@ -867,8 +891,8 @@ int pplx_late_model_encode_tokens(const pplx_late_model_t *model,
                                 n_tokens, ws->states) != 0)
         return -1;
 
-    linear_nobias_weight(out_vectors, ws->states, &model->projection,
-                         n_tokens, hidden, dim);
+    linear_nobias_weight(ws->base_ws, out_vectors, ws->states,
+                         &model->projection, n_tokens, hidden, dim);
     if (normalize) {
         for (int i = 0; i < n_tokens; i++) {
             if (pplx_l2_normalize(out_vectors + (size_t)i * dim, dim) != 0)
@@ -976,6 +1000,13 @@ size_t pplx_workspace_nbytes(const pplx_workspace_t *ws)
     if (add_size(total, offset_bytes, &total) != 0)
         return SIZE_MAX;
     if (add_size(total, ws->attn_scores_bytes, &total) != 0)
+        return SIZE_MAX;
+
+    size_t widen_bytes = 0;
+    if (ws->bf16_widen_count > 0 &&
+        mul_size(ws->bf16_widen_count, sizeof(float), &widen_bytes) != 0)
+        return SIZE_MAX;
+    if (add_size(total, widen_bytes, &total) != 0)
         return SIZE_MAX;
 
     return total;
@@ -1088,7 +1119,7 @@ static int forward_packed_slice_inplace(const pplx_model_t *model,
 
         qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
 
-        linear_qkv_weight(q_buf, k_buf, v_buf, x_norm,
+        linear_qkv_weight(ws, q_buf, k_buf, v_buf, x_norm,
                           &l->wq, &l->wk, &l->wv,
                           total_seq, hidden, q_dim, kv_dim);
 
@@ -1109,16 +1140,16 @@ static int forward_packed_slice_inplace(const pplx_model_t *model,
             n_kv_heads, head_dim, scale, ws->attn_scores,
             ws->attn_scores_bytes);
 
-        linear_nobias_weight(proj_out, attn_out, &l->wo, total_seq, q_dim, hidden);
+        linear_nobias_weight(ws, proj_out, attn_out, &l->wo, total_seq, q_dim, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);
 
         qwen_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
 
-        linear_pair_weight(ffn_gate, ffn_up, x_norm,
+        linear_pair_weight(ws, ffn_gate, ffn_up, x_norm,
                            &l->gate_proj, &l->up_proj,
                            total_seq, hidden, inter, inter);
         qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
-        linear_nobias_weight(proj_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
+        linear_nobias_weight(ws, proj_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);
     }
 

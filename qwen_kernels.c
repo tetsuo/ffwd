@@ -261,7 +261,7 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
 }
 
 /* Convert bf16 buffer to f32 buffer */
-static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+void qwen_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     size_t i = 0;
     uint32_t *d = (uint32_t *)(void *)dst;
@@ -279,100 +279,6 @@ static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     for (size_t i = 0; i < n; i++)
         d[i] = ((uint32_t)src[i]) << 16;
 #endif
-}
-
-/* Reusable scratch buffer for bf16->f32 conversion */
-static float *bf16_scratch = NULL;
-static size_t bf16_scratch_cap = 0;
-
-static float *bf16_get_scratch(size_t n) {
-    if (n > bf16_scratch_cap) {
-        free(bf16_scratch);
-        bf16_scratch = (float *)malloc(n * sizeof(float));
-        bf16_scratch_cap = bf16_scratch ? n : 0;
-    }
-    return bf16_scratch;
-}
-
-typedef struct {
-    const uint16_t *src;
-    size_t n;
-    float *dst_f32;
-} bf16_cache_entry_t;
-
-static bf16_cache_entry_t *bf16_cache = NULL;
-static int bf16_cache_len = 0;
-static int bf16_cache_cap = 0;
-static size_t bf16_cache_bytes = 0;
-static size_t bf16_cache_limit_bytes = 0;
-static int bf16_cache_limit_init = 0;
-
-static void bf16_cache_init_limit(void) {
-    if (bf16_cache_limit_init) return;
-    bf16_cache_limit_init = 1;
-
-    /* Default OFF. Override with QWEN_BF16_CACHE_MB=<n> to enable. */
-    unsigned long long mb = 0;
-    const char *env = getenv("QWEN_BF16_CACHE_MB");
-    if (env && env[0] != '\0') {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) mb = v;
-    }
-    bf16_cache_limit_bytes = (size_t)(mb * 1024ULL * 1024ULL);
-
-    if (qwen_verbose >= 2) {
-        fprintf(stderr, "BF16 cache: limit=%llu MB\n", mb);
-    }
-}
-
-static const float *bf16_get_cached_f32(const uint16_t *src, size_t n) {
-    bf16_cache_init_limit();
-
-    for (int i = 0; i < bf16_cache_len; i++) {
-        if (bf16_cache[i].src == src && bf16_cache[i].n == n) {
-            return bf16_cache[i].dst_f32;
-        }
-    }
-
-    if (bf16_cache_limit_bytes == 0) return NULL;
-
-    size_t bytes = n * sizeof(float);
-    if (bytes > bf16_cache_limit_bytes) return NULL;
-    if (bf16_cache_bytes + bytes > bf16_cache_limit_bytes) return NULL;
-
-    float *dst = (float *)malloc(bytes);
-    if (!dst) return NULL;
-    bf16_to_f32_buf(dst, src, n);
-
-    if (bf16_cache_len == bf16_cache_cap) {
-        int new_cap = bf16_cache_cap > 0 ? bf16_cache_cap * 2 : 256;
-        bf16_cache_entry_t *tmp = (bf16_cache_entry_t *)realloc(
-            bf16_cache, (size_t)new_cap * sizeof(bf16_cache_entry_t));
-        if (!tmp) {
-            free(dst);
-            return NULL;
-        }
-        bf16_cache = tmp;
-        bf16_cache_cap = new_cap;
-    }
-
-    bf16_cache[bf16_cache_len].src = src;
-    bf16_cache[bf16_cache_len].n = n;
-    bf16_cache[bf16_cache_len].dst_f32 = dst;
-    bf16_cache_len++;
-    bf16_cache_bytes += bytes;
-    return dst;
-}
-
-static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
-    const float *cached = bf16_get_cached_f32(src, n);
-    if (cached) return cached;
-
-    float *scratch = bf16_get_scratch(n);
-    if (!scratch) return NULL;
-    bf16_to_f32_buf(scratch, src, n);
-    return scratch;
 }
 
 /*
@@ -673,30 +579,10 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
     }
-    if (seq_len <= 16) {
-        bf16_linear_rows(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
-        return;
-    }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
-}
-
-void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
-                      const float *b, int seq_len, int in_dim, int out_dim) {
-    if (seq_len == 1) {
-        bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
-        return;
-    }
-    if (seq_len <= 16) {
-        bf16_linear_rows(y, x, W_bf16, b, seq_len, in_dim, out_dim);
-        return;
-    }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
+    /* Callers route longer sequences through an F32-widened weight matrix in
+     * caller-owned scratch (see embed.c); this per-row path stays correct for
+     * any length. */
+    bf16_linear_rows(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
 }
 
 /* Find argmax over a range of output rows [start, end).
@@ -758,17 +644,6 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
     return best;
 }
 
-void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
-                         int M, int K, int N) {
-    if (M == 1) {
-        bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
-    } else {
-        size_t n = (size_t)N * K;
-        const float *B_f32 = bf16_get_f32_view(B_bf16, n);
-        if (!B_f32) return;
-        qwen_matmul_t(C, A, B_f32, M, K, N);
-    }
-}
 
 /* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)

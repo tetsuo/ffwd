@@ -59,6 +59,12 @@ struct pplx_workspace {
     float *rope_cos;
     float *rope_sin;
     int    rope_cache_cap;
+
+    /* F32 view of one BF16 weight matrix for SGEMM dispatch, grown to the
+     * largest projection. Workspace-owned so concurrent workspaces on one
+     * model never share conversion scratch. */
+    float *bf16_widen;
+    size_t bf16_widen_count;
 };
 
 #endif /* PPLX_EMBED_INTERNAL_H */
