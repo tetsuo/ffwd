@@ -55,17 +55,6 @@ static int utf8_encode_cp(int cp, char out[4]) {
     return 3;
 }
 
-static int utf8_encode_full_cp(int cp, char out[4]) {
-    if (cp < 0x80) return utf8_encode_cp(cp, out);
-    if (cp < 0x800) return utf8_encode_cp(cp, out);
-    if (cp < 0x10000) return utf8_encode_cp(cp, out);
-    out[0] = (char)(0xF0 | (cp >> 18));
-    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-    out[3] = (char)(0x80 | (cp & 0x3F));
-    return 4;
-}
-
 /*
  * Decode a GPT-2 encoded token string (vocab key) to raw bytes/UTF-8 text.
  * Returns allocated string (caller must free).
@@ -635,7 +624,7 @@ static char *normalize_nfc_latin(const char *text) {
             int composed = compose_latin_mark(cp, mark);
             if (composed) {
                 char tmp[4];
-                int n = utf8_encode_full_cp(composed, tmp);
+                int n = utf8_encode_cp(composed, tmp);
                 for (int i = 0; i < n; i++) out[w++] = tmp[i];
                 p += mark_len;
                 continue;
@@ -1039,7 +1028,7 @@ static int normalize_nfc_latin_into(qwen_tokenizer_workspace_t *ws,
             int composed = compose_latin_mark(cp, mark);
             if (composed) {
                 char tmp[4];
-                int n = utf8_encode_full_cp(composed, tmp);
+                int n = utf8_encode_cp(composed, tmp);
                 memcpy(ws->normalized + w, tmp, (size_t)n);
                 w += (size_t)n;
                 p += mark_len;
