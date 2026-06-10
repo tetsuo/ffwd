@@ -361,6 +361,59 @@ static char *str_concat2(const char *a, const char *b) {
     return r;
 }
 
+/* ========================================================================
+ * Integer-pair BPE merges: (left_id, right_id) -> (rank, merged_id)
+ * ======================================================================== */
+
+typedef struct {
+    uint64_t key;       /* (left_id << 32) | right_id; UINT64_MAX = empty */
+    int rank;
+    int merged_id;
+} pair_merge_entry_t;
+
+static uint64_t pair_hash(uint64_t k) {
+    /* splitmix64 finalizer */
+    k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL;
+    k ^= k >> 27; k *= 0x94d049bb133111ebULL;
+    k ^= k >> 31;
+    return k;
+}
+
+static void pair_map_insert(pair_merge_entry_t *map, int cap, uint64_t key,
+                            int rank, int merged_id) {
+    int mask = cap - 1;
+    int idx = (int)(pair_hash(key) & (uint64_t)mask);
+    for (int probe = 0; probe < cap; probe++, idx = (idx + 1) & mask) {
+        if (map[idx].key == UINT64_MAX) {
+            map[idx].key = key;
+            map[idx].rank = rank;
+            map[idx].merged_id = merged_id;
+            return;
+        }
+        if (map[idx].key == key) return; /* first (lowest) rank wins */
+    }
+}
+
+/* Returns the rank and sets *merged_id, or INT_MAX when the pair never
+ * merges. */
+static int pair_merge_lookup(const qwen_tokenizer_t *tok, int left, int right,
+                             int *merged_id) {
+    const pair_merge_entry_t *map =
+        (const pair_merge_entry_t *)tok->int_merges;
+    uint64_t key = ((uint64_t)(uint32_t)left << 32) | (uint32_t)right;
+    int mask = tok->int_merges_cap - 1;
+    int idx = (int)(pair_hash(key) & (uint64_t)mask);
+    for (int probe = 0; probe < tok->int_merges_cap;
+         probe++, idx = (idx + 1) & mask) {
+        if (map[idx].key == UINT64_MAX) return INT_MAX;
+        if (map[idx].key == key) {
+            *merged_id = map[idx].merged_id;
+            return map[idx].rank;
+        }
+    }
+    return INT_MAX;
+}
+
 static int merge_rank(const qwen_tokenizer_t *tok, const char *a, const char *b) {
     if (!tok->merge_map || tok->merge_map_cap <= 0) return INT_MAX;
 
@@ -863,7 +916,34 @@ struct qwen_tokenizer_workspace {
     int syms_cap;
     int *ids;
     int ids_cap;
+    /* Integer-pair BPE merge scratch: token id, doubly-linked live order,
+     * and the cached (rank, merged id) of the pair starting at each live
+     * position. */
+    int *bpe_ids;
+    int *bpe_prv;
+    int *bpe_nxt;
+    int *bpe_rnk;
+    int *bpe_mrg;
+    int bpe_cap;
 };
+
+static int reserve_bpe(qwen_tokenizer_workspace_t *ws, int need) {
+    if (ws->bpe_cap >= need) return 0;
+    int new_cap = ws->bpe_cap ? ws->bpe_cap : 64;
+    while (new_cap < need) {
+        if (new_cap > INT_MAX / 2) return -1;
+        new_cap *= 2;
+    }
+    int *p;
+#define R(field) \
+    p = (int *)realloc(ws->field, (size_t)new_cap * sizeof(int)); \
+    if (!p) return -1; \
+    ws->field = p;
+    R(bpe_ids) R(bpe_prv) R(bpe_nxt) R(bpe_rnk) R(bpe_mrg)
+#undef R
+    ws->bpe_cap = new_cap;
+    return 0;
+}
 
 static int reserve_bytes(char **buf, size_t *cap, size_t need) {
     if (*cap >= need) return 0;
@@ -997,11 +1077,11 @@ static int output_append_id(int *out_ids, int out_cap, int *n_ids,
     return 0;
 }
 
-static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
-                                qwen_tokenizer_workspace_t *ws,
-                                const char *mapped,
-                                int *out_ids, int out_cap,
-                                int *n_ids, int *overflow) {
+static int encode_bpe_word_into_slow(const qwen_tokenizer_t *tok,
+                                     qwen_tokenizer_workspace_t *ws,
+                                     const char *mapped,
+                                     int *out_ids, int out_cap,
+                                     int *n_ids, int *overflow) {
     if (!mapped || !*mapped) return 0;
 
     int n_syms = 0;
@@ -1065,6 +1145,82 @@ static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
         if (id < 0) return -1;
         output_append_id(out_ids, out_cap, n_ids, overflow, id);
     }
+    return 0;
+}
+
+/* Integer-pair BPE merge: token ids in a doubly-linked array with cached
+ * pair ranks; each merge updates only the two adjacent pairs. Falls back to
+ * the string-based loop when the int tables are unavailable. Identical
+ * output: initial ids are the byte-level single-char token ids and every
+ * merge result is the vocab id of the concatenated pair. */
+static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
+                                qwen_tokenizer_workspace_t *ws,
+                                const char *mapped,
+                                int *out_ids, int out_cap,
+                                int *n_ids, int *overflow) {
+    if (!mapped || !*mapped) return 0;
+    if (!tok->int_merges || !tok->cp_to_id)
+        return encode_bpe_word_into_slow(tok, ws, mapped, out_ids, out_cap,
+                                         n_ids, overflow);
+
+    int n = 0;
+    for (const unsigned char *p = (const unsigned char *)mapped; *p; ) {
+        p += utf8_char_len(*p);
+        n++;
+    }
+    if (n <= 0) return 0;
+    if (reserve_bpe(ws, n) != 0) return -1;
+
+    int *ids = ws->bpe_ids, *prv = ws->bpe_prv, *nxt = ws->bpe_nxt;
+    int *rnk = ws->bpe_rnk, *mrg = ws->bpe_mrg;
+
+    int i = 0;
+    for (const unsigned char *p = (const unsigned char *)mapped; *p; ) {
+        int len = utf8_char_len(*p);
+        int cp;
+        if (len == 1) cp = *p;
+        else if (len == 2) cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F);
+        else cp = 512; /* byte-level alphabet never exceeds two bytes */
+        int id = cp < 512 ? tok->cp_to_id[cp] : -1;
+        if (id < 0)
+            return encode_bpe_word_into_slow(tok, ws, mapped, out_ids,
+                                             out_cap, n_ids, overflow);
+        ids[i] = id;
+        prv[i] = i - 1;
+        nxt[i] = i + 1 < n ? i + 1 : -1;
+        i++;
+        p += len;
+    }
+
+    for (int j = 0; j < n - 1; j++)
+        rnk[j] = pair_merge_lookup(tok, ids[j], ids[j + 1], &mrg[j]);
+    if (n > 0) rnk[n - 1] = INT_MAX;
+
+    for (;;) {
+        int best = -1, best_rank = INT_MAX;
+        for (int j = 0; j != -1 && nxt[j] != -1; j = nxt[j]) {
+            if (rnk[j] < best_rank) {
+                best_rank = rnk[j];
+                best = j;
+            }
+        }
+        if (best < 0) break;
+
+        ids[best] = mrg[best];
+        int dead = nxt[best];
+        nxt[best] = nxt[dead];
+        if (nxt[dead] != -1) prv[nxt[dead]] = best;
+
+        if (prv[best] != -1)
+            rnk[prv[best]] = pair_merge_lookup(tok, ids[prv[best]], ids[best],
+                                               &mrg[prv[best]]);
+        rnk[best] = nxt[best] != -1
+            ? pair_merge_lookup(tok, ids[best], ids[nxt[best]], &mrg[best])
+            : INT_MAX;
+    }
+
+    for (int j = 0; j != -1; j = nxt[j])
+        output_append_id(out_ids, out_cap, n_ids, overflow, ids[j]);
     return 0;
 }
 
@@ -1270,6 +1426,18 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
         fclose(f);
         return -1;
     }
+    tok->int_merges_cap = next_pow2(n_pairs * 2);
+    pair_merge_entry_t *pm = (pair_merge_entry_t *)
+        calloc((size_t)tok->int_merges_cap, sizeof(pair_merge_entry_t));
+    if (pm) {
+        for (int i = 0; i < tok->int_merges_cap; i++) {
+            pm[i].key = UINT64_MAX;
+            pm[i].rank = INT_MAX;
+            pm[i].merged_id = -1;
+        }
+    }
+    tok->int_merges = pm;
+
     int rank = 0;
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
@@ -1283,12 +1451,65 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
         memcpy(key + la + 1, b, lb);
         key[la + 1 + lb] = '\0';
 
+        if (tok->int_merges) {
+            /* Resolve (a, b) and the merged token a+b to vocab ids; if any
+             * merge is unresolvable, drop the whole int table and keep the
+             * string-based loop as the only path. */
+            const str_int_entry_t *vm = (const str_int_entry_t *)tok->vocab_map;
+            int left = map_get(vm, tok->vocab_map_cap, a);
+            int right = map_get(vm, tok->vocab_map_cap, b);
+            char ab[8192];
+            int merged = -1;
+            if (la + lb < sizeof(ab)) {
+                memcpy(ab, a, la);
+                memcpy(ab + la, b, lb);
+                ab[la + lb] = '\0';
+                merged = map_get(vm, tok->vocab_map_cap, ab);
+            }
+            if (left < 0 || right < 0 || merged < 0) {
+                free(tok->int_merges);
+                tok->int_merges = NULL;
+                tok->int_merges_cap = 0;
+            } else {
+                pair_map_insert((pair_merge_entry_t *)tok->int_merges,
+                                tok->int_merges_cap,
+                                ((uint64_t)(uint32_t)left << 32) |
+                                    (uint32_t)right,
+                                rank, merged);
+            }
+        }
         (void)map_insert_owned((str_int_entry_t *)tok->merge_map,
                                tok->merge_map_cap, &key, rank);
         free(key);
         rank++;
     }
     fclose(f);
+
+    /* Byte-level unicode codepoint -> single-char token id table. */
+    if (tok->int_merges) {
+        init_gpt2_mapping();
+        tok->cp_to_id = (int *)malloc(512 * sizeof(int));
+        if (tok->cp_to_id) {
+            for (int i = 0; i < 512; i++) tok->cp_to_id[i] = -1;
+            for (int byte = 0; byte < 256 && tok->cp_to_id; byte++) {
+                int cp = gpt2_byte_to_unicode[byte];
+                char buf[4];
+                int n;
+                if (cp < 0x80) { buf[0] = (char)cp; n = 1; }
+                else { buf[0] = (char)(0xC0 | (cp >> 6));
+                       buf[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+                buf[n] = '\0';
+                int id = map_get((const str_int_entry_t *)tok->vocab_map,
+                                 tok->vocab_map_cap, buf);
+                if (id < 0) {
+                    free(tok->cp_to_id);
+                    tok->cp_to_id = NULL;
+                } else {
+                    tok->cp_to_id[cp] = id;
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -1445,6 +1666,11 @@ void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws) {
     free(ws->arena);
     free(ws->syms);
     free(ws->ids);
+    free(ws->bpe_ids);
+    free(ws->bpe_prv);
+    free(ws->bpe_nxt);
+    free(ws->bpe_rnk);
+    free(ws->bpe_mrg);
     free(ws);
 }
 
@@ -1519,5 +1745,7 @@ void qwen_tokenizer_free(qwen_tokenizer_t *tok) {
         free(tok->merge_map);
     }
     free(tok->vocab_map);
+    free(tok->int_merges);
+    free(tok->cp_to_id);
     free(tok);
 }

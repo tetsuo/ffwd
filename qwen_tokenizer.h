@@ -19,6 +19,14 @@ typedef struct {
     int vocab_map_cap;
     void *merge_map;
     int merge_map_cap;
+    /* Integer-pair BPE merge table: (left_id, right_id) -> (rank, merged_id).
+     * NULL when the vocab could not resolve every merge; encoding then falls
+     * back to the string-based merge loop. */
+    void *int_merges;
+    int int_merges_cap;
+    /* Byte-level unicode codepoint -> single-character token id (512 slots),
+     * or NULL when any byte token is missing from the vocab. */
+    int *cp_to_id;
 } qwen_tokenizer_t;
 
 typedef struct qwen_tokenizer_workspace qwen_tokenizer_workspace_t;
