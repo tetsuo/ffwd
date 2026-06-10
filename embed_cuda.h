@@ -5,25 +5,36 @@
 #ifndef PPLX_EMBED_CUDA_H
 #define PPLX_EMBED_CUDA_H
 
+/* Public-API export annotation. The libraries are built with
+ * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * from the shared library; everything else stays internal. */
+#ifndef PPLX_API
+#if defined(__GNUC__)
+#define PPLX_API __attribute__((visibility("default")))
+#else
+#define PPLX_API
+#endif
+#endif
+
 #include "embed.h"
 
 typedef struct pplx_cuda_ctx pplx_cuda_ctx_t;
 
-int pplx_cuda_set_fast_gemm(const char *mode);
-int pplx_cuda_set_weights_bf16(int on);
+PPLX_API int pplx_cuda_set_fast_gemm(const char *mode);
+PPLX_API int pplx_cuda_set_weights_bf16(int on);
 
-pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir);
-void pplx_cuda_free(pplx_cuda_ctx_t *ctx);
+PPLX_API pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir);
+PPLX_API void pplx_cuda_free(pplx_cuda_ctx_t *ctx);
 
-const pplx_config_t *pplx_cuda_config(const pplx_cuda_ctx_t *ctx);
+PPLX_API const pplx_config_t *pplx_cuda_config(const pplx_cuda_ctx_t *ctx);
 
-int pplx_cuda_embed_into(pplx_cuda_ctx_t *ctx, const int *token_ids,
+PPLX_API int pplx_cuda_embed_into(pplx_cuda_ctx_t *ctx, const int *token_ids,
                          int n_tokens, float *out_embedding);
-float *pplx_cuda_embed(pplx_cuda_ctx_t *ctx, const int *token_ids,
+PPLX_API float *pplx_cuda_embed(pplx_cuda_ctx_t *ctx, const int *token_ids,
                        int n_tokens);
-int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+PPLX_API int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
                           int batch, float *out_embeddings);
-int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
+PPLX_API int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
                                 const pplx_context_input_t *inputs,
                                 int batch, float *out_embeddings);
 

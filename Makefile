@@ -136,7 +136,7 @@ cuda:
 # -arch=native targets the GPU present at build time (we always build CUDA
 # on the machine that runs it), avoiding first-load PTX JIT.
 embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
-	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC,-fvisibility=hidden -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
 # Shared library (built by every backend target from the same objects)
@@ -197,7 +197,7 @@ test:
 	./tests/test_late
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/cli_under_test \
 	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
-	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c -lm
 	./tests/test_cli ./tests/cli_under_test
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
@@ -255,7 +255,7 @@ coverage:
 	LLVM_PROFILE_FILE=$(COV_DIR)/late.profraw ./tests/test_late
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/cli_under_test \
 	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
-	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c -lm
 	LLVM_PROFILE_FILE=$(COV_DIR)/cli_%p.profraw ./tests/test_cli ./tests/cli_under_test
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
