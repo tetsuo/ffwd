@@ -183,15 +183,21 @@ static void bm_rms_norm(bench_state_t *b)
     free(y); free(w); free(x);
 }
 
-static void bm_swiglu(bench_state_t *b)
+/* The engine's SwiGLU op mutates gate in place, so each iteration restores
+ * it first; the memcpy is a constant part of the measured loop. */
+static void bm_silu_mul(bench_state_t *b)
 {
-    float *gate_up = alloc_f32((size_t)SEQ * 2 * INTER, 26);
-    float *out = alloc_f32((size_t)SEQ * INTER, 27);
+    size_t n = (size_t)SEQ * INTER;
+    float *gate0 = alloc_f32(n, 26);
+    float *gate = alloc_f32(n, 26);
+    float *up = alloc_f32(n, 27);
     bench_begin(b);
-    for (long i = 0; i < b->n; i++)
-        qwen_swiglu_multiply(out, gate_up, SEQ, INTER);
-    bench_sink += out[0];
-    free(out); free(gate_up);
+    for (long i = 0; i < b->n; i++) {
+        memcpy(gate, gate0, n * sizeof(float));
+        qwen_silu_mul_inplace(gate, up, (int)n);
+    }
+    bench_sink += gate[0];
+    free(up); free(gate); free(gate0);
 }
 
 static void bm_dot(bench_state_t *b)
@@ -217,7 +223,7 @@ static const bench_case_t CASES[] = {
     {"attn/softmax_128x128", bm_softmax},
     {"attn/rope_seq128_16h", bm_rope},
     {"norm/rms_s8_1024", bm_rms_norm},
-    {"act/swiglu_s8_3072", bm_swiglu},
+    {"act/silu_mul_s8_3072", bm_silu_mul},
     {"reduce/dot_1024", bm_dot},
 };
 

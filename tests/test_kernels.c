@@ -277,6 +277,103 @@ static void test_bf16_qkv(void) {
     qwen_set_threads(1);
 }
 
+/* seq==1 routes through bf16_matvec_threaded; a pool splits the output
+ * rows across matvec_worker calls. Both must match the scalar reference. */
+static void check_bf16_matvec(int n_threads) {
+    enum { in_dim = 19, out_dim = 23 };
+    float x[in_dim];
+    uint16_t w[out_dim * in_dim];
+    float got[out_dim];
+
+    for (int i = 0; i < in_dim; i++)
+        x[i] = sinf((float)i * 0.37f) - 0.2f;
+    for (int i = 0; i < out_dim * in_dim; i++)
+        w[i] = f32_to_bf16(cosf((float)i * 0.21f) + 0.05f);
+
+    qwen_set_threads(n_threads);
+    qwen_linear_nobias_bf16(got, x, w, 1, in_dim, out_dim);
+
+    for (int o = 0; o < out_dim; o++) {
+        float want = 0.0f;
+        for (int i = 0; i < in_dim; i++)
+            want += x[i] * bf16_to_f32(w[o * in_dim + i]);
+        expect_close("bf16_matvec", got[o], want, 1e-6f);
+    }
+}
+
+static void test_bf16_matvec(void) {
+    check_bf16_matvec(1);
+    check_bf16_matvec(4);
+    qwen_set_threads(1);
+}
+
+/* Above QWEN_RMS_NORM_PARALLEL_ELEMS (256k elements) rms_norm fans out to
+ * rms_norm_worker; row-wise math is identical, so results must match the
+ * single-thread run exactly. */
+static void test_rms_norm_threaded(void) {
+    enum { seq = 96, hidden = 3072 };   /* 294912 elements */
+    size_t elems = (size_t)seq * hidden;
+    float *x = (float *)malloc(elems * sizeof(float));
+    float *w = (float *)malloc((size_t)hidden * sizeof(float));
+    float *one = (float *)malloc(elems * sizeof(float));
+    float *many = (float *)malloc(elems * sizeof(float));
+    if (!x || !w || !one || !many) {
+        fprintf(stderr, "rms_norm_threaded: allocation failure\n");
+        failures++;
+        free(many); free(one); free(w); free(x);
+        return;
+    }
+    unsigned s = 7u;
+    for (size_t i = 0; i < elems; i++) {
+        s = s * 1664525u + 1013904223u;
+        x[i] = (float)((s >> 8) & 0xFFFF) / 32768.0f - 1.0f;
+    }
+    for (int i = 0; i < hidden; i++)
+        w[i] = 0.8f + 0.01f * (float)(i % 7);
+
+    qwen_set_threads(1);
+    qwen_rms_norm(one, x, w, seq, hidden, 1e-6f);
+    qwen_set_threads(4);
+    qwen_rms_norm(many, x, w, seq, hidden, 1e-6f);
+    qwen_set_threads(1);
+
+    for (size_t i = 0; i < elems; i++) {
+        if (one[i] != many[i]) {
+            fprintf(stderr, "rms_norm_threaded: mismatch at %zu: %.9g %.9g\n",
+                    i, one[i], many[i]);
+            failures++;
+            break;
+        }
+    }
+    free(many); free(one); free(w); free(x);
+}
+
+/* bf16->f32 widening is an exact bit shift; check the SIMD body and the
+ * remainder lanes against the scalar definition. */
+static void test_bf16_widen_buf(void) {
+    enum { NMAXW = 67 };
+    static const int sizes[] = {1, 7, 8, 15, 64, NMAXW};
+    uint16_t src[NMAXW];
+    float got[NMAXW];
+
+    for (int i = 0; i < NMAXW; i++)
+        src[i] = f32_to_bf16(sinf((float)i * 0.13f) * 3.0f);
+
+    for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
+        int n = sizes[t];
+        memset(got, 0, sizeof(got));
+        qwen_bf16_to_f32_buf(got, src, (size_t)n);
+        for (int i = 0; i < n; i++) {
+            float want = bf16_to_f32(src[i]);
+            if (memcmp(&got[i], &want, sizeof(float)) != 0) {
+                fprintf(stderr, "bf16_widen n=%d at %d: %.9g want %.9g\n",
+                        n, i, got[i], want);
+                failures++;
+            }
+        }
+    }
+}
+
 static void check_bf16_pair(int n_threads) {
     enum { seq = 4, in_dim = 5, a_dim = 3, b_dim = 7 };
     float x[seq * in_dim];
@@ -404,6 +501,9 @@ int main(void) {
     test_packed_gqa_attention_long();
     test_bf16_linear();
     test_bf16_qkv();
+    test_bf16_matvec();
+    test_rms_norm_threaded();
+    test_bf16_widen_buf();
     test_bf16_pair();
     test_generic_vs_impl();
     if (failures != 0) return 1;

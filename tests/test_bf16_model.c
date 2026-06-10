@@ -69,6 +69,30 @@ int main(void) {
         return 1;
     }
 
+    /* Sequences longer than 16 tokens take the widen-to-F32 weight path
+     * (linear_nobias_weight); parity must hold there too. */
+    enum { LONG_N = 24 };
+    int long_ids[LONG_N];
+    for (int i = 0; i < LONG_N; i++) long_ids[i] = (i % 14) + 1;
+    if (pplx_model_embed_into(mf32, wf32, long_ids, LONG_N, a) != 0 ||
+        pplx_model_embed_into(mbf16, wbf16, long_ids, LONG_N, b) != 0) {
+        fprintf(stderr, "long-sequence embedding failed\n");
+        return 1;
+    }
+    float long_diff = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        if (!isfinite(a[i]) || !isfinite(b[i])) {
+            fprintf(stderr, "non-finite long-sequence value\n");
+            return 1;
+        }
+        float d = fabsf(a[i] - b[i]);
+        if (d > long_diff) long_diff = d;
+    }
+    if (long_diff > 2e-5f) {
+        fprintf(stderr, "bad widen-path parity: max_diff=%.9g\n", long_diff);
+        return 1;
+    }
+
     printf("ok: bf16 model parity dim=%d max_abs_diff=%.9g norm=%.9g\n",
            dim, max_diff, norm);
 

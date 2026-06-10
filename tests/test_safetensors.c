@@ -109,6 +109,18 @@ int main(void)
              ONE_TENSOR_B, zeros, 4);
     check("multi", path_in("valid_multi"), 1);
 
+    /* Payload accounting across shards: two 4-byte F32 tensors. */
+    {
+        multi_safetensors_t *ms = multi_safetensors_open(path_in("valid_multi"));
+        size_t nbytes = 0;
+        if (!ms || multi_safetensors_data_nbytes(ms, &nbytes) != 0 ||
+            nbytes != 8) {
+            fprintf(stderr, "multi data_nbytes: got %zu want 8\n", nbytes);
+            failures++;
+        }
+        multi_safetensors_close(ms);
+    }
+
     mkdir(path_in("missing"), 0755);
     write_st(path_in("missing/model-00001-of-00002.safetensors"),
              ONE_TENSOR_X, zeros, 4);
