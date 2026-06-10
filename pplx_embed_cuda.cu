@@ -537,14 +537,14 @@ static int launch_check(void)
 }
 
 // Compute type for CUDA GEMMs. Default is exact F32 (== cublasSgemm).
-// PPLX_CUDA_FAST_GEMM={bf16,tf32,16f} selects a reduced-precision tensor-core
+// PPLX_CUDA_GEMM_MODE={bf16,tf32,16f} selects a reduced-precision tensor-core
 // matmul that keeps F32 inputs/outputs and F32 accumulation but rounds operands
 // internally.
 static cublasComputeType_t gemm_compute(void)
 {
     static int env_init = 0;
     if (!g_gemm_compute_set && !env_init) {
-        const char *e = getenv("PPLX_CUDA_FAST_GEMM");
+        const char *e = getenv("PPLX_CUDA_GEMM_MODE");
         if (e && parse_gemm_compute(e, &g_gemm_compute) == 0)
             g_gemm_compute_set = 1;
         env_init = 1;

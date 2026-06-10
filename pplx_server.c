@@ -2266,29 +2266,26 @@ static int mlx_memory_preflight(const pplx_server_config_t *cfg) {
                    "skipping MLX memory preflight");
         return 0;
     }
-    uint64_t budget =
-        physical / 100 * PPLX_MLX_MEMORY_BUDGET_PERCENT +
-        physical % 100 * PPLX_MLX_MEMORY_BUDGET_PERCENT / 100;
+    double utilization = cfg->memory_utilization > 0.0
+        ? cfg->memory_utilization
+        : PPLX_MLX_MEMORY_BUDGET_PERCENT / 100.0;
+    uint64_t budget = (uint64_t)((double)physical * utilization);
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log("pplx-serve: MLX memory preflight: %.1f GiB tensors, "
-               "%.1f GiB estimated resident, %.1f GiB safety budget",
+               "%.1f GiB estimated resident, %.1f GiB budget "
+               "(%.2f of physical memory)",
                (double)payload / gib, (double)estimated / gib,
-               (double)budget / gib);
+               (double)budget / gib, utilization);
     if (cfg->mlx_quantize_bits) {
         server_log("pplx-serve: MLX %d-bit quantization enabled; preflight "
                    "uses source payload as a conservative peak estimate",
                    cfg->mlx_quantize_bits);
     }
     if (estimated <= budget) return 0;
-    if (cfg->allow_memory_overcommit) {
-        server_log("pplx-serve: warning: MLX memory estimate exceeds safety "
-                   "budget; continuing due to --allow-memory-overcommit");
-        return 0;
-    }
-    server_log("pplx-serve: refusing MLX model set above host-memory safety "
+    server_log("pplx-serve: refusing MLX model set above the host-memory "
                "budget");
-    server_log("pplx-serve: use BF16 artifacts, load fewer models, or pass "
-               "--allow-memory-overcommit");
+    server_log("pplx-serve: use BF16 artifacts, load fewer models, or raise "
+               "--memory-utilization (values above 1.0 overcommit)");
     return -1;
 }
 

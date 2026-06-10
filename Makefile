@@ -34,8 +34,12 @@ CUDA_SRCS = pplx_embed_cuda.cu
 
 OBJS     = $(SRCS:.c=.o)
 MLX_OBJS = $(MLX_SRCS:.c=.o)
-TARGET   = pplx_embed
-LIB      = libpplxembed.a
+TARGET        = pplx_embed
+SERVER_TARGET = pplx-embed-server
+LIB           = libpplxembed.a
+
+KERNEL_SRCS = qwen_asr_kernels.c qwen_asr_kernels_generic.c \
+              qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c
 
 ifeq ($(shell uname -s),Darwin)
 SHARED_LIB   = libpplxembed.dylib
@@ -45,7 +49,7 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all blas mlx cuda shared debug clean help
+.PHONY: all blas mlx cuda shared test debug clean help
 
 all: help
 
@@ -57,14 +61,16 @@ help:
 	@echo "  make mlx      Build with Apple MLX GPU backend (recommended on Apple Silicon)"
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
 	@echo "  make shared   Build the shared library ($(SHARED_LIB), BLAS backend)"
+	@echo "  make test     Build and run the C test suite (no model files needed)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
-	@echo "Every backend target also produces the static library $(LIB)."
+	@echo "Each backend target builds ./$(TARGET) (CLI), ./$(SERVER_TARGET)"
+	@echo "(HTTP API), and the static library $(LIB)."
 	@echo ""
 	@echo "Usage:"
 	@echo "  ./pplx_embed -d /path/to/model-dir \"text1\" \"text2\""
-	@echo "  ./pplx_embed -d /path/to/model-dir --mlx \"text1\" \"text2\"  (if built with make mlx)"
+	@echo "  ./pplx-embed-server --model pplx-embed-v1-0.6b=/path/to/model-dir"
 
 # =============================================================================
 # BLAS build (Apple Accelerate on macOS, OpenBLAS on Linux)
@@ -84,7 +90,7 @@ blas: LDFLAGS += -lopenblas
 endif
 blas:
 	$(MAKE) clean
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
 # MLX build (Apple Silicon GPU - uses mlx-c pure C API)
@@ -105,7 +111,7 @@ mlx: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
 endif
 mlx:
 	$(MAKE) clean
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_mlx.o"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_mlx.o"
 
 # =============================================================================
 # CUDA build (Linux NVIDIA GPU - uses CUDA Runtime + cuBLAS)
@@ -118,7 +124,7 @@ cuda: LDFLAGS += -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
 cuda:
 	$(MAKE) clean
 	$(MAKE) pplx_embed_cuda.o
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_cuda.o"
+	$(MAKE) $(TARGET) $(SERVER_TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_cuda.o"
 
 pplx_embed_cuda.o: pplx_embed_cuda.cu pplx_embed_cuda.h pplx_embed_internal.h pplx_embed.h
 	$(NVCC) -O3 -std=c++17 -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
@@ -140,6 +146,26 @@ shared:
 $(SHARED_LIB): $(OBJS) $(EXTRA_OBJS)
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
 
+
+# =============================================================================
+# Tests (no model files required)
+# =============================================================================
+ifeq ($(UNAME_S),Darwin)
+TEST_BLAS_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+TEST_BLAS_LDFLAGS = -framework Accelerate
+else
+TEST_BLAS_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+TEST_BLAS_LDFLAGS = -lopenblas
+endif
+
+test:
+	$(CC) -Wall -Wextra -O2 -I. -o tests/test_kernels_generic \
+	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread
+	./tests/test_kernels_generic
+	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) -I. -o tests/test_kernels_blas \
+	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	./tests/test_kernels_blas
+
 # =============================================================================
 # Debug build
 # =============================================================================
@@ -160,6 +186,9 @@ $(LIB): $(OBJS) $(EXTRA_OBJS)
 $(TARGET): $(LIB) main.o
 	$(CC) $(CFLAGS) -o $@ main.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
 
+$(SERVER_TARGET): $(LIB) server_main.o
+	$(CC) $(CFLAGS) -o $@ server_main.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
+
 # =============================================================================
 # Compile rules
 # =============================================================================
@@ -175,7 +204,10 @@ pplx_server.o: pplx_server.c pplx_server.h pplx_embed.h pplx_embed_mlx.h qwen_as
 pplx_embed_mlx.o: pplx_embed_mlx.c pplx_embed_mlx.h pplx_embed.h qwen_asr_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-main.o: main.c pplx_embed.h pplx_distributed.h pplx_server.h qwen_asr_kernels.h qwen_asr_tokenizer.h
+main.o: main.c pplx_embed.h pplx_distributed.h qwen_asr_kernels.h qwen_asr_tokenizer.h
+	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
+
+server_main.o: server_main.c pplx_embed.h pplx_server.h qwen_asr_kernels.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h
@@ -201,5 +233,6 @@ deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
 
 # =============================================================================
 clean:
-	rm -f $(OBJS) pplx_embed_mlx.o pplx_embed_cuda.o main.o $(TARGET) \
-	      $(LIB) libpplxembed.dylib libpplxembed.so
+	rm -f $(OBJS) pplx_embed_mlx.o pplx_embed_cuda.o main.o server_main.o \
+	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
+	      tests/test_kernels_generic tests/test_kernels_blas
