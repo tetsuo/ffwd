@@ -56,7 +56,9 @@ static const char *TF_MERGES[] = {
     "\xC4\xA0w or",
 };
 enum { TF_N_MERGED = sizeof(TF_MERGED) / sizeof(TF_MERGED[0]) };
-enum { TF_VOCAB_SIZE = 256 + TF_N_MERGED };
+/* The special token goes last so contextual-separator ids resolve in-range. */
+enum { TF_EOT_ID = 256 + TF_N_MERGED };
+enum { TF_VOCAB_SIZE = TF_EOT_ID + 1 };
 
 /* Write vocab.json + merges.txt into dir. Returns 0 on success. */
 static int tf_write_vocab(const char *dir)
@@ -73,6 +75,7 @@ static int tf_write_vocab(const char *dir)
     }
     for (int i = 0; i < TF_N_MERGED; i++)
         fprintf(f, ", \"%s\": %d", TF_MERGED[i], 256 + i);
+    fprintf(f, ", \"<|endoftext|>\": %d", TF_EOT_ID);
     fputs("}", f);
     fclose(f);
 

@@ -37,6 +37,10 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path);
 /* Decode a single token ID to text. Returns pointer to internal string. */
 const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id);
 
+/* Look up the id of a raw vocab.json token string (e.g. "<|endoftext|>").
+ * Returns -1 when the token is not in the vocab. */
+int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *token);
+
 /* Encode UTF-8 text into token IDs using BPE.
  * Returns malloc'd array of token IDs and sets *out_n_tokens.
  * Returns NULL on error (and sets *out_n_tokens to 0). */

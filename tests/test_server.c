@@ -228,7 +228,7 @@ static int http_req(int port, const char *method, const char *path,
 }
 
 typedef struct {
-    pplx_server_model_spec_t spec;
+    pplx_server_model_spec_t spec[2];
     pplx_server_config_t cfg;
     int rc;
 } srv_ctx;
@@ -306,15 +306,15 @@ static void test_http_embeddings(int port)
                          "{\"model\":\"pplx-embed-v1-0.6b\","
                          "\"input\":[]}", NULL, NULL) == 422);
 
-    /* Contextual endpoint: standard id is the wrong enum, contextual id is
-     * valid but not loaded. */
+    /* Contextual endpoint: standard id is the wrong enum, the 4B contextual
+     * id is valid but not loaded. */
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
                          TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\","
                          "\"input\":[[\"a\"]]}", NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
                          TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"pplx-embed-context-v1-4b\","
                          "\"input\":[[\"a\"]]}", NULL, NULL) == 503);
 
     /* Happy path, float encoding, single string input. */
@@ -429,6 +429,122 @@ static void test_http_embeddings(int port)
     }
 }
 
+/* data[di].data[ci].embedding from a contextual response. */
+static cJSON *ctx_chunk_emb(cJSON *root, int di, int ci)
+{
+    cJSON *docs = cJSON_GetObjectItemCaseSensitive(root, "data");
+    cJSON *doc = cJSON_GetArrayItem(docs, di);
+    cJSON *chunks = cJSON_GetObjectItemCaseSensitive(doc, "data");
+    cJSON *item = cJSON_GetArrayItem(chunks, ci);
+    return cJSON_GetObjectItemCaseSensitive(item, "embedding");
+}
+
+static double emb_max_absdiff(cJSON *a, cJSON *b)
+{
+    if (!cJSON_IsArray(a) || !cJSON_IsArray(b)) return 1e9;
+    int n = cJSON_GetArraySize(a);
+    if (n != cJSON_GetArraySize(b)) return 1e9;
+    double m = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = fabs(cJSON_GetArrayItem(a, i)->valuedouble -
+                        cJSON_GetArrayItem(b, i)->valuedouble);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+static void test_http_contextual(int port)
+{
+    char *body = NULL;
+
+    /* Input must be an array of chunk arrays; chunks must be non-empty. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
+                         TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "\"input\":\"hi\"}", NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
+                         TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "\"input\":[[\"\"]]}", NULL, NULL) == 422);
+
+    /* Happy path: chunks concatenate per document with one separator token
+     * between them, one embedding per chunk in document order. Fixture
+     * token counts: hello=1, world=3, held=2, one separator in doc 0, so
+     * usage must report 7. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
+                         TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "\"input\":[[\"hello\",\"world\"],[\"held\"]],"
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *multi = body ? cJSON_Parse(body) : NULL;
+    TEST_ASSERT(multi != NULL);
+    free(body);
+    body = NULL;
+    if (multi) {
+        cJSON *docs = cJSON_GetObjectItemCaseSensitive(multi, "data");
+        TEST_ASSERT(cJSON_IsArray(docs) && cJSON_GetArraySize(docs) == 2);
+        for (int di = 0; di < 2; di++) {
+            cJSON *doc = cJSON_GetArrayItem(docs, di);
+            cJSON *idx = cJSON_GetObjectItemCaseSensitive(doc, "index");
+            cJSON *chunks = cJSON_GetObjectItemCaseSensitive(doc, "data");
+            TEST_ASSERT(idx && idx->valueint == di);
+            TEST_ASSERT(cJSON_IsArray(chunks));
+            TEST_ASSERT(cJSON_GetArraySize(chunks) == (di == 0 ? 2 : 1));
+            for (int ci = 0; ci < cJSON_GetArraySize(chunks); ci++) {
+                cJSON *item = cJSON_GetArrayItem(chunks, ci);
+                cJSON *cidx = cJSON_GetObjectItemCaseSensitive(item, "index");
+                cJSON *emb = ctx_chunk_emb(multi, di, ci);
+                TEST_ASSERT(cidx && cidx->valueint == ci);
+                TEST_ASSERT(cJSON_IsArray(emb) &&
+                            cJSON_GetArraySize(emb) == 1024);
+            }
+        }
+        cJSON *usage = cJSON_GetObjectItemCaseSensitive(multi, "usage");
+        cJSON *total = usage
+            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        TEST_ASSERT(total && total->valueint == 7);
+    }
+
+    /* A single-chunk document has no separators and its pooling span covers
+     * the whole sequence, so it must match the standard embedding of the
+     * same text from the same weights. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
+                         TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "\"input\":[[\"hello\"]],"
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *single = body ? cJSON_Parse(body) : NULL;
+    TEST_ASSERT(single != NULL);
+    free(body);
+    body = NULL;
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "\"input\":\"hello\","
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *std = body ? cJSON_Parse(body) : NULL;
+    TEST_ASSERT(std != NULL);
+    free(body);
+    body = NULL;
+
+    if (multi && single && std) {
+        cJSON *std_emb = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(std, "data"),
+                               0), "embedding");
+        cJSON *alone = ctx_chunk_emb(single, 0, 0);
+        cJSON *in_doc = ctx_chunk_emb(multi, 0, 0);
+        TEST_ASSERT(emb_max_absdiff(std_emb, alone) < 1e-4);
+        /* Whole-document attention: the same chunk next to a neighbor must
+         * pool to a different vector. */
+        TEST_ASSERT(emb_max_absdiff(alone, in_doc) > 1e-3);
+    }
+    cJSON_Delete(multi);
+    cJSON_Delete(single);
+    cJSON_Delete(std);
+}
+
 static void test_http_server(void)
 {
     char dir[1024];
@@ -454,10 +570,14 @@ static void test_http_server(void)
 
     srv_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.spec.id = "pplx-embed-v1-0.6b";
-    ctx.spec.path = dir;
-    ctx.cfg.models = &ctx.spec;
-    ctx.cfg.n_models = 1;
+    /* Both 0.6b slots serve the same tiny weights; the contextual slot
+     * resolves its separator from the fixture's <|endoftext|>. */
+    ctx.spec[0].id = "pplx-embed-v1-0.6b";
+    ctx.spec[0].path = dir;
+    ctx.spec[1].id = "pplx-embed-context-v1-0.6b";
+    ctx.spec[1].path = dir;
+    ctx.cfg.models = ctx.spec;
+    ctx.cfg.n_models = 2;
     ctx.cfg.port = port;
     ctx.cfg.batch_size = 2;
     ctx.cfg.batch_wait_us = 1000;
@@ -477,7 +597,10 @@ static void test_http_server(void)
         usleep(50 * 1000);
     }
     TEST_ASSERT(up);
-    if (up) test_http_embeddings(port);
+    if (up) {
+        test_http_embeddings(port);
+        test_http_contextual(port);
+    }
 
     stop_signal_handler(SIGTERM);
     pthread_join(th, NULL);

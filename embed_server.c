@@ -2151,7 +2151,14 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
                    path);
         return -1;
     }
-    m->context_separator_id = PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
+    /* The contextual chunk separator is the tokenizer's <|endoftext|>. The
+     * released models keep added special tokens out of vocab.json, so the
+     * family constant is the normal case; a vocab that does define the
+     * token (e.g. small test models) takes precedence so the id stays
+     * inside that model's embedding table. */
+    int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
+    m->context_separator_id = sep_id >= 0
+        ? sep_id : PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
 #ifdef USE_MLX
     if (s->use_mlx) {
         /* MLX streams are thread-local. The inference worker loads the MLX

@@ -1644,6 +1644,12 @@ const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id) {
     return tok->id_to_text[token_id] ? tok->id_to_text[token_id] : "";
 }
 
+int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *token) {
+    if (!tok || !token || !tok->vocab_map) return -1;
+    return map_get((const str_int_entry_t *)tok->vocab_map,
+                   tok->vocab_map_cap, token);
+}
+
 int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens) {
     if (out_n_tokens) *out_n_tokens = 0;
     if (!tok || !text || text[0] == '\0') return NULL;
