@@ -12,6 +12,9 @@ tests/test_late
 tests/test_cli
 tests/cli_under_test
 bench/bench_tokenizer
+bench/bench_kernels
+bench/bench_model
+bench/results/
 coverage/
 book/
 .venv/

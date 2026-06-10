@@ -48,7 +48,8 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda test coverage bench-tokenizer debug clean help
+.PHONY: all cpu metal cuda test coverage bench bench-model bench-tokenizer \
+        debug clean help
 
 all: help
 
@@ -61,6 +62,9 @@ help:
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
 	@echo "  make test     Build and run the C test suite (no model files needed)"
 	@echo "  make coverage Test-suite line coverage report (clang/llvm-cov)"
+	@echo "  make bench    Kernel microbenchmarks; records bench/results/*.json"
+	@echo "  make bench-model MODEL_DIR=...  End-to-end embedding benchmark"
+	@echo "                (compare records with scripts/benchstat.py)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
@@ -272,6 +276,29 @@ bench-tokenizer:
 	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
 	    bench/bench_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS) -lm -lpthread
 	@echo "run: bench/bench_tokenizer <model_dir> [runs]"
+
+# =============================================================================
+# Regression microbenchmarks (Go-style; see bench/bench.h). Each run records
+# a JSON sample set under bench/results/, keyed by commit; compare two
+# records with scripts/benchstat.py to see if a change helped or hurt.
+# =============================================================================
+BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
+BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -I.
+
+bench:
+	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_kernels \
+	    bench/bench_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	@mkdir -p bench/results
+	./bench/bench_kernels --json bench/results/kernels-$(BENCH_STAMP).json
+	@echo "compare: scripts/benchstat.py bench/results/OLD.json bench/results/NEW.json"
+
+bench-model:
+	@test -n "$(MODEL_DIR)" || { echo "usage: make bench-model MODEL_DIR=/path/to/model-dir"; exit 1; }
+	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_model \
+	    bench/bench_model.c embed.c qwen_safetensors.c $(KERNEL_SRCS) \
+	    -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	@mkdir -p bench/results
+	./bench/bench_model "$(MODEL_DIR)" --json bench/results/model-$(BENCH_STAMP).json
 
 # =============================================================================
 # Debug build
