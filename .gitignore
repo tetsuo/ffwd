@@ -6,6 +6,7 @@ tests/test_kernels_*
 tests/test_safetensors
 tests/test_bf16_model
 tests/test_server
+tests/test_tokenizer
 bench/bench_tokenizer
 book/
 .venv/

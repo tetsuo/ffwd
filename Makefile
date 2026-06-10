@@ -164,6 +164,9 @@ test:
 	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) -I. -o tests/test_kernels_blas \
 	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_kernels_blas
+	$(CC) -Wall -Wextra -O2 -I. -o tests/test_tokenizer \
+	    tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS) -lm -lpthread
+	./tests/test_tokenizer
 	$(CC) -Wall -Wextra -O2 -I. -o tests/test_safetensors \
 	    tests/test_safetensors.c qwen_safetensors.c
 	./tests/test_safetensors
@@ -252,4 +255,5 @@ clean:
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
+	      tests/test_tokenizer \
 	      bench/bench_tokenizer
