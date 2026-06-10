@@ -1,7 +1,11 @@
 CC          = gcc
-# Keep IEEE math semantics by default. Some GCC/OpenBLAS Linux builds produced
-# NaN embeddings with -ffast-math.
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native
+# Allow FP reassociation and contraction so reduction loops vectorize, but do
+# not assume finite math or approximate libm calls: full -ffast-math produced
+# NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
+# -fapprox-func are the unsafe parts and stay off).
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native \
+              -fno-math-errno -ffp-contract=fast -fno-trapping-math \
+              -fno-signed-zeros -fassociative-math -freciprocal-math
 LDFLAGS     = -lm -lpthread
 CJSON_CFLAGS ?= $(shell sh -c 'pkg-config --cflags libcjson 2>/dev/null')
 CJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs libcjson 2>/dev/null')
