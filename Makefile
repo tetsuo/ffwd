@@ -164,6 +164,13 @@ test:
 	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) -I. -o tests/test_kernels_blas \
 	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_kernels_blas
+	$(CC) -Wall -Wextra -O2 -I. -o tests/test_safetensors \
+	    tests/test_safetensors.c qwen_safetensors.c
+	./tests/test_safetensors
+	$(CC) -Wall -Wextra -O2 -I. -o tests/test_bf16_model \
+	    tests/test_bf16_model.c embed.c qwen_safetensors.c $(KERNEL_SRCS) \
+	    -lm -lpthread
+	./tests/test_bf16_model
 
 bench-tokenizer:
 	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
@@ -237,4 +244,5 @@ deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
 clean:
 	rm -f $(OBJS) embed_mlx.o embed_cuda.o embed_cli.o embed_server.o \
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
-	      tests/test_kernels_generic tests/test_kernels_blas
+	      tests/test_kernels_generic tests/test_kernels_blas \
+	      tests/test_safetensors tests/test_bf16_model bench/bench_tokenizer

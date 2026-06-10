@@ -1,21 +1,33 @@
 /* tests/test_bf16_model.c - F32 vs BF16 loader/dispatch parity on a tiny
- * synthetic model. Runs via `make test`. */
+ * synthetic model. Hermetic: builds its own model dirs. Runs via
+ * `make test`. */
 
 #include "embed.h"
+#include "tiny_model.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s f32_model bf16_model\n", argv[0]);
+int main(void) {
+    char root[1024], f32_dir[1088], bf16_dir[1088];
+    snprintf(root, sizeof(root), "%s/pplx-bf16-test-XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
+    snprintf(f32_dir, sizeof(f32_dir), "%s/f32", root);
+    snprintf(bf16_dir, sizeof(bf16_dir), "%s/bf16", root);
+    if (mkdir(f32_dir, 0755) != 0 || mkdir(bf16_dir, 0755) != 0 ||
+        tm_write_model(f32_dir, "F32") != 0 ||
+        tm_write_model(bf16_dir, "BF16") != 0) {
+        fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
 
     int ids[] = {1, 2, 3, 4};
-    pplx_model_t *mf32 = pplx_model_load(argv[1]);
-    pplx_model_t *mbf16 = pplx_model_load(argv[2]);
+    pplx_model_t *mf32 = pplx_model_load(f32_dir);
+    pplx_model_t *mbf16 = pplx_model_load(bf16_dir);
     if (!mf32 || !mbf16) {
         fprintf(stderr, "model load failed\n");
         return 1;

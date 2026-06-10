@@ -3,6 +3,8 @@ pplx-embed
 pplx-embed-server
 libpplxembed.*
 tests/test_kernels_*
+tests/test_safetensors
+tests/test_bf16_model
 bench/bench_tokenizer
 book/
 .venv/
