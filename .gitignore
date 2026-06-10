@@ -1,5 +1,8 @@
 *.o
-pplx_embed
+pplx-embed
+pplx-embed-server
+libpplxembed.*
+tests/test_kernels_*
 book/
 .venv/
 __pycache__/
