@@ -1,10 +1,10 @@
 /*
- * qwen_asr_safetensors.h - Safetensors file format reader (multi-shard support)
+ * qwen_safetensors.h - Safetensors file format reader (multi-shard support)
  * Adapted from voxtral-realtime project.
  */
 
-#ifndef QWEN_ASR_SAFETENSORS_H
-#define QWEN_ASR_SAFETENSORS_H
+#ifndef QWEN_SAFETENSORS_H
+#define QWEN_SAFETENSORS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -76,4 +76,4 @@ int64_t safetensor_numel(const safetensor_t *t);
 void safetensor_print(const safetensor_t *t);
 void safetensors_print_all(const safetensors_file_t *sf);
 
-#endif /* QWEN_ASR_SAFETENSORS_H */
+#endif /* QWEN_SAFETENSORS_H */

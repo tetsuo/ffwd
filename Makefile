@@ -19,12 +19,12 @@ UNAME_S := $(shell uname -s)
 SRCS = pplx_embed.c \
        pplx_distributed.c \
        pplx_server.c \
-       qwen_asr_kernels.c \
-       qwen_asr_kernels_generic.c \
-       qwen_asr_kernels_neon.c \
-       qwen_asr_kernels_avx.c \
-       qwen_asr_tokenizer.c \
-       qwen_asr_safetensors.c \
+       qwen_kernels.c \
+       qwen_kernels_generic.c \
+       qwen_kernels_neon.c \
+       qwen_kernels_avx.c \
+       qwen_tokenizer.c \
+       qwen_safetensors.c \
        deps/ae/ae.c \
        deps/ae/anet.c \
        deps/ae/monotonic.c
@@ -38,8 +38,8 @@ TARGET        = pplx_embed
 SERVER_TARGET = pplx-embed-server
 LIB           = libpplxembed.a
 
-KERNEL_SRCS = qwen_asr_kernels.c qwen_asr_kernels_generic.c \
-              qwen_asr_kernels_neon.c qwen_asr_kernels_avx.c
+KERNEL_SRCS = qwen_kernels.c qwen_kernels_generic.c \
+              qwen_kernels_neon.c qwen_kernels_avx.c
 
 ifeq ($(shell uname -s),Darwin)
 SHARED_LIB   = libpplxembed.dylib
@@ -192,40 +192,40 @@ $(SERVER_TARGET): $(LIB) server_main.o
 # =============================================================================
 # Compile rules
 # =============================================================================
-pplx_embed.o: pplx_embed.c pplx_embed.h qwen_asr_kernels.h qwen_asr_safetensors.h
+pplx_embed.o: pplx_embed.c pplx_embed.h qwen_kernels.h qwen_safetensors.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 pplx_distributed.o: pplx_distributed.c pplx_distributed.h pplx_embed.h pplx_embed_mlx.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-pplx_server.o: pplx_server.c pplx_server.h pplx_embed.h pplx_embed_mlx.h qwen_asr_tokenizer.h deps/ae/ae.h deps/ae/anet.h
+pplx_server.o: pplx_server.c pplx_server.h pplx_embed.h pplx_embed_mlx.h qwen_tokenizer.h deps/ae/ae.h deps/ae/anet.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
-pplx_embed_mlx.o: pplx_embed_mlx.c pplx_embed_mlx.h pplx_embed.h qwen_asr_safetensors.h
+pplx_embed_mlx.o: pplx_embed_mlx.c pplx_embed_mlx.h pplx_embed.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-main.o: main.c pplx_embed.h pplx_distributed.h qwen_asr_kernels.h qwen_asr_tokenizer.h
+main.o: main.c pplx_embed.h pplx_distributed.h qwen_kernels.h qwen_tokenizer.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
-server_main.o: server_main.c pplx_embed.h pplx_server.h qwen_asr_kernels.h
+server_main.o: server_main.c pplx_embed.h pplx_server.h qwen_kernels.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
-qwen_asr_kernels.o: qwen_asr_kernels.c qwen_asr_kernels.h qwen_asr_kernels_impl.h
+qwen_kernels.o: qwen_kernels.c qwen_kernels.h qwen_kernels_impl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-qwen_asr_kernels_generic.o: qwen_asr_kernels_generic.c qwen_asr_kernels_impl.h
+qwen_kernels_generic.o: qwen_kernels_generic.c qwen_kernels_impl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-qwen_asr_kernels_neon.o: qwen_asr_kernels_neon.c qwen_asr_kernels_impl.h
+qwen_kernels_neon.o: qwen_kernels_neon.c qwen_kernels_impl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-qwen_asr_kernels_avx.o: qwen_asr_kernels_avx.c qwen_asr_kernels_impl.h
+qwen_kernels_avx.o: qwen_kernels_avx.c qwen_kernels_impl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-qwen_asr_tokenizer.o: qwen_asr_tokenizer.c qwen_asr_tokenizer.h qwen_asr_kernels.h
+qwen_tokenizer.o: qwen_tokenizer.c qwen_tokenizer.h qwen_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-qwen_asr_safetensors.o: qwen_asr_safetensors.c qwen_asr_safetensors.h
+qwen_safetensors.o: qwen_safetensors.c qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h

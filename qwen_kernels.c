@@ -1,5 +1,5 @@
-#include "qwen_asr_kernels.h"
-#include "qwen_asr_kernels_impl.h"
+#include "qwen_kernels.h"
+#include "qwen_kernels_impl.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>

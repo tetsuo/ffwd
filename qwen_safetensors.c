@@ -1,4 +1,4 @@
-#include "qwen_asr_safetensors.h"
+#include "qwen_safetensors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

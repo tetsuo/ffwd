@@ -1,6 +1,6 @@
 #include "pplx_embed_mlx.h"
 #include "pplx_embed.h"
-#include "qwen_asr_safetensors.h"
+#include "qwen_safetensors.h"
 
 #include <mlx/c/mlx.h>
 

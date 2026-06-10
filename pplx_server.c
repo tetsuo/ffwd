@@ -4,8 +4,8 @@
 
 #include "pplx_server.h"
 #include "pplx_embed.h"
-#include "qwen_asr_safetensors.h"
-#include "qwen_asr_tokenizer.h"
+#include "qwen_safetensors.h"
+#include "qwen_tokenizer.h"
 
 #ifdef USE_MLX
 #include "pplx_embed_mlx.h"

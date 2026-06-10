@@ -1,12 +1,12 @@
 /*
- * qwen_asr_kernels.h - Math kernels for Qwen3-ASR inference
+ * qwen_kernels.h - Math kernels for Qwen3-ASR inference
  *
  * Low-level math operations. All operate on float32 tensors in row-major order.
  * Adapted from voxtral-realtime project.
  */
 
-#ifndef QWEN_ASR_KERNELS_H
-#define QWEN_ASR_KERNELS_H
+#ifndef QWEN_KERNELS_H
+#define QWEN_KERNELS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -207,4 +207,4 @@ int qwen_get_num_cpus(void);
 /* Global verbose flag */
 extern int qwen_verbose;
 
-#endif /* QWEN_ASR_KERNELS_H */
+#endif /* QWEN_KERNELS_H */

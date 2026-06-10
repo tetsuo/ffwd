@@ -2,7 +2,7 @@
 #define PPLX_EMBED_INTERNAL_H
 
 #include "pplx_embed.h"
-#include "qwen_asr_safetensors.h"
+#include "qwen_safetensors.h"
 
 typedef struct {
     safetensor_dtype_t dtype;

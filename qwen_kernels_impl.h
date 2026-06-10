@@ -1,9 +1,9 @@
 /*
- * qwen_asr_kernels_impl.h - internal architecture dispatch for hot kernels
+ * qwen_kernels_impl.h - internal architecture dispatch for hot kernels
  */
 
-#ifndef QWEN_ASR_KERNELS_IMPL_H
-#define QWEN_ASR_KERNELS_IMPL_H
+#ifndef QWEN_KERNELS_IMPL_H
+#define QWEN_KERNELS_IMPL_H
 
 #include <stdint.h>
 
@@ -62,4 +62,4 @@ void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int 
 #define qwen_vec_scale_add_impl qwen_vec_scale_add_generic
 #endif
 
-#endif /* QWEN_ASR_KERNELS_IMPL_H */
+#endif /* QWEN_KERNELS_IMPL_H */

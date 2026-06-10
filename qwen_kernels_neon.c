@@ -1,8 +1,8 @@
 /*
- * qwen_asr_kernels_neon.c - ARM NEON hot kernels
+ * qwen_kernels_neon.c - ARM NEON hot kernels
  */
 
-#include "qwen_asr_kernels_impl.h"
+#include "qwen_kernels_impl.h"
 
 #ifdef __ARM_NEON
 

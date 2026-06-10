@@ -2,8 +2,8 @@
 
 #include "pplx_embed.h"
 #include "pplx_distributed.h"
-#include "qwen_asr_kernels.h"
-#include "qwen_asr_tokenizer.h"
+#include "qwen_kernels.h"
+#include "qwen_tokenizer.h"
 
 #ifdef USE_MLX
 #include "pplx_embed_mlx.h"

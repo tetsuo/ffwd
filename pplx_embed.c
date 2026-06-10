@@ -1,7 +1,7 @@
 #include "pplx_embed.h"
 #include "pplx_embed_internal.h"
-#include "qwen_asr_kernels.h"
-#include "qwen_asr_safetensors.h"
+#include "qwen_kernels.h"
+#include "qwen_safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>

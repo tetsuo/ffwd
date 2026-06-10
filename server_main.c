@@ -2,7 +2,7 @@
 
 #include "pplx_embed.h"
 #include "pplx_server.h"
-#include "qwen_asr_kernels.h"
+#include "qwen_kernels.h"
 
 #ifdef USE_CUDA
 #include "pplx_embed_cuda.h"

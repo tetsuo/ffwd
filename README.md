@@ -81,7 +81,7 @@ Output is a line-delimited stream of JSON objects with the embedding vector, dim
 
 ```c
 #include "pplx_embed.h"
-#include "qwen_asr_tokenizer.h"
+#include "qwen_tokenizer.h"
 
 /* Load model */
 pplx_ctx_t *ctx = pplx_load("/path/to/model");

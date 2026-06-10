@@ -2,7 +2,7 @@
  * Runs via `make test` (generic and BLAS variants) and
  * scripts/check_kernel_golden.py. No model files required. */
 
-#include "qwen_asr_kernels.h"
+#include "qwen_kernels.h"
 
 #include <math.h>
 #include <stdint.h>

@@ -1,5 +1,5 @@
-#include "qwen_asr_tokenizer.h"
-#include "qwen_asr_kernels.h"
+#include "qwen_tokenizer.h"
+#include "qwen_kernels.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>

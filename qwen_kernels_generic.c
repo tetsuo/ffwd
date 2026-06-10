@@ -1,8 +1,8 @@
 /*
- * qwen_asr_kernels_generic.c - architecture-generic hot kernels
+ * qwen_kernels_generic.c - architecture-generic hot kernels
  */
 
-#include "qwen_asr_kernels_impl.h"
+#include "qwen_kernels_impl.h"
 
 #include <string.h>
 
