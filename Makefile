@@ -48,7 +48,7 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all blas mlx cuda shared test debug clean help
+.PHONY: all blas mlx cuda shared test bench-tokenizer debug clean help
 
 all: help
 
@@ -164,6 +164,11 @@ test:
 	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) -I. -o tests/test_kernels_blas \
 	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_kernels_blas
+
+bench-tokenizer:
+	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
+	    bench/bench_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS) -lm -lpthread
+	@echo "run: bench/bench_tokenizer <model_dir> [runs]"
 
 # =============================================================================
 # Debug build
