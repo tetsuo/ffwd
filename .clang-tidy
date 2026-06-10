@@ -1,0 +1,13 @@
+Checks: >
+  -*,
+  clang-analyzer-core.*,
+  clang-analyzer-unix.*,
+  clang-analyzer-deadcode.*,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memory-comparison,
+  bugprone-suspicious-memset-usage,
+  bugprone-not-null-terminated-result,
+  bugprone-infinite-loop
+WarningsAsErrors: '*'
+HeaderFilterRegex: ''
+FormatStyle: none
