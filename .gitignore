@@ -7,6 +7,7 @@ tests/test_safetensors
 tests/test_bf16_model
 tests/test_server
 tests/test_tokenizer
+tests/test_workspace
 bench/bench_tokenizer
 coverage/
 book/

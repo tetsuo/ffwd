@@ -165,6 +165,8 @@ TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
 TEST_SAFETENSORS_SRCS = tests/test_safetensors.c qwen_safetensors.c
 TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
+TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c qwen_tokenizer.c \
+                        qwen_safetensors.c $(KERNEL_SRCS)
 TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_distributed.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
@@ -184,6 +186,9 @@ test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_bf16_model \
 	    $(TEST_BF16_SRCS) -lm -lpthread
 	./tests/test_bf16_model
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_workspace \
+	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
+	./tests/test_workspace
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
@@ -199,7 +204,7 @@ COV_DIR   = coverage
 COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
             tests/test_tokenizer tests/test_safetensors \
-            tests/test_bf16_model tests/test_server
+            tests/test_bf16_model tests/test_workspace tests/test_server
 # Report on project sources only, not the harnesses or vendored deps.
 COV_IGNORE = -ignore-filename-regex='deps/|tests/'
 
@@ -227,6 +232,9 @@ coverage:
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_bf16_model \
 	    $(TEST_BF16_SRCS) -lm -lpthread
 	LLVM_PROFILE_FILE=$(COV_DIR)/bf16_model.profraw ./tests/test_bf16_model
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_workspace \
+	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
+	LLVM_PROFILE_FILE=$(COV_DIR)/workspace.profraw ./tests/test_workspace
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
@@ -312,6 +320,6 @@ clean:
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
-	      tests/test_tokenizer \
+	      tests/test_tokenizer tests/test_workspace \
 	      bench/bench_tokenizer
 	rm -rf $(COV_DIR)

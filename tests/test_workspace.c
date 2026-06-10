@@ -1,13 +1,18 @@
 /* tests/test_workspace.c - model/workspace API lifecycle tests.
- * Runs via `make test`. Uses a tiny synthetic model. */
+ * Hermetic by default (synthesizes a tiny model + tokenizer fixture);
+ * pass a MODEL_DIR to run the same checks against real weights, which is
+ * what scripts/check_workspace_api.py does. Runs via `make test`. */
 
 #include "embed.h"
 #include "qwen_tokenizer.h"
+#include "tiny_model.h"
+#include "tok_fixture.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static float max_abs_diff(const float *a, const float *b, int n)
 {
@@ -21,12 +26,26 @@ static float max_abs_diff(const float *a, const float *b, int n)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL_DIR\n", argv[0]);
+    char fixture_dir[1024];
+    const char *model_dir;
+    if (argc == 2) {
+        model_dir = argv[1];
+    } else if (argc == 1) {
+        /* Tiny hidden size keeps it fast; the vocab must cover every id the
+         * byte-complete tokenizer fixture can emit. */
+        tm_dims_t dims = {4, 2, 1, 2, 8, TF_VOCAB_SIZE};
+        snprintf(fixture_dir, sizeof(fixture_dir), "%s/pplx-ws-test-XXXXXX",
+                 getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        if (!mkdtemp(fixture_dir) || tf_write_vocab(fixture_dir) != 0 ||
+            tm_write_model_dims(fixture_dir, "F32", &dims) != 0) {
+            fprintf(stderr, "fixture creation failed\n");
+            return 2;
+        }
+        model_dir = fixture_dir;
+    } else {
+        fprintf(stderr, "usage: %s [MODEL_DIR]\n", argv[0]);
         return 2;
     }
-
-    const char *model_dir = argv[1];
     char vocab_path[4096];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
 
