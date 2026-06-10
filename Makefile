@@ -35,8 +35,17 @@ CUDA_SRCS = pplx_embed_cuda.cu
 OBJS     = $(SRCS:.c=.o)
 MLX_OBJS = $(MLX_SRCS:.c=.o)
 TARGET   = pplx_embed
+LIB      = libpplxembed.a
 
-.PHONY: all blas mlx cuda debug clean help
+ifeq ($(shell uname -s),Darwin)
+SHARED_LIB   = libpplxembed.dylib
+SHARED_FLAGS = -dynamiclib
+else
+SHARED_LIB   = libpplxembed.so
+SHARED_FLAGS = -shared
+endif
+
+.PHONY: all blas mlx cuda shared debug clean help
 
 all: help
 
@@ -47,8 +56,11 @@ help:
 	@echo "  make blas     Build with BLAS acceleration (CPU)"
 	@echo "  make mlx      Build with Apple MLX GPU backend (recommended on Apple Silicon)"
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
+	@echo "  make shared   Build the shared library ($(SHARED_LIB), BLAS backend)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
+	@echo ""
+	@echo "Every backend target also produces the static library $(LIB)."
 	@echo ""
 	@echo "Usage:"
 	@echo "  ./pplx_embed -d /path/to/model-dir \"text1\" \"text2\""
@@ -112,6 +124,23 @@ pplx_embed_cuda.o: pplx_embed_cuda.cu pplx_embed_cuda.h pplx_embed_internal.h pp
 	$(NVCC) -O3 -std=c++17 -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # =============================================================================
+# Shared library (BLAS backend; override CFLAGS/LDFLAGS for other backends)
+# =============================================================================
+ifeq ($(UNAME_S),Darwin)
+shared: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+shared: LDFLAGS += -framework Accelerate
+else
+shared: CFLAGS  = $(CFLAGS_BASE) -fPIC -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+shared: LDFLAGS += -lopenblas
+endif
+shared:
+	$(MAKE) clean
+	$(MAKE) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+
+$(SHARED_LIB): $(OBJS) $(EXTRA_OBJS)
+	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
+
+# =============================================================================
 # Debug build
 # =============================================================================
 SANITIZE ?= address,undefined
@@ -123,10 +152,13 @@ debug:
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
-# Link
+# Static library and binary link
 # =============================================================================
-$(TARGET): $(OBJS) $(EXTRA_OBJS) main.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
+$(LIB): $(OBJS) $(EXTRA_OBJS)
+	ar rcs $@ $^
+
+$(TARGET): $(LIB) main.o
+	$(CC) $(CFLAGS) -o $@ main.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
 
 # =============================================================================
 # Compile rules
@@ -169,4 +201,5 @@ deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
 
 # =============================================================================
 clean:
-	rm -f $(OBJS) pplx_embed_mlx.o pplx_embed_cuda.o main.o $(TARGET)
+	rm -f $(OBJS) pplx_embed_mlx.o pplx_embed_cuda.o main.o $(TARGET) \
+	      $(LIB) libpplxembed.dylib libpplxembed.so
