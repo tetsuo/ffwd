@@ -74,12 +74,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    size_t initial_ws_bytes = pplx_workspace_nbytes(batch_ws);
-    if (initial_ws_bytes == 0) {
-        fprintf(stderr, "workspace byte accounting returned zero\n");
-        goto fail;
-    }
-
     const char *texts[] = {
         "query: what is the capital of France?",
         "document: Paris is the capital of France.",
@@ -87,9 +81,17 @@ int main(int argc, char **argv)
         "document: Istanbul is a major city in Turkey."
     };
     const int batch = (int)(sizeof(texts) / sizeof(texts[0]));
+    /* Initialized before the first `goto fail` so the cleanup loop never
+     * sees indeterminate pointers. */
     int *ids[4] = {0};
     int ntok[4] = {0};
     pplx_input_t inputs[4];
+
+    size_t initial_ws_bytes = pplx_workspace_nbytes(batch_ws);
+    if (initial_ws_bytes == 0) {
+        fprintf(stderr, "workspace byte accounting returned zero\n");
+        goto fail;
+    }
 
     for (int i = 0; i < batch; i++) {
         ids[i] = qwen_tokenizer_encode(tok, texts[i], &ntok[i]);
