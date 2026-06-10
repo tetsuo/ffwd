@@ -8,6 +8,7 @@ tests/test_bf16_model
 tests/test_server
 tests/test_tokenizer
 bench/bench_tokenizer
+coverage/
 book/
 .venv/
 __pycache__/

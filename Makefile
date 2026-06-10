@@ -48,7 +48,7 @@ SHARED_LIB   = libpplxembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda lib test bench-tokenizer debug clean help
+.PHONY: all cpu metal cuda lib test coverage bench-tokenizer debug clean help
 
 all: help
 
@@ -61,6 +61,7 @@ help:
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
 	@echo "  make lib      Build the shared library ($(SHARED_LIB), CPU backend)"
 	@echo "  make test     Build and run the C test suite (no model files needed)"
+	@echo "  make coverage Test-suite line coverage report (clang/llvm-cov)"
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
@@ -157,29 +158,85 @@ TEST_BLAS_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 TEST_BLAS_LDFLAGS = -lopenblas
 endif
 
+# Source lists shared by `test` and `coverage` so the two cannot drift.
+TEST_CC_FLAGS         = -Wall -Wextra -O2 -I.
+TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
+TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
+TEST_SAFETENSORS_SRCS = tests/test_safetensors.c qwen_safetensors.c
+TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c qwen_safetensors.c \
+                        $(KERNEL_SRCS)
+TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_distributed.c \
+                        qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
+                        deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
+
 test:
-	$(CC) -Wall -Wextra -O2 -I. -o tests/test_kernels_generic \
-	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_kernels_generic \
+	    $(TEST_KERNELS_SRCS) -lm -lpthread
 	./tests/test_kernels_generic
-	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) -I. -o tests/test_kernels_blas \
-	    tests/test_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_kernels_blas \
+	    $(TEST_KERNELS_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_kernels_blas
-	$(CC) -Wall -Wextra -O2 -I. -o tests/test_tokenizer \
-	    tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS) -lm -lpthread
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_tokenizer \
+	    $(TEST_TOKENIZER_SRCS) -lm -lpthread
 	./tests/test_tokenizer
-	$(CC) -Wall -Wextra -O2 -I. -o tests/test_safetensors \
-	    tests/test_safetensors.c qwen_safetensors.c
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_safetensors $(TEST_SAFETENSORS_SRCS)
 	./tests/test_safetensors
-	$(CC) -Wall -Wextra -O2 -I. -o tests/test_bf16_model \
-	    tests/test_bf16_model.c embed.c qwen_safetensors.c $(KERNEL_SRCS) \
-	    -lm -lpthread
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_bf16_model \
+	    $(TEST_BF16_SRCS) -lm -lpthread
 	./tests/test_bf16_model
-	$(CC) -Wall -Wextra -O2 $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae \
-	    -o tests/test_server tests/test_server.c embed.c embed_distributed.c \
-	    qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
-	    deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c \
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
+	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
 	./tests/test_server
+
+# =============================================================================
+# Test-suite line coverage (requires clang + llvm-cov/llvm-profdata; this is
+# the default toolchain on macOS. Writes a per-file text summary to stdout
+# and a browsable HTML report to coverage/coverage.html.)
+# =============================================================================
+COV_DIR   = coverage
+# Source-based coverage; -O0 so no line is folded away by the optimizer.
+COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0
+COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
+            tests/test_tokenizer tests/test_safetensors \
+            tests/test_bf16_model tests/test_server
+# Report on project sources only, not the harnesses or vendored deps.
+COV_IGNORE = -ignore-filename-regex='deps/|tests/'
+
+ifeq ($(UNAME_S),Darwin)
+LLVM_PROFDATA = xcrun llvm-profdata
+LLVM_COV      = xcrun llvm-cov
+else
+LLVM_PROFDATA = llvm-profdata
+LLVM_COV      = llvm-cov
+endif
+
+coverage:
+	rm -rf $(COV_DIR) && mkdir -p $(COV_DIR)
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_kernels_generic \
+	    $(TEST_KERNELS_SRCS) -lm -lpthread
+	LLVM_PROFILE_FILE=$(COV_DIR)/kernels_generic.profraw ./tests/test_kernels_generic
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_kernels_blas \
+	    $(TEST_KERNELS_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/kernels_blas.profraw ./tests/test_kernels_blas
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_tokenizer \
+	    $(TEST_TOKENIZER_SRCS) -lm -lpthread
+	LLVM_PROFILE_FILE=$(COV_DIR)/tokenizer.profraw ./tests/test_tokenizer
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_safetensors $(TEST_SAFETENSORS_SRCS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/safetensors.profraw ./tests/test_safetensors
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_bf16_model \
+	    $(TEST_BF16_SRCS) -lm -lpthread
+	LLVM_PROFILE_FILE=$(COV_DIR)/bf16_model.profraw ./tests/test_bf16_model
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
+	    -o tests/test_server $(TEST_SERVER_SRCS) \
+	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/server.profraw ./tests/test_server
+	$(LLVM_PROFDATA) merge -sparse $(COV_DIR)/*.profraw -o $(COV_DIR)/tests.profdata
+	$(LLVM_COV) report -instr-profile=$(COV_DIR)/tests.profdata $(COV_IGNORE) \
+	    $(addprefix -object ,$(COV_BINS))
+	$(LLVM_COV) show -format=html -instr-profile=$(COV_DIR)/tests.profdata \
+	    $(COV_IGNORE) $(addprefix -object ,$(COV_BINS)) > $(COV_DIR)/coverage.html
+	@echo "HTML report: $(COV_DIR)/coverage.html"
 
 bench-tokenizer:
 	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
@@ -257,3 +314,4 @@ clean:
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
 	      tests/test_tokenizer \
 	      bench/bench_tokenizer
+	rm -rf $(COV_DIR)
