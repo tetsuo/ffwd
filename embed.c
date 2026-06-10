@@ -934,10 +934,68 @@ int pplx_late_maxsim_batch(const float *query_vectors, int query_tokens,
         return -1;
 
     for (int i = 0; i < docs; i++) {
+        if (doc_offsets[i] < 0 || doc_offsets[i + 1] <= doc_offsets[i])
+            return -1;
+    }
+
+#ifdef USE_BLAS
+    /* One similarity GEMM per group of whole candidates:
+     * S[query_tokens, group_tokens] = Q @ D_group^T, then per-document
+     * row-max plus sum. The group token budget bounds the scratch matrix;
+     * one oversized document still runs alone in a group of its own. */
+    enum { LATE_GROUP_TOKEN_BUDGET = 4096 };
+    int total = doc_offsets[docs];
+    int budget = LATE_GROUP_TOKEN_BUDGET;
+    size_t cap = (size_t)query_tokens *
+        (size_t)(total < budget ? total : budget);
+    int largest = 0;
+    for (int i = 0; i < docs; i++) {
+        int len = doc_offsets[i + 1] - doc_offsets[i];
+        if (len > largest) largest = len;
+    }
+    if ((size_t)query_tokens * (size_t)largest > cap)
+        cap = (size_t)query_tokens * (size_t)largest;
+    float *sim = (float *)malloc(cap * sizeof(float));
+    if (sim) {
+        int doc = 0;
+        while (doc < docs) {
+            int first = doc;
+            int start = doc_offsets[first];
+            doc++;
+            while (doc < docs &&
+                   doc_offsets[doc + 1] - start <= budget &&
+                   doc_offsets[doc + 1] - start <=
+                       (int)(cap / (size_t)query_tokens))
+                doc++;
+            int group_tokens = doc_offsets[doc] - start;
+
+            qwen_matmul_t(sim, query_vectors,
+                          doc_vectors + (size_t)start * dim,
+                          query_tokens, dim, group_tokens);
+
+            for (int i = first; i < doc; i++) {
+                int s0 = doc_offsets[i] - start;
+                int s1 = doc_offsets[i + 1] - start;
+                float score = 0.0f;
+                for (int qi = 0; qi < query_tokens; qi++) {
+                    const float *row = sim + (size_t)qi * group_tokens;
+                    float best = row[s0];
+                    for (int t = s0 + 1; t < s1; t++)
+                        if (row[t] > best) best = row[t];
+                    score += best;
+                }
+                scores[i] = score;
+            }
+        }
+        free(sim);
+        return 0;
+    }
+    /* Allocation failure: fall through to the scalar path. */
+#endif
+
+    for (int i = 0; i < docs; i++) {
         int start = doc_offsets[i];
         int end = doc_offsets[i + 1];
-        if (start < 0 || end <= start)
-            return -1;
         scores[i] = pplx_late_maxsim(query_vectors, query_tokens,
                                      doc_vectors + (size_t)start * dim,
                                      end - start, dim);
