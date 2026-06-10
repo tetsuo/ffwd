@@ -5,11 +5,14 @@
 #ifndef TINY_MODEL_H
 #define TINY_MODEL_H
 
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 static uint16_t tm_f32_to_bf16(float x)
 {
@@ -54,6 +57,59 @@ typedef struct {
 
 enum { TM_N_SPECS = 13 };
 
+/* Write a safetensors file holding `specs` with tm_value() contents.
+ * dtype: "F32" or "BF16". Returns 0 on success. */
+static int tm_write_safetensors(const char *path, const char *dtype,
+                                const tm_spec_t *specs, int n_specs)
+{
+    int bf16 = strcmp(dtype, "BF16") == 0;
+    size_t esize = bf16 ? 2 : 4;
+
+    char header[4096];
+    size_t hoff = 0, doff = 0;
+    hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "{");
+    for (int t = 0; t < n_specs; t++) {
+        const tm_spec_t *s = &specs[t];
+        size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
+        size_t end = doff + n * esize;
+        if (s->cols)
+            hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
+                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d,%d],"
+                "\"data_offsets\":[%zu,%zu]}",
+                t ? "," : "", s->name, dtype, s->rows, s->cols, doff, end);
+        else
+            hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
+                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d],"
+                "\"data_offsets\":[%zu,%zu]}",
+                t ? "," : "", s->name, dtype, s->rows, doff, end);
+        doff = end;
+    }
+    hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "}");
+    if (hoff >= sizeof(header) - 1) return -1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    unsigned char len8[8];
+    for (int i = 0; i < 8; i++) len8[i] = (unsigned char)(hoff >> (8 * i));
+    fwrite(len8, 1, 8, f);
+    fwrite(header, 1, hoff, f);
+    for (int t = 0; t < n_specs; t++) {
+        const tm_spec_t *s = &specs[t];
+        size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
+        for (size_t i = 0; i < n; i++) {
+            float v = tm_value(s->name, i);
+            if (bf16) {
+                uint16_t h = tm_f32_to_bf16(v);
+                fwrite(&h, sizeof(h), 1, f);
+            } else {
+                fwrite(&v, sizeof(v), 1, f);
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
 /* Write config.json + model.safetensors with the given dimensions into dir.
  * dtype: "F32" or "BF16". Returns 0 on success. */
 static int tm_write_model_dims(const char *dir, const char *dtype,
@@ -88,53 +144,39 @@ static int tm_write_model_dims(const char *dir, const char *dtype,
             d->intermediate, d->vocab);
     fclose(f);
 
-    int bf16 = strcmp(dtype, "BF16") == 0;
-    size_t esize = bf16 ? 2 : 4;
-
-    char header[4096];
-    size_t hoff = 0, doff = 0;
-    hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "{");
-    for (int t = 0; t < TM_N_SPECS; t++) {
-        const tm_spec_t *s = &specs[t];
-        size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
-        size_t end = doff + n * esize;
-        if (s->cols)
-            hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
-                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d,%d],"
-                "\"data_offsets\":[%zu,%zu]}",
-                t ? "," : "", s->name, dtype, s->rows, s->cols, doff, end);
-        else
-            hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
-                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d],"
-                "\"data_offsets\":[%zu,%zu]}",
-                t ? "," : "", s->name, dtype, s->rows, doff, end);
-        doff = end;
-    }
-    hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "}");
-    if (hoff >= sizeof(header) - 1) return -1;
-
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
-    f = fopen(path, "wb");
+    return tm_write_safetensors(path, dtype, specs, TM_N_SPECS);
+}
+
+/* Add the 1_Dense per-token projection head that turns a base model dir into
+ * a late-interaction snapshot. weight_name is "linear.weight" for a valid
+ * head; pass another name to synthesize a malformed head. */
+static inline int tm_write_late_projection_named(const char *dir,
+                                                 const char *dtype,
+                                                 int token_dim, int hidden,
+                                                 const char *weight_name)
+{
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/1_Dense", dir);
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) return -1;
+
+    snprintf(path, sizeof(path), "%s/1_Dense/config.json", dir);
+    FILE *f = fopen(path, "w");
     if (!f) return -1;
-    unsigned char len8[8];
-    for (int i = 0; i < 8; i++) len8[i] = (unsigned char)(hoff >> (8 * i));
-    fwrite(len8, 1, 8, f);
-    fwrite(header, 1, hoff, f);
-    for (int t = 0; t < TM_N_SPECS; t++) {
-        const tm_spec_t *s = &specs[t];
-        size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
-        for (size_t i = 0; i < n; i++) {
-            float v = tm_value(s->name, i);
-            if (bf16) {
-                uint16_t h = tm_f32_to_bf16(v);
-                fwrite(&h, sizeof(h), 1, f);
-            } else {
-                fwrite(&v, sizeof(v), 1, f);
-            }
-        }
-    }
+    fprintf(f, "{\"in_features\":%d,\"out_features\":%d,\"bias\":false}",
+            hidden, token_dim);
     fclose(f);
-    return 0;
+
+    const tm_spec_t spec = {weight_name, token_dim, hidden};
+    snprintf(path, sizeof(path), "%s/1_Dense/model.safetensors", dir);
+    return tm_write_safetensors(path, dtype, &spec, 1);
+}
+
+static inline int tm_write_late_projection(const char *dir, const char *dtype,
+                                           int token_dim, int hidden)
+{
+    return tm_write_late_projection_named(dir, dtype, token_dim, hidden,
+                                          "linear.weight");
 }
 
 /* The historical default fixture: 4-dim hidden, 16-token vocab. */

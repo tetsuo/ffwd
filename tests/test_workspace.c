@@ -24,6 +24,86 @@ static float max_abs_diff(const float *a, const float *b, int n)
     return m;
 }
 
+/* The allocating and pooling API variants must agree with the *_into
+ * results validated in main. reference is the batched row for ids0. */
+static int check_alloc_and_pooling_variants(const pplx_model_t *model,
+                                            pplx_workspace_t *ws,
+                                            const int *ids0, int n0,
+                                            const float *states,
+                                            const float *reference,
+                                            const pplx_config_t *cfg)
+{
+    int rc = 1;
+    int dim = cfg->hidden_size;
+    float *emb = NULL, *fwd = NULL, *pooled = NULL, *span_out = NULL;
+
+    emb = pplx_model_embed(model, ws, ids0, n0);
+    fwd = pplx_model_forward(model, ws, ids0, n0);
+    pooled = (float *)calloc((size_t)dim, sizeof(float));
+    span_out = (float *)calloc((size_t)2 * dim, sizeof(float));
+    if (!emb || !fwd || !pooled || !span_out) {
+        fprintf(stderr, "alloc-variant allocation failure\n");
+        goto done;
+    }
+
+    if (pplx_model_embed(NULL, ws, ids0, n0) != NULL ||
+        pplx_model_embed(model, ws, NULL, n0) != NULL ||
+        pplx_model_forward(model, ws, ids0, 0) != NULL ||
+        pplx_pool_batch(cfg, states, NULL, 1, pooled) == 0) {
+        fprintf(stderr, "alloc variants accepted invalid arguments\n");
+        goto done;
+    }
+
+    if (max_abs_diff(emb, reference, dim) > 0.00005f) {
+        fprintf(stderr, "pplx_model_embed disagrees with batched row\n");
+        goto done;
+    }
+    if (max_abs_diff(fwd, states, n0 * dim) > 0.000001f) {
+        fprintf(stderr, "pplx_model_forward disagrees with forward_into\n");
+        goto done;
+    }
+
+    /* Mean-pooling the final states reproduces the embedding. */
+    if (pplx_pool_batch(cfg, states, &n0, 1, pooled) != 0 ||
+        max_abs_diff(pooled, reference, dim) > 0.00005f) {
+        fprintf(stderr, "pplx_pool_batch disagrees with embedding\n");
+        goto done;
+    }
+
+    /* One span covering the whole sequence pools to the embedding, and
+     * two halves recombine into it by token-count weighting. */
+    pplx_span_t whole = {0, n0};
+    if (pplx_model_embed_spans(model, ws, ids0, n0, &whole, 1,
+                               span_out) != 0 ||
+        max_abs_diff(span_out, reference, dim) > 0.00005f) {
+        fprintf(stderr, "whole-sequence span disagrees with embedding\n");
+        goto done;
+    }
+    int h = n0 / 2;
+    pplx_span_t halves[2] = {{0, h}, {h, n0 - h}};
+    if (pplx_model_embed_spans(model, ws, ids0, n0, halves, 2,
+                               span_out) != 0) {
+        fprintf(stderr, "pplx_model_embed_spans failed for two spans\n");
+        goto done;
+    }
+    for (int d = 0; d < dim; d++) {
+        float combined = ((float)h * span_out[d] +
+                          (float)(n0 - h) * span_out[dim + d]) / (float)n0;
+        if (fabsf(combined - reference[d]) > 0.00005f) {
+            fprintf(stderr, "half spans do not recombine into embedding\n");
+            goto done;
+        }
+    }
+
+    rc = 0;
+done:
+    free(span_out);
+    free(pooled);
+    free(fwd);
+    free(emb);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     char fixture_dir[1024];
@@ -179,6 +259,15 @@ int main(int argc, char **argv)
 
     if (pplx_model_forward_into(model, batch_ws, ids[0], ntok[0], states) != 0) {
         fprintf(stderr, "pplx_model_forward_into failed\n");
+        free(states);
+        free(normalized);
+        free(single);
+        free(batched);
+        goto fail;
+    }
+
+    if (check_alloc_and_pooling_variants(model, batch_ws, ids[0], ntok[0],
+                                         states, batched, cfg) != 0) {
         free(states);
         free(normalized);
         free(single);

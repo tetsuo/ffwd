@@ -167,9 +167,14 @@ TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
 TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
+TEST_LATE_SRCS        = tests/test_late.c embed.c qwen_tokenizer.c \
+                        qwen_safetensors.c $(KERNEL_SRCS)
 TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_distributed.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
+# The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
+TEST_CLI_BIN_SRCS     = embed_cli.c embed.c embed_distributed.c \
+                        qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
 
 test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_kernels_generic \
@@ -189,6 +194,13 @@ test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	./tests/test_workspace
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_late \
+	    $(TEST_LATE_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	./tests/test_late
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/cli_under_test \
+	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c
+	./tests/test_cli ./tests/cli_under_test
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
@@ -207,7 +219,8 @@ COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
             -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
             tests/test_tokenizer tests/test_safetensors \
-            tests/test_bf16_model tests/test_workspace tests/test_server
+            tests/test_bf16_model tests/test_workspace tests/test_late \
+            tests/cli_under_test tests/test_server
 # Report on project sources only - not the harnesses, vendored deps, or
 # system headers (cJSON lands under /opt or /usr otherwise).
 COV_IGNORE = -ignore-filename-regex='deps/|tests/|/opt/|/usr/'
@@ -239,6 +252,13 @@ coverage:
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	LLVM_PROFILE_FILE=$(COV_DIR)/workspace.profraw ./tests/test_workspace
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_late \
+	    $(TEST_LATE_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/late.profraw ./tests/test_late
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/cli_under_test \
+	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c
+	LLVM_PROFILE_FILE=$(COV_DIR)/cli_%p.profraw ./tests/test_cli ./tests/cli_under_test
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
