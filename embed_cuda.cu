@@ -144,12 +144,16 @@ static uint16_t f32_to_bf16(float f)
 }
 
 // Store weights as native BF16 on the device when set (halves weight memory and
-// feeds BF16 tensor cores); default keeps exact F32. Read at load time.
+// feeds BF16 tensor cores); default keeps exact F32 for F32 model files. When
+// the flag was never set explicitly, the loader follows the model file dtype,
+// matching the CPU and MLX backends.
 static int g_weights_bf16 = 0;
+static int g_weights_bf16_set = 0;
 
 int pplx_cuda_set_weights_bf16(int on)
 {
     g_weights_bf16 = on ? 1 : 0;
+    g_weights_bf16_set = 1;
     return 0;
 }
 
@@ -838,6 +842,16 @@ pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir)
     }
     ctx->cpu = cpu;
     ctx->config = cpu->config;
+
+    /* Without an explicit --cuda-weight-dtype, store weights in the model
+     * file's dtype: BF16 snapshots load as BF16 (bit-exact pass-through),
+     * F32 snapshots keep the exact F32 default. */
+    if (!g_weights_bf16_set) {
+        g_weights_bf16 = cpu->weights.embed_tokens.dtype == DTYPE_BF16;
+        if (g_weights_bf16)
+            fprintf(stderr, "cuda: BF16 model file; storing weights as BF16 "
+                            "(use --cuda-weight-dtype f32 to override)\n");
+    }
 
     if (cudaStreamCreate(&ctx->stream) != cudaSuccess ||
         cublasCreate(&ctx->blas) != CUBLAS_STATUS_SUCCESS ||
