@@ -1,5 +1,5 @@
 /*
- * pplx_distributed.c - Stateless two-node layer-sharded inference.
+ * embed_distributed.c - Stateless two-node layer-sharded inference.
  *
  * This first transport is deliberately synchronous: one coordinator sends a
  * packed hidden-state batch to one final worker and receives pooled
@@ -7,10 +7,10 @@
  * retries, and richer transport can extend it without changing model math.
  */
 
-#include "pplx_distributed.h"
+#include "embed_distributed.h"
 
 #ifdef USE_MLX
-#include "pplx_embed_mlx.h"
+#include "embed_mlx.h"
 #endif
 
 #include <arpa/inet.h>

@@ -1,7 +1,7 @@
 #ifndef PPLX_EMBED_INTERNAL_H
 #define PPLX_EMBED_INTERNAL_H
 
-#include "pplx_embed.h"
+#include "embed.h"
 #include "qwen_safetensors.h"
 
 typedef struct {

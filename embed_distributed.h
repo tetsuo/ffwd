@@ -1,11 +1,11 @@
 /*
- * pplx_distributed.h - Stateless two-node layer-sharded inference.
+ * embed_distributed.h - Stateless two-node layer-sharded inference.
  */
 
 #ifndef PPLX_DISTRIBUTED_H
 #define PPLX_DISTRIBUTED_H
 
-#include "pplx_embed.h"
+#include "embed.h"
 
 typedef struct pplx_dist_client pplx_dist_client_t;
 

@@ -1,5 +1,5 @@
-#include "pplx_embed_mlx.h"
-#include "pplx_embed.h"
+#include "embed_mlx.h"
+#include "embed.h"
 #include "qwen_safetensors.h"
 
 #include <mlx/c/mlx.h>
@@ -333,7 +333,7 @@ static void upcast_f32_inplace(mlx_array *a, mlx_stream s)
  * ======================================================================== */
 
 /* We duplicate a minimal config parser here so MLX can load standalone.
- * (Same logic as pplx_embed.c:parse_config, kept inline for simplicity.) */
+ * (Same logic as embed.c:parse_config, kept inline for simplicity.) */
 
 static const char *skip_ws_m(const char *p)
 {

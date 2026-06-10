@@ -1,11 +1,11 @@
 /*
- * pplx_embed_cuda.h - CUDA/cuBLAS backend for pplx-embed inference.
+ * embed_cuda.h - CUDA/cuBLAS backend for pplx-embed inference.
  */
 
 #ifndef PPLX_EMBED_CUDA_H
 #define PPLX_EMBED_CUDA_H
 
-#include "pplx_embed.h"
+#include "embed.h"
 
 typedef struct pplx_cuda_ctx pplx_cuda_ctx_t;
 

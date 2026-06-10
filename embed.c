@@ -1,5 +1,5 @@
-#include "pplx_embed.h"
-#include "pplx_embed_internal.h"
+#include "embed.h"
+#include "embed_internal.h"
 #include "qwen_kernels.h"
 #include "qwen_safetensors.h"
 

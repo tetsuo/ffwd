@@ -1,6 +1,6 @@
 extern "C" {
-#include "pplx_embed_cuda.h"
-#include "pplx_embed_internal.h"
+#include "embed_cuda.h"
+#include "embed_internal.h"
 }
 
 #include <cuda_runtime.h>

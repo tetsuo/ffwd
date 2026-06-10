@@ -1,5 +1,5 @@
 /*
- * pplx_embed_mlx.h - MLX GPU backend for pplx-embed inference
+ * embed_mlx.h - MLX GPU backend for pplx-embed inference
  *
  * Uses Apple's mlx-c to run the transformer on Metal.
  */
@@ -9,7 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "pplx_embed.h"
+#include "embed.h"
 
 /* Opaque MLX model context */
 typedef struct pplx_mlx_ctx pplx_mlx_ctx_t;
@@ -143,7 +143,7 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
                                const pplx_context_input_t *inputs, int batch,
                                float *out_embeddings);
 
-/* Get the config (so main.c can read hidden_size etc.) */
+/* Get the config (so embed_cli.c can read hidden_size etc.) */
 const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx);
 
 #endif /* PPLX_EMBED_MLX_H */

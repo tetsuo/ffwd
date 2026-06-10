@@ -1,5 +1,5 @@
 /*
- * pplx_embed.h - Pure C inference for Perplexity AI's pplx-embed models.
+ * embed.h - Pure C inference for Perplexity AI's pplx-embed models.
  *
  * Supports all pplx-embed-v1 and pplx-embed-context-v1 variants (0.6B, 4B).
  */

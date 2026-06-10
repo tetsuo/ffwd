@@ -1,15 +1,15 @@
-/* main.c - pplx_embed command-line tool */
+/* embed_cli.c - pplx-embed command-line tool */
 
-#include "pplx_embed.h"
-#include "pplx_distributed.h"
+#include "embed.h"
+#include "embed_distributed.h"
 #include "qwen_kernels.h"
 #include "qwen_tokenizer.h"
 
 #ifdef USE_MLX
-#include "pplx_embed_mlx.h"
+#include "embed_mlx.h"
 #endif
 #ifdef USE_CUDA
-#include "pplx_embed_cuda.h"
+#include "embed_cuda.h"
 #endif
 
 #include <stdio.h>
