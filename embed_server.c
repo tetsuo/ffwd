@@ -60,7 +60,10 @@
 #define PPLX_API_MAX_CONTEXT_CHUNKS 16000
 #define PPLX_API_MAX_ITEM_TOKENS 32768
 #define PPLX_API_MAX_TOTAL_TOKENS 120000
-#define PPLX_SERVER_DEFAULT_BATCH_SIZE 8
+/* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
+ * short-request throughput over 8 with no long-document penalty, while 128
+ * was no faster and inflated long-document tail latency. */
+#define PPLX_SERVER_DEFAULT_BATCH_SIZE 32
 #define PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
 #define PPLX_SERVER_BATCH_WAIT_US 1000
 #define PPLX_SERVER_MICROBATCH_MAX_JOBS 128
@@ -2455,7 +2458,7 @@ static void print_usage(const char *prog)
         "  --api-key K               Require Authorization: Bearer K\n"
         "  --cors                    Enable CORS headers\n"
         "  -b, --batch-size N        Max texts or documents per inference batch\n"
-        "                            (default: 8)\n"
+        "                            (default: 32)\n"
         "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
         "  --batch-wait-us N         Micro-batch wait in microseconds\n"
         "                            (default: 1000; 0 drains only queued work)\n"
@@ -2750,7 +2753,7 @@ int main(int argc, char *argv[])
         .n_models = model_specs.n,
         .host = host,
         .port = port,
-        .batch_size = batch_size > 0 ? batch_size : 8,
+        .batch_size = batch_size > 0 ? batch_size : PPLX_SERVER_DEFAULT_BATCH_SIZE,
         .max_batch_tokens = max_batch_tokens,
         .batch_wait_us = batch_wait_us,
         .use_mlx = use_mlx,
