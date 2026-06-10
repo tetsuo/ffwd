@@ -16,6 +16,7 @@ bench/bench_kernels
 bench/bench_model
 bench/results/
 coverage/
+*.profraw
 book/
 .venv/
 __pycache__/
