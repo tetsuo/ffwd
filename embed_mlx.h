@@ -40,17 +40,6 @@ PPLX_API pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir);
 PPLX_API pplx_mlx_ctx_t *pplx_mlx_load_with_options(const char *model_dir,
                                            const pplx_mlx_options_t *opts);
 
-/*
- * Load one contiguous transformer layer range for distributed execution.
- * Uses the same half-open range and endpoint ownership rules as
- * pplx_model_load_slice().
- */
-PPLX_API pplx_mlx_ctx_t *pplx_mlx_load_slice(const char *model_dir,
-                                    int layer_start, int layer_end);
-PPLX_API pplx_mlx_ctx_t *pplx_mlx_load_slice_with_options(
-    const char *model_dir, int layer_start, int layer_end,
-    const pplx_mlx_options_t *opts);
-
 PPLX_API void pplx_mlx_free(pplx_mlx_ctx_t *ctx);
 
 /*
@@ -124,19 +113,6 @@ PPLX_API int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
  */
 PPLX_API int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
                          int batch, float *out_embeddings);
-
-/*
- * MLX equivalent of pplx_model_forward_slice_batch().
- *
- * Hidden states cross the API boundary as packed float32 rows even though MLX
- * executes a padded dense batch internally.
- */
-PPLX_API int pplx_mlx_forward_slice_batch(pplx_mlx_ctx_t *ctx,
-                                 const pplx_input_t *inputs, int batch,
-                                 const float *input_states,
-                                 int layer_start, int layer_end,
-                                 int apply_final_norm,
-                                 float *out_states);
 
 /*
  * Run one contextual sequence and pool selected token spans.

@@ -1,7 +1,6 @@
 /* embed_cli.c - pplx-embed command-line tool */
 
 #include "embed.h"
-#include "embed_distributed.h"
 #include "qwen_kernels.h"
 #include "qwen_tokenizer.h"
 
@@ -35,13 +34,6 @@ static void print_usage(const char *prog)
         "  --mlx        Use Apple MLX GPU backend\n"
         "  --cuda       Use CUDA/cuBLAS GPU backend\n"
         "  --stream     Read lines from stdin, write one JSON embedding per line\n"
-        "  --dist-worker\n"
-        "               Serve one final distributed layer shard\n"
-        "  --dist-remote HOST:PORT\n"
-        "               Use one remote final shard for CLI or --stream inference\n"
-        "  --layers A:B Distributed half-open layer range, for example 0:14\n"
-        "  --dist-activation-bits N\n"
-        "               Distributed activation transport width: 32 or 16 (default: 32)\n"
         "  --mlx-quant-bits N\n"
         "               Quantize MLX linear weights to 8 bits at load time\n"
         "  --mlx-quant-group-size N\n"
@@ -51,8 +43,6 @@ static void print_usage(const char *prog)
         "  --cuda-weight-dtype DTYPE\n"
         "               CUDA weight storage: f32 or bf16 (default: f32). bf16 halves\n"
         "               weight memory and uses BF16 tensor cores\n"
-        "  --host HOST  Bind host for --dist-worker (default: 127.0.0.1)\n"
-        "  --port N     Bind port for --dist-worker (default: 8000)\n"
         "  -b, --batch-size N\n"
         "               Max texts per engine batch (default: all; --stream: 1)\n"
         "  -t, --threads N\n"
@@ -68,14 +58,11 @@ static void print_usage(const char *prog)
         "  2+ text args    Print cosine similarity matrix\n"
         "  no args         Batch: read all stdin lines, then similarity matrix\n"
         "  --stream        Streaming: read stdin lines, write JSON per line\n"
-        "  --dist-worker   Final layer-shard worker\n"
         "\n"
         "Examples:\n"
         "  %s -d ./model \"query: what is AI?\"\n"
-        "  %s -d ./model --mlx --stream < texts.txt\n"
-        "  %s -d ./model --dist-worker --layers 14:28 --port 9000\n"
-        "  %s -d ./model --dist-remote 127.0.0.1:9000 --layers 0:14 \"text\"\n",
-        prog, prog, prog, prog, prog);
+        "  %s -d ./model --mlx --stream < texts.txt\n",
+        prog, prog, prog);
 }
 
 /* ========================================================================
@@ -85,7 +72,6 @@ static void print_usage(const char *prog)
 typedef struct {
     pplx_model_t     *model;
     pplx_workspace_t *workspace;
-    pplx_dist_client_t *dist;
 #ifdef USE_MLX
     pplx_mlx_ctx_t   *mlx_ctx;
 #endif
@@ -105,9 +91,6 @@ typedef struct {
 static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
                               int batch, float *out_embeddings)
 {
-    if (e->dist)
-        return pplx_dist_client_embed_batch(e->dist, inputs, batch,
-                                            out_embeddings);
 #ifdef USE_MLX
     if (e->mlx_ctx)
         return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
@@ -118,30 +101,6 @@ static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
 #endif
     return pplx_model_embed_batch(e->model, e->workspace,
                                   inputs, batch, out_embeddings);
-}
-
-static int parse_layers(const char *arg, int *start, int *end)
-{
-    int used = 0;
-    if (!arg || sscanf(arg, "%d:%d%n", start, end, &used) != 2 ||
-        arg[used] != '\0' || *start < 0 || *start >= *end)
-        return -1;
-    return 0;
-}
-
-static int parse_endpoint(const char *arg, char *host, size_t hostlen, int *port)
-{
-    const char *colon = arg ? strrchr(arg, ':') : NULL;
-    if (!colon || colon == arg || !colon[1]) return -1;
-    size_t n = (size_t)(colon - arg);
-    if (n >= hostlen) return -1;
-    memcpy(host, arg, n);
-    host[n] = '\0';
-    int used = 0;
-    if (sscanf(colon + 1, "%d%n", port, &used) != 1 ||
-        colon[1 + used] != '\0' || *port <= 0 || *port > 65535)
-        return -1;
-    return 0;
 }
 
 static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
@@ -474,18 +433,11 @@ int main(int argc, char *argv[])
     int use_mlx    = 0;
     int use_cuda   = 0;
     int stdin_mode = 0;
-    int dist_worker_mode = 0;
-    const char *dist_remote = NULL;
-    int layer_start = -1;
-    int layer_end = -1;
     int batch_size = 0;
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
     const char *cuda_fast_gemm = NULL;
     const char *cuda_weights = NULL;
-    int dist_activation_bits = 32;
-    const char *host = "127.0.0.1";
-    int port = 8000;
 
     int arg_start = 1;
     while (arg_start < argc && argv[arg_start][0] == '-') {
@@ -543,29 +495,12 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--cuda-weight-dtype")) {
             cuda_weights = argv[++arg_start];
         }
-        else if (!strcmp(f, "--host"))   { host = argv[++arg_start]; }
-        else if (!strcmp(f, "--port"))   { port = atoi(argv[++arg_start]); }
-        else if (!strcmp(f, "--layers")) {
-            if (parse_layers(argv[++arg_start], &layer_start, &layer_end) != 0) {
-                fprintf(stderr, "--layers expects START:END with START < END\n");
-                return 1;
-            }
-        }
-        else if (!strcmp(f, "--dist-activation-bits")) {
-            dist_activation_bits = atoi(argv[++arg_start]);
-            if (dist_activation_bits != 32 && dist_activation_bits != 16) {
-                fprintf(stderr, "--dist-activation-bits must be 32 or 16\n");
-                return 1;
-            }
-        }
         else if (!strcmp(f, "-e") || !strcmp(f, "--embeddings")) {
             print_embs = 1;
         }
         else if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose++; }
         else if (!strcmp(f, "-vv"))     { verbose = 2; }
         else if (!strcmp(f, "--stream")) { stdin_mode = 1; }
-        else if (!strcmp(f, "--dist-worker")) { dist_worker_mode = 1; }
-        else if (!strcmp(f, "--dist-remote")) { dist_remote = argv[++arg_start]; }
         else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
@@ -637,28 +572,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (dist_worker_mode && dist_remote) {
-        fprintf(stderr, "--dist-worker and --dist-remote are mutually exclusive\n");
-        return 1;
-    }
-    if ((dist_worker_mode || dist_remote) &&
-        (layer_start < 0 || layer_end < 0)) {
-        fprintf(stderr, "distributed mode requires --layers START:END\n");
-        return 1;
-    }
-    if (dist_activation_bits != 32 && !dist_remote) {
-        fprintf(stderr, "--dist-activation-bits is only valid with --dist-remote\n");
-        return 1;
-    }
-    if (dist_remote && layer_start != 0) {
-        fprintf(stderr, "--dist-remote coordinator layers must start at zero\n");
-        return 1;
-    }
-    if ((dist_worker_mode || dist_remote) && use_cuda) {
-        fprintf(stderr, "distributed mode is not available with --cuda yet\n");
-        return 1;
-    }
-
     /* Threads (CPU backend) */
     if (!use_mlx && !use_cuda) {
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
@@ -674,17 +587,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    pplx_dist_options_t dist_opts = {
-        .mlx_quantize_bits = mlx_quantize_bits,
-        .mlx_quantize_group_size = mlx_quantize_group_size,
-        .activation_bits = dist_activation_bits,
-    };
-
-    if (dist_worker_mode)
-        return pplx_dist_run_worker_with_options(
-            model_dir, host, port, layer_start, layer_end, use_mlx,
-            &dist_opts);
-
     /* Tokenizer */
     char vocab_path[1024];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
@@ -699,25 +601,7 @@ int main(int argc, char *argv[])
     t0 = now_ms();
 
 #ifdef USE_MLX
-    if (dist_remote) {
-        char remote_host[1024];
-        int remote_port = 0;
-        if (parse_endpoint(dist_remote, remote_host, sizeof(remote_host),
-                           &remote_port) != 0) {
-            fprintf(stderr, "--dist-remote expects HOST:PORT\n");
-            qwen_tokenizer_free(tok);
-            return 1;
-        }
-        e.dist = pplx_dist_client_open_with_options(
-            model_dir, remote_host, remote_port, layer_end, use_mlx,
-            &dist_opts);
-        if (!e.dist) {
-            fprintf(stderr, "failed to connect distributed worker\n");
-            qwen_tokenizer_free(tok);
-            return 1;
-        }
-        e.dim = pplx_dist_client_config(e.dist)->hidden_size;
-    } else if (use_mlx) {
+    if (use_mlx) {
         pplx_mlx_options_t mlx_opts = {
             .quantize_bits = mlx_quantize_bits,
             .quantize_group_size = mlx_quantize_group_size,
@@ -743,40 +627,20 @@ int main(int argc, char *argv[])
     } else
 #endif
     {
-        if (dist_remote) {
-            char remote_host[1024];
-            int remote_port = 0;
-            if (parse_endpoint(dist_remote, remote_host, sizeof(remote_host),
-                               &remote_port) != 0) {
-                fprintf(stderr, "--dist-remote expects HOST:PORT\n");
-                qwen_tokenizer_free(tok);
-                return 1;
-            }
-            e.dist = pplx_dist_client_open_with_options(
-                model_dir, remote_host, remote_port, layer_end, use_mlx,
-                &dist_opts);
-            if (!e.dist) {
-                fprintf(stderr, "failed to connect distributed worker\n");
-                qwen_tokenizer_free(tok);
-                return 1;
-            }
-            e.dim = pplx_dist_client_config(e.dist)->hidden_size;
-        } else {
-            e.model = pplx_model_load(model_dir);
-            if (!e.model) {
-                fprintf(stderr, "failed to load model\n");
-                qwen_tokenizer_free(tok);
-                return 1;
-            }
-            e.workspace = pplx_workspace_new(e.model);
-            if (!e.workspace) {
-                fprintf(stderr, "failed to allocate workspace\n");
-                pplx_model_free(e.model);
-                qwen_tokenizer_free(tok);
-                return 1;
-            }
-            e.dim = pplx_model_config(e.model)->hidden_size;
+        e.model = pplx_model_load(model_dir);
+        if (!e.model) {
+            fprintf(stderr, "failed to load model\n");
+            qwen_tokenizer_free(tok);
+            return 1;
         }
+        e.workspace = pplx_workspace_new(e.model);
+        if (!e.workspace) {
+            fprintf(stderr, "failed to allocate workspace\n");
+            pplx_model_free(e.model);
+            qwen_tokenizer_free(tok);
+            return 1;
+        }
+        e.dim = pplx_model_config(e.model)->hidden_size;
     }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s%s\n",
@@ -789,7 +653,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "failed to allocate tokenizer workspace\n");
         if (e.workspace) pplx_workspace_free(e.workspace);
         if (e.model) pplx_model_free(e.model);
-        if (e.dist) pplx_dist_client_free(e.dist);
 #ifdef USE_MLX
         if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif
@@ -810,7 +673,6 @@ int main(int argc, char *argv[])
     /* Cleanup */
     if (e.workspace) pplx_workspace_free(e.workspace);
     if (e.model) pplx_model_free(e.model);
-    if (e.dist) pplx_dist_client_free(e.dist);
 #ifdef USE_MLX
     if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif

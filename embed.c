@@ -717,12 +717,6 @@ pplx_model_t *pplx_model_load(const char *model_dir)
     return model_load_range_ex(model_dir, 0, -1, 0);
 }
 
-pplx_model_t *pplx_model_load_slice(const char *model_dir,
-                                    int layer_start, int layer_end)
-{
-    return model_load_range_ex(model_dir, layer_start, layer_end, 0);
-}
-
 void pplx_model_free(pplx_model_t *model)
 {
     if (!model) return;
@@ -1439,42 +1433,6 @@ int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
     if (rc == 0)
         pool_embeddings(model, ws, offsets, batch, out_embeddings);
 
-    return rc;
-}
-
-int pplx_model_forward_slice_batch(const pplx_model_t *model,
-                                   pplx_workspace_t *ws,
-                                   const pplx_input_t *inputs, int batch,
-                                   const float *input_states,
-                                   int layer_start, int layer_end,
-                                   int apply_final_norm,
-                                   float *out_states)
-{
-    if (!model || !ws || !inputs || batch <= 0 || !out_states ||
-        layer_start < 0 || layer_start > layer_end ||
-        layer_end > model->config.n_layers)
-        return -1;
-
-    if (ensure_offsets(ws, batch) != 0) return -1;
-    int *offsets = ws->offsets;
-
-    int total_seq = 0;
-    int max_seq = 0;
-    if (build_offsets(inputs, batch, layer_start == 0, offsets,
-                      &total_seq, &max_seq) != 0)
-        return -1;
-
-    int rc = forward_packed_slice_inplace(model, ws, inputs, batch, offsets,
-                                          total_seq, max_seq, input_states,
-                                          layer_start, layer_end,
-                                          apply_final_norm);
-    if (rc == 0) {
-        size_t count;
-        if (mul_size((size_t)total_seq,
-                     (size_t)model->config.hidden_size, &count) != 0)
-            return -1;
-        memcpy(out_states, ws->x, count * sizeof(float));
-    }
     return rc;
 }
 

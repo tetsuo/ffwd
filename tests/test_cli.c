@@ -167,9 +167,6 @@ int main(int argc, char **argv)
         {"--cuda", "--cuda without CUDA build"},
         {"--mlx-quant-bits 4", "--mlx-quant-bits 4"},
         {"--mlx-quant-group-size 0", "--mlx-quant-group-size 0"},
-        {"--layers 5:2", "inverted --layers range"},
-        {"--layers nope", "malformed --layers"},
-        {"--dist-activation-bits 8", "--dist-activation-bits 8"},
         {"--cuda-gemm-mode f32 -d X t", "--cuda-gemm-mode without CUDA"},
         {"--cuda-weight-dtype bf16 -d X t", "--cuda-weight-dtype without CUDA"},
     };
@@ -179,15 +176,6 @@ int main(int argc, char **argv)
     /* Validation that runs after the model dir is accepted. */
     snprintf(args, sizeof(args), "-d '%s' --mlx-quant-bits 8 t", g_dir);
     expect(run_cli(args, NULL) == 1, "--mlx-quant-bits without --mlx");
-    snprintf(args, sizeof(args), "-d '%s' --dist-worker", g_dir);
-    expect(run_cli(args, NULL) == 1, "--dist-worker without --layers");
-    snprintf(args, sizeof(args),
-             "-d '%s' --dist-worker --dist-remote h:1 --layers 0:1", g_dir);
-    expect(run_cli(args, NULL) == 1, "--dist-worker with --dist-remote");
-    snprintf(args, sizeof(args),
-             "-d '%s' --dist-activation-bits 16 t", g_dir);
-    expect(run_cli(args, NULL) == 1,
-           "--dist-activation-bits without --dist-remote");
 
     if (g_failures) {
         fprintf(stderr, "%d CLI check(s) failed\n", g_failures);

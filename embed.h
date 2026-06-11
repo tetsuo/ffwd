@@ -88,17 +88,6 @@ typedef struct {
  */
 PPLX_API pplx_model_t *pplx_model_load(const char *model_dir);
 
-/*
- * Load one contiguous transformer layer range for distributed execution.
- *
- * layer_start is inclusive and layer_end is exclusive. A range beginning at
- * zero also loads the token embedding table. A range ending at n_layers also
- * loads the final RMSNorm. Safetensors remain mmap-backed, so unselected
- * weights are not touched.
- */
-PPLX_API pplx_model_t *pplx_model_load_slice(const char *model_dir,
-                                    int layer_start, int layer_end);
-
 PPLX_API void pplx_model_free(pplx_model_t *model);
 
 /*
@@ -156,27 +145,6 @@ PPLX_API int pplx_model_embed_into(const pplx_model_t *model, pplx_workspace_t *
 PPLX_API int pplx_model_embed_batch(const pplx_model_t *model, pplx_workspace_t *ws,
                            const pplx_input_t *inputs, int batch,
                            float *out_embeddings);
-
-/*
- * Run a contiguous transformer layer range for a packed/ragged batch.
- *
- * layer_start is inclusive and layer_end is exclusive. For a range beginning
- * at layer 0, input_states must be NULL and every input must provide token
- * ids. For a later range, input_states must contain the preceding range's
- * packed [sum(n_tokens), hidden_size] output; token ids are not required.
- *
- * apply_final_norm is valid only for a range ending at the final transformer
- * layer. out_states receives packed [sum(n_tokens), hidden_size] states.
- *
- * This is the core execution boundary used by layer-sharded inference.
- */
-PPLX_API int pplx_model_forward_slice_batch(const pplx_model_t *model,
-                                   pplx_workspace_t *ws,
-                                   const pplx_input_t *inputs, int batch,
-                                   const float *input_states,
-                                   int layer_start, int layer_end,
-                                   int apply_final_norm,
-                                   float *out_states);
 
 /*
  * Mean-pool packed final hidden states for a ragged batch.

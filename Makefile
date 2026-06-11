@@ -19,7 +19,6 @@ UNAME_S := $(shell uname -s)
 
 # Source files
 SRCS = embed.c \
-       embed_distributed.c \
        qwen_kernels.c \
        qwen_kernels_generic.c \
        qwen_kernels_neon.c \
@@ -167,11 +166,11 @@ TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
 TEST_LATE_SRCS        = tests/test_late.c embed.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
-TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_distributed.c \
+TEST_SERVER_SRCS      = tests/test_server.c embed.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 # The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
-TEST_CLI_BIN_SRCS     = embed_cli.c embed.c embed_distributed.c \
+TEST_CLI_BIN_SRCS     = embed_cli.c embed.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
 
 test:
@@ -335,16 +334,13 @@ $(SERVER_TARGET): $(LIB) embed_server.o
 embed.o: embed.c embed.h qwen_kernels.h qwen_safetensors.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
-embed_distributed.o: embed_distributed.c embed_distributed.h embed.h embed_mlx.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
 embed_server.o: embed_server.c embed_server.h embed.h embed_mlx.h qwen_tokenizer.h deps/ae/ae.h deps/ae/anet.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 embed_mlx.o: embed_mlx.c embed_mlx.h embed.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-embed_cli.o: embed_cli.c embed.h embed_distributed.h qwen_kernels.h qwen_tokenizer.h
+embed_cli.o: embed_cli.c embed.h qwen_kernels.h qwen_tokenizer.h
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 
