@@ -39,13 +39,13 @@ static int check_maxsim_batch_parity(const float *query, int query_tokens,
 {
     float scores[8];
     if (n_docs > (int)(sizeof(scores) / sizeof(scores[0]))) return 1;
-    if (pplx_late_maxsim_batch(query, query_tokens, docs, offsets, n_docs,
+    if (embed_late_maxsim_batch(query, query_tokens, docs, offsets, n_docs,
                                dim, scores) != 0) {
         fprintf(stderr, "maxsim_batch (%s) failed\n", what);
         return 1;
     }
     for (int i = 0; i < n_docs; i++) {
-        float one = pplx_late_maxsim(query, query_tokens,
+        float one = embed_late_maxsim(query, query_tokens,
                                      docs + (size_t)offsets[i] * dim,
                                      offsets[i + 1] - offsets[i], dim);
         if (fabsf(scores[i] - one) > 0.0001f) {
@@ -64,10 +64,10 @@ int main(void)
     int hidden = dims.hidden;
 
     qwen_tokenizer_t *tok = NULL;
-    pplx_model_t *base = NULL;
-    pplx_workspace_t *base_ws = NULL;
-    pplx_late_model_t *late = NULL;
-    pplx_late_workspace_t *ws = NULL;
+    embed_model_t *base = NULL;
+    embed_workspace_t *base_ws = NULL;
+    embed_late_model_t *late = NULL;
+    embed_late_workspace_t *ws = NULL;
     int *ids = NULL;
     float *states = NULL, *raw = NULL, *vecs = NULL, *expected = NULL;
     float *doc_vecs = NULL;
@@ -75,7 +75,7 @@ int main(void)
     int *doc_ids[3] = {0};
 
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/pplx-late-test-XXXXXX",
+    snprintf(dir, sizeof(dir), "%s/embed-late-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir) || tf_write_vocab(dir) != 0 ||
         tm_write_model_dims(dir, "F32", &dims) != 0) {
@@ -85,25 +85,25 @@ int main(void)
 
     /* The base model must load before the projection exists; keep it for
      * the reference forward pass below. */
-    base = pplx_model_load(dir);
-    if (!base || !(base_ws = pplx_workspace_new(base))) {
+    base = embed_model_load(dir);
+    if (!base || !(base_ws = embed_workspace_new(base))) {
         fprintf(stderr, "failed to load base model\n");
         goto fail;
     }
 
     /* No 1_Dense head yet: not a late model. */
-    if (pplx_late_model_load(dir) != NULL) {
+    if (embed_late_model_load(dir) != NULL) {
         fprintf(stderr, "late load succeeded without 1_Dense\n");
         goto fail;
     }
-    if (pplx_late_model_config(NULL) != NULL ||
-        pplx_late_model_token_dim(NULL) != 0 ||
-        pplx_late_workspace_new(NULL) != NULL) {
+    if (embed_late_model_config(NULL) != NULL ||
+        embed_late_model_token_dim(NULL) != 0 ||
+        embed_late_workspace_new(NULL) != NULL) {
         fprintf(stderr, "NULL-argument handling failed\n");
         goto fail;
     }
-    pplx_late_workspace_free(NULL);
-    pplx_late_model_free(NULL);
+    embed_late_workspace_free(NULL);
+    embed_late_model_free(NULL);
 
     /* A head whose tensor is not named linear.weight must be rejected. */
     if (tm_write_late_projection_named(dir, "F32", TOKEN_DIM, hidden,
@@ -111,7 +111,7 @@ int main(void)
         fprintf(stderr, "failed to write malformed projection\n");
         goto fail;
     }
-    if (pplx_late_model_load(dir) != NULL) {
+    if (embed_late_model_load(dir) != NULL) {
         fprintf(stderr, "late load accepted a head without linear.weight\n");
         goto fail;
     }
@@ -120,26 +120,26 @@ int main(void)
         fprintf(stderr, "failed to write projection\n");
         goto fail;
     }
-    late = pplx_late_model_load(dir);
+    late = embed_late_model_load(dir);
     if (!late) {
         fprintf(stderr, "late model load failed\n");
         goto fail;
     }
 
     /* With the projection present the dir is no longer a pooled model. */
-    if (pplx_model_load(dir) != NULL) {
+    if (embed_model_load(dir) != NULL) {
         fprintf(stderr, "pooled load accepted a late-interaction snapshot\n");
         goto fail;
     }
 
-    const pplx_config_t *cfg = pplx_late_model_config(late);
+    const embed_config_t *cfg = embed_late_model_config(late);
     if (!cfg || cfg->hidden_size != hidden ||
-        pplx_late_model_token_dim(late) != TOKEN_DIM) {
+        embed_late_model_token_dim(late) != TOKEN_DIM) {
         fprintf(stderr, "late config/token_dim mismatch\n");
         goto fail;
     }
 
-    ws = pplx_late_workspace_new(late);
+    ws = embed_late_workspace_new(late);
     if (!ws) {
         fprintf(stderr, "late workspace allocation failed\n");
         goto fail;
@@ -169,25 +169,25 @@ int main(void)
         goto fail;
     }
 
-    if (pplx_late_model_encode_tokens(late, ws, NULL, n_tokens, 1, vecs) == 0 ||
-        pplx_late_model_encode_tokens(late, ws, ids, 0, 1, vecs) == 0 ||
-        pplx_late_model_encode_tokens(NULL, ws, ids, n_tokens, 1, vecs) == 0 ||
-        pplx_late_model_encode_tokens(late, NULL, ids, n_tokens, 1, vecs) == 0) {
+    if (embed_late_model_encode_tokens(late, ws, NULL, n_tokens, 1, vecs) == 0 ||
+        embed_late_model_encode_tokens(late, ws, ids, 0, 1, vecs) == 0 ||
+        embed_late_model_encode_tokens(NULL, ws, ids, n_tokens, 1, vecs) == 0 ||
+        embed_late_model_encode_tokens(late, NULL, ids, n_tokens, 1, vecs) == 0) {
         fprintf(stderr, "encode accepted invalid arguments\n");
         goto fail;
     }
 
-    if (pplx_late_model_encode_tokens(late, ws, ids, n_tokens, 0, raw) != 0 ||
-        pplx_late_model_encode_tokens(late, ws, ids, n_tokens, 1, vecs) != 0) {
+    if (embed_late_model_encode_tokens(late, ws, ids, n_tokens, 0, raw) != 0 ||
+        embed_late_model_encode_tokens(late, ws, ids, n_tokens, 1, vecs) != 0) {
         fprintf(stderr, "encode_tokens failed\n");
         goto fail;
     }
 
     /* Reference: run the same tokens through the standalone base model and
      * apply the projection by hand from the fixture's deterministic values. */
-    states = pplx_model_forward(base, base_ws, ids, n_tokens);
+    states = embed_model_forward(base, base_ws, ids, n_tokens);
     if (!states) {
-        fprintf(stderr, "pplx_model_forward failed\n");
+        fprintf(stderr, "embed_model_forward failed\n");
         goto fail;
     }
     for (int t = 0; t < n_tokens; t++) {
@@ -227,13 +227,13 @@ int main(void)
     {
         static const float q2[4] = {1.0f, 0.0f, 0.0f, 1.0f};
         static const float d2[4] = {1.0f, 0.0f, 0.0f, -1.0f};
-        float s = pplx_late_maxsim(q2, 2, d2, 2, 2);
+        float s = embed_late_maxsim(q2, 2, d2, 2, 2);
         if (fabsf(s - 1.0f) > 0.000001f) {
             fprintf(stderr, "maxsim hand check: got %g, want 1\n", s);
             goto fail;
         }
-        if (pplx_late_maxsim(NULL, 2, d2, 2, 2) != 0.0f ||
-            pplx_late_maxsim(q2, 0, d2, 2, 2) != 0.0f) {
+        if (embed_late_maxsim(NULL, 2, d2, 2, 2) != 0.0f ||
+            embed_late_maxsim(q2, 0, d2, 2, 2) != 0.0f) {
             fprintf(stderr, "maxsim accepted invalid arguments\n");
             goto fail;
         }
@@ -260,7 +260,7 @@ int main(void)
             goto fail;
         }
         for (int i = 0; i < 3; i++) {
-            if (pplx_late_model_encode_tokens(
+            if (embed_late_model_encode_tokens(
                     late, ws, doc_ids[i], lens[i], 1,
                     doc_vecs + (size_t)offsets[i] * TOKEN_DIM) != 0) {
                 fprintf(stderr, "doc encode failed\n");
@@ -274,11 +274,11 @@ int main(void)
         float scores[3];
         int bad_first[4] = {1, 2, 3, 4};
         int empty_doc[3] = {0, 2, 2};
-        if (pplx_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3,
+        if (embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3,
                                    TOKEN_DIM, scores) == 0 ||
-            pplx_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2,
+            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2,
                                    TOKEN_DIM, scores) == 0 ||
-            pplx_late_maxsim_batch(vecs, n_tokens, doc_vecs, offsets, 3,
+            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, offsets, 3,
                                    TOKEN_DIM, NULL) == 0) {
             fprintf(stderr, "maxsim_batch accepted invalid arguments\n");
             goto fail;
@@ -325,9 +325,9 @@ fail:
     free(states);
     free(ids);
     qwen_tokenizer_free(tok);
-    pplx_late_workspace_free(ws);
-    pplx_late_model_free(late);
-    pplx_workspace_free(base_ws);
-    pplx_model_free(base);
+    embed_late_workspace_free(ws);
+    embed_late_model_free(late);
+    embed_workspace_free(base_ws);
+    embed_model_free(base);
     return rc;
 }

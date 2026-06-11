@@ -30,9 +30,9 @@ typedef struct {
     cuda_matrix_t gate_up_proj, down_proj;
 } cuda_layer_t;
 
-struct pplx_cuda_ctx {
-    pplx_model_t *cpu;
-    pplx_config_t config;
+struct embed_cuda_ctx {
+    embed_model_t *cpu;
+    embed_config_t config;
     cudaStream_t stream;
     cublasHandle_t blas;
     cuda_matrix_t embed_tokens;
@@ -125,7 +125,7 @@ static int parse_gemm_compute(const char *mode, cublasComputeType_t *out)
 static cublasComputeType_t g_gemm_compute = CUBLAS_COMPUTE_32F;
 static int g_gemm_compute_set = 0;
 
-int pplx_cuda_set_fast_gemm(const char *mode)
+int embed_cuda_set_fast_gemm(const char *mode)
 {
     cublasComputeType_t ct;
     if (parse_gemm_compute(mode, &ct) != 0)
@@ -169,14 +169,14 @@ static uint16_t f32_to_bf16(float f)
 static int g_weights_bf16 = 0;
 static int g_weights_bf16_set = 0;
 
-int pplx_cuda_set_weights_bf16(int on)
+int embed_cuda_set_weights_bf16(int on)
 {
     g_weights_bf16 = on ? 1 : 0;
     g_weights_bf16_set = 1;
     return 0;
 }
 
-static int copy_weight_host_f32(float *dst, const pplx_weight_ref_t *w,
+static int copy_weight_host_f32(float *dst, const embed_weight_ref_t *w,
                                 size_t count)
 {
     if (!dst || !w || !w->data) return -1;
@@ -233,7 +233,7 @@ static int upload_weight(cuda_matrix_t *m, const float *src, size_t count,
     return 0;
 }
 
-static int load_matrix(cuda_matrix_t *m, const pplx_weight_ref_t *w,
+static int load_matrix(cuda_matrix_t *m, const embed_weight_ref_t *w,
                        int rows, int cols)
 {
     if (!m || !w || rows <= 0 || cols <= 0) return -1;
@@ -249,8 +249,8 @@ static int load_matrix(cuda_matrix_t *m, const pplx_weight_ref_t *w,
     return r;
 }
 
-static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
-                           const pplx_config_t *c)
+static int load_qkv_matrix(cuda_matrix_t *m, const embed_layer_t *src,
+                           const embed_config_t *c)
 {
     if (!m || !src || !c) return -1;
     int rows = c->q_dim + 2 * c->kv_dim;
@@ -271,8 +271,8 @@ static int load_qkv_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
     return r;
 }
 
-static int load_gate_up_matrix(cuda_matrix_t *m, const pplx_layer_t *src,
-                               const pplx_config_t *c)
+static int load_gate_up_matrix(cuda_matrix_t *m, const embed_layer_t *src,
+                               const embed_config_t *c)
 {
     if (!m || !src || !c) return -1;
     int rows = 2 * c->intermediate_size;
@@ -574,14 +574,14 @@ static int launch_check(void)
 }
 
 // Compute type for CUDA GEMMs. Default is exact F32 (== cublasSgemm).
-// PPLX_CUDA_GEMM_MODE={bf16,tf32,16f} selects a reduced-precision tensor-core
+// EMBED_CUDA_GEMM_MODE={bf16,tf32,16f} selects a reduced-precision tensor-core
 // matmul that keeps F32 inputs/outputs and F32 accumulation but rounds operands
 // internally.
 static cublasComputeType_t gemm_compute(void)
 {
     static int env_init = 0;
     if (!g_gemm_compute_set && !env_init) {
-        const char *e = getenv("PPLX_CUDA_GEMM_MODE");
+        const char *e = getenv("EMBED_CUDA_GEMM_MODE");
         if (e && parse_gemm_compute(e, &g_gemm_compute) == 0)
             g_gemm_compute_set = 1;
         env_init = 1;
@@ -594,7 +594,7 @@ static cublasComputeType_t gemm_compute(void)
 // already produced in BF16 by the upstream kernel, otherwise the F32 operand
 // is cast into ctx->act_bf16 first. With F32 weights this is the exact path,
 // honoring gemm_compute().
-static int linear_ex(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+static int linear_ex(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                      const void *x, int x_is_bf16, float *y, int rows,
                      int in_dim, int out_dim, int x_stride, float beta)
 {
@@ -627,21 +627,21 @@ static int linear_ex(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
     return 0;
 }
 
-static int linear(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+static int linear(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                   const float *x, float *y, int rows, int in_dim, int out_dim)
 {
     return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 0.0f);
 }
 
 // x points at activations already stored as BF16 (e.g. ctx->act_bf16).
-static int linear_bf16x(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+static int linear_bf16x(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                         const void *x, float *y, int rows, int in_dim,
                         int out_dim, int x_stride, float beta)
 {
     return linear_ex(ctx, w, x, 1, y, rows, in_dim, out_dim, x_stride, beta);
 }
 
-static int linear_accum(pplx_cuda_ctx_t *ctx, const cuda_matrix_t *w,
+static int linear_accum(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
                         const float *x, float *y,
                         int rows, int in_dim, int out_dim)
 {
@@ -683,10 +683,10 @@ static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
 // layer-invariant). attn_G stays 0 - per-sequence fallback - for ragged
 // batches, single sequences, or when one sequence's scores exceed the
 // budget.
-static int attn_batched_setup(pplx_cuda_ctx_t *ctx, int batch, int q_offset,
+static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
                               int qkv_dim)
 {
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     ctx->attn_G = 0;
     if (batch < 2) return 0;
     int L = ctx->offsets_host[1] - ctx->offsets_host[0];
@@ -773,12 +773,12 @@ static int attn_batched_setup(pplx_cuda_ctx_t *ctx, int batch, int q_offset,
 // out_bf16 != NULL selects the BF16-weight layout: V and the softmax
 // probabilities are stored BF16 and the @V GEMM emits BF16 attention output
 // at out_bf16 (stride q_dim), ready for the wo projection without a cast.
-static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
+static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
                                int batch, int q_offset, int k_offset,
                                int v_offset, int qkv_dim, float scale,
                                __nv_bfloat16 *out_bf16)
 {
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     int q_dim = c->q_dim;
     int hd = c->head_dim;
     int H = c->n_heads;
@@ -884,9 +884,9 @@ static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
     return 0;
 }
 
-static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_seq)
+static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_seq)
 {
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     if (total > ctx->seq_cap) {
         cudaFree(ctx->x);
         cudaFree(ctx->x_norm);
@@ -985,10 +985,10 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
     return 0;
 }
 
-static int ensure_pooled_rows(pplx_cuda_ctx_t *ctx, int rows)
+static int ensure_pooled_rows(embed_cuda_ctx_t *ctx, int rows)
 {
     if (rows <= ctx->pooled_rows_cap) return 0;
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     cudaFree(ctx->pooled_out);
     ctx->pooled_out = NULL;
     CUDA_CHECK(cudaMalloc((void **)&ctx->pooled_out,
@@ -997,7 +997,7 @@ static int ensure_pooled_rows(pplx_cuda_ctx_t *ctx, int rows)
     return 0;
 }
 
-static int ensure_span_buffers(pplx_cuda_ctx_t *ctx, int n_spans)
+static int ensure_span_buffers(embed_cuda_ctx_t *ctx, int n_spans)
 {
     if (n_spans <= ctx->span_cap) return 0;
     cudaFree(ctx->span_starts);
@@ -1012,8 +1012,8 @@ static int ensure_span_buffers(pplx_cuda_ctx_t *ctx, int n_spans)
     return 0;
 }
 
-static int load_layer(cuda_layer_t *dst, const pplx_layer_t *src,
-                      const pplx_config_t *c)
+static int load_layer(cuda_layer_t *dst, const embed_layer_t *src,
+                      const embed_config_t *c)
 {
     return
         load_qkv_matrix(&dst->qkv, src, c) ||
@@ -1039,14 +1039,14 @@ static void free_layer(cuda_layer_t *l)
     cuda_matrix_free(&l->down_proj);
 }
 
-pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir)
+embed_cuda_ctx_t *embed_cuda_load(const char *model_dir)
 {
-    pplx_model_t *cpu = pplx_model_load(model_dir);
+    embed_model_t *cpu = embed_model_load(model_dir);
     if (!cpu) return NULL;
 
-    pplx_cuda_ctx_t *ctx = (pplx_cuda_ctx_t *)calloc(1, sizeof(*ctx));
+    embed_cuda_ctx_t *ctx = (embed_cuda_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx) {
-        pplx_model_free(cpu);
+        embed_model_free(cpu);
         return NULL;
     }
     ctx->cpu = cpu;
@@ -1065,26 +1065,26 @@ pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir)
     if (cudaStreamCreate(&ctx->stream) != cudaSuccess ||
         cublasCreate(&ctx->blas) != CUBLAS_STATUS_SUCCESS ||
         cublasSetStream(ctx->blas, ctx->stream) != CUBLAS_STATUS_SUCCESS) {
-        pplx_cuda_free(ctx);
+        embed_cuda_free(ctx);
         return NULL;
     }
 
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     ctx->layers = (cuda_layer_t *)calloc((size_t)c->n_layers, sizeof(*ctx->layers));
     if (!ctx->layers) {
-        pplx_cuda_free(ctx);
+        embed_cuda_free(ctx);
         return NULL;
     }
     if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens,
                     c->vocab_size, c->hidden_size) != 0 ||
         load_vector(&ctx->norm, cpu->weights.norm, c->hidden_size) != 0) {
-        pplx_cuda_free(ctx);
+        embed_cuda_free(ctx);
         return NULL;
     }
     for (int i = 0; i < c->n_layers; i++) {
         if (load_layer(&ctx->layers[i], &cpu->weights.layers[i], c) != 0) {
             fprintf(stderr, "cuda: failed to load layer %d\n", i);
-            pplx_cuda_free(ctx);
+            embed_cuda_free(ctx);
             return NULL;
         }
     }
@@ -1092,7 +1092,7 @@ pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir)
     return ctx;
 }
 
-void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
+void embed_cuda_free(embed_cuda_ctx_t *ctx)
 {
     if (!ctx) return;
     cuda_matrix_free(&ctx->embed_tokens);
@@ -1125,20 +1125,20 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->span_lens);
     if (ctx->blas) cublasDestroy(ctx->blas);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
-    pplx_model_free(ctx->cpu);
+    embed_model_free(ctx->cpu);
     free(ctx);
 }
 
-const pplx_config_t *pplx_cuda_config(const pplx_cuda_ctx_t *ctx)
+const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx)
 {
     return ctx ? &ctx->config : NULL;
 }
 
-static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
                               int batch)
 {
     if (!ctx || !inputs || batch <= 0) return -1;
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     int *h_offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
     if (!h_offsets) return -1;
     int total = 0, max_seq = 0;
@@ -1299,11 +1299,11 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     return 0;
 }
 
-int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
                           int batch, float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     if (cuda_forward_batch(ctx, inputs, batch) != 0)
         return -1;
     if (ensure_pooled_rows(ctx, batch) != 0)
@@ -1323,16 +1323,16 @@ int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     return 0;
 }
 
-int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
-                                const pplx_context_input_t *inputs,
+int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
+                                const embed_context_input_t *inputs,
                                 int batch, float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     int total_spans = 0;
     int total_tokens = 0;
     for (int b = 0; b < batch; b++) {
-        const pplx_context_input_t *input = &inputs[b];
+        const embed_context_input_t *input = &inputs[b];
         int n_tokens = input->input.n_tokens;
         if (!input->input.ids || n_tokens <= 0 || !input->spans ||
             input->n_spans <= 0 || total_spans > INT_MAX - input->n_spans ||
@@ -1349,7 +1349,7 @@ int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
         total_tokens += n_tokens;
     }
 
-    pplx_input_t *packed = (pplx_input_t *)malloc((size_t)batch * sizeof(*packed));
+    embed_input_t *packed = (embed_input_t *)malloc((size_t)batch * sizeof(*packed));
     int *h_starts = (int *)malloc((size_t)total_spans * sizeof(int));
     int *h_lens = (int *)malloc((size_t)total_spans * sizeof(int));
     if (!packed || !h_starts || !h_lens) {
@@ -1362,7 +1362,7 @@ int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
     int token_offset = 0;
     int span_offset = 0;
     for (int b = 0; b < batch; b++) {
-        const pplx_context_input_t *input = &inputs[b];
+        const embed_context_input_t *input = &inputs[b];
         packed[b] = input->input;
         for (int s = 0; s < input->n_spans; s++) {
             h_starts[span_offset] = token_offset + input->spans[s].start;
@@ -1414,21 +1414,21 @@ cleanup:
     return rc;
 }
 
-int pplx_cuda_embed_into(pplx_cuda_ctx_t *ctx, const int *token_ids,
+int embed_cuda_encode_into(embed_cuda_ctx_t *ctx, const int *token_ids,
                          int n_tokens, float *out_embedding)
 {
-    pplx_input_t input = { token_ids, n_tokens };
-    return pplx_cuda_embed_batch(ctx, &input, 1, out_embedding);
+    embed_input_t input = { token_ids, n_tokens };
+    return embed_cuda_encode_batch(ctx, &input, 1, out_embedding);
 }
 
-float *pplx_cuda_embed(pplx_cuda_ctx_t *ctx, const int *token_ids,
+float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids,
                        int n_tokens)
 {
     if (!ctx) return NULL;
     int hidden = ctx->config.hidden_size;
     float *out = (float *)malloc((size_t)hidden * sizeof(float));
     if (!out) return NULL;
-    if (pplx_cuda_embed_into(ctx, token_ids, n_tokens, out) != 0) {
+    if (embed_cuda_encode_into(ctx, token_ids, n_tokens, out) != 0) {
         free(out);
         return NULL;
     }

@@ -8,13 +8,13 @@
 #define QWEN_KERNELS_H
 
 /* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * -fvisibility=hidden, so only declarations carrying EMBED_API are exported
  * from the shared library; everything else stays internal. */
-#ifndef PPLX_API
+#ifndef EMBED_API
 #if defined(__GNUC__)
-#define PPLX_API __attribute__((visibility("default")))
+#define EMBED_API __attribute__((visibility("default")))
 #else
-#define PPLX_API
+#define EMBED_API
 #endif
 #endif
 
@@ -142,12 +142,12 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
 
 /* Set number of threads for parallel operations (default: 1).
  * Creates a persistent thread pool. Call before inference. */
-PPLX_API void qwen_set_threads(int n);
+EMBED_API void qwen_set_threads(int n);
 
 /* Get number of available CPU cores */
-PPLX_API int qwen_get_num_cpus(void);
+EMBED_API int qwen_get_num_cpus(void);
 
 /* Global verbose flag */
-PPLX_API extern int qwen_verbose;
+EMBED_API extern int qwen_verbose;
 
 #endif /* QWEN_KERNELS_H */

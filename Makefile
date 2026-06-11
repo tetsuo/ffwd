@@ -3,7 +3,7 @@ CC          = gcc
 # not assume finite math or approximate libm calls: full -ffast-math produced
 # NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
 # -fapprox-func are the unsafe parts and stay off).
-# -fvisibility=hidden pairs with PPLX_API in the public headers: a new
+# -fvisibility=hidden pairs with EMBED_API in the public headers: a new
 # public function without the annotation will be missing from the shared lib.
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -fPIC -fvisibility=hidden \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
@@ -34,18 +34,18 @@ CUDA_SRCS = embed_cuda.cu
 
 OBJS     = $(SRCS:.c=.o)
 MLX_OBJS = $(MLX_SRCS:.c=.o)
-TARGET        = pplx-embed
-SERVER_TARGET = pplx-embed-server
-LIB           = libpplxembed.a
+TARGET        = embed
+SERVER_TARGET = embed-server
+LIB           = libembed.a
 
 KERNEL_SRCS = qwen_kernels.c qwen_kernels_generic.c \
               qwen_kernels_neon.c qwen_kernels_avx.c
 
 ifeq ($(shell uname -s),Darwin)
-SHARED_LIB   = libpplxembed.dylib
+SHARED_LIB   = libembed.dylib
 SHARED_FLAGS = -dynamiclib
 else
-SHARED_LIB   = libpplxembed.so
+SHARED_LIB   = libembed.so
 SHARED_FLAGS = -shared
 endif
 
@@ -55,23 +55,17 @@ endif
 all: help
 
 help:
-	@echo "pplx-embed - Inference for pplx-embed-v1 and pplx-embed-context-v1 embedding models"
-	@echo ""
-	@echo "Build targets:"
+	@echo "Targets:"
 	@echo "  make cpu      Build the CPU backend (BLAS: Accelerate on macOS, OpenBLAS on Linux)"
 	@echo "  make metal    Build the Apple GPU backend via MLX (recommended on Apple Silicon)"
 	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
 	@echo "  make test     Build and run the C test suite (no model files needed)"
 	@echo "  make coverage Test-suite line coverage report (clang/llvm-cov)"
 	@echo "  make bench    Kernel microbenchmarks; records bench/results/*.json"
-	@echo "  make bench-model MODEL_DIR=...  End-to-end embedding benchmark"
-	@echo "                (compare records with scripts/benchstat.py)"
-	@echo "  make debug    Debug build with AddressSanitizer"
+	@echo "  make bench-model MODEL_DIR=/path/to/model"
+	@echo "                End-to-end embedding benchmark"
+	@echo "  make debug    Debug build"
 	@echo "  make clean    Remove build artifacts"
-	@echo ""
-	@echo "Usage:"
-	@echo "  ./pplx-embed -d /path/to/model-dir \"text1\" \"text2\""
-	@echo "  ./pplx-embed-server --model pplx-embed-v1-0.6b=/path/to/model-dir"
 
 # =============================================================================
 # CPU build (BLAS: Apple Accelerate on macOS, OpenBLAS on Linux)
@@ -363,7 +357,7 @@ deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
 # =============================================================================
 clean:
 	rm -f $(OBJS) embed_mlx.o embed_cuda.o embed_cli.o embed_server.o \
-	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
+	      $(TARGET) $(SERVER_TARGET) $(LIB) libembed.dylib libembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
 	      tests/test_tokenizer tests/test_workspace tests/test_cli tests/test_late \

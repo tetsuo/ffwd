@@ -271,7 +271,7 @@ static void test_loader_edges(const char *root)
 int main(void)
 {
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/pplx-tok-test-XXXXXX",
+    snprintf(dir, sizeof(dir), "%s/embed-tok-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir) || tf_write_vocab(dir) != 0) {
         fprintf(stderr, "fixture creation failed\n");

@@ -32,8 +32,8 @@ typedef struct {
     mlx_linear_t gate_proj, up_proj, down_proj;
 } mlx_layer_t;
 
-struct pplx_mlx_ctx {
-    pplx_config_t config;
+struct embed_mlx_ctx {
+    embed_config_t config;
     mlx_array embed_tokens;
     mlx_layer_t *layers;        /* heap-allocated [n_layers] */
     mlx_array norm;
@@ -46,15 +46,15 @@ struct pplx_mlx_ctx {
     mlx_dtype weight_dtype;
 };
 
-struct pplx_mlx_late_ctx {
-    pplx_mlx_ctx_t *base;
+struct embed_mlx_late_ctx {
+    embed_mlx_ctx_t *base;
     multi_safetensors_t *dense_ms;
     mlx_linear_t projection;
     int token_dim;
 };
 
-struct pplx_mlx_late_vectors {
-    pplx_mlx_late_ctx_t *owner;
+struct embed_mlx_late_vectors {
+    embed_mlx_late_ctx_t *owner;
     mlx_array vectors;          /* [tokens, dim] */
     int tokens;
     int dim;
@@ -73,7 +73,7 @@ static int mlx_mul_size(size_t a, size_t b, size_t *out)
     return 0;
 }
 
-static mlx_dtype mlx_weight_dtype(const pplx_mlx_ctx_t *ctx)
+static mlx_dtype mlx_weight_dtype(const embed_mlx_ctx_t *ctx)
 {
     return ctx->weight_dtype;
 }
@@ -311,7 +311,7 @@ static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s)
     return res;
 }
 
-const pplx_config_t *pplx_mlx_config(const pplx_mlx_ctx_t *ctx)
+const embed_config_t *embed_mlx_config(const embed_mlx_ctx_t *ctx)
 {
     return ctx ? &ctx->config : NULL;
 }
@@ -358,7 +358,7 @@ static const char *json_find_m(const char *json, const char *key)
     return NULL;
 }
 
-static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
+static int mlx_parse_config(embed_config_t *cfg, const char *model_dir)
 {
     char path[1024];
     int path_len = snprintf(path, sizeof(path), "%s/config.json", model_dir);
@@ -387,9 +387,9 @@ static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
     GI("num_hidden_layers",   n_layers, 0);
     GI("num_attention_heads",  n_heads, 0);
     GI("num_key_value_heads",  n_kv_heads, 0);
-    GI("head_dim",             head_dim, PPLX_HEAD_DIM);
+    GI("head_dim",             head_dim, EMBED_HEAD_DIM);
     GI("intermediate_size",   intermediate_size, 0);
-    GI("vocab_size",           vocab_size, PPLX_VOCAB_SIZE);
+    GI("vocab_size",           vocab_size, EMBED_VOCAB_SIZE);
     GF("rms_norm_eps",  rms_norm_eps, 1e-6f);
     GF("rope_theta",    rope_theta, 1000000.0f);
 #undef GI
@@ -418,9 +418,9 @@ static int mlx_parse_config(pplx_config_t *cfg, const char *model_dir)
                 cfg->n_kv_heads, cfg->head_dim, cfg->intermediate_size);
         return -1;
     }
-    if (cfg->n_layers > PPLX_MAX_LAYERS) {
+    if (cfg->n_layers > EMBED_MAX_LAYERS) {
         fprintf(stderr, "mlx: too many layers (%d > %d)\n",
-                cfg->n_layers, PPLX_MAX_LAYERS);
+                cfg->n_layers, EMBED_MAX_LAYERS);
         return -1;
     }
     return 0;
@@ -443,9 +443,9 @@ static int mlx_model_dir_has_late_projection(const char *model_dir)
            mlx_model_dir_has_file(model_dir, "1_Dense/model.safetensors");
 }
 
-static pplx_mlx_options_t normalize_mlx_options(const pplx_mlx_options_t *opts)
+static embed_mlx_options_t normalize_mlx_options(const embed_mlx_options_t *opts)
 {
-    pplx_mlx_options_t out = {0};
+    embed_mlx_options_t out = {0};
     if (opts) out = *opts;
     if (out.quantize_bits != 0 &&
         out.quantize_bits != 8) {
@@ -481,12 +481,12 @@ static int prepare_layer_transposes(mlx_layer_t *l, mlx_stream s)
            prepare_linear_transpose(&l->down_proj, s);
 }
 
-static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
+static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
                                          int layer_start, int layer_end,
-                                         const pplx_mlx_options_t *opts,
+                                         const embed_mlx_options_t *opts,
                                          int allow_late)
 {
-    pplx_mlx_options_t options = normalize_mlx_options(opts);
+    embed_mlx_options_t options = normalize_mlx_options(opts);
     if (options.quantize_bits < 0) return NULL;
     if (!allow_late && mlx_model_dir_has_late_projection(model_dir)) {
         fprintf(stderr, "mlx: late-interaction models require token-level "
@@ -495,14 +495,14 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         return NULL;
     }
 
-    pplx_mlx_ctx_t *ctx = calloc(1, sizeof(pplx_mlx_ctx_t));
+    embed_mlx_ctx_t *ctx = calloc(1, sizeof(embed_mlx_ctx_t));
     if (!ctx) return NULL;
     ctx->quantize_bits = options.quantize_bits;
     ctx->quantize_group_size = options.quantize_group_size;
 
     if (mlx_parse_config(&ctx->config, model_dir) != 0) { free(ctx); return NULL; }
 
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     if (layer_end == -1)
         layer_end = c->n_layers;
     if (layer_start < 0 || layer_start >= layer_end ||
@@ -578,7 +578,7 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         LD(down_proj,      "layers.%d.mlp.down_proj.weight", h, inter);
 #undef LD
 
-        if (pplx_verbose >= 2) fprintf(stderr, "  mlx layer %d loaded\n", i);
+        if (embed_verbose >= 2) fprintf(stderr, "  mlx layer %d loaded\n", i);
     }
 
     if (layer_end == c->n_layers) {
@@ -609,7 +609,7 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
                 goto fail;
         }
         mlx_clear_cache();
-        if (pplx_verbose >= 1)
+        if (embed_verbose >= 1)
             fprintf(stderr, "mlx: quantized linear weights to %d-bit "
                     "(group_size=%d)\n",
                     ctx->quantize_bits, ctx->quantize_group_size);
@@ -620,7 +620,7 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         }
     }
 
-    if (pplx_verbose >= 2) {
+    if (embed_verbose >= 2) {
         size_t active = 0, cache = 0, peak = 0;
         mlx_get_active_memory(&active);
         mlx_get_cache_memory(&cache);
@@ -632,24 +632,24 @@ static pplx_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
                 (double)peak / (1024.0 * 1024.0 * 1024.0));
     }
 
-    if (pplx_verbose >= 1)
+    if (embed_verbose >= 1)
         fprintf(stderr, "mlx: layers [%d, %d) loaded (%d-dim)\n",
                 layer_start, layer_end, h);
 
     return ctx;
 
 fail:
-    pplx_mlx_free(ctx);
+    embed_mlx_free(ctx);
     return NULL;
 }
 
-pplx_mlx_ctx_t *pplx_mlx_load(const char *model_dir)
+embed_mlx_ctx_t *embed_mlx_load(const char *model_dir)
 {
     return mlx_load_range_ex(model_dir, 0, -1, NULL, 0);
 }
 
-pplx_mlx_ctx_t *pplx_mlx_load_with_options(const char *model_dir,
-                                           const pplx_mlx_options_t *opts)
+embed_mlx_ctx_t *embed_mlx_load_with_options(const char *model_dir,
+                                           const embed_mlx_options_t *opts)
 {
     return mlx_load_range_ex(model_dir, 0, -1, opts, 0);
 }
@@ -668,7 +668,7 @@ static void free_mlx_layer(mlx_layer_t *l)
     free_linear(&l->down_proj);
 }
 
-void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
+void embed_mlx_free(embed_mlx_ctx_t *ctx)
 {
     if (!ctx) return;
     mlx_array_free(ctx->embed_tokens);
@@ -683,15 +683,15 @@ void pplx_mlx_free(pplx_mlx_ctx_t *ctx)
     free(ctx);
 }
 
-pplx_mlx_late_ctx_t *pplx_mlx_late_load_with_options(
-    const char *model_dir, const pplx_mlx_options_t *opts)
+embed_mlx_late_ctx_t *embed_mlx_late_load_with_options(
+    const char *model_dir, const embed_mlx_options_t *opts)
 {
     if (!mlx_model_dir_has_late_projection(model_dir)) {
         fprintf(stderr, "mlx late: missing 1_Dense projection\n");
         return NULL;
     }
 
-    pplx_mlx_late_ctx_t *late = calloc(1, sizeof(*late));
+    embed_mlx_late_ctx_t *late = calloc(1, sizeof(*late));
     if (!late) return NULL;
 
     late->base = mlx_load_range_ex(model_dir, 0, -1, opts, 1);
@@ -731,36 +731,36 @@ pplx_mlx_late_ctx_t *pplx_mlx_late_load_with_options(
         goto fail;
     late->token_dim = shape[0];
 
-    if (pplx_verbose >= 1)
+    if (embed_verbose >= 1)
         fprintf(stderr, "mlx late: token projection loaded (%d-dim)\n",
                 late->token_dim);
     return late;
 
 fail:
-    pplx_mlx_late_free(late);
+    embed_mlx_late_free(late);
     return NULL;
 }
 
-pplx_mlx_late_ctx_t *pplx_mlx_late_load(const char *model_dir)
+embed_mlx_late_ctx_t *embed_mlx_late_load(const char *model_dir)
 {
-    return pplx_mlx_late_load_with_options(model_dir, NULL);
+    return embed_mlx_late_load_with_options(model_dir, NULL);
 }
 
-void pplx_mlx_late_free(pplx_mlx_late_ctx_t *ctx)
+void embed_mlx_late_free(embed_mlx_late_ctx_t *ctx)
 {
     if (!ctx) return;
     free_linear(&ctx->projection);
     if (ctx->dense_ms) multi_safetensors_close(ctx->dense_ms);
-    pplx_mlx_free(ctx->base);
+    embed_mlx_free(ctx->base);
     free(ctx);
 }
 
-const pplx_config_t *pplx_mlx_late_config(const pplx_mlx_late_ctx_t *ctx)
+const embed_config_t *embed_mlx_late_config(const embed_mlx_late_ctx_t *ctx)
 {
     return ctx && ctx->base ? &ctx->base->config : NULL;
 }
 
-int pplx_mlx_late_token_dim(const pplx_mlx_late_ctx_t *ctx)
+int embed_mlx_late_token_dim(const embed_mlx_late_ctx_t *ctx)
 {
     return ctx ? ctx->token_dim : 0;
 }
@@ -769,12 +769,12 @@ int pplx_mlx_late_token_dim(const pplx_mlx_late_ctx_t *ctx)
  * Forward pass
  * ======================================================================== */
 
-static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
+static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx, mlx_array x,
                                     int batch, int max_seq, int has_padding,
                                     mlx_array attn_mask,
                                     int layer_start, int layer_end)
 {
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
@@ -899,20 +899,20 @@ static mlx_array mlx_forward_layers(pplx_mlx_ctx_t *ctx, mlx_array x,
     return x;
 }
 
-pplx_mlx_late_vectors_t *pplx_mlx_late_encode_tokens_device(
-    pplx_mlx_late_ctx_t *ctx, const int *token_ids, int n_tokens,
+embed_mlx_late_vectors_t *embed_mlx_late_encode_tokens_device(
+    embed_mlx_late_ctx_t *ctx, const int *token_ids, int n_tokens,
     int normalize)
 {
     if (!ctx || !ctx->base || !token_ids || n_tokens <= 0 ||
         ctx->token_dim <= 0 || !linear_ok(ctx->projection))
         return NULL;
 
-    pplx_mlx_ctx_t *base = ctx->base;
+    embed_mlx_ctx_t *base = ctx->base;
     if (base->layer_start != 0 || base->layer_end != base->config.n_layers ||
         !arr_ok(base->embed_tokens) || !arr_ok(base->norm))
         return NULL;
 
-    const pplx_config_t *c = &base->config;
+    const embed_config_t *c = &base->config;
     mlx_stream S = base->stream;
     for (int i = 0; i < n_tokens; i++) {
         if (token_ids[i] < 0 || token_ids[i] >= c->vocab_size) {
@@ -935,7 +935,7 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_encode_tokens_device(
     free(ids_data);
     if (!arr_ok(ids)) return NULL;
 
-    pplx_mlx_late_vectors_t *result = NULL;
+    embed_mlx_late_vectors_t *result = NULL;
     mlx_array x = mlx_array_new();
     mlx_array x_normed = (mlx_array){0};
     mlx_array projected = (mlx_array){0};
@@ -997,7 +997,7 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_encode_tokens_device(
     mlx_reshape(&reshaped, projected, vec_shape, 2, S);
     if (!arr_ok(reshaped)) goto cleanup;
 
-    result = (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*result));
+    result = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*result));
     if (!result) goto cleanup;
     result->owner = ctx;
     result->vectors = reshaped;
@@ -1013,24 +1013,24 @@ cleanup:
     return result;
 }
 
-void pplx_mlx_late_vectors_free(pplx_mlx_late_vectors_t *vecs)
+void embed_mlx_late_vectors_free(embed_mlx_late_vectors_t *vecs)
 {
     if (!vecs) return;
     mlx_array_free(vecs->vectors);
     free(vecs);
 }
 
-int pplx_mlx_late_vectors_token_count(const pplx_mlx_late_vectors_t *vecs)
+int embed_mlx_late_vectors_token_count(const embed_mlx_late_vectors_t *vecs)
 {
     return vecs ? vecs->tokens : 0;
 }
 
-int pplx_mlx_late_vectors_dim(const pplx_mlx_late_vectors_t *vecs)
+int embed_mlx_late_vectors_dim(const embed_mlx_late_vectors_t *vecs)
 {
     return vecs ? vecs->dim : 0;
 }
 
-int pplx_mlx_late_vectors_copy(const pplx_mlx_late_vectors_t *vecs,
+int embed_mlx_late_vectors_copy(const embed_mlx_late_vectors_t *vecs,
                                float *out_vectors)
 {
     if (!vecs || !out_vectors || !arr_ok(vecs->vectors) ||
@@ -1061,15 +1061,15 @@ int pplx_mlx_late_vectors_copy(const pplx_mlx_late_vectors_t *vecs,
     return rc;
 }
 
-pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_concat(
-    pplx_mlx_late_ctx_t *ctx,
-    const pplx_mlx_late_vectors_t *const *items, int count)
+embed_mlx_late_vectors_t *embed_mlx_late_vectors_concat(
+    embed_mlx_late_ctx_t *ctx,
+    const embed_mlx_late_vectors_t *const *items, int count)
 {
     if (!ctx || !ctx->base || !items || count <= 0) return NULL;
     int dim = 0;
     int total = 0;
     for (int i = 0; i < count; i++) {
-        const pplx_mlx_late_vectors_t *v = items[i];
+        const embed_mlx_late_vectors_t *v = items[i];
         if (!v || v->owner != ctx || !arr_ok(v->vectors) ||
             v->tokens <= 0 || v->dim <= 0)
             return NULL;
@@ -1097,8 +1097,8 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_concat(
         return NULL;
     }
 
-    pplx_mlx_late_vectors_t *out =
-        (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    embed_mlx_late_vectors_t *out =
+        (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
     if (!out) {
         mlx_array_free(joined);
         return NULL;
@@ -1110,8 +1110,8 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_concat(
     return out;
 }
 
-pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_select(
-    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *vecs,
+embed_mlx_late_vectors_t *embed_mlx_late_vectors_select(
+    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *vecs,
     const int *token_indices, int count)
 {
     if (!ctx || !ctx->base || !vecs || vecs->owner != ctx ||
@@ -1145,8 +1145,8 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_select(
         return NULL;
     }
 
-    pplx_mlx_late_vectors_t *out =
-        (pplx_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    embed_mlx_late_vectors_t *out =
+        (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
     if (!out) {
         mlx_array_free(selected);
         return NULL;
@@ -1158,9 +1158,9 @@ pplx_mlx_late_vectors_t *pplx_mlx_late_vectors_select(
     return out;
 }
 
-int pplx_mlx_late_maxsim_batch_device(
-    pplx_mlx_late_ctx_t *ctx, const pplx_mlx_late_vectors_t *query,
-    const pplx_mlx_late_vectors_t *docs, const int *doc_offsets,
+int embed_mlx_late_maxsim_batch_device(
+    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *query,
+    const embed_mlx_late_vectors_t *docs, const int *doc_offsets,
     int docs_count, float *scores)
 {
     if (!ctx || !query || !docs || !doc_offsets || docs_count <= 0 ||
@@ -1346,28 +1346,28 @@ cleanup:
     return rc;
 }
 
-int pplx_mlx_late_encode_tokens(pplx_mlx_late_ctx_t *ctx,
+int embed_mlx_late_encode_tokens(embed_mlx_late_ctx_t *ctx,
                                 const int *token_ids, int n_tokens,
                                 int normalize, float *out_vectors)
 {
-    pplx_mlx_late_vectors_t *vecs =
-        pplx_mlx_late_encode_tokens_device(ctx, token_ids, n_tokens,
+    embed_mlx_late_vectors_t *vecs =
+        embed_mlx_late_encode_tokens_device(ctx, token_ids, n_tokens,
                                            normalize);
     if (!vecs) return -1;
-    int rc = pplx_mlx_late_vectors_copy(vecs, out_vectors);
-    pplx_mlx_late_vectors_free(vecs);
+    int rc = embed_mlx_late_vectors_copy(vecs, out_vectors);
+    embed_mlx_late_vectors_free(vecs);
     return rc;
 }
 
-static int pplx_mlx_embed_batch_dense(pplx_mlx_ctx_t *ctx,
-                                      const pplx_input_t *inputs, int batch,
+static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
+                                      const embed_input_t *inputs, int batch,
                                       float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings ||
         ctx->layer_start != 0 || ctx->layer_end != ctx->config.n_layers)
         return -1;
 
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
 
     int hidden     = c->hidden_size;
@@ -1516,7 +1516,7 @@ static int pplx_mlx_embed_batch_dense(pplx_mlx_ctx_t *ctx,
 
 typedef struct {
     int index;
-    const pplx_input_t *input;
+    const embed_input_t *input;
 } mlx_batch_item_t;
 
 static int mlx_batch_item_cmp(const void *a, const void *b)
@@ -1535,7 +1535,7 @@ static int mlx_padding_exceeds_limit(size_t padded, size_t tokens)
     return padded * 5 > tokens * 11;
 }
 
-static int mlx_batch_should_split(const pplx_input_t *inputs, int batch,
+static int mlx_batch_should_split(const embed_input_t *inputs, int batch,
                                   int *out_total_tokens, int *out_max_seq)
 {
     int max_seq = 0;
@@ -1557,7 +1557,7 @@ static int mlx_batch_should_split(const pplx_input_t *inputs, int batch,
     return mlx_padding_exceeds_limit(padded, (size_t)total_tokens);
 }
 
-static int mlx_should_add_to_group(const pplx_mlx_ctx_t *ctx,
+static int mlx_should_add_to_group(const embed_mlx_ctx_t *ctx,
                                    int group_count, int group_max,
                                    int next_tokens)
 {
@@ -1579,19 +1579,19 @@ static int mlx_should_add_to_group(const pplx_mlx_ctx_t *ctx,
     return merged <= split_total;
 }
 
-int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
+int embed_mlx_encode_batch(embed_mlx_ctx_t *ctx, const embed_input_t *inputs,
                          int batch, float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
         return -1;
 
     if (!mlx_batch_should_split(inputs, batch, NULL, NULL))
-        return pplx_mlx_embed_batch_dense(ctx, inputs, batch, out_embeddings);
+        return embed_mlx_encode_batch_dense(ctx, inputs, batch, out_embeddings);
 
     const int hidden = ctx->config.hidden_size;
     mlx_batch_item_t *items = (mlx_batch_item_t *)malloc(
         (size_t)batch * sizeof(*items));
-    pplx_input_t *group_inputs = (pplx_input_t *)malloc(
+    embed_input_t *group_inputs = (embed_input_t *)malloc(
         (size_t)batch * sizeof(*group_inputs));
     size_t group_values, group_bytes;
     if (mlx_mul_size((size_t)batch, (size_t)hidden, &group_values) != 0 ||
@@ -1638,7 +1638,7 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
         int group_count = end - start;
         for (int i = 0; i < group_count; i++)
             group_inputs[i] = *items[start + i].input;
-        rc = pplx_mlx_embed_batch_dense(ctx, group_inputs, group_count,
+        rc = embed_mlx_encode_batch_dense(ctx, group_inputs, group_count,
                                         group_out);
         if (rc != 0) break;
         for (int i = 0; i < group_count; i++) {
@@ -1654,17 +1654,17 @@ int pplx_mlx_embed_batch(pplx_mlx_ctx_t *ctx, const pplx_input_t *inputs,
     return rc;
 }
 
-int pplx_mlx_embed_into(pplx_mlx_ctx_t *ctx, const int *token_ids,
+int embed_mlx_encode_into(embed_mlx_ctx_t *ctx, const int *token_ids,
                         int n_tokens, float *out_embedding)
 {
-    pplx_input_t input = { token_ids, n_tokens };
-    return pplx_mlx_embed_batch(ctx, &input, 1, out_embedding);
+    embed_input_t input = { token_ids, n_tokens };
+    return embed_mlx_encode_batch(ctx, &input, 1, out_embedding);
 }
 
 typedef struct {
     int index;
     int span_offset;
-    const pplx_context_input_t *input;
+    const embed_context_input_t *input;
 } mlx_context_batch_item_t;
 
 static int mlx_context_batch_item_cmp(const void *a, const void *b)
@@ -1683,7 +1683,7 @@ static int mlx_context_padding_exceeds_limit(size_t padded, size_t tokens)
     return padded * 4 > tokens * 5;
 }
 
-static int mlx_context_batch_should_split(const pplx_context_input_t *inputs,
+static int mlx_context_batch_should_split(const embed_context_input_t *inputs,
                                           int batch, int *out_total_spans)
 {
     int max_seq = 0;
@@ -1710,8 +1710,8 @@ static int mlx_context_batch_should_split(const pplx_context_input_t *inputs,
     return mlx_context_padding_exceeds_limit(padded, (size_t)total_tokens);
 }
 
-static int pplx_mlx_embed_spans_batch_dense(pplx_mlx_ctx_t *ctx,
-                                            const pplx_context_input_t *inputs,
+static int embed_mlx_encode_spans_batch_dense(embed_mlx_ctx_t *ctx,
+                                            const embed_context_input_t *inputs,
                                             int batch, float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings ||
@@ -1720,14 +1720,14 @@ static int pplx_mlx_embed_spans_batch_dense(pplx_mlx_ctx_t *ctx,
         !arr_ok(ctx->embed_tokens) || !arr_ok(ctx->norm))
         return -1;
 
-    const pplx_config_t *c = &ctx->config;
+    const embed_config_t *c = &ctx->config;
     mlx_stream S = ctx->stream;
     int hidden = c->hidden_size;
     int max_seq = 0;
     int total_spans = 0;
     int has_padding = 0;
     for (int b = 0; b < batch; b++) {
-        const pplx_context_input_t *input = &inputs[b];
+        const embed_context_input_t *input = &inputs[b];
         int n_tokens = input->input.n_tokens;
         if (!input->input.ids || n_tokens <= 0 || !input->spans ||
             input->n_spans <= 0 || total_spans > INT_MAX - input->n_spans)
@@ -1773,7 +1773,7 @@ static int pplx_mlx_embed_spans_batch_dense(pplx_mlx_ctx_t *ctx,
         return -1;
     }
     for (int b = 0; b < batch; b++) {
-        const pplx_input_t *input = &inputs[b].input;
+        const embed_input_t *input = &inputs[b].input;
         for (int t = 0; t < max_seq; t++) {
             size_t row = (size_t)b * max_seq + t;
             if (t < input->n_tokens) {
@@ -1855,7 +1855,7 @@ static int pplx_mlx_embed_spans_batch_dense(pplx_mlx_ctx_t *ctx,
         int pooled_count = 0;
         for (int b = 0; b < batch; b++) {
             for (int s = 0; s < inputs[b].n_spans; s++) {
-                const pplx_span_t *span = &inputs[b].spans[s];
+                const embed_span_t *span = &inputs[b].spans[s];
                 int start[] = {b, span->start, 0};
                 int stop[] = {b + 1, span->start + span->n_tokens, hidden};
                 int strides[] = {1, 1, 1};
@@ -1891,7 +1891,7 @@ static int pplx_mlx_embed_spans_batch_dense(pplx_mlx_ctx_t *ctx,
         int span_count = 0;
         for (int b = 0; b < batch; b++) {
             for (int s = 0; s < inputs[b].n_spans; s++) {
-                const pplx_span_t *span = &inputs[b].spans[s];
+                const embed_span_t *span = &inputs[b].spans[s];
                 int base = b * max_seq;
                 int start = span->start;
                 int stop = span->start + span->n_tokens;
@@ -1994,8 +1994,8 @@ cleanup:
     return rc;
 }
 
-int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
-                               const pplx_context_input_t *inputs, int batch,
+int embed_mlx_encode_spans_batch(embed_mlx_ctx_t *ctx,
+                               const embed_context_input_t *inputs, int batch,
                                float *out_embeddings)
 {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
@@ -2003,13 +2003,13 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
 
     int total_spans = 0;
     if (!mlx_context_batch_should_split(inputs, batch, &total_spans))
-        return pplx_mlx_embed_spans_batch_dense(ctx, inputs, batch,
+        return embed_mlx_encode_spans_batch_dense(ctx, inputs, batch,
                                                 out_embeddings);
 
     const int hidden = ctx->config.hidden_size;
     mlx_context_batch_item_t *items = (mlx_context_batch_item_t *)malloc(
         (size_t)batch * sizeof(*items));
-    pplx_context_input_t *group_inputs = (pplx_context_input_t *)malloc(
+    embed_context_input_t *group_inputs = (embed_context_input_t *)malloc(
         (size_t)batch * sizeof(*group_inputs));
     size_t group_values, group_bytes;
     if (mlx_mul_size((size_t)total_spans, (size_t)hidden, &group_values) != 0 ||
@@ -2060,7 +2060,7 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
         int group_count = end - start;
         for (int i = 0; i < group_count; i++)
             group_inputs[i] = *items[start + i].input;
-        rc = pplx_mlx_embed_spans_batch_dense(ctx, group_inputs,
+        rc = embed_mlx_encode_spans_batch_dense(ctx, group_inputs,
                                               group_count, group_out);
         if (rc != 0) break;
         int src_span = 0;
@@ -2079,19 +2079,19 @@ int pplx_mlx_embed_spans_batch(pplx_mlx_ctx_t *ctx,
     return rc;
 }
 
-int pplx_mlx_embed_spans(pplx_mlx_ctx_t *ctx, const int *token_ids,
-                         int n_tokens, const pplx_span_t *spans,
+int embed_mlx_encode_spans(embed_mlx_ctx_t *ctx, const int *token_ids,
+                         int n_tokens, const embed_span_t *spans,
                          int n_spans, float *out_embeddings)
 {
-    pplx_context_input_t input = {
+    embed_context_input_t input = {
         .input = { token_ids, n_tokens },
         .spans = spans,
         .n_spans = n_spans,
     };
-    return pplx_mlx_embed_spans_batch(ctx, &input, 1, out_embeddings);
+    return embed_mlx_encode_spans_batch(ctx, &input, 1, out_embeddings);
 }
 
-float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
+float *embed_mlx_encode(embed_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
 {
     if (!ctx || !token_ids || n_tokens <= 0) return NULL;
 
@@ -2102,7 +2102,7 @@ float *pplx_mlx_embed(pplx_mlx_ctx_t *ctx, const int *token_ids, int n_tokens)
     float *out = (float *)malloc(out_bytes);
     if (!out) return NULL;
 
-    if (pplx_mlx_embed_into(ctx, token_ids, n_tokens, out) != 0) {
+    if (embed_mlx_encode_into(ctx, token_ids, n_tokens, out) != 0) {
         free(out);
         return NULL;
     }

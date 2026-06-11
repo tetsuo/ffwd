@@ -13,7 +13,7 @@
 
 int main(void) {
     char root[1024], f32_dir[1088], bf16_dir[1088];
-    snprintf(root, sizeof(root), "%s/pplx-bf16-test-XXXXXX",
+    snprintf(root, sizeof(root), "%s/embed-bf16-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
     snprintf(f32_dir, sizeof(f32_dir), "%s/f32", root);
@@ -26,26 +26,26 @@ int main(void) {
     }
 
     int ids[] = {1, 2, 3, 4};
-    pplx_model_t *mf32 = pplx_model_load(f32_dir);
-    pplx_model_t *mbf16 = pplx_model_load(bf16_dir);
+    embed_model_t *mf32 = embed_model_load(f32_dir);
+    embed_model_t *mbf16 = embed_model_load(bf16_dir);
     if (!mf32 || !mbf16) {
         fprintf(stderr, "model load failed\n");
         return 1;
     }
 
-    const pplx_config_t *cfg = pplx_model_config(mf32);
+    const embed_config_t *cfg = embed_model_config(mf32);
     int dim = cfg->hidden_size;
     float *a = (float *)malloc((size_t)dim * sizeof(float));
     float *b = (float *)malloc((size_t)dim * sizeof(float));
-    pplx_workspace_t *wf32 = pplx_workspace_new(mf32);
-    pplx_workspace_t *wbf16 = pplx_workspace_new(mbf16);
+    embed_workspace_t *wf32 = embed_workspace_new(mf32);
+    embed_workspace_t *wbf16 = embed_workspace_new(mbf16);
     if (!a || !b || !wf32 || !wbf16) {
         fprintf(stderr, "allocation failed\n");
         return 1;
     }
 
-    if (pplx_model_embed_into(mf32, wf32, ids, 4, a) != 0 ||
-        pplx_model_embed_into(mbf16, wbf16, ids, 4, b) != 0) {
+    if (embed_model_encode_into(mf32, wf32, ids, 4, a) != 0 ||
+        embed_model_encode_into(mbf16, wbf16, ids, 4, b) != 0) {
         fprintf(stderr, "embedding failed\n");
         return 1;
     }
@@ -74,8 +74,8 @@ int main(void) {
     enum { LONG_N = 24 };
     int long_ids[LONG_N];
     for (int i = 0; i < LONG_N; i++) long_ids[i] = (i % 14) + 1;
-    if (pplx_model_embed_into(mf32, wf32, long_ids, LONG_N, a) != 0 ||
-        pplx_model_embed_into(mbf16, wbf16, long_ids, LONG_N, b) != 0) {
+    if (embed_model_encode_into(mf32, wf32, long_ids, LONG_N, a) != 0 ||
+        embed_model_encode_into(mbf16, wbf16, long_ids, LONG_N, b) != 0) {
         fprintf(stderr, "long-sequence embedding failed\n");
         return 1;
     }
@@ -96,10 +96,10 @@ int main(void) {
     printf("ok: bf16 model parity dim=%d max_abs_diff=%.9g norm=%.9g\n",
            dim, max_diff, norm);
 
-    pplx_workspace_free(wf32);
-    pplx_workspace_free(wbf16);
-    pplx_model_free(mf32);
-    pplx_model_free(mbf16);
+    embed_workspace_free(wf32);
+    embed_workspace_free(wbf16);
+    embed_model_free(mf32);
+    embed_model_free(mbf16);
     free(a);
     free(b);
     return 0;

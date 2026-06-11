@@ -1,7 +1,7 @@
 *.o
-pplx-embed
-pplx-embed-server
-libpplxembed.*
+embed
+embed-server
+libembed.*
 tests/test_kernels_*
 tests/test_safetensors
 tests/test_bf16_model
@@ -17,13 +17,10 @@ bench/bench_model
 bench/results/
 coverage/
 *.profraw
-book/
 .venv/
 __pycache__/
 *.pyc
 .DS_Store
-pplx_server
-client
 tmp
 private
 .vscode

@@ -228,15 +228,15 @@ static int http_req(int port, const char *method, const char *path,
 }
 
 typedef struct {
-    pplx_server_model_spec_t spec[2];
-    pplx_server_config_t cfg;
+    embed_server_model_spec_t spec[2];
+    embed_server_config_t cfg;
     int rc;
 } srv_ctx;
 
 static void *srv_thread_main(void *arg)
 {
     srv_ctx *s = (srv_ctx *)arg;
-    s->rc = pplx_run_server(&s->cfg);
+    s->rc = embed_run_server(&s->cfg);
     return NULL;
 }
 
@@ -548,7 +548,7 @@ static void test_http_contextual(int port)
 static void test_http_server(void)
 {
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/pplx-srv-test-XXXXXX",
+    snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir)) {
         fprintf(stderr, "FAIL: mkdtemp\n");

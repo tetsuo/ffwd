@@ -46,29 +46,29 @@
 
 #include <cjson/cJSON.h>
 
-#define PPLX_HTTP_IO_BUF 8192
-#define PPLX_HTTP_MAX_HEADER (64u * 1024u)
-#define PPLX_HTTP_MAX_BODY (64u * 1024u * 1024u)
-#define PPLX_HTTP_MAX_PATH 255u
-#define PPLX_HTTP_BACKLOG 128
-#define PPLX_HTTP_SETSIZE 10240
-#define PPLX_HTTP_CLIENT_TIMEOUT_MS 30000
-#define PPLX_HTTP_SWEEP_MS 1000
+#define EMBED_HTTP_IO_BUF 8192
+#define EMBED_HTTP_MAX_HEADER (64u * 1024u)
+#define EMBED_HTTP_MAX_BODY (64u * 1024u * 1024u)
+#define EMBED_HTTP_MAX_PATH 255u
+#define EMBED_HTTP_BACKLOG 128
+#define EMBED_HTTP_SETSIZE 10240
+#define EMBED_HTTP_CLIENT_TIMEOUT_MS 30000
+#define EMBED_HTTP_SWEEP_MS 1000
 
-#define PPLX_API_MAX_STANDARD_INPUTS 512
-#define PPLX_API_MAX_CONTEXT_DOCS 512
-#define PPLX_API_MAX_CONTEXT_CHUNKS 16000
-#define PPLX_API_MAX_ITEM_TOKENS 32768
-#define PPLX_API_MAX_TOTAL_TOKENS 120000
+#define EMBED_API_MAX_STANDARD_INPUTS 512
+#define EMBED_API_MAX_CONTEXT_DOCS 512
+#define EMBED_API_MAX_CONTEXT_CHUNKS 16000
+#define EMBED_API_MAX_ITEM_TOKENS 32768
+#define EMBED_API_MAX_TOTAL_TOKENS 120000
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
-#define PPLX_SERVER_DEFAULT_BATCH_SIZE 32
-#define PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
-#define PPLX_SERVER_BATCH_WAIT_US 1000
-#define PPLX_SERVER_MICROBATCH_MAX_JOBS 128
-#define PPLX_MLX_MEMORY_BUDGET_PERCENT 90
-#define PPLX_MLX_RESIDENT_MULTIPLIER 2
+#define EMBED_SERVER_DEFAULT_BATCH_SIZE 32
+#define EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
+#define EMBED_SERVER_BATCH_WAIT_US 1000
+#define EMBED_SERVER_MICROBATCH_MAX_JOBS 128
+#define EMBED_MLX_MEMORY_BUDGET_PERCENT 90
+#define EMBED_MLX_RESIDENT_MULTIPLIER 2
 
 typedef struct {
     char *ptr;
@@ -77,7 +77,7 @@ typedef struct {
 } sbuf;
 
 static void die_oom(void) {
-    fprintf(stderr, "pplx-serve: out of memory\n");
+    fprintf(stderr, "embed-server: out of memory\n");
     exit(1);
 }
 
@@ -232,13 +232,13 @@ typedef struct {
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
     int context_separator_id;
-    pplx_model_t *cpu_model;
-    pplx_workspace_t *cpu_ws;
+    embed_model_t *cpu_model;
+    embed_workspace_t *cpu_ws;
 #ifdef USE_MLX
-    pplx_mlx_ctx_t *mlx_ctx;
+    embed_mlx_ctx_t *mlx_ctx;
 #endif
 #ifdef USE_CUDA
-    pplx_cuda_ctx_t *cuda_ctx;
+    embed_cuda_ctx_t *cuda_ctx;
 #endif
 } loaded_model;
 
@@ -280,7 +280,7 @@ typedef struct {
 
 typedef struct {
     char method[8];
-    char path[PPLX_HTTP_MAX_PATH + 1];
+    char path[EMBED_HTTP_MAX_PATH + 1];
     char version[16];
     char *body;
     size_t body_len;
@@ -310,7 +310,7 @@ struct job {
     http_server *srv;
     client *c;
     char method[8];
-    char path[PPLX_HTTP_MAX_PATH + 1];
+    char path[EMBED_HTTP_MAX_PATH + 1];
     char *body;
     size_t body_len;
     char *auth;
@@ -576,7 +576,7 @@ static int parse_request_headers(client *c) {
         char *end = NULL;
         errno = 0;
         unsigned long long v = strtoull(cl, &end, 10);
-        if (errno || !end || *end || v > PPLX_HTTP_MAX_BODY) {
+        if (errno || !end || *end || v > EMBED_HTTP_MAX_BODY) {
             free(cl);
             return -1;
         }
@@ -591,14 +591,14 @@ static int complete_request(client *c) {
     if (!c->header_done) {
         ssize_t hend = find_header_end(c->in.ptr, c->in.len);
         if (hend < 0) {
-            if (c->in.len > PPLX_HTTP_MAX_HEADER) return -1;
+            if (c->in.len > EMBED_HTTP_MAX_HEADER) return -1;
             return 0;
         }
         c->header_done = 1;
         c->header_len = (size_t)hend;
         if (parse_request_headers(c) != 0) return -1;
     }
-    if (c->content_length > PPLX_HTTP_MAX_BODY) return -1;
+    if (c->content_length > EMBED_HTTP_MAX_BODY) return -1;
     if (c->in.len < c->header_len + c->content_length) return 0;
     c->req.body_len = c->content_length;
     c->req.body = xmalloc(c->content_length + 1);
@@ -824,7 +824,7 @@ static void dispatch_request(client *c) {
 static void read_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
     (void)loop; (void)mask;
     client *c = clientData;
-    char tmp[PPLX_HTTP_IO_BUF];
+    char tmp[EMBED_HTTP_IO_BUF];
     for (;;) {
         ssize_t n = read(fd, tmp, sizeof(tmp));
         if (n > 0) {
@@ -891,11 +891,11 @@ static int timeout_cb(aeEventLoop *loop, long long id, void *clientData) {
          * processed by the worker; long batch queues (e.g. 4B long-document
          * batches) must not be reaped as idle. */
         if (!c->cancelled && c->refcount <= 1 &&
-            now - c->last_active_ms > PPLX_HTTP_CLIENT_TIMEOUT_MS)
+            now - c->last_active_ms > EMBED_HTTP_CLIENT_TIMEOUT_MS)
             close_client(c);
         c = next;
     }
-    return PPLX_HTTP_SWEEP_MS;
+    return EMBED_HTTP_SWEEP_MS;
 }
 
 static void signal_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
@@ -1095,7 +1095,7 @@ typedef struct {
     const char *encoding;
     int n_inputs;
     token_buf *tokens;
-    pplx_input_t *inputs;
+    embed_input_t *inputs;
     int total_tokens;
     int ready;
 } embedding_request;
@@ -1103,7 +1103,7 @@ typedef struct {
 typedef struct {
     int *ids;
     int n_tokens;
-    pplx_span_t *spans;
+    embed_span_t *spans;
     int n_spans;
 } contextual_doc;
 
@@ -1160,31 +1160,31 @@ static int tokenize_one(loaded_model *m, job *j, const char *text,
     return 0;
 }
 
-static int model_embed_batch(loaded_model *m, const pplx_input_t *inputs,
+static int model_embed_batch(loaded_model *m, const embed_input_t *inputs,
                              int batch, float *out) {
 #ifdef USE_MLX
     if (m->mlx_ctx)
-        return pplx_mlx_embed_batch(m->mlx_ctx, inputs, batch, out);
+        return embed_mlx_encode_batch(m->mlx_ctx, inputs, batch, out);
 #endif
 #ifdef USE_CUDA
     if (m->cuda_ctx)
-        return pplx_cuda_embed_batch(m->cuda_ctx, inputs, batch, out);
+        return embed_cuda_encode_batch(m->cuda_ctx, inputs, batch, out);
 #endif
-    return pplx_model_embed_batch(m->cpu_model, m->cpu_ws, inputs, batch, out);
+    return embed_model_encode_batch(m->cpu_model, m->cpu_ws, inputs, batch, out);
 }
 
 static int model_embed_spans_batch(loaded_model *m,
-                                   const pplx_context_input_t *inputs,
+                                   const embed_context_input_t *inputs,
                                    int batch, float *out) {
 #ifdef USE_MLX
     if (m->mlx_ctx)
-        return pplx_mlx_embed_spans_batch(m->mlx_ctx, inputs, batch, out);
+        return embed_mlx_encode_spans_batch(m->mlx_ctx, inputs, batch, out);
 #endif
 #ifdef USE_CUDA
     if (m->cuda_ctx)
-        return pplx_cuda_embed_spans_batch(m->cuda_ctx, inputs, batch, out);
+        return embed_cuda_encode_spans_batch(m->cuda_ctx, inputs, batch, out);
 #endif
-    return pplx_model_embed_spans_batch(m->cpu_model, m->cpu_ws, inputs, batch,
+    return embed_model_encode_spans_batch(m->cpu_model, m->cpu_ws, inputs, batch,
                                         out);
 }
 
@@ -1274,7 +1274,7 @@ static int embedding_request_compatible(const embedding_request *a,
 }
 
 typedef struct {
-    pplx_input_t input;
+    embed_input_t input;
     int output_index;
 } embedding_batch_item;
 
@@ -1319,7 +1319,7 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
         ? reqs[0]->j->srv->batch_size : total_inputs;
     if (max_batch > total_inputs) max_batch = total_inputs;
     int max_batch_tokens = reqs[0]->j->srv->max_batch_tokens;
-    pplx_input_t *inputs = xmalloc((size_t)max_batch * sizeof(*inputs));
+    embed_input_t *inputs = xmalloc((size_t)max_batch * sizeof(*inputs));
     float *batch_embs = xmalloc((size_t)max_batch * dim * sizeof(float));
 
     int failed = 0;
@@ -1414,7 +1414,7 @@ static int contextual_request_fits_group(const contextual_request *r,
 }
 
 typedef struct {
-    pplx_context_input_t input;
+    embed_context_input_t input;
     int output_span_index;
     int order;
 } contextual_batch_item;
@@ -1476,7 +1476,7 @@ static void execute_contextual_request_list(contextual_request **reqs,
         ? reqs[0]->j->srv->batch_size : total_docs;
     if (max_batch > total_docs) max_batch = total_docs;
     int max_batch_tokens = reqs[0]->j->srv->max_batch_tokens;
-    pplx_context_input_t *inputs =
+    embed_context_input_t *inputs =
         xmalloc((size_t)max_batch * sizeof(*inputs));
     float *batch_embs = NULL;
     size_t batch_emb_cap = 0;
@@ -1488,7 +1488,7 @@ static void execute_contextual_request_list(contextual_request **reqs,
         int tokens = 0;
         int chunks = 0;
         while (start + cur < total_docs && cur < max_batch) {
-            const pplx_context_input_t *input = &items[start + cur].input;
+            const embed_context_input_t *input = &items[start + cur].input;
             if (!inference_batch_accepts_input(m, cur, tokens,
                                                input->input.n_tokens,
                                                max_batch_tokens))
@@ -1605,7 +1605,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
         if (n_inputs < 1)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at least 1 item",
                    "value_error.list.min_items");
-        else if (n_inputs > PPLX_API_MAX_STANDARD_INPUTS)
+        else if (n_inputs > EMBED_API_MAX_STANDARD_INPUTS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 512 items",
                    "value_error.list.max_items");
         cJSON *item;
@@ -1646,7 +1646,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
                 out->inputs[0].ids = out->tokens[0].ids;
                 out->inputs[0].n_tokens = out->tokens[0].n_tokens;
                 out->total_tokens = out->tokens[0].n_tokens;
-                if (out->tokens[0].n_tokens > PPLX_API_MAX_ITEM_TOKENS)
+                if (out->tokens[0].n_tokens > EMBED_API_MAX_ITEM_TOKENS)
                     ve_add(detail, "[\"body\",\"input\"]",
                            "input exceeds 32768 token limit",
                            "value_error.context_length");
@@ -1670,7 +1670,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
                     out->inputs[idx].ids = out->tokens[idx].ids;
                     out->inputs[idx].n_tokens = out->tokens[idx].n_tokens;
                     out->total_tokens += out->tokens[idx].n_tokens;
-                    if (out->tokens[idx].n_tokens > PPLX_API_MAX_ITEM_TOKENS)
+                    if (out->tokens[idx].n_tokens > EMBED_API_MAX_ITEM_TOKENS)
                         ve_add(detail, loc, "input exceeds 32768 token limit",
                                "value_error.context_length");
                 }
@@ -1678,7 +1678,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
             }
         }
 
-        if (out->total_tokens > PPLX_API_MAX_TOTAL_TOKENS)
+        if (out->total_tokens > EMBED_API_MAX_TOTAL_TOKENS)
             ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
                    "value_error.context_length");
     }
@@ -1721,7 +1721,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
         if (n_docs < 1)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at least 1 document",
                    "value_error.list.min_items");
-        else if (n_docs > PPLX_API_MAX_CONTEXT_DOCS)
+        else if (n_docs > EMBED_API_MAX_CONTEXT_DOCS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 512 documents",
                    "value_error.list.max_items");
         cJSON *doc_arr;
@@ -1736,8 +1736,8 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
                 continue;
             }
             int doc_chunks = cJSON_GetArraySize(doc_arr);
-            if (doc_chunks > PPLX_API_MAX_CONTEXT_CHUNKS - total_chunks)
-                total_chunks = PPLX_API_MAX_CONTEXT_CHUNKS + 1;
+            if (doc_chunks > EMBED_API_MAX_CONTEXT_CHUNKS - total_chunks)
+                total_chunks = EMBED_API_MAX_CONTEXT_CHUNKS + 1;
             else
                 total_chunks += doc_chunks;
             if (doc_chunks < 1) {
@@ -1760,7 +1760,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
             }
             di++;
         }
-        if (total_chunks > PPLX_API_MAX_CONTEXT_CHUNKS)
+        if (total_chunks > EMBED_API_MAX_CONTEXT_CHUNKS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 16000 chunks",
                    "value_error.list.max_items");
     }
@@ -1804,7 +1804,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
                 ci++;
             }
 
-            if (doc_tokens > PPLX_API_MAX_ITEM_TOKENS) {
+            if (doc_tokens > EMBED_API_MAX_ITEM_TOKENS) {
                 char loc[64];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
                 ve_add(detail, loc, "document exceeds 32768 token limit",
@@ -1832,7 +1832,7 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
             free(chunk_tokens);
             di++;
         }
-        if (request_tokens > PPLX_API_MAX_TOTAL_TOKENS) {
+        if (request_tokens > EMBED_API_MAX_TOTAL_TOKENS) {
             ve_add(detail, "[\"body\",\"input\"]",
                    "request exceeds 120000 token limit",
                    "value_error.context_length");
@@ -1994,21 +1994,21 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
-            pplx_mlx_options_t mlx_opts = {
+            embed_mlx_options_t mlx_opts = {
                 .quantize_bits = s->mlx_quantize_bits,
                 .quantize_group_size = s->mlx_quantize_group_size,
             };
-            m->mlx_ctx = pplx_mlx_load_with_options(m->path, &mlx_opts);
+            m->mlx_ctx = embed_mlx_load_with_options(m->path, &mlx_opts);
             if (!m->mlx_ctx) {
-                server_log("pplx-serve: failed to load MLX model on worker: %s",
+                server_log("embed-server: failed to load MLX model on worker: %s",
                            m->path);
                 rc = 1;
                 break;
             }
-            if (pplx_mlx_config(m->mlx_ctx)->hidden_size != m->info->dim) {
-                server_log("pplx-serve: model %s has unexpected dimension %d",
+            if (embed_mlx_config(m->mlx_ctx)->hidden_size != m->info->dim) {
+                server_log("embed-server: model %s has unexpected dimension %d",
                            m->info->id,
-                           pplx_mlx_config(m->mlx_ctx)->hidden_size);
+                           embed_mlx_config(m->mlx_ctx)->hidden_size);
                 rc = 1;
                 break;
             }
@@ -2023,7 +2023,7 @@ static void *worker_main(void *arg) {
             for (int i = 0; i < 4; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->mlx_ctx) {
-                    pplx_mlx_free(m->mlx_ctx);
+                    embed_mlx_free(m->mlx_ctx);
                     m->mlx_ctx = NULL;
                 }
             }
@@ -2037,17 +2037,17 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
-            m->cuda_ctx = pplx_cuda_load(m->path);
+            m->cuda_ctx = embed_cuda_load(m->path);
             if (!m->cuda_ctx) {
-                server_log("pplx-serve: failed to load CUDA model on worker: %s",
+                server_log("embed-server: failed to load CUDA model on worker: %s",
                            m->path);
                 rc = 1;
                 break;
             }
-            if (pplx_cuda_config(m->cuda_ctx)->hidden_size != m->info->dim) {
-                server_log("pplx-serve: model %s has unexpected dimension %d",
+            if (embed_cuda_config(m->cuda_ctx)->hidden_size != m->info->dim) {
+                server_log("embed-server: model %s has unexpected dimension %d",
                            m->info->id,
-                           pplx_cuda_config(m->cuda_ctx)->hidden_size);
+                           embed_cuda_config(m->cuda_ctx)->hidden_size);
                 rc = 1;
                 break;
             }
@@ -2062,7 +2062,7 @@ static void *worker_main(void *arg) {
             for (int i = 0; i < 4; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->cuda_ctx) {
-                    pplx_cuda_free(m->cuda_ctx);
+                    embed_cuda_free(m->cuda_ctx);
                     m->cuda_ctx = NULL;
                 }
             }
@@ -2080,7 +2080,7 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue_job(s);
         if (!j) break;
-        job *jobs[PPLX_SERVER_MICROBATCH_MAX_JOBS];
+        job *jobs[EMBED_SERVER_MICROBATCH_MAX_JOBS];
         int n_jobs = 1;
         jobs[0] = j;
 
@@ -2090,7 +2090,7 @@ static void *worker_main(void *arg) {
             if (s->batch_wait_us > 0)
                 usleep((useconds_t)s->batch_wait_us);
             n_jobs += drain_ready_jobs(s, jobs + 1,
-                                       PPLX_SERVER_MICROBATCH_MAX_JOBS - 1);
+                                       EMBED_SERVER_MICROBATCH_MAX_JOBS - 1);
         }
 
         process_job_group(s, jobs, n_jobs);
@@ -2100,7 +2100,7 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (m->mlx_ctx) {
-                pplx_mlx_free(m->mlx_ctx);
+                embed_mlx_free(m->mlx_ctx);
                 m->mlx_ctx = NULL;
             }
         }
@@ -2111,7 +2111,7 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < 4; i++) {
             loaded_model *m = &s->models[i];
             if (m->cuda_ctx) {
-                pplx_cuda_free(m->cuda_ctx);
+                embed_cuda_free(m->cuda_ctx);
                 m->cuda_ctx = NULL;
             }
         }
@@ -2124,10 +2124,10 @@ static int listen_on(const char *host, int port) {
     char portbuf[32];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     char err[ANET_ERR_LEN];
-    int fd = anetTcpServer(err, port, (char *)host, PPLX_HTTP_BACKLOG);
+    int fd = anetTcpServer(err, port, (char *)host, EMBED_HTTP_BACKLOG);
     (void)portbuf;
     if (fd == ANET_ERR) {
-        server_log("pplx-serve: listen failed on %s:%d: %s", host, port, err);
+        server_log("embed-server: listen failed on %s:%d: %s", host, port, err);
         return -1;
     }
     set_nonblock(fd);
@@ -2142,12 +2142,12 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
     m->tok = qwen_tokenizer_load(vocab_path);
     if (!m->tok) {
-        server_log("pplx-serve: failed to load tokenizer: %s", vocab_path);
+        server_log("embed-server: failed to load tokenizer: %s", vocab_path);
         return -1;
     }
     m->tok_ws = qwen_tokenizer_workspace_new();
     if (!m->tok_ws) {
-        server_log("pplx-serve: failed to allocate tokenizer workspace: %s",
+        server_log("embed-server: failed to allocate tokenizer workspace: %s",
                    path);
         return -1;
     }
@@ -2158,7 +2158,7 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
      * inside that model's embedding table. */
     int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
     m->context_separator_id = sep_id >= 0
-        ? sep_id : PPLX_CONTEXT_SEPARATOR_TOKEN_ID;
+        ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
 #ifdef USE_MLX
     if (s->use_mlx) {
         /* MLX streams are thread-local. The inference worker loads the MLX
@@ -2172,19 +2172,19 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         return 0;
     }
 #endif
-    m->cpu_model = pplx_model_load(path);
+    m->cpu_model = embed_model_load(path);
     if (!m->cpu_model) {
-        server_log("pplx-serve: failed to load model: %s", path);
+        server_log("embed-server: failed to load model: %s", path);
         return -1;
     }
-    m->cpu_ws = pplx_workspace_new(m->cpu_model);
+    m->cpu_ws = embed_workspace_new(m->cpu_model);
     if (!m->cpu_ws) {
-        server_log("pplx-serve: failed to allocate workspace: %s", path);
+        server_log("embed-server: failed to allocate workspace: %s", path);
         return -1;
     }
-    if (pplx_model_config(m->cpu_model)->hidden_size != m->info->dim) {
-        server_log("pplx-serve: model %s has unexpected dimension %d",
-                   m->info->id, pplx_model_config(m->cpu_model)->hidden_size);
+    if (embed_model_config(m->cpu_model)->hidden_size != m->info->dim) {
+        server_log("embed-server: model %s has unexpected dimension %d",
+                   m->info->id, embed_model_config(m->cpu_model)->hidden_size);
         return -1;
     }
     return 0;
@@ -2196,13 +2196,13 @@ static void free_models(http_server *s) {
         free(m->path);
         if (m->tok_ws) qwen_tokenizer_workspace_free(m->tok_ws);
         if (m->tok) qwen_tokenizer_free(m->tok);
-        if (m->cpu_ws) pplx_workspace_free(m->cpu_ws);
-        if (m->cpu_model) pplx_model_free(m->cpu_model);
+        if (m->cpu_ws) embed_workspace_free(m->cpu_ws);
+        if (m->cpu_model) embed_model_free(m->cpu_model);
 #ifdef USE_MLX
-        if (m->mlx_ctx) pplx_mlx_free(m->mlx_ctx);
+        if (m->mlx_ctx) embed_mlx_free(m->mlx_ctx);
 #endif
 #ifdef USE_CUDA
-        if (m->cuda_ctx) pplx_cuda_free(m->cuda_ctx);
+        if (m->cuda_ctx) embed_cuda_free(m->cuda_ctx);
 #endif
     }
 }
@@ -2223,23 +2223,23 @@ static uint64_t physical_memory_nbytes(void) {
     return (uint64_t)pages * (uint64_t)page_size;
 }
 
-static int validate_model_specs(const pplx_server_config_t *cfg) {
+static int validate_model_specs(const embed_server_config_t *cfg) {
     int seen[4] = {0};
     for (int i = 0; i < cfg->n_models; i++) {
-        const pplx_server_model_spec_t *spec = &cfg->models[i];
+        const embed_server_model_spec_t *spec = &cfg->models[i];
         model_slot slot = model_slot_for_id(spec->id);
         if (slot == MODEL_UNKNOWN) {
-            fprintf(stderr, "pplx-serve: unknown model id: %s\n",
+            fprintf(stderr, "embed-server: unknown model id: %s\n",
                     spec->id ? spec->id : "<null>");
             return -1;
         }
         if (!spec->path || !spec->path[0]) {
-            fprintf(stderr, "pplx-serve: model %s has an empty path\n",
+            fprintf(stderr, "embed-server: model %s has an empty path\n",
                     spec->id);
             return -1;
         }
         if (seen[slot]) {
-            fprintf(stderr, "pplx-serve: duplicate model id: %s\n", spec->id);
+            fprintf(stderr, "embed-server: duplicate model id: %s\n", spec->id);
             return -1;
         }
         seen[slot] = 1;
@@ -2247,7 +2247,7 @@ static int validate_model_specs(const pplx_server_config_t *cfg) {
     return 0;
 }
 
-static int mlx_memory_preflight(const pplx_server_config_t *cfg) {
+static int mlx_memory_preflight(const embed_server_config_t *cfg) {
     if (!cfg->use_mlx) return 0;
 
     uint64_t payload = 0;
@@ -2257,55 +2257,55 @@ static int mlx_memory_preflight(const pplx_server_config_t *cfg) {
         size_t model_payload = 0;
         if (!ms || multi_safetensors_data_nbytes(ms, &model_payload) != 0) {
             multi_safetensors_close(ms);
-            fprintf(stderr, "pplx-serve: failed to inspect MLX model: %s\n",
+            fprintf(stderr, "embed-server: failed to inspect MLX model: %s\n",
                     cfg->models[i].path);
             return -1;
         }
         multi_safetensors_close(ms);
         if ((uint64_t)model_payload > UINT64_MAX - payload) {
-            fprintf(stderr, "pplx-serve: MLX model payload size overflow\n");
+            fprintf(stderr, "embed-server: MLX model payload size overflow\n");
             return -1;
         }
         payload += (uint64_t)model_payload;
     }
 
-    if (payload > UINT64_MAX / PPLX_MLX_RESIDENT_MULTIPLIER) {
-        fprintf(stderr, "pplx-serve: MLX resident-memory estimate overflow\n");
+    if (payload > UINT64_MAX / EMBED_MLX_RESIDENT_MULTIPLIER) {
+        fprintf(stderr, "embed-server: MLX resident-memory estimate overflow\n");
         return -1;
     }
-    uint64_t estimated = payload * PPLX_MLX_RESIDENT_MULTIPLIER;
+    uint64_t estimated = payload * EMBED_MLX_RESIDENT_MULTIPLIER;
     uint64_t physical = physical_memory_nbytes();
     if (physical == 0) {
-        server_log("pplx-serve: warning: could not determine physical memory; "
+        server_log("embed-server: warning: could not determine physical memory; "
                    "skipping MLX memory preflight");
         return 0;
     }
     double utilization = cfg->memory_utilization > 0.0
         ? cfg->memory_utilization
-        : PPLX_MLX_MEMORY_BUDGET_PERCENT / 100.0;
+        : EMBED_MLX_MEMORY_BUDGET_PERCENT / 100.0;
     uint64_t budget = (uint64_t)((double)physical * utilization);
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    server_log("pplx-serve: MLX memory preflight: %.1f GiB tensors, "
+    server_log("embed-server: MLX memory preflight: %.1f GiB tensors, "
                "%.1f GiB estimated resident, %.1f GiB budget "
                "(%.2f of physical memory)",
                (double)payload / gib, (double)estimated / gib,
                (double)budget / gib, utilization);
     if (cfg->mlx_quantize_bits) {
-        server_log("pplx-serve: MLX %d-bit quantization enabled; preflight "
+        server_log("embed-server: MLX %d-bit quantization enabled; preflight "
                    "uses source payload as a conservative peak estimate",
                    cfg->mlx_quantize_bits);
     }
     if (estimated <= budget) return 0;
-    server_log("pplx-serve: refusing MLX model set above the host-memory "
+    server_log("embed-server: refusing MLX model set above the host-memory "
                "budget");
-    server_log("pplx-serve: use BF16 artifacts, load fewer models, or raise "
+    server_log("embed-server: use BF16 artifacts, load fewer models, or raise "
                "--memory-utilization (values above 1.0 overcommit)");
     return -1;
 }
 
-int pplx_run_server(const pplx_server_config_t *cfg) {
+int embed_run_server(const embed_server_config_t *cfg) {
     if (!cfg || !cfg->models || cfg->n_models <= 0) {
-        fprintf(stderr, "pplx-serve: at least one --model MODEL_ID=PATH is required\n");
+        fprintf(stderr, "embed-server: at least one --model MODEL_ID=PATH is required\n");
         return 1;
     }
     if (validate_model_specs(cfg) != 0 || mlx_memory_preflight(cfg) != 0)
@@ -2316,11 +2316,11 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     s.host = cfg->host && cfg->host[0] ? cfg->host : "127.0.0.1";
     s.port = cfg->port > 0 ? cfg->port : 8000;
     s.batch_size = cfg->batch_size > 0
-        ? cfg->batch_size : PPLX_SERVER_DEFAULT_BATCH_SIZE;
+        ? cfg->batch_size : EMBED_SERVER_DEFAULT_BATCH_SIZE;
     s.max_batch_tokens = cfg->max_batch_tokens > 0
-        ? cfg->max_batch_tokens : PPLX_SERVER_DEFAULT_MAX_BATCH_TOKENS;
+        ? cfg->max_batch_tokens : EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0
-        ? cfg->batch_wait_us : PPLX_SERVER_BATCH_WAIT_US;
+        ? cfg->batch_wait_us : EMBED_SERVER_BATCH_WAIT_US;
     s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
     s.use_cuda = cfg->use_cuda;
@@ -2330,7 +2330,7 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     if (cfg->api_key && cfg->api_key[0])
         s.api_key = xstrdup(cfg->api_key);
     else {
-        const char *env_key = getenv("PPLX_API_KEY");
+        const char *env_key = getenv("EMBED_API_KEY");
         if (env_key && env_key[0]) s.api_key = xstrdup(env_key);
     }
 
@@ -2340,7 +2340,7 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     for (int i = 0; i < cfg->n_models; i++) {
         model_slot slot = model_slot_for_id(cfg->models[i].id);
         if (slot == MODEL_UNKNOWN) {
-            fprintf(stderr, "pplx-serve: unknown model id: %s\n", cfg->models[i].id);
+            fprintf(stderr, "embed-server: unknown model id: %s\n", cfg->models[i].id);
             free_models(&s);
             return 1;
         }
@@ -2369,15 +2369,15 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     signal(SIGPIPE, SIG_IGN);
     g_signal_wfd = s.signal_pipe[1];
 
-    s.loop = aeCreateEventLoop(PPLX_HTTP_SETSIZE);
+    s.loop = aeCreateEventLoop(EMBED_HTTP_SETSIZE);
     if (!s.loop) {
-        fprintf(stderr, "pplx-serve: failed to create event loop\n");
+        fprintf(stderr, "embed-server: failed to create event loop\n");
         free_models(&s);
         return 1;
     }
 
     if (pthread_create(&s.worker, NULL, worker_main, &s) != 0) {
-        fprintf(stderr, "pplx-serve: failed to start worker\n");
+        fprintf(stderr, "embed-server: failed to start worker\n");
         aeDeleteEventLoop(s.loop);
         free_models(&s);
         return 1;
@@ -2412,12 +2412,12 @@ int pplx_run_server(const pplx_server_config_t *cfg) {
     aeCreateFileEvent(s.loop, s.listen_fd, AE_READABLE, accept_cb, &s);
     aeCreateFileEvent(s.loop, s.completion_pipe[0], AE_READABLE, completion_cb, &s);
     aeCreateFileEvent(s.loop, s.signal_pipe[0], AE_READABLE, signal_cb, &s);
-    aeCreateTimeEvent(s.loop, PPLX_HTTP_SWEEP_MS, timeout_cb, &s, NULL);
+    aeCreateTimeEvent(s.loop, EMBED_HTTP_SWEEP_MS, timeout_cb, &s, NULL);
 
-    server_log("pplx-serve: listening on http://%s:%d", s.host, s.port);
+    server_log("embed-server: listening on http://%s:%d", s.host, s.port);
     aeMain(s.loop);
 
-    server_log("pplx-serve: shutdown requested");
+    server_log("embed-server: shutdown requested");
     if (s.listen_fd >= 0) close(s.listen_fd);
     client *c = s.clients;
     while (c) {
@@ -2490,7 +2490,7 @@ static void print_usage(const char *prog)
 }
 
 typedef struct {
-    pplx_server_model_spec_t *v;
+    embed_server_model_spec_t *v;
     int n;
     int cap;
 } model_specs_t;
@@ -2684,7 +2684,7 @@ int main(int argc, char *argv[])
         arg++;
     }
 
-    pplx_verbose = verbose;
+    embed_verbose = verbose;
     qwen_verbose = verbose;
 
     if (arg < argc) {
@@ -2712,7 +2712,7 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
-        if (pplx_cuda_set_fast_gemm(cuda_fast_gemm) != 0) {
+        if (embed_cuda_set_fast_gemm(cuda_fast_gemm) != 0) {
             fprintf(stderr, "--cuda-gemm-mode must be f32, tf32, bf16, or 16f\n");
             free_model_specs(&model_specs);
             return 1;
@@ -2732,9 +2732,9 @@ int main(int argc, char *argv[])
             return 1;
         }
         if (!strcmp(cuda_weights, "bf16")) {
-            pplx_cuda_set_weights_bf16(1);
+            embed_cuda_set_weights_bf16(1);
         } else if (!strcmp(cuda_weights, "f32")) {
-            pplx_cuda_set_weights_bf16(0);
+            embed_cuda_set_weights_bf16(0);
         } else {
             fprintf(stderr, "--cuda-weight-dtype must be f32 or bf16\n");
             free_model_specs(&model_specs);
@@ -2755,12 +2755,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Using %s GPU backend\n", use_mlx ? "MLX" : "CUDA");
     }
 
-    pplx_server_config_t scfg = {
+    embed_server_config_t scfg = {
         .models = model_specs.v,
         .n_models = model_specs.n,
         .host = host,
         .port = port,
-        .batch_size = batch_size > 0 ? batch_size : PPLX_SERVER_DEFAULT_BATCH_SIZE,
+        .batch_size = batch_size > 0 ? batch_size : EMBED_SERVER_DEFAULT_BATCH_SIZE,
         .max_batch_tokens = max_batch_tokens,
         .batch_wait_us = batch_wait_us,
         .use_mlx = use_mlx,
@@ -2771,7 +2771,7 @@ int main(int argc, char *argv[])
         .enable_cors = cors,
         .api_key = api_key,
     };
-    int rc = pplx_run_server(&scfg);
+    int rc = embed_run_server(&scfg);
     free_model_specs(&model_specs);
     return rc;
 }

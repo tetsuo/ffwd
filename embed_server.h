@@ -1,14 +1,14 @@
-#ifndef PPLX_SERVER_H
-#define PPLX_SERVER_H
+#ifndef EMBED_SERVER_H
+#define EMBED_SERVER_H
 
 /* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * -fvisibility=hidden, so only declarations carrying EMBED_API are exported
  * from the shared library; everything else stays internal. */
-#ifndef PPLX_API
+#ifndef EMBED_API
 #if defined(__GNUC__)
-#define PPLX_API __attribute__((visibility("default")))
+#define EMBED_API __attribute__((visibility("default")))
 #else
-#define PPLX_API
+#define EMBED_API
 #endif
 #endif
 
@@ -17,10 +17,10 @@
 typedef struct {
     const char *id;
     const char *path;
-} pplx_server_model_spec_t;
+} embed_server_model_spec_t;
 
 typedef struct {
-    const pplx_server_model_spec_t *models;
+    const embed_server_model_spec_t *models;
     int n_models;
     const char *host;
     int port;
@@ -36,8 +36,8 @@ typedef struct {
                                    values above 1.0 allow overcommit */
     int enable_cors;
     const char *api_key;
-} pplx_server_config_t;
+} embed_server_config_t;
 
-PPLX_API int pplx_run_server(const pplx_server_config_t *cfg);
+EMBED_API int embed_run_server(const embed_server_config_t *cfg);
 
 #endif

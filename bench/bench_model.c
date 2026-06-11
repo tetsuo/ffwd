@@ -13,8 +13,8 @@
 #include "embed.h"
 #include "qwen_kernels.h"
 
-static pplx_model_t *g_model;
-static pplx_workspace_t *g_ws;
+static embed_model_t *g_model;
+static embed_workspace_t *g_ws;
 static int g_hidden;
 
 enum { MAX_BATCH = 8 };
@@ -29,14 +29,14 @@ static void bm_embed(bench_state_t *b, int batch, int len)
         s = s * 1664525u + 1013904223u;
         ids[i] = (int)(s % 1000u);    /* ordinary vocab rows */
     }
-    pplx_input_t inputs[MAX_BATCH];
+    embed_input_t inputs[MAX_BATCH];
     for (int i = 0; i < batch; i++) {
         inputs[i].ids = ids + (size_t)i * len;
         inputs[i].n_tokens = len;
     }
     bench_begin(b);
     for (long i = 0; i < b->n; i++) {
-        if (pplx_model_embed_batch(g_model, g_ws, inputs, batch, out) != 0)
+        if (embed_model_encode_batch(g_model, g_ws, inputs, batch, out) != 0)
             exit(2);
         bench_sink += out[0];
     }
@@ -70,17 +70,17 @@ int main(int argc, char **argv)
     if (threads < 1) threads = 1;
     qwen_set_threads(threads);
 
-    g_model = pplx_model_load(argv[1]);
+    g_model = embed_model_load(argv[1]);
     if (!g_model) {
         fprintf(stderr, "failed to load model from %s\n", argv[1]);
         return 1;
     }
-    g_ws = pplx_workspace_new(g_model);
+    g_ws = embed_workspace_new(g_model);
     if (!g_ws) {
-        pplx_model_free(g_model);
+        embed_model_free(g_model);
         return 1;
     }
-    g_hidden = pplx_model_config(g_model)->hidden_size;
+    g_hidden = embed_model_config(g_model)->hidden_size;
 
     char meta[160];
     snprintf(meta, sizeof(meta), "suite=model threads=%d hidden=%d",
@@ -91,7 +91,7 @@ int main(int argc, char **argv)
     bench_parse_args(&opts, argc - 1, argv + 1);
     int rc = bench_main(&opts, CASES, (int)(sizeof(CASES) / sizeof(CASES[0])));
 
-    pplx_workspace_free(g_ws);
-    pplx_model_free(g_model);
+    embed_workspace_free(g_ws);
+    embed_model_free(g_model);
     return rc;
 }

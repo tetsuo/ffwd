@@ -1,4 +1,4 @@
-/* tests/test_cli.c - drives the pplx-embed CLI binary end to end.
+/* tests/test_cli.c - drives the embed CLI binary end to end.
  * Hermetic: synthesizes a tiny model + tokenizer fixture, then runs the
  * binary given as argv[1] through its modes and flag validation paths,
  * checking exit codes and output shapes. Runs via `make test`. */
@@ -90,10 +90,10 @@ static int stdout_is_embedding(int dim)
 
 int main(int argc, char **argv)
 {
-    g_cli = argc > 1 ? argv[1] : "./pplx-embed";
+    g_cli = argc > 1 ? argv[1] : "./embed";
 
     tm_dims_t dims = {4, 2, 1, 2, 8, TF_VOCAB_SIZE};
-    snprintf(g_dir, sizeof(g_dir), "%s/pplx-cli-test-XXXXXX",
+    snprintf(g_dir, sizeof(g_dir), "%s/embed-cli-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(g_dir) || tf_write_vocab(g_dir) != 0 ||
         tm_write_model_dims(g_dir, "F32", &dims) != 0) {
@@ -109,7 +109,7 @@ int main(int argc, char **argv)
     /* Help and missing-argument handling. */
     expect(run_cli("-h", NULL) == 0, "-h exits 0");
     expect(run_cli("", NULL) == 1, "no arguments exits 1");
-    expect(run_cli("-d /nonexistent-pplx-dir hi", NULL) == 1,
+    expect(run_cli("-d /nonexistent-embed-dir hi", NULL) == 1,
            "missing model dir exits 1");
 
     /* Mode 1: one text prints one embedding line. */

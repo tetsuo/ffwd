@@ -1,41 +1,41 @@
 /*
- * embed_cuda.h - CUDA/cuBLAS backend for pplx-embed inference.
+ * embed_cuda.h - CUDA/cuBLAS backend
  */
 
-#ifndef PPLX_EMBED_CUDA_H
-#define PPLX_EMBED_CUDA_H
+#ifndef EMBED_CUDA_H
+#define EMBED_CUDA_H
 
 /* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * -fvisibility=hidden, so only declarations carrying EMBED_API are exported
  * from the shared library; everything else stays internal. */
-#ifndef PPLX_API
+#ifndef EMBED_API
 #if defined(__GNUC__)
-#define PPLX_API __attribute__((visibility("default")))
+#define EMBED_API __attribute__((visibility("default")))
 #else
-#define PPLX_API
+#define EMBED_API
 #endif
 #endif
 
 #include "embed.h"
 
-typedef struct pplx_cuda_ctx pplx_cuda_ctx_t;
+typedef struct embed_cuda_ctx embed_cuda_ctx_t;
 
-PPLX_API int pplx_cuda_set_fast_gemm(const char *mode);
-PPLX_API int pplx_cuda_set_weights_bf16(int on);
+EMBED_API int embed_cuda_set_fast_gemm(const char *mode);
+EMBED_API int embed_cuda_set_weights_bf16(int on);
 
-PPLX_API pplx_cuda_ctx_t *pplx_cuda_load(const char *model_dir);
-PPLX_API void pplx_cuda_free(pplx_cuda_ctx_t *ctx);
+EMBED_API embed_cuda_ctx_t *embed_cuda_load(const char *model_dir);
+EMBED_API void embed_cuda_free(embed_cuda_ctx_t *ctx);
 
-PPLX_API const pplx_config_t *pplx_cuda_config(const pplx_cuda_ctx_t *ctx);
+EMBED_API const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx);
 
-PPLX_API int pplx_cuda_embed_into(pplx_cuda_ctx_t *ctx, const int *token_ids,
+EMBED_API int embed_cuda_encode_into(embed_cuda_ctx_t *ctx, const int *token_ids,
                          int n_tokens, float *out_embedding);
-PPLX_API float *pplx_cuda_embed(pplx_cuda_ctx_t *ctx, const int *token_ids,
+EMBED_API float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids,
                        int n_tokens);
-PPLX_API int pplx_cuda_embed_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
+EMBED_API int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
                           int batch, float *out_embeddings);
-PPLX_API int pplx_cuda_embed_spans_batch(pplx_cuda_ctx_t *ctx,
-                                const pplx_context_input_t *inputs,
+EMBED_API int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
+                                const embed_context_input_t *inputs,
                                 int batch, float *out_embeddings);
 
-#endif /* PPLX_EMBED_CUDA_H */
+#endif /* EMBED_CUDA_H */

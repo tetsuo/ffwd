@@ -1,4 +1,4 @@
-/* embed_cli.c - pplx-embed command-line tool */
+/* embed_cli.c - embed command-line tool */
 
 #include "embed.h"
 #include "qwen_kernels.h"
@@ -70,13 +70,13 @@ static void print_usage(const char *prog)
  * ======================================================================== */
 
 typedef struct {
-    pplx_model_t     *model;
-    pplx_workspace_t *workspace;
+    embed_model_t     *model;
+    embed_workspace_t *workspace;
 #ifdef USE_MLX
-    pplx_mlx_ctx_t   *mlx_ctx;
+    embed_mlx_ctx_t   *mlx_ctx;
 #endif
 #ifdef USE_CUDA
-    pplx_cuda_ctx_t  *cuda_ctx;
+    embed_cuda_ctx_t  *cuda_ctx;
 #endif
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
@@ -88,18 +88,18 @@ typedef struct {
     int  n_tokens;
 } token_buf_t;
 
-static int engine_embed_batch(engine_t *e, const pplx_input_t *inputs,
+static int engine_embed_batch(engine_t *e, const embed_input_t *inputs,
                               int batch, float *out_embeddings)
 {
 #ifdef USE_MLX
     if (e->mlx_ctx)
-        return pplx_mlx_embed_batch(e->mlx_ctx, inputs, batch, out_embeddings);
+        return embed_mlx_encode_batch(e->mlx_ctx, inputs, batch, out_embeddings);
 #endif
 #ifdef USE_CUDA
     if (e->cuda_ctx)
-        return pplx_cuda_embed_batch(e->cuda_ctx, inputs, batch, out_embeddings);
+        return embed_cuda_encode_batch(e->cuda_ctx, inputs, batch, out_embeddings);
 #endif
-    return pplx_model_embed_batch(e->model, e->workspace,
+    return embed_model_encode_batch(e->model, e->workspace,
                                   inputs, batch, out_embeddings);
 }
 
@@ -116,7 +116,7 @@ static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
         return -1;
     }
 
-    if (pplx_verbose >= 1) {
+    if (embed_verbose >= 1) {
         fprintf(stderr, "tokens (%d): ", out->n_tokens);
         for (int i = 0; i < out->n_tokens && i < 20; i++)
             fprintf(stderr, "%d ", out->ids[i]);
@@ -148,7 +148,7 @@ static void print_embedding_raw(const float *emb, int dim)
 
 static size_t engine_workspace_nbytes(const engine_t *e)
 {
-    return (e && e->workspace) ? pplx_workspace_nbytes(e->workspace) : 0;
+    return (e && e->workspace) ? embed_workspace_nbytes(e->workspace) : 0;
 }
 
 static void print_embedding_json(const float *emb, int dim, int n_tokens,
@@ -173,7 +173,7 @@ static int process_stdin_batch(engine_t *e, char **lines, int n_lines)
     if (n_lines <= 0) return 0;
 
     token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_lines, sizeof(token_buf_t));
-    pplx_input_t *inputs = (pplx_input_t *)malloc((size_t)n_lines * sizeof(pplx_input_t));
+    embed_input_t *inputs = (embed_input_t *)malloc((size_t)n_lines * sizeof(embed_input_t));
     int *input_to_line = (int *)malloc((size_t)n_lines * sizeof(int));
     float *embs = (float *)malloc((size_t)n_lines * e->dim * sizeof(float));
     if (!tokens || !inputs || !input_to_line || !embs) {
@@ -201,7 +201,7 @@ static int process_stdin_batch(engine_t *e, char **lines, int n_lines)
         double t0 = now_ms();
         rc = engine_embed_batch(e, inputs, n_inputs, embs);
         ms = now_ms() - t0;
-        if (pplx_verbose >= 1)
+        if (embed_verbose >= 1)
             fprintf(stderr, "embed batch: %d texts in %.1f ms\n", n_inputs, ms);
     }
 
@@ -238,7 +238,7 @@ static int run_stdin(engine_t *e, int batch_size)
     char line[65536];
     if (batch_size <= 0) batch_size = 1;
 
-    if (pplx_verbose >= 1)
+    if (embed_verbose >= 1)
         fprintf(stderr, "stdin: ready, reading from stdin (batch_size=%d)\n",
                 batch_size);
 
@@ -257,7 +257,7 @@ static int run_stdin(engine_t *e, int batch_size)
             line[--len] = '\0';
         if (len == 0) continue;
 
-        if (pplx_verbose >= 1)
+        if (embed_verbose >= 1)
             fprintf(stderr, "stdin: \"%.*s%s\"\n",
                     (int)(len > 60 ? 60 : len), line, len > 60 ? "..." : "");
 
@@ -288,7 +288,7 @@ static int run_stdin(engine_t *e, int batch_size)
     }
     free(batch_lines);
 
-    if (pplx_verbose >= 1)
+    if (embed_verbose >= 1)
         fprintf(stderr, "stdin: EOF\n");
 
     return rc;
@@ -346,7 +346,7 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
 
     int dim = e->dim;
     token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_texts, sizeof(token_buf_t));
-    pplx_input_t *inputs = (pplx_input_t *)malloc((size_t)n_texts * sizeof(pplx_input_t));
+    embed_input_t *inputs = (embed_input_t *)malloc((size_t)n_texts * sizeof(embed_input_t));
     float *embs = (float *)malloc((size_t)n_texts * dim * sizeof(float));
     if (!tokens || !inputs || !embs) {
         fprintf(stderr, "OOM\n");
@@ -357,7 +357,7 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
     }
 
     for (int i = 0; i < n_texts; i++) {
-        if (pplx_verbose >= 1)
+        if (embed_verbose >= 1)
             fprintf(stderr, "[%d/%d] \"%s\"\n", i+1, n_texts, texts[i]);
         if (tokenize_text(e, texts[i], &tokens[i]) != 0) {
             rc = 1;
@@ -379,7 +379,7 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
             rc = 1;
             goto done;
         }
-        if (pplx_verbose >= 1)
+        if (embed_verbose >= 1)
             fprintf(stderr, "embed batch: [%d..%d] %d texts in %.1f ms\n",
                     start, start + cur - 1, cur, now_ms() - t0);
     }
@@ -394,7 +394,7 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
         for (int i = 0; i < n_texts; i++) {
             printf("[%d] ", i);
             for (int j = 0; j < n_texts; j++)
-                printf("  %.4f", (double)pplx_cosine_similarity(
+                printf("  %.4f", (double)embed_cosine_similarity(
                     embs + (size_t)i * dim, embs + (size_t)j * dim, dim));
             printf("  \"%s\"\n", texts[i]);
         }
@@ -527,7 +527,7 @@ int main(int argc, char *argv[])
         arg_start++;
     }
 
-    pplx_verbose = verbose;
+    embed_verbose = verbose;
     qwen_verbose = verbose;
 
     if (cuda_fast_gemm) {
@@ -536,7 +536,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "--cuda-gemm-mode requires --cuda or --backend cuda\n");
             return 1;
         }
-        if (pplx_cuda_set_fast_gemm(cuda_fast_gemm) != 0) {
+        if (embed_cuda_set_fast_gemm(cuda_fast_gemm) != 0) {
             fprintf(stderr, "--cuda-gemm-mode must be f32, tf32, bf16, or 16f\n");
             return 1;
         }
@@ -553,9 +553,9 @@ int main(int argc, char *argv[])
             return 1;
         }
         if (!strcmp(cuda_weights, "bf16")) {
-            pplx_cuda_set_weights_bf16(1);
+            embed_cuda_set_weights_bf16(1);
         } else if (!strcmp(cuda_weights, "f32")) {
-            pplx_cuda_set_weights_bf16(0);
+            embed_cuda_set_weights_bf16(0);
         } else {
             fprintf(stderr, "--cuda-weight-dtype must be f32 or bf16\n");
             return 1;
@@ -602,45 +602,45 @@ int main(int argc, char *argv[])
 
 #ifdef USE_MLX
     if (use_mlx) {
-        pplx_mlx_options_t mlx_opts = {
+        embed_mlx_options_t mlx_opts = {
             .quantize_bits = mlx_quantize_bits,
             .quantize_group_size = mlx_quantize_group_size,
         };
-        e.mlx_ctx = pplx_mlx_load_with_options(model_dir, &mlx_opts);
+        e.mlx_ctx = embed_mlx_load_with_options(model_dir, &mlx_opts);
         if (!e.mlx_ctx) {
             fprintf(stderr, "failed to load model\n");
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = pplx_mlx_config(e.mlx_ctx)->hidden_size;
+        e.dim = embed_mlx_config(e.mlx_ctx)->hidden_size;
     } else
 #endif
 #ifdef USE_CUDA
     if (use_cuda) {
-        e.cuda_ctx = pplx_cuda_load(model_dir);
+        e.cuda_ctx = embed_cuda_load(model_dir);
         if (!e.cuda_ctx) {
             fprintf(stderr, "failed to load CUDA model\n");
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = pplx_cuda_config(e.cuda_ctx)->hidden_size;
+        e.dim = embed_cuda_config(e.cuda_ctx)->hidden_size;
     } else
 #endif
     {
-        e.model = pplx_model_load(model_dir);
+        e.model = embed_model_load(model_dir);
         if (!e.model) {
             fprintf(stderr, "failed to load model\n");
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.workspace = pplx_workspace_new(e.model);
+        e.workspace = embed_workspace_new(e.model);
         if (!e.workspace) {
             fprintf(stderr, "failed to allocate workspace\n");
-            pplx_model_free(e.model);
+            embed_model_free(e.model);
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = pplx_model_config(e.model)->hidden_size;
+        e.dim = embed_model_config(e.model)->hidden_size;
     }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s%s\n",
@@ -651,13 +651,13 @@ int main(int argc, char *argv[])
     e.tok_ws = qwen_tokenizer_workspace_new();
     if (!e.tok_ws) {
         fprintf(stderr, "failed to allocate tokenizer workspace\n");
-        if (e.workspace) pplx_workspace_free(e.workspace);
-        if (e.model) pplx_model_free(e.model);
+        if (e.workspace) embed_workspace_free(e.workspace);
+        if (e.model) embed_model_free(e.model);
 #ifdef USE_MLX
-        if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
+        if (e.mlx_ctx) embed_mlx_free(e.mlx_ctx);
 #endif
 #ifdef USE_CUDA
-        if (e.cuda_ctx) pplx_cuda_free(e.cuda_ctx);
+        if (e.cuda_ctx) embed_cuda_free(e.cuda_ctx);
 #endif
         qwen_tokenizer_free(tok);
         return 1;
@@ -671,13 +671,13 @@ int main(int argc, char *argv[])
         rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size);
 
     /* Cleanup */
-    if (e.workspace) pplx_workspace_free(e.workspace);
-    if (e.model) pplx_model_free(e.model);
+    if (e.workspace) embed_workspace_free(e.workspace);
+    if (e.model) embed_model_free(e.model);
 #ifdef USE_MLX
-    if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
+    if (e.mlx_ctx) embed_mlx_free(e.mlx_ctx);
 #endif
 #ifdef USE_CUDA
-    if (e.cuda_ctx) pplx_cuda_free(e.cuda_ctx);
+    if (e.cuda_ctx) embed_cuda_free(e.cuda_ctx);
 #endif
     qwen_tokenizer_workspace_free(e.tok_ws);
     qwen_tokenizer_free(tok);

@@ -64,7 +64,7 @@ static const char ONE_TENSOR_X[] =
 
 int main(void)
 {
-    snprintf(tmproot, sizeof(tmproot), "%s/pplx-st-test-XXXXXX",
+    snprintf(tmproot, sizeof(tmproot), "%s/embed-st-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(tmproot)) { perror("mkdtemp"); return 2; }
 

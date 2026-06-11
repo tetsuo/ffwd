@@ -10,13 +10,13 @@
 #define QWEN_TOKENIZER_H
 
 /* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying PPLX_API are exported
+ * -fvisibility=hidden, so only declarations carrying EMBED_API are exported
  * from the shared library; everything else stays internal. */
-#ifndef PPLX_API
+#ifndef EMBED_API
 #if defined(__GNUC__)
-#define PPLX_API __attribute__((visibility("default")))
+#define EMBED_API __attribute__((visibility("default")))
 #else
-#define PPLX_API
+#define EMBED_API
 #endif
 #endif
 
@@ -43,29 +43,29 @@ typedef struct {
 typedef struct qwen_tokenizer_workspace qwen_tokenizer_workspace_t;
 
 /* Load tokenizer from vocab.json in model directory */
-PPLX_API qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path);
+EMBED_API qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path);
 
 /* Decode a single token ID to text. Returns pointer to internal string. */
-PPLX_API const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id);
+EMBED_API const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id);
 
 /* Look up the id of a raw vocab.json token string (e.g. "<|endoftext|>").
  * Returns -1 when the token is not in the vocab. */
-PPLX_API int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *token);
+EMBED_API int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *token);
 
 /* Encode UTF-8 text into token IDs using BPE.
  * Returns malloc'd array of token IDs and sets *out_n_tokens.
  * Returns NULL on error (and sets *out_n_tokens to 0). */
-PPLX_API int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens);
+EMBED_API int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens);
 
 /* Reusable scratch for allocation-light repeated encoding. */
-PPLX_API qwen_tokenizer_workspace_t *qwen_tokenizer_workspace_new(void);
-PPLX_API void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws);
+EMBED_API qwen_tokenizer_workspace_t *qwen_tokenizer_workspace_new(void);
+EMBED_API void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws);
 
 /* Encode into caller-provided out_ids[0..out_cap-1].
  * Returns 0 on success, -1 on error, -2 if out_cap is too small.
  * In all cases *out_n_tokens is set to the number of tokens needed/emitted
  * when out_n_tokens is non-NULL. */
-PPLX_API int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
+EMBED_API int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
                                qwen_tokenizer_workspace_t *ws,
                                const char *text,
                                int *out_ids, int out_cap,
@@ -73,12 +73,12 @@ PPLX_API int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
 
 /* Same tokenization as qwen_tokenizer_encode(), but reuses ws internally and
  * performs only the final returned int[] allocation. */
-PPLX_API int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
+EMBED_API int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
                                           qwen_tokenizer_workspace_t *ws,
                                           const char *text,
                                           int *out_n_tokens);
 
 /* Free tokenizer */
-PPLX_API void qwen_tokenizer_free(qwen_tokenizer_t *tok);
+EMBED_API void qwen_tokenizer_free(qwen_tokenizer_t *tok);
 
 #endif /* QWEN_TOKENIZER_H */
