@@ -59,11 +59,25 @@ struct pplx_cuda_ctx {
     float *vexp;
     float *attn_scores;
     void *attn_probs;   // BF16 softmax output (bf16 weights)
+    long long attn_scores_elems;
+    long long attn_probs_elems;
+    // Equal-length micro-batch attention: pointer arrays for batched GEMMs,
+    // built once per forward pass (layer-invariant buffer addresses).
+    // attn_G is the number of sequences whose score tensors fit the scratch
+    // budget at once; 0 disables the batched path for this forward.
+    const void **attn_ptrs;       // device: [K|Q|S|V|P|O] x batch x n_heads
+    const void **attn_ptrs_host;
+    int attn_ptrs_cap;            // capacity in pointer entries
+    int attn_G;
+    int attn_L;
     int *span_starts;
     int *span_lens;
     int pooled_rows_cap;
     int span_cap;
 };
+
+// Scratch budget for the batched-attention score tensors (F32 elements).
+enum { CUDA_ATTN_SCORES_BUDGET = 64 * 1024 * 1024 };
 
 #define CUDA_CHECK(expr) do {                                      \
     cudaError_t _e = (expr);                                       \
@@ -659,6 +673,98 @@ static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
 // -> @V via cuBLAS. Requires ctx->kexp, ctx->vexp ([total x q_dim]) and
 // ctx->attn_scores ([n_heads x max_seq x max_seq]) to be allocated. h_offsets
 // is the host copy of the packed sequence boundaries.
+// Prepare the equal-length batched-attention path for one forward pass:
+// grow the score/probability scratch to hold attn_G sequences at once and
+// upload the pointer arrays for the two batched GEMMs (buffer addresses are
+// layer-invariant). attn_G stays 0 - per-sequence fallback - for ragged
+// batches, single sequences, or when one sequence's scores exceed the
+// budget.
+static int attn_batched_setup(pplx_cuda_ctx_t *ctx, int batch, int q_offset,
+                              int qkv_dim)
+{
+    const pplx_config_t *c = &ctx->config;
+    ctx->attn_G = 0;
+    if (batch < 2) return 0;
+    int L = ctx->offsets_host[1] - ctx->offsets_host[0];
+    for (int b = 1; b < batch; b++)
+        if (ctx->offsets_host[b + 1] - ctx->offsets_host[b] != L) return 0;
+    int H = c->n_heads, hd = c->head_dim, q_dim = c->q_dim;
+    long long per = (long long)H * L * L;
+    if (per <= 0 || per > CUDA_ATTN_SCORES_BUDGET / 2) return 0;
+    int G = (int)(CUDA_ATTN_SCORES_BUDGET / per);
+    if (G > batch) G = batch;
+    if (G < 2) return 0;
+
+    int bf16 = g_weights_bf16;
+    long long want = (long long)G * per;
+    if (want > ctx->attn_scores_elems) {
+        cudaFree(ctx->attn_scores);
+        ctx->attn_scores = NULL;
+        ctx->attn_scores_elems = 0;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
+                              (size_t)want * sizeof(float)));
+        ctx->attn_scores_elems = want;
+    }
+    if (bf16 && want > ctx->attn_probs_elems) {
+        cudaFree(ctx->attn_probs);
+        ctx->attn_probs = NULL;
+        ctx->attn_probs_elems = 0;
+        CUDA_CHECK(cudaMalloc(&ctx->attn_probs,
+                              (size_t)want * sizeof(__nv_bfloat16)));
+        ctx->attn_probs_elems = want;
+    }
+
+    int entries = 6 * batch * H;
+    if (entries > ctx->attn_ptrs_cap) {
+        cudaFree((void *)ctx->attn_ptrs);
+        free((void *)ctx->attn_ptrs_host);
+        ctx->attn_ptrs = NULL;
+        ctx->attn_ptrs_cap = 0;
+        ctx->attn_ptrs_host =
+            (const void **)malloc((size_t)entries * sizeof(void *));
+        if (!ctx->attn_ptrs_host) return -1;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_ptrs,
+                              (size_t)entries * sizeof(void *)));
+        ctx->attn_ptrs_cap = entries;
+    }
+
+    const void **K = ctx->attn_ptrs_host;
+    const void **Q = K + (size_t)batch * H;
+    const void **S = Q + (size_t)batch * H;
+    const void **V = S + (size_t)batch * H;
+    const void **P = V + (size_t)batch * H;
+    const void **O = P + (size_t)batch * H;
+    const __nv_bfloat16 *vb = (const __nv_bfloat16 *)ctx->vexp;
+    const __nv_bfloat16 *pb = (const __nv_bfloat16 *)ctx->attn_probs;
+    const __nv_bfloat16 *ab = (const __nv_bfloat16 *)ctx->act_bf16;
+    for (int b = 0; b < batch; b++) {
+        // Score/probability rows cycle every G sequences (chunked reuse).
+        long long srow = (long long)(b % G) * per;
+        size_t tok = (size_t)b * L;
+        for (int h = 0; h < H; h++) {
+            size_t i = (size_t)b * H + h;
+            K[i] = ctx->kexp + tok * q_dim + (size_t)h * hd;
+            Q[i] = ctx->qkv + tok * qkv_dim + q_offset + (size_t)h * hd;
+            S[i] = ctx->attn_scores + srow + (long long)h * L * L;
+            if (bf16) {
+                V[i] = vb + tok * q_dim + (size_t)h * hd;
+                P[i] = pb + srow + (long long)h * L * L;
+                O[i] = ab + tok * q_dim + (size_t)h * hd;
+            } else {
+                V[i] = ctx->vexp + tok * q_dim + (size_t)h * hd;
+                P[i] = S[i];
+                O[i] = ctx->attn_out + tok * q_dim + (size_t)h * hd;
+            }
+        }
+    }
+    CUDA_CHECK(cudaMemcpy((void *)ctx->attn_ptrs, ctx->attn_ptrs_host,
+                          (size_t)entries * sizeof(void *),
+                          cudaMemcpyHostToDevice));
+    ctx->attn_G = G;
+    ctx->attn_L = L;
+    return 0;
+}
+
 // out_bf16 != NULL selects the BF16-weight layout: V and the softmax
 // probabilities are stored BF16 and the @V GEMM emits BF16 attention output
 // at out_bf16 (stride q_dim), ready for the wo projection without a cast.
@@ -688,6 +794,47 @@ static int cuda_attention_gemm(pplx_cuda_ctx_t *ctx, const int *h_offsets,
             qkv_dim, k_offset, v_offset);
     }
     if (launch_check() != 0) return -1;
+
+    if (ctx->attn_G >= 2) {
+        int G = ctx->attn_G, L = ctx->attn_L;
+        const void *const *K = (const void *const *)ctx->attn_ptrs;
+        const void *const *Q = K + (size_t)batch * H;
+        void *const *S = (void *const *)(Q + (size_t)batch * H);
+        const void *const *V = (const void *const *)S + (size_t)batch * H;
+        const void *const *P = V + (size_t)batch * H;
+        void *const *O = (void *const *)(P + (size_t)batch * H);
+        cudaDataType pv = out_bf16 ? CUDA_R_16BF : CUDA_R_32F;
+        cublasComputeType_t av_ct =
+            out_bf16 ? CUBLAS_COMPUTE_32F : gemm_compute();
+        for (int s = 0; s < batch; s += G) {
+            int g = batch - s < G ? batch - s : G;
+            int n = g * H;
+            size_t off = (size_t)s * H;
+            /* scores = scale * Q @ K^T, batched over (seq, head) */
+            CUBLAS_CHECK(cublasGemmBatchedEx(
+                ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
+                &alpha, K + off, CUDA_R_32F, q_dim,
+                Q + off, CUDA_R_32F, qkv_dim,
+                &beta, S + off, CUDA_R_32F, L,
+                n, gemm_compute(), CUBLAS_GEMM_DEFAULT));
+            if (out_bf16) {
+                attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
+            } else {
+                attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, ctx->attn_scores, L);
+            }
+            if (launch_check() != 0) return -1;
+            /* O = P @ V, batched over (seq, head) */
+            CUBLAS_CHECK(cublasGemmBatchedEx(
+                ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
+                &one, V + off, pv, q_dim,
+                P + off, pv, L,
+                &beta, O + off, pv, q_dim,
+                n, av_ct, CUBLAS_GEMM_DEFAULT));
+        }
+        return 0;
+    }
 
     for (int b = 0; b < batch; b++) {
         int start = h_offsets[b];
@@ -777,16 +924,24 @@ static int ensure_buffers(pplx_cuda_ctx_t *ctx, int total, int batch, int max_se
     if (max_seq > ctx->max_seq_cap) {
         cudaFree(ctx->rope_cos);
         cudaFree(ctx->rope_sin);
-        cudaFree(ctx->attn_scores);
-        ctx->attn_scores = NULL;
-        cudaFree(ctx->attn_probs);
-        ctx->attn_probs = NULL;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
-                              (size_t)c->n_heads * max_seq * max_seq * sizeof(float)));
-        if (g_weights_bf16)
+        long long score_elems = (long long)c->n_heads * max_seq * max_seq;
+        if (score_elems > ctx->attn_scores_elems) {
+            cudaFree(ctx->attn_scores);
+            ctx->attn_scores = NULL;
+            ctx->attn_scores_elems = 0;
+            CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
+                                  (size_t)score_elems * sizeof(float)));
+            ctx->attn_scores_elems = score_elems;
+        }
+        if (g_weights_bf16 && score_elems > ctx->attn_probs_elems) {
+            cudaFree(ctx->attn_probs);
+            ctx->attn_probs = NULL;
+            ctx->attn_probs_elems = 0;
             CUDA_CHECK(cudaMalloc(&ctx->attn_probs,
-                                  (size_t)c->n_heads * max_seq * max_seq *
+                                  (size_t)score_elems *
                                       sizeof(__nv_bfloat16)));
+            ctx->attn_probs_elems = score_elems;
+        }
         float *hcos = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
         float *hsin = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
         if (!hcos || !hsin) {
@@ -959,6 +1114,8 @@ void pplx_cuda_free(pplx_cuda_ctx_t *ctx)
     cudaFree(ctx->act_bf16);
     cudaFree(ctx->attn_scores);
     cudaFree(ctx->attn_probs);
+    cudaFree((void *)ctx->attn_ptrs);
+    free((void *)ctx->attn_ptrs_host);
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
     if (ctx->blas) cublasDestroy(ctx->blas);
@@ -1043,6 +1200,8 @@ static int cuda_forward_batch(pplx_cuda_ctx_t *ctx, const pplx_input_t *inputs,
     // projection GEMM consumes before any later producer reuses the buffer
     // (single stream). No cast launches remain in the layer loop.
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim) != 0)
+        return -1;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
         int wbf16 = l->qkv.bf16;
