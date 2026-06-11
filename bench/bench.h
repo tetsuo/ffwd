@@ -1,4 +1,4 @@
-/* bench/bench.h - minimal Go-style microbenchmark harness.
+/* bench/bench.h - minimal microbenchmark harness.
  *
  * A benchmark function receives a bench_state_t and must run its measured
  * loop exactly b->n times. Call bench_begin(b) after setup so allocation
@@ -14,7 +14,7 @@
  *
  * The harness calibrates n until one run takes at least --benchtime-ms
  * (default 300), then takes --count (default 10) timed samples and prints
- * one Go-style line per benchmark with the median ns/op and the spread.
+ * one line per benchmark with the median ns/op and the spread.
  * --json PATH writes every sample plus run metadata for benchstat.py.
  * --filter SUBSTR runs the matching subset.
  */

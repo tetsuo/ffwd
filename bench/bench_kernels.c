@@ -4,7 +4,7 @@
  * 8 KV heads x head_dim 128, intermediate 3072) so a slowdown here predicts
  * a slowdown in inference. Single-threaded by default for stable numbers;
  * --threads N opts into the pool. Build and record via `make bench`,
- * compare records with scripts/benchstat.py.
+ * compare records with bench/benchstat.py.
  */
 
 #include "bench.h"

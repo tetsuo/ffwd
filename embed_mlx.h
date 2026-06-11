@@ -1,5 +1,5 @@
 /*
- * embed_mlx.h - MLX GPU backend for pplx-embed inference
+ * embed_mlx.h - MLX GPU backend for Apple Silicon
  *
  * Uses Apple's mlx-c to run the transformer on Metal.
  */

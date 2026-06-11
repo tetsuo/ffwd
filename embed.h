@@ -1,7 +1,5 @@
 /*
- * embed.h - Pure C inference for Perplexity AI's pplx-embed models.
- *
- * Supports all pplx-embed-v1 and pplx-embed-context-v1 variants (0.6B, 4B).
+ * embed.h - pplx-embed API
  */
 
 #ifndef PPLX_EMBED_H
@@ -116,7 +114,7 @@ PPLX_API size_t pplx_workspace_nbytes(const pplx_workspace_t *ws);
  *   3. Final RMSNorm
  *   4. Mean pooling over all positions
  *
- * Perplexity embeddings are intentionally not L2-normalized. Use cosine
+ * pplx-embed-v1 embeddings are intentionally not L2-normalized. Use cosine
  * similarity for comparisons, or normalize explicitly before storing in vector
  * databases that only support inner product.
  *

@@ -69,10 +69,6 @@ help:
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
-	@echo "Each backend target builds ./$(TARGET) (CLI), ./$(SERVER_TARGET)"
-	@echo "(HTTP API), the static library $(LIB), and the shared library"
-	@echo "$(SHARED_LIB) for that backend."
-	@echo ""
 	@echo "Usage:"
 	@echo "  ./pplx-embed -d /path/to/model-dir \"text1\" \"text2\""
 	@echo "  ./pplx-embed-server --model pplx-embed-v1-0.6b=/path/to/model-dir"
@@ -155,7 +151,7 @@ TEST_BLAS_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 TEST_BLAS_LDFLAGS = -lopenblas
 endif
 
-# Source lists shared by `test` and `coverage` so the two cannot drift.
+# Source lists shared by test and coverage targets so the two cannot drift.
 TEST_CC_FLAGS         = -Wall -Wextra -O2 -I.
 TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
 TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
@@ -204,14 +200,13 @@ test:
 	./tests/test_server
 
 # =============================================================================
-# Test-suite line coverage (requires clang + llvm-cov/llvm-profdata; this is
-# the default toolchain on macOS. Writes a per-file text summary to stdout
-# and a browsable HTML report to coverage/html/index.html.)
+# Test-suite line coverage (requires clang + llvm-cov/llvm-profdata. Writes a
+# per-file text summary to stdout and an HTML report to coverage/html/index.html.)
 # =============================================================================
 COV_DIR   = coverage
 # Source-based coverage; -O0 so no line is folded away by the optimizer.
-# The "." compilation dir keeps report paths relative to the repo root
-# (run llvm-cov from the repo root so sources resolve).
+# The "." compilation dir keeps report paths relative to the repo root;
+# run llvm-cov from the repo root so sources resolve.
 COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
             -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
@@ -281,9 +276,9 @@ bench-tokenizer:
 	@echo "run: bench/bench_tokenizer <model_dir> [runs]"
 
 # =============================================================================
-# Regression microbenchmarks (Go-style; see bench/bench.h). Each run records
-# a JSON sample set under bench/results/, keyed by commit; compare two
-# records with scripts/benchstat.py to see if a change helped or hurt.
+# Regression microbenchmarks (see bench/bench.h). Each run records a JSON
+# sample set under bench/results/, keyed by commit; compare two records with
+# bench/benchstat.py to see if a change helped or hurt.
 # =============================================================================
 # Dirtiness ignores .gitignore so local-only ignore entries do not mark
 # every record as -dirty.
@@ -295,7 +290,7 @@ bench:
 	    bench/bench_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	@mkdir -p bench/results
 	./bench/bench_kernels --json bench/results/kernels-$(BENCH_STAMP).json
-	@echo "compare: scripts/benchstat.py bench/results/OLD.json bench/results/NEW.json"
+	@echo "compare: ./bench/benchstat.py bench/results/OLD.json bench/results/NEW.json"
 
 bench-model:
 	@test -n "$(MODEL_DIR)" || { echo "usage: make bench-model MODEL_DIR=/path/to/model-dir"; exit 1; }
@@ -371,6 +366,6 @@ clean:
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libpplxembed.dylib libpplxembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
-	      tests/test_tokenizer tests/test_workspace \
-	      bench/bench_tokenizer
+	      tests/test_tokenizer tests/test_workspace tests/test_cli tests/test_late \
+	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels bench/bench_model
 	rm -rf $(COV_DIR)
