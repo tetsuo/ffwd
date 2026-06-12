@@ -66,6 +66,7 @@
 #define EMBED_SERVER_DEFAULT_BATCH_SIZE 32
 #define EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
 #define EMBED_SERVER_BATCH_WAIT_US 0
+#define EMBED_SERVER_CUDA_BATCH_WAIT_US 1000
 #define EMBED_SERVER_MICROBATCH_MAX_JOBS 128
 #define EMBED_MLX_MEMORY_BUDGET_PERCENT 90
 #define EMBED_MLX_RESIDENT_MULTIPLIER 2
@@ -2358,7 +2359,9 @@ int embed_run_server(const embed_server_config_t *cfg) {
     s.max_batch_tokens = cfg->max_batch_tokens > 0
         ? cfg->max_batch_tokens : EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0
-        ? cfg->batch_wait_us : EMBED_SERVER_BATCH_WAIT_US;
+        ? cfg->batch_wait_us
+        : (cfg->use_cuda ? EMBED_SERVER_CUDA_BATCH_WAIT_US
+                         : EMBED_SERVER_BATCH_WAIT_US);
     s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
     s.use_cuda = cfg->use_cuda;
@@ -2506,7 +2509,7 @@ static void print_usage(const char *prog)
         "                            (default: 32)\n"
         "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
         "  --batch-wait-us N         First-arrival micro-batch deadline in us\n"
-        "                            (default: 0; drain queued work immediately)\n"
+        "                            (default: CUDA 1000; CPU/MLX 0)\n"
         "  --memory-utilization F    Fraction of physical memory the MLX model-set\n"
         "                            preflight may plan for (default: 0.90; values\n"
         "                            above 1.0 overcommit)\n"
