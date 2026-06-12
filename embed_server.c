@@ -65,7 +65,7 @@
  * was no faster and inflated long-document tail latency. */
 #define EMBED_SERVER_DEFAULT_BATCH_SIZE 32
 #define EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
-#define EMBED_SERVER_BATCH_WAIT_US 1000
+#define EMBED_SERVER_BATCH_WAIT_US 0
 #define EMBED_SERVER_MICROBATCH_MAX_JOBS 128
 #define EMBED_MLX_MEMORY_BUDGET_PERCENT 90
 #define EMBED_MLX_RESIDENT_MULTIPLIER 2
@@ -692,29 +692,78 @@ static void enqueue_done(job *j) {
     (void)write(s->completion_pipe[1], &byte, 1);
 }
 
-static job *dequeue_job(http_server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->job_head && !s->stopping)
-        pthread_cond_wait(&s->cv, &s->mu);
+static job *pop_job_locked(http_server *s) {
     job *j = s->job_head;
     if (j) {
         s->job_head = j->next;
         if (!s->job_head) s->job_tail = NULL;
         j->next = NULL;
     }
-    pthread_mutex_unlock(&s->mu);
     return j;
 }
 
-static int drain_ready_jobs(http_server *s, job **jobs, int max_jobs) {
-    int n = 0;
+static int cond_wait_until_ns(pthread_cond_t *cv, pthread_mutex_t *mu,
+                              uint64_t deadline_ns) {
+    uint64_t now_ns = nstime();
+    if (now_ns >= deadline_ns) return ETIMEDOUT;
+
+    uint64_t remaining_ns = deadline_ns - now_ns;
+    struct timespec abs;
+    if (clock_gettime(CLOCK_REALTIME, &abs) != 0) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        abs.tv_sec = tv.tv_sec;
+        abs.tv_nsec = (long)tv.tv_usec * 1000L;
+    }
+    abs.tv_sec += (time_t)(remaining_ns / 1000000000u);
+    abs.tv_nsec += (long)(remaining_ns % 1000000000u);
+    if (abs.tv_nsec >= 1000000000L) {
+        abs.tv_sec++;
+        abs.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(cv, mu, &abs);
+}
+
+static int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
+    if (max_jobs <= 0) return 0;
+
     pthread_mutex_lock(&s->mu);
-    while (n < max_jobs && s->job_head) {
-        job *j = s->job_head;
-        s->job_head = j->next;
-        if (!s->job_head) s->job_tail = NULL;
-        j->next = NULL;
-        jobs[n++] = j;
+    while (!s->job_head && !s->stopping)
+        pthread_cond_wait(&s->cv, &s->mu);
+
+    job *first = pop_job_locked(s);
+    if (!first) {
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+
+    int n = 1;
+    jobs[0] = first;
+    int batchable = s->batch_size > 1 &&
+        (!strcmp(first->path, "/v1/embeddings") ||
+         !strcmp(first->path, "/v1/contextualizedembeddings"));
+    if (!batchable) {
+        pthread_mutex_unlock(&s->mu);
+        return n;
+    }
+
+    /* Exact item and token budgets are applied after worker-side tokenization;
+     * this queue stage only defines which arrival window may be grouped. */
+    uint64_t wait_ns = (uint64_t)s->batch_wait_us * 1000u;
+    uint64_t deadline_ns = first->created_ns > UINT64_MAX - wait_ns
+        ? UINT64_MAX : first->created_ns + wait_ns;
+    while (n < max_jobs) {
+        while (!s->job_head && !s->stopping && wait_ns > 0) {
+            int rc = cond_wait_until_ns(&s->cv, &s->mu, deadline_ns);
+            if (rc == ETIMEDOUT) break;
+        }
+        if (!s->job_head)
+            break;
+        if (wait_ns > 0 && s->job_head->created_ns > deadline_ns)
+            break;
+        jobs[n++] = pop_job_locked(s);
+        if (wait_ns == 0 && !s->job_head)
+            break;
     }
     pthread_mutex_unlock(&s->mu);
     return n;
@@ -2078,21 +2127,10 @@ static void *worker_main(void *arg) {
     }
 
     for (;;) {
-        job *j = dequeue_job(s);
-        if (!j) break;
         job *jobs[EMBED_SERVER_MICROBATCH_MAX_JOBS];
-        int n_jobs = 1;
-        jobs[0] = j;
-
-        if ((!strcmp(j->path, "/v1/embeddings") ||
-             !strcmp(j->path, "/v1/contextualizedembeddings")) &&
-            s->batch_size > 1) {
-            if (s->batch_wait_us > 0)
-                usleep((useconds_t)s->batch_wait_us);
-            n_jobs += drain_ready_jobs(s, jobs + 1,
-                                       EMBED_SERVER_MICROBATCH_MAX_JOBS - 1);
-        }
-
+        int n_jobs = collect_job_batch(
+            s, jobs, EMBED_SERVER_MICROBATCH_MAX_JOBS);
+        if (n_jobs == 0) break;
         process_job_group(s, jobs, n_jobs);
     }
 #ifdef USE_MLX
@@ -2467,8 +2505,8 @@ static void print_usage(const char *prog)
         "  -b, --batch-size N        Max texts or documents per inference batch\n"
         "                            (default: 32)\n"
         "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
-        "  --batch-wait-us N         Micro-batch wait in microseconds\n"
-        "                            (default: 1000; 0 drains only queued work)\n"
+        "  --batch-wait-us N         First-arrival micro-batch deadline in us\n"
+        "                            (default: 0; drain queued work immediately)\n"
         "  --memory-utilization F    Fraction of physical memory the MLX model-set\n"
         "                            preflight may plan for (default: 0.90; values\n"
         "                            above 1.0 overcommit)\n"
