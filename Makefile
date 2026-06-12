@@ -49,8 +49,8 @@ SHARED_LIB   = libembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda test test-bf16 coverage bench bench-model bench-tokenizer \
-        debug clean help
+.PHONY: all cpu metal cuda test test-bf16 test-safetensors coverage bench \
+        bench-model bench-tokenizer debug clean help
 
 all: help
 
