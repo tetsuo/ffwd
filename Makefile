@@ -49,7 +49,7 @@ SHARED_LIB   = libembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda test coverage bench bench-model bench-tokenizer \
+.PHONY: all cpu metal cuda test test-bf16 coverage bench bench-model bench-tokenizer \
         debug clean help
 
 all: help
@@ -192,6 +192,17 @@ test:
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
 	./tests/test_server
+
+test-bf16:
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_bf16_model \
+	    $(TEST_BF16_SRCS) -lm -lpthread
+	./tests/test_bf16_model
+
+test-safetensors:
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_safetensors \
+	    $(TEST_SAFETENSORS_SRCS) -lm -lpthread
+	./tests/test_safetensors
+
 
 # =============================================================================
 # Test-suite line coverage (requires clang + llvm-cov/llvm-profdata. Writes a
