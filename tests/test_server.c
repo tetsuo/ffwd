@@ -677,11 +677,16 @@ static void test_http_rerank(int port)
             ? cJSON_GetObjectItemCaseSensitive(usage, "document_tokens") : NULL;
         cJSON *total_tokens = usage
             ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
-        TEST_ASSERT(query_tokens && query_tokens->valueint == 32);
-        TEST_ASSERT(document_tokens && document_tokens->valueint > 0);
-        TEST_ASSERT(total_tokens &&
-                    total_tokens->valueint ==
+        TEST_ASSERT(query_tokens && document_tokens && total_tokens);
+        if (query_tokens && document_tokens && total_tokens) {
+            TEST_ASSERT(cJSON_IsNumber(query_tokens));
+            TEST_ASSERT(cJSON_IsNumber(document_tokens));
+            TEST_ASSERT(cJSON_IsNumber(total_tokens));
+            TEST_ASSERT(query_tokens->valueint == 32);
+            TEST_ASSERT(document_tokens->valueint > 0);
+            TEST_ASSERT(total_tokens->valueint ==
                         query_tokens->valueint + document_tokens->valueint);
+        }
         cJSON_Delete(root);
     }
     free(body);

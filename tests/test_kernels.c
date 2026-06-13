@@ -365,7 +365,10 @@ static void test_bf16_widen_buf(void) {
         qwen_bf16_to_f32_buf(got, src, (size_t)n);
         for (int i = 0; i < n; i++) {
             float want = bf16_to_f32(src[i]);
-            if (memcmp(&got[i], &want, sizeof(float)) != 0) {
+            uint32_t got_bits, want_bits;
+            memcpy(&got_bits, &got[i], sizeof(got_bits));
+            memcpy(&want_bits, &want, sizeof(want_bits));
+            if (got_bits != want_bits) {
                 fprintf(stderr, "bf16_widen n=%d at %d: %.9g want %.9g\n",
                         n, i, got[i], want);
                 failures++;

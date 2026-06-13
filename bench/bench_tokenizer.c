@@ -28,6 +28,12 @@ static int same_ids(const int *a, int na, const int *b, int nb)
 
 int main(int argc, char **argv)
 {
+    int status = 1;
+    int **gold = NULL;
+    int *gold_n = NULL;
+    int **bufs = NULL;
+    int *caps = NULL;
+
     if (argc < 4) {
         fprintf(stderr, "usage: %s VOCAB_JSON RUNS TEXT...\n", argv[0]);
         return 2;
@@ -43,37 +49,39 @@ int main(int argc, char **argv)
     qwen_tokenizer_workspace_t *ws = qwen_tokenizer_workspace_new();
     if (!tok || !ws) {
         fprintf(stderr, "failed to initialize tokenizer\n");
-        return 1;
+        goto cleanup;
     }
 
-    int **gold = (int **)calloc((size_t)n_texts, sizeof(*gold));
-    int *gold_n = (int *)calloc((size_t)n_texts, sizeof(*gold_n));
-    int **bufs = (int **)calloc((size_t)n_texts, sizeof(*bufs));
-    int *caps = (int *)calloc((size_t)n_texts, sizeof(*caps));
-    if (!gold || !gold_n || !bufs || !caps) return 1;
+    gold = (int **)calloc((size_t)n_texts, sizeof(*gold));
+    gold_n = (int *)calloc((size_t)n_texts, sizeof(*gold_n));
+    bufs = (int **)calloc((size_t)n_texts, sizeof(*bufs));
+    caps = (int *)calloc((size_t)n_texts, sizeof(*caps));
+    if (!gold || !gold_n || !bufs || !caps) goto cleanup;
 
     int tokens_per_pass = 0;
     for (int i = 0; i < n_texts; i++) {
         gold[i] = qwen_tokenizer_encode(tok, texts[i], &gold_n[i]);
-        if (!gold[i] || gold_n[i] <= 0) return 1;
+        if (!gold[i] || gold_n[i] <= 0) goto cleanup;
         tokens_per_pass += gold_n[i];
 
         int n_ws = 0;
         int *ids_ws = qwen_tokenizer_encode_with_workspace(tok, ws, texts[i],
                                                            &n_ws);
-        if (!ids_ws || !same_ids(gold[i], gold_n[i], ids_ws, n_ws))
-            return 1;
+        if (!ids_ws || !same_ids(gold[i], gold_n[i], ids_ws, n_ws)) {
+            free(ids_ws);
+            goto cleanup;
+        }
         free(ids_ws);
 
         caps[i] = (int)(strlen(texts[i]) * 2 + 8);
         if (caps[i] < gold_n[i]) caps[i] = gold_n[i];
         bufs[i] = (int *)malloc((size_t)caps[i] * sizeof(int));
-        if (!bufs[i]) return 1;
+        if (!bufs[i]) goto cleanup;
         int n_into = 0;
         if (qwen_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i],
                                        &n_into) != 0 ||
             !same_ids(gold[i], gold_n[i], bufs[i], n_into))
-            return 1;
+            goto cleanup;
     }
 
     double t0 = now_ms();
@@ -82,7 +90,10 @@ int main(int argc, char **argv)
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
             int *ids = qwen_tokenizer_encode(tok, texts[i], &n);
-            if (!ids || n != gold_n[i]) return 1;
+            if (!ids || n != gold_n[i]) {
+                free(ids);
+                goto cleanup;
+            }
             old_tokens += n;
             free(ids);
         }
@@ -96,7 +107,10 @@ int main(int argc, char **argv)
             int n = 0;
             int *ids = qwen_tokenizer_encode_with_workspace(tok, ws, texts[i],
                                                             &n);
-            if (!ids || n != gold_n[i]) return 1;
+            if (!ids || n != gold_n[i]) {
+                free(ids);
+                goto cleanup;
+            }
             ws_tokens += n;
             free(ids);
         }
@@ -110,7 +124,7 @@ int main(int argc, char **argv)
             int n = 0;
             int rc = qwen_tokenizer_encode_into(tok, ws, texts[i], bufs[i],
                                                 caps[i], &n);
-            if (rc != 0 || n != gold_n[i]) return 1;
+            if (rc != 0 || n != gold_n[i]) goto cleanup;
             into_tokens += n;
         }
     }
@@ -126,9 +140,12 @@ int main(int argc, char **argv)
            into_ms, (double)into_tokens / (into_ms / 1000.0),
            old_ms / into_ms);
 
+    status = 0;
+
+cleanup:
     for (int i = 0; i < n_texts; i++) {
-        free(gold[i]);
-        free(bufs[i]);
+        if (gold) free(gold[i]);
+        if (bufs) free(bufs[i]);
     }
     free(gold);
     free(gold_n);
@@ -136,5 +153,5 @@ int main(int argc, char **argv)
     free(caps);
     qwen_tokenizer_workspace_free(ws);
     qwen_tokenizer_free(tok);
-    return 0;
+    return status;
 }
