@@ -58,8 +58,13 @@
 #define EMBED_API_MAX_STANDARD_INPUTS 512
 #define EMBED_API_MAX_CONTEXT_DOCS 512
 #define EMBED_API_MAX_CONTEXT_CHUNKS 16000
+#define EMBED_API_MAX_RERANK_DOCUMENTS 1000
 #define EMBED_API_MAX_ITEM_TOKENS 32768
 #define EMBED_API_MAX_TOTAL_TOKENS 120000
+#define EMBED_LATE_QUERY_TOKENS 32
+#define EMBED_LATE_MASK_TOKEN_ID 151642
+#define EMBED_LATE_QUERY_PREFIX_ID 151669
+#define EMBED_LATE_DOCUMENT_PREFIX_ID 151670
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
@@ -202,26 +207,36 @@ typedef enum {
     MODEL_STD_4,
     MODEL_CTX_06,
     MODEL_CTX_4,
+    MODEL_LATE_06,
+    MODEL_COUNT,
     MODEL_UNKNOWN
 } model_slot;
 
+typedef enum {
+    MODEL_KIND_STANDARD,
+    MODEL_KIND_CONTEXTUAL,
+    MODEL_KIND_LATE
+} model_kind;
+
 typedef struct {
     const char *id;
-    int is_contextual;
+    model_kind kind;
     int dim;
+    int token_dim;
     double price_per_mtok;
 } model_info;
 
 static const model_info k_models[] = {
-    {"pplx-embed-v1-0.6b", 0, 1024, 0.004},
-    {"pplx-embed-v1-4b", 0, 2560, 0.030},
-    {"pplx-embed-context-v1-0.6b", 1, 1024, 0.008},
-    {"pplx-embed-context-v1-4b", 1, 2560, 0.050},
+    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 0, 0.004},
+    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 0, 0.030},
+    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 0, 0.008},
+    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 0, 0.050},
+    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 0.0},
 };
 
 static model_slot model_slot_for_id(const char *id) {
     if (!id) return MODEL_UNKNOWN;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < MODEL_COUNT; i++) {
         if (!strcmp(id, k_models[i].id)) return (model_slot)i;
     }
     return MODEL_UNKNOWN;
@@ -233,10 +248,18 @@ typedef struct {
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
     int context_separator_id;
+    int late_mask_id;
+    int late_query_prefix_id;
+    int late_document_prefix_id;
+    int late_skip_ids[64];
+    int n_late_skip_ids;
     embed_model_t *cpu_model;
     embed_workspace_t *cpu_ws;
+    embed_late_model_t *cpu_late_model;
+    embed_late_workspace_t *cpu_late_ws;
 #ifdef USE_MLX
     embed_mlx_ctx_t *mlx_ctx;
+    embed_mlx_late_ctx_t *mlx_late_ctx;
 #endif
 #ifdef USE_CUDA
     embed_cuda_ctx_t *cuda_ctx;
@@ -258,7 +281,7 @@ typedef struct {
     int batch_wait_us;
     int enable_cors;
     char *api_key;
-    loaded_model models[4];
+    loaded_model models[MODEL_COUNT];
     int use_mlx;
     int use_cuda;
     int mlx_quantize_bits;
@@ -472,6 +495,27 @@ static void append_json_error(sbuf *b, const char *message, const char *type) {
     sbuf_puts(b, "\",\"type\":\"");
     sbuf_puts(b, type ? type : "server_error");
     sbuf_puts(b, "\"}}");
+}
+
+static void append_json_string(sbuf *b, const char *s) {
+    sbuf_putc(b, '"');
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"': sbuf_puts(b, "\\\""); break;
+        case '\\': sbuf_puts(b, "\\\\"); break;
+        case '\b': sbuf_puts(b, "\\b"); break;
+        case '\f': sbuf_puts(b, "\\f"); break;
+        case '\n': sbuf_puts(b, "\\n"); break;
+        case '\r': sbuf_puts(b, "\\r"); break;
+        case '\t': sbuf_puts(b, "\\t"); break;
+        default:
+            if (*p < 0x20)
+                sbuf_printf(b, "\\u%04x", (unsigned)*p);
+            else
+                sbuf_putc(b, (char)*p);
+        }
+    }
+    sbuf_putc(b, '"');
 }
 
 static char *json_error_body(const char *message, const char *type, size_t *len) {
@@ -824,10 +868,11 @@ static void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask)
     }
 }
 
-static bool route_is_embedding(const char *method, const char *path) {
+static bool route_is_inference(const char *method, const char *path) {
     return !strcmp(method, "POST") &&
            (!strcmp(path, "/v1/embeddings") ||
-            !strcmp(path, "/v1/contextualizedembeddings"));
+            !strcmp(path, "/v1/contextualizedembeddings") ||
+            !strcmp(path, "/v1/rerank"));
 }
 
 static void dispatch_request(client *c) {
@@ -839,7 +884,7 @@ static void dispatch_request(client *c) {
         return;
     }
 
-    if (!route_is_embedding(c->req.method, c->req.path)) {
+    if (!route_is_inference(c->req.method, c->req.path)) {
         size_t len;
         char *body = json_error_body("unknown endpoint", "invalid_request_error", &len);
         append_http_response(c, 404, "application/json", body, len);
@@ -1170,6 +1215,27 @@ typedef struct {
     int ready;
 } contextual_request;
 
+typedef struct {
+    int *ids;
+    int n_tokens;
+    int *keep;
+    int n_keep;
+} late_tokens;
+
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    late_tokens query;
+    late_tokens *documents;
+    int n_documents;
+    int top_n;
+    int return_documents;
+    int query_tokens;
+    int document_tokens;
+    int ready;
+} rerank_request;
+
 static void free_token_bufs(token_buf *t, int n) {
     if (!t) return;
     for (int i = 0; i < n; i++) free(t[i].ids);
@@ -1195,6 +1261,23 @@ static void contextual_request_free(contextual_request *r) {
     memset(r, 0, sizeof(*r));
 }
 
+static void late_tokens_free(late_tokens *t) {
+    if (!t) return;
+    free(t->ids);
+    free(t->keep);
+    memset(t, 0, sizeof(*t));
+}
+
+static void rerank_request_free(rerank_request *r) {
+    if (!r) return;
+    late_tokens_free(&r->query);
+    for (int i = 0; i < r->n_documents; i++)
+        late_tokens_free(&r->documents[i]);
+    free(r->documents);
+    if (r->root) cJSON_Delete(r->root);
+    memset(r, 0, sizeof(*r));
+}
+
 static int tokenize_one(loaded_model *m, job *j, const char *text,
                         token_buf *out) {
     memset(out, 0, sizeof(*out));
@@ -1208,6 +1291,47 @@ static int tokenize_one(loaded_model *m, job *j, const char *text,
         return -1;
     }
     return 0;
+}
+
+static int late_id_is_skipped(const loaded_model *m, int id) {
+    for (int i = 0; i < m->n_late_skip_ids; i++) {
+        if (m->late_skip_ids[i] == id) return 1;
+    }
+    return 0;
+}
+
+static int tokenize_late_text(loaded_model *m, job *j, const char *text,
+                              int is_query, late_tokens *out) {
+    token_buf raw = {0};
+    if (tokenize_one(m, j, text, &raw) != 0) return -1;
+
+    int raw_tokens = raw.n_tokens;
+    int target = raw_tokens + 1;
+    if (is_query && target < EMBED_LATE_QUERY_TOKENS)
+        target = EMBED_LATE_QUERY_TOKENS;
+
+    out->ids = xmalloc((size_t)target * sizeof(*out->ids));
+    out->ids[0] = raw.ids[0];
+    out->ids[1] = is_query ? m->late_query_prefix_id
+                           : m->late_document_prefix_id;
+    if (raw_tokens > 1) {
+        memcpy(out->ids + 2, raw.ids + 1,
+               (size_t)(raw_tokens - 1) * sizeof(*out->ids));
+    }
+    out->n_tokens = raw_tokens + 1;
+    if (is_query) {
+        while (out->n_tokens < EMBED_LATE_QUERY_TOKENS)
+            out->ids[out->n_tokens++] = m->late_mask_id;
+        out->n_keep = out->n_tokens;
+    } else {
+        out->keep = xmalloc((size_t)out->n_tokens * sizeof(*out->keep));
+        for (int i = 0; i < out->n_tokens; i++) {
+            if (!late_id_is_skipped(m, out->ids[i]))
+                out->keep[out->n_keep++] = i;
+        }
+    }
+    free(raw.ids);
+    return out->n_keep > 0 ? 0 : -1;
 }
 
 static int model_embed_batch(loaded_model *m, const embed_input_t *inputs,
@@ -1528,7 +1652,7 @@ static void execute_contextual_request_list(contextual_request **reqs,
     int max_batch_tokens = reqs[0]->j->srv->max_batch_tokens;
     embed_context_input_t *inputs =
         xmalloc((size_t)max_batch * sizeof(*inputs));
-    float *batch_embs = NULL;
+    float *batch_embs = xmalloc(sizeof(*batch_embs));
     size_t batch_emb_cap = 0;
 
     int failed = 0;
@@ -1592,7 +1716,7 @@ static void execute_contextual_request_list(contextual_request **reqs,
     free(items);
 }
 
-static int validate_common(cJSON *root, cJSON *detail, int expect_context,
+static int validate_common(cJSON *root, cJSON *detail, model_kind expected_kind,
                            loaded_model **out_model, int *out_dims,
                            const char **out_encoding, http_server *s) {
     cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
@@ -1604,7 +1728,7 @@ static int validate_common(cJSON *root, cJSON *detail, int expect_context,
     } else {
         model_id = model_item->valuestring;
         model_slot slot = model_slot_for_id(model_id);
-        if (slot == MODEL_UNKNOWN || k_models[slot].is_contextual != expect_context) {
+        if (slot == MODEL_UNKNOWN || k_models[slot].kind != expected_kind) {
             ve_add(detail, "[\"body\",\"model\"]",
                    "value is not a valid enum member for this endpoint", "enum");
         } else {
@@ -1636,7 +1760,8 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s,
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
-    int unloaded = validate_common(root, detail, 0, &m, &dims, &encoding, s);
+    int unloaded = validate_common(root, detail, MODEL_KIND_STANDARD,
+                                   &m, &dims, &encoding, s);
     out->model = m;
     out->dims = dims;
     out->encoding = encoding;
@@ -1753,7 +1878,8 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
-    int unloaded = validate_common(root, detail, 1, &m, &dims, &encoding, s);
+    int unloaded = validate_common(root, detail, MODEL_KIND_CONTEXTUAL,
+                                   &m, &dims, &encoding, s);
     out->model = m;
     out->dims = dims;
     out->encoding = encoding;
@@ -1902,6 +2028,337 @@ static void prepare_contextual_request(job *j, cJSON *root, http_server *s,
     cJSON_Delete(detail);
 }
 
+static int validate_rerank_model(cJSON *root, cJSON *detail, http_server *s,
+                                 loaded_model **out_model) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "model");
+    if (!item) {
+        ve_add(detail, "[\"body\",\"model\"]", "field required", "missing");
+        return 0;
+    }
+    if (!cJSON_IsString(item) || !item->valuestring) {
+        ve_add(detail, "[\"body\",\"model\"]", "model must be a string",
+               "type_error.string");
+        return 0;
+    }
+    model_slot slot = model_slot_for_id(item->valuestring);
+    if (slot == MODEL_UNKNOWN || k_models[slot].kind != MODEL_KIND_LATE) {
+        ve_add(detail, "[\"body\",\"model\"]",
+               "value is not a valid enum member for this endpoint", "enum");
+        return 0;
+    }
+    *out_model = s->models[slot].info ? &s->models[slot] : NULL;
+    return *out_model ? 0 : 503;
+}
+
+static void prepare_rerank_request(job *j, cJSON *root, http_server *s,
+                                   rerank_request *out) {
+    memset(out, 0, sizeof(*out));
+    out->j = j;
+    out->root = root;
+
+    cJSON *detail = cJSON_CreateArray();
+    int unloaded = validate_rerank_model(root, detail, s, &out->model);
+    cJSON *query = cJSON_GetObjectItemCaseSensitive(root, "query");
+    cJSON *documents = cJSON_GetObjectItemCaseSensitive(root, "documents");
+    if (!query) {
+        ve_add(detail, "[\"body\",\"query\"]", "field required", "missing");
+    } else if (!cJSON_IsString(query)) {
+        ve_add(detail, "[\"body\",\"query\"]", "query must be a string",
+               "type_error.string");
+    } else if (!query->valuestring || !query->valuestring[0]) {
+        ve_add(detail, "[\"body\",\"query\"]", "query must not be empty",
+               "value_error.empty");
+    }
+
+    int n_documents = 0;
+    if (!documents) {
+        ve_add(detail, "[\"body\",\"documents\"]", "field required", "missing");
+    } else if (!cJSON_IsArray(documents)) {
+        ve_add(detail, "[\"body\",\"documents\"]",
+               "documents must be an array of strings", "type_error.array");
+    } else {
+        n_documents = cJSON_GetArraySize(documents);
+        if (n_documents < 1)
+            ve_add(detail, "[\"body\",\"documents\"]",
+                   "documents must contain at least 1 item",
+                   "value_error.list.min_items");
+        else if (n_documents > EMBED_API_MAX_RERANK_DOCUMENTS)
+            ve_add(detail, "[\"body\",\"documents\"]",
+                   "documents must contain at most 1000 items",
+                   "value_error.list.max_items");
+        cJSON *document;
+        int i = 0;
+        cJSON_ArrayForEach(document, documents) {
+            char loc[72];
+            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", i++);
+            if (!cJSON_IsString(document))
+                ve_add(detail, loc, "document must be a string",
+                       "type_error.string");
+            else if (!document->valuestring || !document->valuestring[0])
+                ve_add(detail, loc, "document must not be empty",
+                       "value_error.empty");
+        }
+    }
+
+    cJSON *top_n = cJSON_GetObjectItemCaseSensitive(root, "top_n");
+    cJSON *top_k = cJSON_GetObjectItemCaseSensitive(root, "top_k");
+    if (top_n && top_k) {
+        ve_add(detail, "[\"body\",\"top_n\"]",
+               "top_n and top_k are aliases; provide only one",
+               "value_error.conflict");
+    }
+    cJSON *top = top_n ? top_n : top_k;
+    out->top_n = n_documents;
+    if (top) {
+        if (!cjson_is_integer(top)) {
+            ve_add(detail, top_n ? "[\"body\",\"top_n\"]"
+                                 : "[\"body\",\"top_k\"]",
+                   "top_n must be an integer", "type_error.integer");
+        } else {
+            out->top_n = top->valueint;
+            if (out->top_n < 1 || out->top_n > n_documents)
+                ve_add(detail, top_n ? "[\"body\",\"top_n\"]"
+                                     : "[\"body\",\"top_k\"]",
+                       "top_n must be between 1 and the number of documents",
+                       "value_error.range");
+        }
+    }
+
+    cJSON *return_documents =
+        cJSON_GetObjectItemCaseSensitive(root, "return_documents");
+    if (return_documents) {
+        if (!cJSON_IsBool(return_documents))
+            ve_add(detail, "[\"body\",\"return_documents\"]",
+                   "return_documents must be a boolean", "type_error.bool");
+        else
+            out->return_documents = cJSON_IsTrue(return_documents);
+    }
+
+    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
+        job_set_error(j, 503, "requested model is valid but not loaded",
+                      "model_not_loaded");
+        cJSON_Delete(detail);
+        return;
+    }
+
+    if (cJSON_GetArraySize(detail) == 0 && out->model) {
+        out->n_documents = n_documents;
+        out->documents = xcalloc((size_t)n_documents, sizeof(*out->documents));
+        if (tokenize_late_text(out->model, j, query->valuestring, 1,
+                               &out->query) != 0) {
+            ve_add(detail, "[\"body\",\"query\"]", "tokenization failed",
+                   "value_error.tokenization");
+        } else {
+            out->query_tokens = out->query.n_tokens;
+            if (out->query_tokens > EMBED_API_MAX_ITEM_TOKENS)
+                ve_add(detail, "[\"body\",\"query\"]",
+                       "query exceeds 32768 token limit",
+                       "value_error.context_length");
+        }
+
+        cJSON *document;
+        int i = 0;
+        cJSON_ArrayForEach(document, documents) {
+            char loc[72];
+            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", i);
+            if (tokenize_late_text(out->model, j, document->valuestring, 0,
+                                   &out->documents[i]) != 0) {
+                ve_add(detail, loc, "tokenization failed",
+                       "value_error.tokenization");
+            } else {
+                int n = out->documents[i].n_tokens;
+                if (n > EMBED_API_MAX_ITEM_TOKENS)
+                    ve_add(detail, loc, "document exceeds 32768 token limit",
+                           "value_error.context_length");
+                if (out->document_tokens <= INT_MAX - n)
+                    out->document_tokens += n;
+                else
+                    out->document_tokens = INT_MAX;
+            }
+            i++;
+        }
+        if (out->query_tokens > EMBED_API_MAX_TOTAL_TOKENS -
+                                out->document_tokens) {
+            ve_add(detail, "[\"body\",\"documents\"]",
+                   "request exceeds 120000 token limit",
+                   "value_error.context_length");
+        }
+    }
+
+    if (cJSON_GetArraySize(detail) > 0) {
+        job_set_422(j, detail);
+        rerank_request_free(out);
+        out->j = j;
+    } else {
+        out->ready = 1;
+    }
+    cJSON_Delete(detail);
+}
+
+typedef struct {
+    int index;
+    float score;
+} rerank_result;
+
+static int rerank_result_cmp(const void *a, const void *b) {
+    const rerank_result *ra = a;
+    const rerank_result *rb = b;
+    if (ra->score > rb->score) return -1;
+    if (ra->score < rb->score) return 1;
+    return ra->index - rb->index;
+}
+
+static int execute_rerank_cpu(rerank_request *r, float *scores) {
+    loaded_model *m = r->model;
+    int dim = m->info->token_dim;
+    int total_doc_vecs = 0;
+    int max_doc_tokens = 0;
+    for (int i = 0; i < r->n_documents; i++) {
+        total_doc_vecs += r->documents[i].n_keep;
+        if (r->documents[i].n_tokens > max_doc_tokens)
+            max_doc_tokens = r->documents[i].n_tokens;
+    }
+
+    float *query = xmalloc((size_t)r->query.n_tokens * dim * sizeof(*query));
+    float *docs = xmalloc((size_t)total_doc_vecs * dim * sizeof(*docs));
+    float *all = xmalloc((size_t)max_doc_tokens * dim * sizeof(*all));
+    int *offsets = xmalloc((size_t)(r->n_documents + 1) * sizeof(*offsets));
+    int rc = embed_late_model_encode_tokens(
+        m->cpu_late_model, m->cpu_late_ws, r->query.ids, r->query.n_tokens,
+        1, query);
+    int pos = 0;
+    offsets[0] = 0;
+    for (int i = 0; rc == 0 && i < r->n_documents; i++) {
+        late_tokens *doc = &r->documents[i];
+        rc = embed_late_model_encode_tokens(
+            m->cpu_late_model, m->cpu_late_ws, doc->ids, doc->n_tokens, 1, all);
+        for (int k = 0; rc == 0 && k < doc->n_keep; k++) {
+            memcpy(docs + (size_t)pos * dim,
+                   all + (size_t)doc->keep[k] * dim,
+                   (size_t)dim * sizeof(*docs));
+            pos++;
+        }
+        offsets[i + 1] = pos;
+    }
+    if (rc == 0)
+        rc = embed_late_maxsim_batch(query, r->query.n_keep, docs, offsets,
+                                     r->n_documents, dim, scores);
+    free(offsets);
+    free(all);
+    free(docs);
+    free(query);
+    return rc;
+}
+
+#ifdef USE_MLX
+static int execute_rerank_mlx(rerank_request *r, float *scores) {
+    loaded_model *m = r->model;
+    embed_mlx_late_vectors_t *query = embed_mlx_late_encode_tokens_device(
+        m->mlx_late_ctx, r->query.ids, r->query.n_tokens, 1);
+    embed_mlx_late_vectors_t **docs =
+        xcalloc((size_t)r->n_documents, sizeof(*docs));
+    const embed_mlx_late_vectors_t **doc_refs =
+        xcalloc((size_t)r->n_documents, sizeof(*doc_refs));
+    int *offsets = xmalloc((size_t)(r->n_documents + 1) * sizeof(*offsets));
+    int rc = query ? 0 : -1;
+    offsets[0] = 0;
+    for (int i = 0; rc == 0 && i < r->n_documents; i++) {
+        late_tokens *doc = &r->documents[i];
+        embed_mlx_late_vectors_t *all = embed_mlx_late_encode_tokens_device(
+            m->mlx_late_ctx, doc->ids, doc->n_tokens, 1);
+        if (!all) {
+            rc = -1;
+            break;
+        }
+        docs[i] = embed_mlx_late_vectors_select(
+            m->mlx_late_ctx, all, doc->keep, doc->n_keep);
+        embed_mlx_late_vectors_free(all);
+        if (!docs[i]) {
+            rc = -1;
+            break;
+        }
+        doc_refs[i] = docs[i];
+        offsets[i + 1] = offsets[i] + doc->n_keep;
+    }
+    embed_mlx_late_vectors_t *packed = rc == 0
+        ? embed_mlx_late_vectors_concat(m->mlx_late_ctx, doc_refs,
+                                        r->n_documents)
+        : NULL;
+    if (!packed) rc = -1;
+    if (rc == 0)
+        rc = embed_mlx_late_maxsim_batch_device(
+            m->mlx_late_ctx, query, packed, offsets, r->n_documents, scores);
+    embed_mlx_late_vectors_free(packed);
+    for (int i = 0; i < r->n_documents; i++)
+        embed_mlx_late_vectors_free(docs[i]);
+    embed_mlx_late_vectors_free(query);
+    free(offsets);
+    free(doc_refs);
+    free(docs);
+    return rc;
+}
+#endif
+
+static void execute_rerank_request(rerank_request *r) {
+    if (!r || !r->model) {
+        if (r && r->j)
+            job_set_error(r->j, 500, "late-interaction model is unavailable",
+                          "server_error");
+        return;
+    }
+    float *scores = xmalloc((size_t)r->n_documents * sizeof(*scores));
+    uint64_t t0 = nstime();
+#ifdef USE_MLX
+    int rc = r->model->mlx_late_ctx
+        ? execute_rerank_mlx(r, scores)
+        : execute_rerank_cpu(r, scores);
+#else
+    int rc = execute_rerank_cpu(r, scores);
+#endif
+    r->j->infer_ns += nstime() - t0;
+    if (rc != 0) {
+        free(scores);
+        job_set_error(r->j, 500, "late-interaction reranking failed",
+                      "server_error");
+        return;
+    }
+
+    rerank_result *ranked =
+        xmalloc((size_t)r->n_documents * sizeof(*ranked));
+    for (int i = 0; i < r->n_documents; i++) {
+        ranked[i].index = i;
+        ranked[i].score = scores[i];
+    }
+    qsort(ranked, (size_t)r->n_documents, sizeof(*ranked), rerank_result_cmp);
+
+    t0 = nstime();
+    sbuf b = {0};
+    sbuf_printf(&b, "{\"object\":\"list\",\"model\":\"%s\",\"results\":[",
+                r->model->info->id);
+    cJSON *documents =
+        cJSON_GetObjectItemCaseSensitive(r->root, "documents");
+    for (int i = 0; i < r->top_n; i++) {
+        if (i) sbuf_putc(&b, ',');
+        sbuf_printf(&b, "{\"index\":%d,\"relevance_score\":%.9g",
+                    ranked[i].index, (double)ranked[i].score);
+        if (r->return_documents) {
+            cJSON *document = cJSON_GetArrayItem(documents, ranked[i].index);
+            sbuf_puts(&b, ",\"document\":");
+            append_json_string(&b, document->valuestring);
+        }
+        sbuf_putc(&b, '}');
+    }
+    sbuf_printf(&b,
+        "],\"usage\":{\"query_tokens\":%d,\"document_tokens\":%d,"
+        "\"total_tokens\":%d}}",
+        r->query_tokens, r->document_tokens,
+        r->query_tokens + r->document_tokens);
+    set_response_from_buf(r->j, &b);
+    r->j->encode_ns += nstime() - t0;
+    free(ranked);
+    free(scores);
+}
+
 static int parse_job_root(job *j, cJSON **out_root) {
     cJSON *detail = cJSON_CreateArray();
     cJSON *root = parse_json_body(j, detail);
@@ -1931,6 +2388,8 @@ static void process_unknown_job(job *j) {
 static void process_job_group(http_server *s, job **jobs, int n_jobs) {
     embedding_request *std_reqs = xcalloc((size_t)n_jobs, sizeof(*std_reqs));
     contextual_request *ctx_reqs = xcalloc((size_t)n_jobs, sizeof(*ctx_reqs));
+    rerank_request *rerank_reqs =
+        xcalloc((size_t)n_jobs, sizeof(*rerank_reqs));
     int *kind = xcalloc((size_t)n_jobs, sizeof(*kind));
     int *done = xcalloc((size_t)n_jobs, sizeof(*done));
     embedding_request **std_group = xmalloc((size_t)n_jobs * sizeof(*std_group));
@@ -1943,6 +2402,8 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
             kind[i] = 1;
         } else if (!strcmp(jobs[i]->path, "/v1/contextualizedembeddings")) {
             kind[i] = 2;
+        } else if (!strcmp(jobs[i]->path, "/v1/rerank")) {
+            kind[i] = 3;
         } else {
             continue;
         }
@@ -1953,8 +2414,10 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
             continue;
         if (kind[i] == 1)
             prepare_embedding_request(jobs[i], root, s, &std_reqs[i]);
-        else
+        else if (kind[i] == 2)
             prepare_contextual_request(jobs[i], root, s, &ctx_reqs[i]);
+        else
+            prepare_rerank_request(jobs[i], root, s, &rerank_reqs[i]);
     }
 
     for (int i = 0; i < n_jobs; i++) {
@@ -1970,14 +2433,20 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
         }
 
         if ((kind[i] == 1 && !std_reqs[i].ready) ||
-            (kind[i] == 2 && !ctx_reqs[i].ready)) {
+            (kind[i] == 2 && !ctx_reqs[i].ready) ||
+            (kind[i] == 3 && !rerank_reqs[i].ready)) {
             job_set_timing_header(jobs[i]);
             enqueue_done(jobs[i]);
             done[i] = 1;
             continue;
         }
 
-        if (kind[i] == 1) {
+        if (kind[i] == 3) {
+            execute_rerank_request(&rerank_reqs[i]);
+            job_set_timing_header(jobs[i]);
+            enqueue_done(jobs[i]);
+            done[i] = 1;
+        } else if (kind[i] == 1) {
             int group_n = 1;
             int group_inputs = std_reqs[i].n_inputs;
             int group_tokens = std_reqs[i].total_tokens;
@@ -2027,11 +2496,13 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
     for (int i = 0; i < n_jobs; i++) {
         embedding_request_free(&std_reqs[i]);
         contextual_request_free(&ctx_reqs[i]);
+        rerank_request_free(&rerank_reqs[i]);
     }
     free(ctx_group);
     free(std_group);
     free(done);
     free(kind);
+    free(rerank_reqs);
     free(ctx_reqs);
     free(std_reqs);
 }
@@ -2041,24 +2512,38 @@ static void *worker_main(void *arg) {
 #ifdef USE_MLX
     if (s->use_mlx) {
         int rc = 0;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MODEL_COUNT; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
             embed_mlx_options_t mlx_opts = {
                 .quantize_bits = s->mlx_quantize_bits,
                 .quantize_group_size = s->mlx_quantize_group_size,
             };
-            m->mlx_ctx = embed_mlx_load_with_options(m->path, &mlx_opts);
-            if (!m->mlx_ctx) {
+            if (m->info->kind == MODEL_KIND_LATE)
+                m->mlx_late_ctx =
+                    embed_mlx_late_load_with_options(m->path, &mlx_opts);
+            else
+                m->mlx_ctx = embed_mlx_load_with_options(m->path, &mlx_opts);
+            if ((!m->mlx_ctx && m->info->kind != MODEL_KIND_LATE) ||
+                (!m->mlx_late_ctx && m->info->kind == MODEL_KIND_LATE)) {
                 server_log("embed-server: failed to load MLX model on worker: %s",
                            m->path);
                 rc = 1;
                 break;
             }
-            if (embed_mlx_config(m->mlx_ctx)->hidden_size != m->info->dim) {
+            const embed_config_t *config = m->info->kind == MODEL_KIND_LATE
+                ? embed_mlx_late_config(m->mlx_late_ctx)
+                : embed_mlx_config(m->mlx_ctx);
+            int token_dim = m->info->kind == MODEL_KIND_LATE
+                ? embed_mlx_late_token_dim(m->mlx_late_ctx) : 0;
+            if (config->hidden_size != m->info->dim ||
+                token_dim != m->info->token_dim ||
+                (m->info->kind == MODEL_KIND_LATE &&
+                 (m->late_mask_id >= config->vocab_size ||
+                  m->late_query_prefix_id >= config->vocab_size ||
+                  m->late_document_prefix_id >= config->vocab_size))) {
                 server_log("embed-server: model %s has unexpected dimension %d",
-                           m->info->id,
-                           embed_mlx_config(m->mlx_ctx)->hidden_size);
+                           m->info->id, config->hidden_size);
                 rc = 1;
                 break;
             }
@@ -2070,11 +2555,15 @@ static void *worker_main(void *arg) {
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         if (rc) {
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < MODEL_COUNT; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->mlx_ctx) {
                     embed_mlx_free(m->mlx_ctx);
                     m->mlx_ctx = NULL;
+                }
+                if (m->mlx_late_ctx) {
+                    embed_mlx_late_free(m->mlx_late_ctx);
+                    m->mlx_late_ctx = NULL;
                 }
             }
             return NULL;
@@ -2084,7 +2573,7 @@ static void *worker_main(void *arg) {
 #ifdef USE_CUDA
     if (s->use_cuda) {
         int rc = 0;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MODEL_COUNT; i++) {
             loaded_model *m = &s->models[i];
             if (!m->info) continue;
             m->cuda_ctx = embed_cuda_load(m->path);
@@ -2109,7 +2598,7 @@ static void *worker_main(void *arg) {
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         if (rc) {
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < MODEL_COUNT; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->cuda_ctx) {
                     embed_cuda_free(m->cuda_ctx);
@@ -2136,18 +2625,22 @@ static void *worker_main(void *arg) {
     }
 #ifdef USE_MLX
     if (s->use_mlx) {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MODEL_COUNT; i++) {
             loaded_model *m = &s->models[i];
             if (m->mlx_ctx) {
                 embed_mlx_free(m->mlx_ctx);
                 m->mlx_ctx = NULL;
+            }
+            if (m->mlx_late_ctx) {
+                embed_mlx_late_free(m->mlx_late_ctx);
+                m->mlx_late_ctx = NULL;
             }
         }
     }
 #endif
 #ifdef USE_CUDA
     if (s->use_cuda) {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MODEL_COUNT; i++) {
             loaded_model *m = &s->models[i];
             if (m->cuda_ctx) {
                 embed_cuda_free(m->cuda_ctx);
@@ -2198,6 +2691,29 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
     m->context_separator_id = sep_id >= 0
         ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+    if (m->info->kind == MODEL_KIND_LATE) {
+        int id = qwen_tokenizer_token_id(m->tok, "[MASK]");
+        m->late_mask_id = id >= 0 ? id : EMBED_LATE_MASK_TOKEN_ID;
+        id = qwen_tokenizer_token_id(m->tok, "[Q]");
+        m->late_query_prefix_id =
+            id >= 0 ? id : EMBED_LATE_QUERY_PREFIX_ID;
+        id = qwen_tokenizer_token_id(m->tok, "[D]");
+        m->late_document_prefix_id =
+            id >= 0 ? id : EMBED_LATE_DOCUMENT_PREFIX_ID;
+
+        const char *punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+        for (const char *p = punct;
+             *p && m->n_late_skip_ids < (int)(sizeof(m->late_skip_ids) /
+                                               sizeof(m->late_skip_ids[0]));
+             p++) {
+            char text[2] = {*p, '\0'};
+            int n_ids = 0;
+            int *ids = qwen_tokenizer_encode(m->tok, text, &n_ids);
+            if (ids && n_ids == 1)
+                m->late_skip_ids[m->n_late_skip_ids++] = ids[0];
+            free(ids);
+        }
+    }
 #ifdef USE_MLX
     if (s->use_mlx) {
         /* MLX streams are thread-local. The inference worker loads the MLX
@@ -2211,34 +2727,64 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         return 0;
     }
 #endif
-    m->cpu_model = embed_model_load(path);
-    if (!m->cpu_model) {
-        server_log("embed-server: failed to load model: %s", path);
-        return -1;
+    const embed_config_t *config = NULL;
+    int token_dim = 0;
+    if (m->info->kind == MODEL_KIND_LATE) {
+        m->cpu_late_model = embed_late_model_load(path);
+        if (!m->cpu_late_model) {
+            server_log("embed-server: failed to load late model: %s", path);
+            return -1;
+        }
+        m->cpu_late_ws = embed_late_workspace_new(m->cpu_late_model);
+        if (!m->cpu_late_ws) {
+            server_log("embed-server: failed to allocate late workspace: %s",
+                       path);
+            return -1;
+        }
+        config = embed_late_model_config(m->cpu_late_model);
+        token_dim = embed_late_model_token_dim(m->cpu_late_model);
+    } else {
+        m->cpu_model = embed_model_load(path);
+        if (!m->cpu_model) {
+            server_log("embed-server: failed to load model: %s", path);
+            return -1;
+        }
+        m->cpu_ws = embed_workspace_new(m->cpu_model);
+        if (!m->cpu_ws) {
+            server_log("embed-server: failed to allocate workspace: %s", path);
+            return -1;
+        }
+        config = embed_model_config(m->cpu_model);
     }
-    m->cpu_ws = embed_workspace_new(m->cpu_model);
-    if (!m->cpu_ws) {
-        server_log("embed-server: failed to allocate workspace: %s", path);
-        return -1;
-    }
-    if (embed_model_config(m->cpu_model)->hidden_size != m->info->dim) {
+    if (config->hidden_size != m->info->dim ||
+        token_dim != m->info->token_dim) {
         server_log("embed-server: model %s has unexpected dimension %d",
-                   m->info->id, embed_model_config(m->cpu_model)->hidden_size);
+                   m->info->id, config->hidden_size);
+        return -1;
+    }
+    if (m->info->kind == MODEL_KIND_LATE &&
+        (m->late_mask_id >= config->vocab_size ||
+         m->late_query_prefix_id >= config->vocab_size ||
+         m->late_document_prefix_id >= config->vocab_size)) {
+        server_log("embed-server: late special-token ids exceed model vocab");
         return -1;
     }
     return 0;
 }
 
 static void free_models(http_server *s) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < MODEL_COUNT; i++) {
         loaded_model *m = &s->models[i];
         free(m->path);
         if (m->tok_ws) qwen_tokenizer_workspace_free(m->tok_ws);
         if (m->tok) qwen_tokenizer_free(m->tok);
         if (m->cpu_ws) embed_workspace_free(m->cpu_ws);
         if (m->cpu_model) embed_model_free(m->cpu_model);
+        if (m->cpu_late_ws) embed_late_workspace_free(m->cpu_late_ws);
+        if (m->cpu_late_model) embed_late_model_free(m->cpu_late_model);
 #ifdef USE_MLX
         if (m->mlx_ctx) embed_mlx_free(m->mlx_ctx);
+        if (m->mlx_late_ctx) embed_mlx_late_free(m->mlx_late_ctx);
 #endif
 #ifdef USE_CUDA
         if (m->cuda_ctx) embed_cuda_free(m->cuda_ctx);
@@ -2263,7 +2809,7 @@ static uint64_t physical_memory_nbytes(void) {
 }
 
 static int validate_model_specs(const embed_server_config_t *cfg) {
-    int seen[4] = {0};
+    int seen[MODEL_COUNT] = {0};
     for (int i = 0; i < cfg->n_models; i++) {
         const embed_server_model_spec_t *spec = &cfg->models[i];
         model_slot slot = model_slot_for_id(spec->id);
@@ -2279,6 +2825,12 @@ static int validate_model_specs(const embed_server_config_t *cfg) {
         }
         if (seen[slot]) {
             fprintf(stderr, "embed-server: duplicate model id: %s\n", spec->id);
+            return -1;
+        }
+        if (cfg->use_cuda && k_models[slot].kind == MODEL_KIND_LATE) {
+            fprintf(stderr,
+                    "embed-server: model %s has no CUDA late-interaction backend\n",
+                    spec->id);
             return -1;
         }
         seen[slot] = 1;
@@ -2495,7 +3047,8 @@ static void print_usage(const char *prog)
     fprintf(stderr,
         "Usage: %s --model ID=DIR [options]\n"
         "\n"
-        "Serves POST /v1/embeddings and /v1/contextualizedembeddings.\n"
+        "Serves POST /v1/embeddings, /v1/contextualizedembeddings, and\n"
+        "/v1/rerank.\n"
         "\n"
         "Options:\n"
         "  --model ID=DIR            Model to serve (repeatable)\n"

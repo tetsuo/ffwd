@@ -56,9 +56,13 @@ static const char *TF_MERGES[] = {
     "\xC4\xA0w or",
 };
 enum { TF_N_MERGED = sizeof(TF_MERGED) / sizeof(TF_MERGED[0]) };
-/* The special token goes last so contextual-separator ids resolve in-range. */
+/* Special tokens go last so contextual and late-interaction ids resolve
+ * in-range for tiny server models. */
 enum { TF_EOT_ID = 256 + TF_N_MERGED };
-enum { TF_VOCAB_SIZE = TF_EOT_ID + 1 };
+enum { TF_MASK_ID = TF_EOT_ID + 1 };
+enum { TF_QUERY_ID = TF_MASK_ID + 1 };
+enum { TF_DOCUMENT_ID = TF_QUERY_ID + 1 };
+enum { TF_VOCAB_SIZE = TF_DOCUMENT_ID + 1 };
 
 /* Write vocab.json + merges.txt into dir. Returns 0 on success. */
 static int tf_write_vocab(const char *dir)
@@ -76,6 +80,9 @@ static int tf_write_vocab(const char *dir)
     for (int i = 0; i < TF_N_MERGED; i++)
         fprintf(f, ", \"%s\": %d", TF_MERGED[i], 256 + i);
     fprintf(f, ", \"<|endoftext|>\": %d", TF_EOT_ID);
+    fprintf(f, ", \"[MASK]\": %d", TF_MASK_ID);
+    fprintf(f, ", \"[Q]\": %d", TF_QUERY_ID);
+    fprintf(f, ", \"[D]\": %d", TF_DOCUMENT_ID);
     fputs("}", f);
     fclose(f);
 

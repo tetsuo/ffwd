@@ -289,7 +289,7 @@ static int http_req(int port, const char *method, const char *path,
 }
 
 typedef struct {
-    embed_server_model_spec_t spec[2];
+    embed_server_model_spec_t spec[3];
     embed_server_config_t cfg;
     int rc;
 } srv_ctx;
@@ -606,9 +606,109 @@ static void test_http_contextual(int port)
     cJSON_Delete(std);
 }
 
+static void test_http_rerank(int port)
+{
+    char *body = NULL;
+
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "\"query\":\"hello\",\"documents\":[\"world\"]}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "\"query\":\"\",\"documents\":[\"world\"]}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "\"query\":\"hello\",\"documents\":[]}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "\"query\":\"hello\",\"documents\":[\"world\"],"
+                         "\"top_n\":1,\"top_k\":1}",
+                         NULL, NULL) == 422);
+
+    const char *request =
+        "{\"model\":\"pplx-embed-v1-late-0.6b\","
+        "\"query\":\"hello\",\"documents\":["
+        "\"hello!\",\"world\",\"quoted \\\"document\\\"\"],"
+        "\"top_n\":2,\"return_documents\":true}";
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY, request,
+                         NULL, &body) == 200);
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    TEST_ASSERT(root != NULL);
+    if (root) {
+        cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "object");
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(root, "model");
+        cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
+        TEST_ASSERT(cJSON_IsString(object) &&
+                    strcmp(object->valuestring, "list") == 0);
+        TEST_ASSERT(cJSON_IsString(model) &&
+                    strcmp(model->valuestring,
+                           "pplx-embed-v1-late-0.6b") == 0);
+        TEST_ASSERT(cJSON_IsArray(results) &&
+                    cJSON_GetArraySize(results) == 2);
+        double previous = INFINITY;
+        int seen[3] = {0};
+        cJSON *result;
+        cJSON_ArrayForEach(result, results) {
+            cJSON *index =
+                cJSON_GetObjectItemCaseSensitive(result, "index");
+            cJSON *score =
+                cJSON_GetObjectItemCaseSensitive(result, "relevance_score");
+            cJSON *document =
+                cJSON_GetObjectItemCaseSensitive(result, "document");
+            TEST_ASSERT(cJSON_IsNumber(index) &&
+                        index->valueint >= 0 && index->valueint < 3);
+            TEST_ASSERT(cJSON_IsNumber(score) &&
+                        score->valuedouble <= previous);
+            TEST_ASSERT(cJSON_IsString(document));
+            if (cJSON_IsNumber(index) && index->valueint >= 0 &&
+                index->valueint < 3)
+                seen[index->valueint]++;
+            if (cJSON_IsNumber(score)) previous = score->valuedouble;
+        }
+        TEST_ASSERT(seen[0] + seen[1] + seen[2] == 2);
+
+        cJSON *usage = cJSON_GetObjectItemCaseSensitive(root, "usage");
+        cJSON *query_tokens = usage
+            ? cJSON_GetObjectItemCaseSensitive(usage, "query_tokens") : NULL;
+        cJSON *document_tokens = usage
+            ? cJSON_GetObjectItemCaseSensitive(usage, "document_tokens") : NULL;
+        cJSON *total_tokens = usage
+            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        TEST_ASSERT(query_tokens && query_tokens->valueint == 32);
+        TEST_ASSERT(document_tokens && document_tokens->valueint > 0);
+        TEST_ASSERT(total_tokens &&
+                    total_tokens->valueint ==
+                        query_tokens->valueint + document_tokens->valueint);
+        cJSON_Delete(root);
+    }
+    free(body);
+    body = NULL;
+
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "\"query\":\"hello\","
+                         "\"documents\":[\"hello\",\"world\"],\"top_k\":1}",
+                         NULL, &body) == 200);
+    root = body ? cJSON_Parse(body) : NULL;
+    TEST_ASSERT(root != NULL);
+    if (root) {
+        cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
+        TEST_ASSERT(cJSON_IsArray(results) &&
+                    cJSON_GetArraySize(results) == 1);
+        cJSON *document = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(results, 0), "document");
+        TEST_ASSERT(document == NULL);
+        cJSON_Delete(root);
+    }
+    free(body);
+}
+
 static void test_http_server(void)
 {
-    char dir[1024];
+    char dir[1024], late_dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir)) {
@@ -616,11 +716,21 @@ static void test_http_server(void)
         test_failures++;
         return;
     }
+    snprintf(late_dir, sizeof(late_dir), "%s/embed-srv-late-test-XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(late_dir)) {
+        fprintf(stderr, "FAIL: late mkdtemp\n");
+        test_failures++;
+        return;
+    }
     /* The 0.6b server slot requires hidden_size 1024; everything else stays
      * tiny. The model vocab covers every tokenizer fixture id. */
     tm_dims_t dims = {1024, 2, 1, 64, 8, TF_VOCAB_SIZE};
     if (tf_write_vocab(dir) != 0 ||
-        tm_write_model_dims(dir, "F32", &dims) != 0) {
+        tm_write_model_dims(dir, "F32", &dims) != 0 ||
+        tf_write_vocab(late_dir) != 0 ||
+        tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
+        tm_write_late_projection(late_dir, "F32", 128, 1024) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
         test_failures++;
         return;
@@ -637,8 +747,10 @@ static void test_http_server(void)
     ctx.spec[0].path = dir;
     ctx.spec[1].id = "pplx-embed-context-v1-0.6b";
     ctx.spec[1].path = dir;
+    ctx.spec[2].id = "pplx-embed-v1-late-0.6b";
+    ctx.spec[2].path = late_dir;
     ctx.cfg.models = ctx.spec;
-    ctx.cfg.n_models = 2;
+    ctx.cfg.n_models = 3;
     ctx.cfg.port = port;
     ctx.cfg.batch_size = 2;
     ctx.cfg.batch_wait_us = 1000;
@@ -661,6 +773,7 @@ static void test_http_server(void)
     if (up) {
         test_http_embeddings(port);
         test_http_contextual(port);
+        test_http_rerank(port);
     }
 
     stop_signal_handler(SIGTERM);
