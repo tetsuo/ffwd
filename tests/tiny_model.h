@@ -57,6 +57,27 @@ typedef struct {
 
 enum { TM_N_SPECS = 13 };
 
+static int tm_write_config(const char *dir, const tm_dims_t *d,
+                           const char *model_type, int eos_token_id)
+{
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/config.json", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "{\"hidden_size\":%d,\"num_hidden_layers\":1,"
+            "\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
+            "\"head_dim\":%d,\"intermediate_size\":%d,\"vocab_size\":%d,"
+            "\"rms_norm_eps\":1e-6,\"rope_theta\":10000.0",
+            d->hidden, d->heads, d->kv_heads, d->head_dim,
+            d->intermediate, d->vocab);
+    if (model_type)
+        fprintf(f, ",\"model_type\":\"%s\",\"eos_token_id\":%d",
+                model_type, eos_token_id);
+    fputs("}", f);
+    fclose(f);
+    return 0;
+}
+
 /* Write a safetensors file holding `specs` with tm_value() contents.
  * dtype: "F32" or "BF16". Returns 0 on success. */
 static int tm_write_safetensors(const char *path, const char *dtype,
@@ -133,19 +154,18 @@ static int tm_write_model_dims(const char *dir, const char *dtype,
     };
 
     char path[2048];
-    snprintf(path, sizeof(path), "%s/config.json", dir);
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    fprintf(f, "{\"hidden_size\":%d,\"num_hidden_layers\":1,"
-            "\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
-            "\"head_dim\":%d,\"intermediate_size\":%d,\"vocab_size\":%d,"
-            "\"rms_norm_eps\":1e-6,\"rope_theta\":10000.0}",
-            d->hidden, d->heads, d->kv_heads, d->head_dim,
-            d->intermediate, d->vocab);
-    fclose(f);
+    if (tm_write_config(dir, d, NULL, -1) != 0) return -1;
 
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     return tm_write_safetensors(path, dtype, specs, TM_N_SPECS);
+}
+
+static inline int tm_write_qwen3_model_dims(const char *dir, const char *dtype,
+                                            const tm_dims_t *d,
+                                            int eos_token_id)
+{
+    if (tm_write_model_dims(dir, dtype, d) != 0) return -1;
+    return tm_write_config(dir, d, "qwen3", eos_token_id);
 }
 
 /* Add the 1_Dense per-token projection head that turns a base model dir into

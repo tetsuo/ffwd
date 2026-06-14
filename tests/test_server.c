@@ -289,7 +289,7 @@ static int http_req(int port, const char *method, const char *path,
 }
 
 typedef struct {
-    embed_server_model_spec_t spec[3];
+    embed_server_model_spec_t spec[4];
     embed_server_config_t cfg;
     int rc;
 } srv_ctx;
@@ -467,6 +467,51 @@ static void test_http_embeddings(int port)
         TEST_ASSERT(cJSON_IsArray(emb) && cJSON_GetArraySize(emb) == 128);
         cJSON_Delete(root);
     }
+    free(body);
+    body = NULL;
+
+    /* Qwen3 appends its terminal token, supports 32D MRL output, and
+     * re-normalizes the truncated prefix. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"Qwen3-Embedding-0.6B\","
+                         "\"input\":\"hello\",\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *qwen_full = body ? parse_embeddings_body(body, 1) : NULL;
+    free(body);
+    body = NULL;
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"Qwen3-Embedding-0.6B\","
+                         "\"input\":\"hello\",\"dimensions\":32,"
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *qwen_mrl = body ? parse_embeddings_body(body, 1) : NULL;
+    if (qwen_full && qwen_mrl) {
+        cJSON *full_data =
+            cJSON_GetObjectItemCaseSensitive(qwen_full, "data");
+        cJSON *mrl_data =
+            cJSON_GetObjectItemCaseSensitive(qwen_mrl, "data");
+        cJSON *full_emb = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(full_data, 0), "embedding");
+        cJSON *mrl_emb = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(mrl_data, 0), "embedding");
+        TEST_ASSERT(cJSON_IsArray(full_emb) &&
+                    cJSON_GetArraySize(full_emb) == 1024);
+        TEST_ASSERT(cJSON_IsArray(mrl_emb) &&
+                    cJSON_GetArraySize(mrl_emb) == 32);
+        double prefix_diff = 0.0;
+        for (int i = 0; i < 32; i++) {
+            double d = fabs(cJSON_GetArrayItem(full_emb, i)->valuedouble -
+                            cJSON_GetArrayItem(mrl_emb, i)->valuedouble);
+            if (d > prefix_diff) prefix_diff = d;
+        }
+        TEST_ASSERT(prefix_diff > 0.0);
+        cJSON *usage = cJSON_GetObjectItemCaseSensitive(qwen_mrl, "usage");
+        cJSON *total = usage
+            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        TEST_ASSERT(total && total->valueint == 2);
+    }
+    cJSON_Delete(qwen_full);
+    cJSON_Delete(qwen_mrl);
     free(body);
     body = NULL;
 
@@ -713,7 +758,7 @@ static void test_http_rerank(int port)
 
 static void test_http_server(void)
 {
-    char dir[1024], late_dir[1024];
+    char dir[1024], late_dir[1024], qwen_dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir)) {
@@ -728,6 +773,13 @@ static void test_http_server(void)
         test_failures++;
         return;
     }
+    snprintf(qwen_dir, sizeof(qwen_dir), "%s/embed-srv-qwen-test-XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(qwen_dir)) {
+        fprintf(stderr, "FAIL: Qwen mkdtemp\n");
+        test_failures++;
+        return;
+    }
     /* The 0.6b server slot requires hidden_size 1024; everything else stays
      * tiny. The model vocab covers every tokenizer fixture id. */
     tm_dims_t dims = {1024, 2, 1, 64, 8, TF_VOCAB_SIZE};
@@ -735,7 +787,10 @@ static void test_http_server(void)
         tm_write_model_dims(dir, "F32", &dims) != 0 ||
         tf_write_vocab(late_dir) != 0 ||
         tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
-        tm_write_late_projection(late_dir, "F32", 128, 1024) != 0) {
+        tm_write_late_projection(late_dir, "F32", 128, 1024) != 0 ||
+        tf_write_vocab(qwen_dir) != 0 ||
+        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims,
+                                  TF_EOT_ID) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
         test_failures++;
         return;
@@ -754,8 +809,10 @@ static void test_http_server(void)
     ctx.spec[1].path = dir;
     ctx.spec[2].id = "pplx-embed-v1-late-0.6b";
     ctx.spec[2].path = late_dir;
+    ctx.spec[3].id = "Qwen3-Embedding-0.6B";
+    ctx.spec[3].path = qwen_dir;
     ctx.cfg.models = ctx.spec;
-    ctx.cfg.n_models = 3;
+    ctx.cfg.n_models = 4;
     ctx.cfg.port = port;
     ctx.cfg.batch_size = 2;
     ctx.cfg.batch_wait_us = 1000;

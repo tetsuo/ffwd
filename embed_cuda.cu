@@ -530,6 +530,45 @@ __global__ static void attn_softmax_kernel(float *scores, P_T *probs, int L)
         store_act(p, (size_t)j, s[j] * inv);
 }
 
+template <typename P_T>
+__global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs,
+                                                   int L)
+{
+    float *s = scores + (size_t)blockIdx.x * L;
+    P_T *p = probs + (size_t)blockIdx.x * L;
+    int query = blockIdx.x % L;
+    int keys = query + 1;
+    int tid = threadIdx.x;
+    __shared__ float red[256];
+
+    float m = -3.402823466e+38F;
+    for (int j = tid; j < keys; j += blockDim.x) m = fmaxf(m, s[j]);
+    red[tid] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int j = tid; j < keys; j += blockDim.x) {
+        float e = __expf(s[j] - m);
+        s[j] = e;
+        sum += e;
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] += red[tid + o];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    for (int j = tid; j < L; j += blockDim.x)
+        store_act(p, (size_t)j, j < keys ? s[j] * inv : 0.0f);
+}
+
 __global__ static void mean_pool_kernel(float *out, const float *x,
                                         const int *offsets, int batch,
                                         int hidden)
@@ -545,6 +584,17 @@ __global__ static void mean_pool_kernel(float *out, const float *x,
             sum += x[(size_t)t * hidden + d];
         out[(size_t)b * hidden + d] = sum / (float)len;
     }
+}
+
+__global__ static void last_pool_kernel(float *out, const float *x,
+                                        const int *offsets, int batch,
+                                        int hidden)
+{
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int last = offsets[b + 1] - 1;
+    for (int d = tid; d < hidden; d += blockDim.x)
+        out[(size_t)b * hidden + d] = x[(size_t)last * hidden + d];
 }
 
 __global__ static void span_pool_kernel(float *out, const float *x,
@@ -783,6 +833,7 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
     int hd = c->head_dim;
     int H = c->n_heads;
     int total = h_offsets[batch];
+    int causal = c->attention_mode == EMBED_ATTENTION_CAUSAL;
     const float alpha = scale, beta = 0.0f, one = 1.0f;
 
     int threads = 256;
@@ -823,11 +874,21 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
                 &beta, S + off, CUDA_R_32F, L,
                 n, gemm_compute(), CUBLAS_GEMM_DEFAULT));
             if (out_bf16) {
-                attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
+                if (causal)
+                    attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores,
+                        (__nv_bfloat16 *)ctx->attn_probs, L);
+                else
+                    attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores,
+                        (__nv_bfloat16 *)ctx->attn_probs, L);
             } else {
-                attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, ctx->attn_scores, L);
+                if (causal)
+                    attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, ctx->attn_scores, L);
+                else
+                    attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, ctx->attn_scores, L);
             }
             if (launch_check() != 0) return -1;
             /* O = P @ V, batched over (seq, head) */
@@ -857,8 +918,12 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
             const __nv_bfloat16 *V =
                 (const __nv_bfloat16 *)ctx->vexp + (size_t)start * q_dim;
             __nv_bfloat16 *O = out_bf16 + (size_t)start * q_dim;
-            attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                ctx->attn_scores, P, L);
+            if (causal)
+                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, P, L);
+            else
+                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, P, L);
             if (launch_check() != 0) return -1;
             /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
             CUBLAS_CHECK(cublasGemmStridedBatchedEx(
@@ -870,8 +935,12 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
         } else {
             const float *V = ctx->vexp + (size_t)start * q_dim;
             float *O = ctx->attn_out + (size_t)start * q_dim;
-            attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                ctx->attn_scores, ctx->attn_scores, L);
+            if (causal)
+                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, ctx->attn_scores, L);
+            else
+                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                    ctx->attn_scores, ctx->attn_scores, L);
             if (launch_check() != 0) return -1;
             /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
             if (gemm_strided_batched(
@@ -1308,8 +1377,12 @@ int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
         return -1;
     if (ensure_pooled_rows(ctx, batch) != 0)
         return -1;
-    mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
-        ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
+    if (c->pooling_mode == EMBED_POOL_LAST_TOKEN)
+        last_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
+            ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
+    else
+        mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
+            ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
     if (launch_check() != 0) return -1;
     cudaError_t ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
                                      (size_t)batch * c->hidden_size * sizeof(float),
@@ -1319,6 +1392,14 @@ int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
     if (ce != cudaSuccess) {
         fprintf(stderr, "cuda output copy failed: %s\n", cudaGetErrorString(ce));
         return -1;
+    }
+    if (c->normalize_embeddings) {
+        for (int b = 0; b < batch; b++) {
+            if (embed_l2_normalize(
+                    out_embeddings + (size_t)b * c->hidden_size,
+                    c->hidden_size) != 0)
+                return -1;
+        }
     }
     return 0;
 }

@@ -185,6 +185,16 @@ static double json_get_double(const char *json, const char *key, double fallback
     return atof(v);
 }
 
+static int json_string_equals(const char *json, const char *key,
+                              const char *expected)
+{
+    const char *v = json_find_key(json, key);
+    if (!v || *v != '"') return 0;
+    v++;
+    size_t len = strlen(expected);
+    return strncmp(v, expected, len) == 0 && v[len] == '"';
+}
+
 static int parse_config(embed_config_t *cfg, const char *model_dir)
 {
     char path[1024];
@@ -225,6 +235,19 @@ static int parse_config(embed_config_t *cfg, const char *model_dir)
     cfg->vocab_size       = json_get_int(buf, "vocab_size", EMBED_VOCAB_SIZE);
     cfg->rms_norm_eps     = (float)json_get_double(buf, "rms_norm_eps", 1e-6);
     cfg->rope_theta       = (float)json_get_double(buf, "rope_theta", 1000000.0);
+    cfg->attention_mode   = EMBED_ATTENTION_BIDIRECTIONAL;
+    cfg->pooling_mode     = EMBED_POOL_MEAN;
+    cfg->normalize_embeddings = 0;
+    cfg->append_terminal_token = 0;
+    cfg->terminal_token_id = -1;
+
+    if (json_string_equals(buf, "model_type", "qwen3")) {
+        cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
+        cfg->pooling_mode = EMBED_POOL_LAST_TOKEN;
+        cfg->normalize_embeddings = 1;
+        cfg->append_terminal_token = 1;
+        cfg->terminal_token_id = json_get_int(buf, "eos_token_id", -1);
+    }
 
     cfg->q_dim = 0;
     cfg->kv_dim = 0;
@@ -244,7 +267,10 @@ static int parse_config(embed_config_t *cfg, const char *model_dir)
         cfg->vocab_size <= 0 || cfg->q_dim <= 0 || cfg->kv_dim <= 0 ||
         (cfg->head_dim & 1) || cfg->n_heads % cfg->n_kv_heads != 0 ||
         !isfinite(cfg->rms_norm_eps) || cfg->rms_norm_eps <= 0.0f ||
-        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f) {
+        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f ||
+        (cfg->append_terminal_token &&
+         (cfg->terminal_token_id < 0 ||
+          cfg->terminal_token_id >= cfg->vocab_size))) {
         fprintf(stderr, "embed_model_load: invalid config in %s "
                 "(hidden=%d, layers=%d, heads=%d/%d, head_dim=%d, inter=%d)\n",
                 path, cfg->hidden_size, cfg->n_layers, cfg->n_heads,
@@ -259,10 +285,14 @@ static int parse_config(embed_config_t *cfg, const char *model_dir)
 
     if (embed_verbose >= 1)
         fprintf(stderr, "config: hidden=%d, layers=%d, heads=%d/%d, "
-                "inter=%d, head_dim=%d\n",
+                "inter=%d, head_dim=%d, attention=%s, pooling=%s\n",
                 cfg->hidden_size, cfg->n_layers,
                 cfg->n_heads, cfg->n_kv_heads,
-                cfg->intermediate_size, cfg->head_dim);
+                cfg->intermediate_size, cfg->head_dim,
+                cfg->attention_mode == EMBED_ATTENTION_CAUSAL
+                    ? "causal" : "bidirectional",
+                cfg->pooling_mode == EMBED_POOL_LAST_TOKEN
+                    ? "last-token" : "mean");
 
     return 0;
 }
@@ -618,6 +648,10 @@ static embed_model_t *model_load_range_ex(const char *model_dir,
     }
     model->layer_start = layer_start;
     model->layer_end = layer_end;
+    model->attention =
+        cfg->attention_mode == EMBED_ATTENTION_CAUSAL
+            ? qwen_causal_gqa_attention_packed_with_scratch
+            : qwen_bidirectional_gqa_attention_packed_with_scratch;
 
     /* Open safetensors (handles single file or multi-shard) */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
@@ -1187,7 +1221,7 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
                                  rope_cos, rope_sin, len, n_kv_heads, head_dim);
         }
 
-        qwen_bidirectional_gqa_attention_packed_with_scratch(
+        model->attention(
             attn_out, q_buf, k_buf, v_buf, offsets, batch, n_heads,
             n_kv_heads, head_dim, scale, ws->attn_scores,
             ws->attn_scores_bytes);
@@ -1223,16 +1257,18 @@ static int forward_packed_inplace(const embed_model_t *model,
                                         apply_final_norm);
 }
 
-static void pool_embeddings(const embed_model_t *model,
-                            const embed_workspace_t *ws,
-                            const int *offsets, int batch,
-                            float *out_embeddings)
+static int pool_embeddings(const embed_model_t *model,
+                           const embed_workspace_t *ws,
+                           const int *offsets, int batch,
+                           float *out_embeddings)
 {
     const embed_config_t *cfg = &model->config;
     int hidden = cfg->hidden_size;
     float eps = cfg->rms_norm_eps;
     const float *norm_weight = model->weights.norm;
     const float *x = ws->x;
+    if (hidden <= 0 || !norm_weight || !x)
+        return -1;
 
     for (int b = 0; b < batch; b++) {
         int start = offsets[b];
@@ -1241,23 +1277,36 @@ static void pool_embeddings(const embed_model_t *model,
         float *emb = out_embeddings + (size_t)b * hidden;
 
         memset(emb, 0, (size_t)hidden * sizeof(float));
-        for (int i = start; i < end; i++) {
-            const float *row = x + (size_t)i * hidden;
-
+        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN) {
+            const float *row = x + (size_t)(end - 1) * hidden;
             float sum_sq = 0.0f;
             for (int d = 0; d < hidden; d++)
                 sum_sq += row[d] * row[d];
-
             float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
             for (int d = 0; d < hidden; d++)
-                emb[d] += row[d] * rms_inv * norm_weight[d];
+                emb[d] = row[d] * rms_inv * norm_weight[d];
+        } else {
+            for (int i = start; i < end; i++) {
+                const float *row = x + (size_t)i * hidden;
+
+                float sum_sq = 0.0f;
+                for (int d = 0; d < hidden; d++)
+                    sum_sq += row[d] * row[d];
+
+                float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
+                for (int d = 0; d < hidden; d++)
+                    emb[d] += row[d] * rms_inv * norm_weight[d];
+            }
+            float inv_len = 1.0f / (float)len;
+            for (int d = 0; d < hidden; d++)
+                emb[d] *= inv_len;
         }
 
-        float inv_len = 1.0f / (float)len;
-        for (int d = 0; d < hidden; d++)
-            emb[d] *= inv_len;
-
+        if (cfg->normalize_embeddings &&
+            embed_l2_normalize(emb, hidden) != 0)
+            return -1;
     }
+    return 0;
 }
 
 /* ========================================================================
@@ -1431,7 +1480,7 @@ int embed_model_encode_batch(const embed_model_t *model, embed_workspace_t *ws,
     int rc = forward_packed_inplace(model, ws, inputs, batch, offsets,
                                     total_seq, max_seq, 0);
     if (rc == 0)
-        pool_embeddings(model, ws, offsets, batch, out_embeddings);
+        rc = pool_embeddings(model, ws, offsets, batch, out_embeddings);
 
     return rc;
 }
@@ -1451,16 +1500,25 @@ int embed_pool_batch(const embed_config_t *cfg, const float *states,
             return -1;
 
         float *emb = out_embeddings + (size_t)b * cfg->hidden_size;
-        memset(emb, 0, (size_t)cfg->hidden_size * sizeof(float));
-        for (int t = 0; t < len; t++) {
-            const float *row = states + (size_t)(offset + t) * cfg->hidden_size;
+        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN) {
+            const float *row =
+                states + (size_t)(offset + len - 1) * cfg->hidden_size;
+            memcpy(emb, row, (size_t)cfg->hidden_size * sizeof(float));
+        } else {
+            memset(emb, 0, (size_t)cfg->hidden_size * sizeof(float));
+            for (int t = 0; t < len; t++) {
+                const float *row =
+                    states + (size_t)(offset + t) * cfg->hidden_size;
+                for (int d = 0; d < cfg->hidden_size; d++)
+                    emb[d] += row[d];
+            }
+            float inv_len = 1.0f / (float)len;
             for (int d = 0; d < cfg->hidden_size; d++)
-                emb[d] += row[d];
+                emb[d] *= inv_len;
         }
-
-        float inv_len = 1.0f / (float)len;
-        for (int d = 0; d < cfg->hidden_size; d++)
-            emb[d] *= inv_len;
+        if (cfg->normalize_embeddings &&
+            embed_l2_normalize(emb, cfg->hidden_size) != 0)
+            return -1;
         offset += len;
     }
     return 0;
@@ -1480,6 +1538,7 @@ float *embed_model_encode(const embed_model_t *model, embed_workspace_t *ws,
     if (!model || !ws || !token_ids || n_tokens <= 0) return NULL;
 
     int hidden = model->config.hidden_size;
+    if (hidden <= 0) return NULL;
     float *emb = malloc_floats((size_t)hidden);
     if (!emb) return NULL;
 

@@ -116,6 +116,20 @@ void qwen_bidirectional_gqa_attention_packed_with_scratch(
     const int *offsets, int batch, int n_heads, int n_kv_heads,
     int head_dim, float scale, float *scratch, size_t scratch_bytes);
 
+/*
+ * Causal GQA attention over a packed/ragged batch. Query position i attends
+ * only to positions at or before i within its sequence.
+ */
+void qwen_causal_gqa_attention_packed(float *out, const float *Q,
+                                      const float *K, const float *V,
+                                      const int *offsets, int batch,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, float scale);
+void qwen_causal_gqa_attention_packed_with_scratch(
+    float *out, const float *Q, const float *K, const float *V,
+    const int *offsets, int batch, int n_heads, int n_kv_heads,
+    int head_dim, float scale, float *scratch, size_t scratch_bytes);
+
 /* ========================================================================
  * Position Embeddings
  * ======================================================================== */

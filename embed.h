@@ -20,7 +20,7 @@
 #include <stdint.h>
 
 /* ========================================================================
- * Shared constants (identical across all models)
+ * Shared constants and family defaults
  * ======================================================================== */
 
 #define EMBED_VOCAB_SIZE     151936
@@ -32,18 +32,33 @@
  * Model Configuration (populated from config.json at load time)
  * ======================================================================== */
 
+typedef enum {
+    EMBED_ATTENTION_BIDIRECTIONAL = 0,
+    EMBED_ATTENTION_CAUSAL = 1,
+} embed_attention_mode_t;
+
+typedef enum {
+    EMBED_POOL_MEAN = 0,
+    EMBED_POOL_LAST_TOKEN = 1,
+} embed_pooling_mode_t;
+
 typedef struct {
-    int hidden_size;        /* 0.6B: 1024   4B: 2560 */
-    int n_layers;           /* 0.6B: 28     4B: 36   */
-    int n_heads;            /* 0.6B: 16     4B: 32   */
-    int n_kv_heads;         /* 0.6B: 8      4B: 8    */
-    int head_dim;           /* always 128 */
+    int hidden_size;
+    int n_layers;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
     int q_dim;              /* n_heads    * head_dim */
     int kv_dim;             /* n_kv_heads * head_dim */
-    int intermediate_size;  /* 0.6B: 3072   4B: 9728 */
-    int vocab_size;         /* 151936 */
-    float rms_norm_eps;     /* 1e-6 */
-    float rope_theta;       /* 1e6  */
+    int intermediate_size;
+    int vocab_size;
+    float rms_norm_eps;
+    float rope_theta;
+    embed_attention_mode_t attention_mode;
+    embed_pooling_mode_t pooling_mode;
+    int normalize_embeddings;
+    int append_terminal_token;
+    int terminal_token_id;
 } embed_config_t;
 
 /* ========================================================================
@@ -110,13 +125,14 @@ EMBED_API size_t embed_workspace_nbytes(const embed_workspace_t *ws);
  * Compute embedding for a token sequence.
  *
  *   1. Token embedding lookup
- *   2. N transformer layers (bidirectional GQA + RoPE + SwiGLU)
+ *   2. N transformer layers (GQA + RoPE + SwiGLU)
  *   3. Final RMSNorm
- *   4. Mean pooling over all positions
+ *   4. Model-defined pooling and optional L2 normalization
  *
- * pplx-embed-v1 embeddings are intentionally not L2-normalized. Use cosine
- * similarity for comparisons, or normalize explicitly before storing in vector
- * databases that only support inner product.
+ * pplx-embed-v1 uses bidirectional attention and unnormalized mean pooling.
+ * Qwen3-Embedding uses causal attention and normalized last-token pooling.
+ * Token IDs are consumed exactly as provided; text frontends append any
+ * model-required terminal token before calling this API.
  *
  * Returns malloc'd float[hidden_size] (caller frees). NULL on error.
  */
@@ -145,7 +161,7 @@ EMBED_API int embed_model_encode_batch(const embed_model_t *model, embed_workspa
                            float *out_embeddings);
 
 /*
- * Mean-pool packed final hidden states for a ragged batch.
+ * Apply the config's pooling mode to packed final hidden states.
  *
  * states is [sum(n_tokens), hidden_size]. seq_lengths contains one positive
  * token count per sequence. The states must already include final RMSNorm.

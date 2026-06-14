@@ -1,8 +1,11 @@
 # embed.c
 
-`embed.c` implements inference for
-[pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed)
-dense/contextual and late-interaction text embedding models.
+`embed.c` implements inference for:
+
+- [pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed)
+  dense, contextual, and late-interaction models
+- [Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding)
+  causal, last-token pooled models
 
 Supported platforms are CUDA/cuBLAS on Linux/NVIDIA, Apple Silicon MLX, and
 CPU/BLAS.
@@ -34,6 +37,17 @@ matrix:
   "Berlin is the capital of Germany."
 ```
 
+Qwen3 retrieval queries benefit from an explicit task instruction. Documents are
+embedded directly:
+
+```bash
+./embed -d ./Qwen3-Embedding-0.6B \
+  $'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: What is the capital of China?'
+```
+
+The Qwen3 tokenizer terminal token is appended automatically by the CLI and
+server. Qwen3 embeddings are L2-normalized; pplx embeddings remain unnormalized.
+
 Pipe in lines and use `--stream` to get one JSON embedding per line:
 
 ```bash
@@ -54,6 +68,7 @@ Serves the HTTP API. Takes one or more `--model ID=DIR` pairs:
 ```bash
 ./embed-server \
   --model pplx-embed-v1-0.6b=./model \
+  --model Qwen3-Embedding-0.6B=./qwen3-model \
   --port 8000
 ```
 
@@ -65,6 +80,9 @@ Perplexity API compatible endpoints:
 Late-interaction reranking endpoint:
 
 - `POST /v1/rerank` — late-interaction MaxSim reranking
+
+For `Qwen3-Embedding-0.6B`, `/v1/embeddings` accepts `dimensions` from 32
+to 1024. Truncated Matryoshka embeddings are re-normalized before encoding.
 
 Example:
 

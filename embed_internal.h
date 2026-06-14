@@ -29,12 +29,18 @@ typedef struct {
     const float *norm;               /* [hidden] */
 } embed_weights_t;
 
+typedef void (*embed_attention_fn)(
+    float *out, const float *Q, const float *K, const float *V,
+    const int *offsets, int batch, int n_heads, int n_kv_heads,
+    int head_dim, float scale, float *scratch, size_t scratch_bytes);
+
 struct embed_model {
     embed_config_t  config;
     embed_weights_t weights;
     void *safetensors;          /* multi_safetensors_t*, keeps mmap alive */
     int layer_start;            /* loaded transformer range, inclusive */
     int layer_end;              /* loaded transformer range, exclusive */
+    embed_attention_fn attention;
 };
 
 struct embed_workspace {

@@ -95,7 +95,7 @@ static void test_rope_neox(void) {
 static void reference_packed_gqa(float *out, const float *Q, const float *K,
                                  const float *V, const int *offsets, int batch,
                                  int n_heads, int n_kv_heads, int head_dim,
-                                 float scale) {
+                                 float scale, int causal) {
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
     int heads_per_kv = n_heads / n_kv_heads;
@@ -105,10 +105,11 @@ static void reference_packed_gqa(float *out, const float *Q, const float *K,
         for (int b = 0; b < batch; b++) {
             int start = offsets[b], end = offsets[b + 1];
             for (int i = start; i < end; i++) {
+                int key_end = causal ? i + 1 : end;
                 const float *q = Q + i * q_hidden + h * head_dim;
                 float *o = out + i * q_hidden + h * head_dim;
                 float max_score = -INFINITY;
-                for (int j = start; j < end; j++) {
+                for (int j = start; j < key_end; j++) {
                     const float *k = K + j * kv_hidden + kv_h * head_dim;
                     float score = 0.0f;
                     for (int d = 0; d < head_dim; d++) score += q[d] * k[d];
@@ -117,7 +118,7 @@ static void reference_packed_gqa(float *out, const float *Q, const float *K,
                 }
                 float denom = 0.0f;
                 for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
-                for (int j = start; j < end; j++) {
+                for (int j = start; j < key_end; j++) {
                     const float *k = K + j * kv_hidden + kv_h * head_dim;
                     const float *v = V + j * kv_hidden + kv_h * head_dim;
                     float score = 0.0f;
@@ -155,7 +156,7 @@ static void test_packed_gqa_attention(void) {
                                             1.0f / sqrtf((float)head_dim));
     reference_packed_gqa(want, Q, K, V, offsets, 2,
                          n_heads, n_kv_heads, head_dim,
-                         1.0f / sqrtf((float)head_dim));
+                         1.0f / sqrtf((float)head_dim), 0);
 
     for (int i = 0; i < total * q_hidden; i++)
         expect_close("packed_gqa", got[i], want[i], 2e-6f);
@@ -186,11 +187,48 @@ static void test_packed_gqa_attention_long(void) {
                                             1.0f / sqrtf((float)head_dim));
     reference_packed_gqa(want, Q, K, V, offsets, 2,
                          n_heads, n_kv_heads, head_dim,
-                         1.0f / sqrtf((float)head_dim));
+                         1.0f / sqrtf((float)head_dim), 0);
     qwen_set_threads(1);
 
     for (int i = 0; i < total * q_hidden; i++)
         expect_close("packed_gqa_long", got[i], want[i], 2e-5f);
+    free(want);
+    free(got);
+    free(V);
+    free(K);
+    free(Q);
+}
+
+static void test_packed_causal_gqa_attention(void) {
+    enum { total = 136, n_heads = 4, n_kv_heads = 2, head_dim = 8 };
+    enum { q_hidden = n_heads * head_dim };
+    enum { kv_hidden = n_kv_heads * head_dim };
+    const int offsets[3] = {0, 7, 136};
+    float *Q = malloc((size_t)total * q_hidden * sizeof(*Q));
+    float *K = malloc((size_t)total * kv_hidden * sizeof(*K));
+    float *V = malloc((size_t)total * kv_hidden * sizeof(*V));
+    float *got = malloc((size_t)total * q_hidden * sizeof(*got));
+    float *want = malloc((size_t)total * q_hidden * sizeof(*want));
+    if (!Q || !K || !V || !got || !want) exit(2);
+
+    for (int i = 0; i < total * q_hidden; i++)
+        Q[i] = sinf((float)i * 0.019f) - 0.2f;
+    for (int i = 0; i < total * kv_hidden; i++) {
+        K[i] = cosf((float)i * 0.013f) + 0.15f;
+        V[i] = sinf((float)i * 0.009f) - cosf((float)i * 0.015f);
+    }
+
+    qwen_set_threads(4);
+    qwen_causal_gqa_attention_packed(got, Q, K, V, offsets, 2,
+                                     n_heads, n_kv_heads, head_dim,
+                                     1.0f / sqrtf((float)head_dim));
+    reference_packed_gqa(want, Q, K, V, offsets, 2,
+                         n_heads, n_kv_heads, head_dim,
+                         1.0f / sqrtf((float)head_dim), 1);
+    qwen_set_threads(1);
+
+    for (int i = 0; i < total * q_hidden; i++)
+        expect_close("packed_causal_gqa", got[i], want[i], 2e-5f);
     free(want);
     free(got);
     free(V);
@@ -492,6 +530,7 @@ int main(void) {
     test_rope_neox();
     test_packed_gqa_attention();
     test_packed_gqa_attention_long();
+    test_packed_causal_gqa_attention();
     test_bf16_linear();
     test_bf16_qkv();
     test_bf16_matvec();

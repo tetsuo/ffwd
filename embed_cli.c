@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 
 static double now_ms(void)
 {
@@ -94,6 +95,8 @@ typedef struct {
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
     int               dim;
+    int               terminal_token_id;
+    int               append_terminal_token;
 } engine_t;
 
 typedef struct {
@@ -127,6 +130,22 @@ static int tokenize_text(engine_t *e, const char *text, token_buf_t *out)
         out->ids = NULL;
         out->n_tokens = 0;
         return -1;
+    }
+    if (e->append_terminal_token) {
+        if (out->n_tokens == INT_MAX) {
+            free(out->ids);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        int *ids = (int *)realloc(
+            out->ids, (size_t)(out->n_tokens + 1) * sizeof(*out->ids));
+        if (!ids) {
+            free(out->ids);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        out->ids = ids;
+        out->ids[out->n_tokens++] = e->terminal_token_id;
     }
 
     if (embed_verbose >= 1) {
@@ -580,6 +599,7 @@ int main(int argc, char *argv[])
     engine_t e = {0};
     e.tok = tok;
     t0 = now_ms();
+    const embed_config_t *config = NULL;
 
 #ifdef USE_MLX
     if (use_mlx) {
@@ -593,7 +613,8 @@ int main(int argc, char *argv[])
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = embed_mlx_config(e.mlx_ctx)->hidden_size;
+        config = embed_mlx_config(e.mlx_ctx);
+        e.dim = config->hidden_size;
     } else
 #endif
 #ifdef USE_CUDA
@@ -604,7 +625,8 @@ int main(int argc, char *argv[])
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = embed_cuda_config(e.cuda_ctx)->hidden_size;
+        config = embed_cuda_config(e.cuda_ctx);
+        e.dim = config->hidden_size;
     } else
 #endif
     {
@@ -621,8 +643,11 @@ int main(int argc, char *argv[])
             qwen_tokenizer_free(tok);
             return 1;
         }
-        e.dim = embed_model_config(e.model)->hidden_size;
+        config = embed_model_config(e.model);
+        e.dim = config->hidden_size;
     }
+    e.append_terminal_token = config->append_terminal_token;
+    e.terminal_token_id = config->terminal_token_id;
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
                 e.dim, now_ms() - t0,

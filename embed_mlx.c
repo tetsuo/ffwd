@@ -358,6 +358,16 @@ static const char *json_find_m(const char *json, const char *key)
     return NULL;
 }
 
+static int json_string_equals_m(const char *json, const char *key,
+                                const char *expected)
+{
+    const char *v = json_find_m(json, key);
+    if (!v || *v != '"') return 0;
+    v++;
+    size_t len = strlen(expected);
+    return strncmp(v, expected, len) == 0 && v[len] == '"';
+}
+
 static int mlx_parse_config(embed_config_t *cfg, const char *model_dir)
 {
     char path[1024];
@@ -394,6 +404,19 @@ static int mlx_parse_config(embed_config_t *cfg, const char *model_dir)
     GF("rope_theta",    rope_theta, 1000000.0f);
 #undef GI
 #undef GF
+    cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
+    cfg->pooling_mode = EMBED_POOL_MEAN;
+    cfg->normalize_embeddings = 0;
+    cfg->append_terminal_token = 0;
+    cfg->terminal_token_id = -1;
+    if (json_string_equals_m(buf, "model_type", "qwen3")) {
+        const char *eos = json_find_m(buf, "eos_token_id");
+        cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
+        cfg->pooling_mode = EMBED_POOL_LAST_TOKEN;
+        cfg->normalize_embeddings = 1;
+        cfg->append_terminal_token = 1;
+        cfg->terminal_token_id = eos ? atoi(eos) : -1;
+    }
 
     cfg->q_dim = 0;
     cfg->kv_dim = 0;
@@ -411,7 +434,10 @@ static int mlx_parse_config(embed_config_t *cfg, const char *model_dir)
         cfg->vocab_size <= 0 || cfg->q_dim <= 0 || cfg->kv_dim <= 0 ||
         (cfg->head_dim & 1) || cfg->n_heads % cfg->n_kv_heads != 0 ||
         !isfinite(cfg->rms_norm_eps) || cfg->rms_norm_eps <= 0.0f ||
-        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f) {
+        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f ||
+        (cfg->append_terminal_token &&
+         (cfg->terminal_token_id < 0 ||
+          cfg->terminal_token_id >= cfg->vocab_size))) {
         fprintf(stderr, "mlx: invalid config in %s "
                 "(hidden=%d, layers=%d, heads=%d/%d, head_dim=%d, inter=%d)\n",
                 path, cfg->hidden_size, cfg->n_layers, cfg->n_heads,
@@ -782,6 +808,8 @@ static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx, mlx_array x,
     int q_dim = c->q_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
     mlx_array null_arr = (mlx_array){0};
+    const char *mask_mode =
+        c->attention_mode == EMBED_ATTENTION_CAUSAL ? "causal" : "";
 
     /* For non-quantized BF16 weights, run the residual stream, norms, and
      * attention in F32; matmuls downcast their operands to BF16 internally
@@ -850,7 +878,7 @@ static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx, mlx_array x,
 
         mlx_array attn = mlx_array_new();
         mlx_fast_scaled_dot_product_attention(
-            &attn, qr, kr, vt, scale, "",
+            &attn, qr, kr, vt, scale, mask_mode,
             has_padding ? local_mask : null_arr, null_arr, S);
         mlx_array_free(qr); mlx_array_free(kr); mlx_array_free(vt);
 
@@ -1373,6 +1401,10 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     int hidden     = c->hidden_size;
     int max_seq    = 0;
     int has_padding = 0;
+    int causal = c->attention_mode == EMBED_ATTENTION_CAUSAL;
+    int last_token_pool = c->pooling_mode == EMBED_POOL_LAST_TOKEN;
+    if (hidden <= 0 || c->vocab_size <= 0)
+        return -1;
 
     for (int b = 0; b < batch; b++) {
         if (!inputs[b].ids || inputs[b].n_tokens <= 0) return -1;
@@ -1383,26 +1415,58 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     for (int b = 0; b < batch; b++) {
         if (inputs[b].n_tokens != max_seq) has_padding = 1;
     }
+    int needs_pool_mask = has_padding && !last_token_pool;
+    int needs_attn_mask = has_padding && !causal;
 
     size_t elems, ids_bytes, mask_bytes, len_bytes, out_values, out_bytes;
+    size_t last_index_bytes = 0;
     if (mlx_mul_size((size_t)batch, (size_t)max_seq, &elems) != 0 ||
         mlx_mul_size(elems, sizeof(int), &ids_bytes) != 0 ||
         mlx_mul_size(elems, sizeof(float), &mask_bytes) != 0 ||
         mlx_mul_size((size_t)batch, sizeof(float), &len_bytes) != 0 ||
         mlx_mul_size((size_t)batch, (size_t)hidden, &out_values) != 0 ||
-        mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0)
+        mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0 ||
+        (last_token_pool &&
+         mlx_mul_size(out_values, sizeof(int), &last_index_bytes) != 0))
+        return -1;
+    if (ids_bytes == 0 || out_bytes == 0 ||
+        (needs_pool_mask && (mask_bytes == 0 || len_bytes == 0)) ||
+        (needs_attn_mask && mask_bytes == 0) ||
+        (last_token_pool && last_index_bytes == 0))
         return -1;
     int *padded_ids = (int *)malloc(ids_bytes);
-    float *pool_mask_data = has_padding ? (float *)malloc(mask_bytes) : NULL;
-    float *attn_mask_data = has_padding ? (float *)malloc(mask_bytes) : NULL;
-    float *len_data = has_padding ? (float *)malloc(len_bytes) : NULL;
-    if (!padded_ids || (has_padding && (!pool_mask_data || !attn_mask_data || !len_data))) {
-        free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+    float *pool_mask_data =
+        needs_pool_mask ? (float *)malloc(mask_bytes) : NULL;
+    float *attn_mask_data =
+        needs_attn_mask ? (float *)malloc(mask_bytes) : NULL;
+    float *len_data = needs_pool_mask ? (float *)malloc(len_bytes) : NULL;
+    int *last_index_data =
+        last_token_pool ? (int *)malloc(last_index_bytes) : NULL;
+    if (!padded_ids ||
+        (needs_pool_mask && (!pool_mask_data || !len_data)) ||
+        (needs_attn_mask && !attn_mask_data)) {
+        free(padded_ids);
+        free(pool_mask_data);
+        free(attn_mask_data);
+        free(len_data);
+        free(last_index_data);
+        return -1;
+    }
+    if (last_token_pool && !last_index_data) {
+        free(padded_ids);
+        free(pool_mask_data);
+        free(attn_mask_data);
+        free(len_data);
         return -1;
     }
 
     for (int b = 0; b < batch; b++) {
-        if (has_padding) len_data[b] = (float)inputs[b].n_tokens;
+        if (needs_pool_mask) len_data[b] = (float)inputs[b].n_tokens;
+        if (last_token_pool) {
+            int index = inputs[b].n_tokens - 1;
+            for (int d = 0; d < hidden; d++)
+                last_index_data[(size_t)b * hidden + d] = index;
+        }
         for (int t = 0; t < max_seq; t++) {
             size_t idx = (size_t)b * max_seq + t;
             if (t < inputs[b].n_tokens) {
@@ -1410,19 +1474,24 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
                 if (id < 0 || id >= c->vocab_size) {
                     fprintf(stderr, "mlx: invalid token id %d at input %d position %d\n",
                             id, b, t);
-                    free(padded_ids); free(pool_mask_data);
-                    free(attn_mask_data); free(len_data);
+                    free(padded_ids);
+                    free(pool_mask_data);
+                    free(attn_mask_data);
+                    free(len_data);
+                    free(last_index_data);
                     return -1;
                 }
                 padded_ids[idx] = id;
-                if (has_padding) {
+                if (needs_pool_mask)
                     pool_mask_data[idx] = 1.0f;
+                if (needs_attn_mask)
                     attn_mask_data[idx] = 0.0f;
-                }
             } else {
                 padded_ids[idx] = 0;
-                pool_mask_data[idx] = 0.0f;
-                attn_mask_data[idx] = -1.0e9f;
+                if (needs_pool_mask)
+                    pool_mask_data[idx] = 0.0f;
+                if (needs_attn_mask)
+                    attn_mask_data[idx] = -1.0e9f;
             }
         }
     }
@@ -1431,33 +1500,42 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     int pool_mask_shape[] = {batch, max_seq, 1};
     int attn_mask_shape[] = {batch, 1, 1, max_seq};
     int len_shape[] = {batch, 1};
+    int last_index_shape[] = {batch, 1, hidden};
 
     mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
-    mlx_array pool_mask = has_padding
+    mlx_array pool_mask = needs_pool_mask
         ? mlx_array_new_data(pool_mask_data, pool_mask_shape, 3, MLX_FLOAT32)
         : (mlx_array){0};
-    mlx_array attn_mask = has_padding
+    mlx_array attn_mask = needs_attn_mask
         ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
         : (mlx_array){0};
-    mlx_array lengths = has_padding
+    mlx_array lengths = needs_pool_mask
         ? mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32)
         : (mlx_array){0};
+    mlx_array last_indices = last_token_pool
+        ? mlx_array_new_data(last_index_data, last_index_shape, 3, MLX_INT32)
+        : (mlx_array){0};
     free(padded_ids); free(pool_mask_data); free(attn_mask_data); free(len_data);
+    free(last_index_data);
 
-    if (!arr_ok(ids) || (has_padding && (!arr_ok(pool_mask) ||
-        !arr_ok(attn_mask) || !arr_ok(lengths)))) {
+    if (!arr_ok(ids) ||
+        (needs_pool_mask && (!arr_ok(pool_mask) || !arr_ok(lengths))) ||
+        (needs_attn_mask && !arr_ok(attn_mask)) ||
+        (last_token_pool && !arr_ok(last_indices))) {
         mlx_array_free(ids); mlx_array_free(pool_mask);
-        if (has_padding) mlx_array_free(attn_mask);
+        mlx_array_free(attn_mask);
         mlx_array_free(lengths);
+        mlx_array_free(last_indices);
         return -1;
     }
-    if (has_padding && mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
+    if (needs_attn_mask && mlx_weight_dtype(ctx) == MLX_BFLOAT16) {
         mlx_array attn_mask_bf16 = mlx_array_new();
         mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
         mlx_array_free(attn_mask);
         attn_mask = attn_mask_bf16;
         if (!arr_ok(attn_mask)) {
             mlx_array_free(ids); mlx_array_free(pool_mask); mlx_array_free(lengths);
+            mlx_array_free(last_indices);
             return -1;
         }
     }
@@ -1468,7 +1546,8 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_array_free(ids);
 
     /* 2. Transformer layers. */
-    x = mlx_forward_layers(ctx, x, batch, max_seq, has_padding, attn_mask,
+    x = mlx_forward_layers(ctx, x, batch, max_seq,
+                           needs_attn_mask, attn_mask,
                            0, c->n_layers);
 
     /* 3. Final RMSNorm. */
@@ -1477,7 +1556,18 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_array_free(x);
 
     mlx_array emb = mlx_array_new();
-    if (has_padding) {
+    if (last_token_pool) {
+        mlx_array selected = mlx_array_new();
+        mlx_take_along_axis(&selected, x_normed, last_indices, 1, S);
+        mlx_array_free(x_normed);
+        mlx_array_free(last_indices);
+        int emb_shape[] = {batch, hidden};
+        mlx_reshape(&emb, selected, emb_shape, 2, S);
+        mlx_array_free(selected);
+        mlx_array_free(pool_mask);
+        mlx_array_free(attn_mask);
+        mlx_array_free(lengths);
+    } else if (has_padding) {
         /* 4. Masked mean pool over T. */
         mlx_array masked = mlx_array_new();
         mlx_multiply(&masked, x_normed, pool_mask, S);
@@ -1508,7 +1598,18 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     int rc = -1;
     if (data) {
         memcpy(out_embeddings, data, out_bytes);
-        rc = 0;
+        if (c->normalize_embeddings) {
+            rc = 0;
+            for (int b = 0; b < batch; b++) {
+                if (embed_l2_normalize(
+                        out_embeddings + (size_t)b * hidden, hidden) != 0) {
+                    rc = -1;
+                    break;
+                }
+            }
+        } else {
+            rc = 0;
+        }
     }
     mlx_array_free(emb_f32);
     return rc;

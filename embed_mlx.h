@@ -108,7 +108,7 @@ EMBED_API int embed_mlx_encode_into(embed_mlx_ctx_t *ctx, const int *token_ids,
  * Compute a true padded dense batch on MLX.
  *
  * out_embeddings is caller-provided [batch, hidden_size].
- * Padded tokens are masked out of attention keys and mean pooling.
+ * Pooling and attention masking follow the loaded model configuration.
  * Returns 0 on success, -1 on error.
  */
 EMBED_API int embed_mlx_encode_batch(embed_mlx_ctx_t *ctx, const embed_input_t *inputs,

@@ -205,6 +205,7 @@ static void sbuf_free(sbuf *b) {
 typedef enum {
     MODEL_STD_06,
     MODEL_STD_4,
+    MODEL_QWEN3_06,
     MODEL_CTX_06,
     MODEL_CTX_4,
     MODEL_LATE_06,
@@ -222,16 +223,27 @@ typedef struct {
     const char *id;
     model_kind kind;
     int dim;
+    int min_dim;
     int token_dim;
     double price_per_mtok;
+    embed_attention_mode_t attention_mode;
+    embed_pooling_mode_t pooling_mode;
+    int normalize_embeddings;
 } model_info;
 
 static const model_info k_models[] = {
-    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 0, 0.004},
-    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 0, 0.030},
-    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 0, 0.008},
-    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 0, 0.050},
-    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 0.0},
+    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, 0.004,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, 0.030,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+    {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, 0.0,
+     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
+    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0, 0.008,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, 0.050,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128, 0.0,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
 };
 
 static model_slot model_slot_for_id(const char *id) {
@@ -253,6 +265,9 @@ typedef struct {
     int late_document_prefix_id;
     int late_skip_ids[64];
     int n_late_skip_ids;
+    int append_terminal_token;
+    int terminal_token_id;
+    int renormalize_truncated;
     embed_model_t *cpu_model;
     embed_workspace_t *cpu_ws;
     embed_late_model_t *cpu_late_model;
@@ -1100,8 +1115,8 @@ static const char *encoding_from_root(cJSON *root, cJSON *detail) {
     return encoding->valuestring;
 }
 
-static int dimensions_from_root(cJSON *root, cJSON *detail, int max_dim,
-                                const char *encoding) {
+static int dimensions_from_root(cJSON *root, cJSON *detail, int min_dim,
+                                int max_dim, const char *encoding) {
     int dims = max_dim;
     cJSON *dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
     if (dimensions) {
@@ -1110,9 +1125,11 @@ static int dimensions_from_root(cJSON *root, cJSON *detail, int max_dim,
                    "type_error.integer");
         } else {
             dims = dimensions->valueint;
-            if (dims < 128 || dims > max_dim) {
+            if (dims < min_dim || dims > max_dim) {
                 char msg[96];
-                snprintf(msg, sizeof(msg), "dimensions must be between 128 and %d", max_dim);
+                snprintf(msg, sizeof(msg),
+                         "dimensions must be between %d and %d",
+                         min_dim, max_dim);
                 ve_add(detail, "[\"body\",\"dimensions\"]", msg, "value_error.range");
             }
         }
@@ -1285,6 +1302,22 @@ static int tokenize_one(loaded_model *m, job *j, const char *text,
         memset(out, 0, sizeof(*out));
         return -1;
     }
+    if (m->append_terminal_token) {
+        if (out->n_tokens == INT_MAX) {
+            free(out->ids);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        int *ids = realloc(
+            out->ids, (size_t)(out->n_tokens + 1) * sizeof(*out->ids));
+        if (!ids) {
+            free(out->ids);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        out->ids = ids;
+        out->ids[out->n_tokens++] = m->terminal_token_id;
+    }
     return 0;
 }
 
@@ -1402,12 +1435,32 @@ static void set_response_from_buf(job *j, sbuf *b) {
     memset(b, 0, sizeof(*b));
 }
 
-static void render_embedding_response(embedding_request *r, const float *embs) {
+static int render_embedding_response(embedding_request *r, const float *embs) {
+    const int full_dim = r->model->info->dim;
+    const float *render_embs = embs;
+    float *truncated = NULL;
+    if (r->model->renormalize_truncated && r->dims < full_dim) {
+        truncated = xmalloc(
+            (size_t)r->n_inputs * r->dims * sizeof(*truncated));
+        for (int i = 0; i < r->n_inputs; i++) {
+            float *dst = truncated + (size_t)i * r->dims;
+            memcpy(dst, embs + (size_t)i * full_dim,
+                   (size_t)r->dims * sizeof(*dst));
+            if (embed_l2_normalize(dst, r->dims) != 0) {
+                free(truncated);
+                return -1;
+            }
+        }
+        render_embs = truncated;
+    }
+    int render_stride = truncated ? r->dims : full_dim;
+
     char **encoded = NULL;
     if (strcmp(r->encoding, "float")) {
         encoded = xcalloc((size_t)r->n_inputs, sizeof(*encoded));
         for (int i = 0; i < r->n_inputs; i++)
-            encoded[i] = encode_embedding(embs + (size_t)i * r->model->info->dim,
+            encoded[i] = encode_embedding(render_embs +
+                                          (size_t)i * render_stride,
                                           r->dims, r->encoding);
     }
 
@@ -1419,7 +1472,7 @@ static void render_embedding_response(embedding_request *r, const float *embs) {
             append_embedding_object(&b, i, encoded[i]);
         else
             append_float_embedding_object(&b, i,
-                embs + (size_t)i * r->model->info->dim, r->dims);
+                render_embs + (size_t)i * render_stride, r->dims);
     }
     double cost = ((double)r->total_tokens / 1000000.0) *
                   r->model->info->price_per_mtok;
@@ -1432,6 +1485,8 @@ static void render_embedding_response(embedding_request *r, const float *embs) {
 
     for (int i = 0; encoded && i < r->n_inputs; i++) free(encoded[i]);
     free(encoded);
+    free(truncated);
+    return 0;
 }
 
 static int embedding_request_compatible(const embedding_request *a,
@@ -1525,7 +1580,10 @@ static void execute_embedding_request_list(embedding_request **reqs, int n_reqs)
             job_set_error(reqs[i]->j, 500, "embedding failed", "server_error");
         } else {
             uint64_t t0 = nstime();
-            render_embedding_response(reqs[i], embs + (size_t)pos * dim);
+            if (render_embedding_response(
+                    reqs[i], embs + (size_t)pos * dim) != 0)
+                job_set_error(reqs[i]->j, 500, "embedding normalization failed",
+                              "server_error");
             reqs[i]->j->encode_ns += nstime() - t0;
         }
         pos += reqs[i]->n_inputs;
@@ -1736,9 +1794,10 @@ static int validate_common(cJSON *root, cJSON *detail, model_kind expected_kind,
         }
     }
     const char *enc = encoding_from_root(root, detail);
-    int max_dim = model_id && model_slot_for_id(model_id) != MODEL_UNKNOWN
-        ? k_models[model_slot_for_id(model_id)].dim : 2560;
-    int dims = dimensions_from_root(root, detail, max_dim, enc);
+    model_slot slot = model_id ? model_slot_for_id(model_id) : MODEL_UNKNOWN;
+    int min_dim = slot != MODEL_UNKNOWN ? k_models[slot].min_dim : 128;
+    int max_dim = slot != MODEL_UNKNOWN ? k_models[slot].dim : 2560;
+    int dims = dimensions_from_root(root, detail, min_dim, max_dim, enc);
     *out_encoding = enc;
     *out_dims = dims;
     return model_id && model_slot_for_id(model_id) != MODEL_UNKNOWN &&
@@ -2502,6 +2561,34 @@ static void process_job_group(http_server *s, job **jobs, int n_jobs) {
     free(std_reqs);
 }
 
+static int configure_loaded_model(loaded_model *m,
+                                  const embed_config_t *config,
+                                  int token_dim)
+{
+    if (!m || !m->info || !config ||
+        config->hidden_size != m->info->dim ||
+        token_dim != m->info->token_dim ||
+        config->attention_mode != m->info->attention_mode ||
+        config->pooling_mode != m->info->pooling_mode ||
+        config->normalize_embeddings != m->info->normalize_embeddings) {
+        if (m && m->info && config)
+            server_log("embed-server: model %s has incompatible config",
+                       m->info->id);
+        return -1;
+    }
+    if (config->append_terminal_token &&
+        (config->terminal_token_id < 0 ||
+         config->terminal_token_id >= config->vocab_size))
+        return -1;
+
+    m->append_terminal_token = config->append_terminal_token;
+    m->terminal_token_id = config->terminal_token_id;
+    m->renormalize_truncated =
+        config->normalize_embeddings &&
+        config->pooling_mode == EMBED_POOL_LAST_TOKEN;
+    return 0;
+}
+
 static void *worker_main(void *arg) {
     http_server *s = arg;
 #ifdef USE_MLX
@@ -2531,14 +2618,11 @@ static void *worker_main(void *arg) {
                 : embed_mlx_config(m->mlx_ctx);
             int token_dim = m->info->kind == MODEL_KIND_LATE
                 ? embed_mlx_late_token_dim(m->mlx_late_ctx) : 0;
-            if (config->hidden_size != m->info->dim ||
-                token_dim != m->info->token_dim ||
+            if (configure_loaded_model(m, config, token_dim) != 0 ||
                 (m->info->kind == MODEL_KIND_LATE &&
                  (m->late_mask_id >= config->vocab_size ||
                   m->late_query_prefix_id >= config->vocab_size ||
                   m->late_document_prefix_id >= config->vocab_size))) {
-                server_log("embed-server: model %s has unexpected dimension %d",
-                           m->info->id, config->hidden_size);
                 rc = 1;
                 break;
             }
@@ -2578,10 +2662,8 @@ static void *worker_main(void *arg) {
                 rc = 1;
                 break;
             }
-            if (embed_cuda_config(m->cuda_ctx)->hidden_size != m->info->dim) {
-                server_log("embed-server: model %s has unexpected dimension %d",
-                           m->info->id,
-                           embed_cuda_config(m->cuda_ctx)->hidden_size);
+            if (configure_loaded_model(
+                    m, embed_cuda_config(m->cuda_ctx), 0) != 0) {
                 rc = 1;
                 break;
             }
@@ -2665,6 +2747,7 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     loaded_model *m = &s->models[slot];
     m->info = &k_models[slot];
     m->path = xstrdup(path);
+    m->terminal_token_id = -1;
     char vocab_path[1024];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
     m->tok = qwen_tokenizer_load(vocab_path);
@@ -2751,10 +2834,7 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
         }
         config = embed_model_config(m->cpu_model);
     }
-    if (config->hidden_size != m->info->dim ||
-        token_dim != m->info->token_dim) {
-        server_log("embed-server: model %s has unexpected dimension %d",
-                   m->info->id, config->hidden_size);
+    if (configure_loaded_model(m, config, token_dim) != 0) {
         return -1;
     }
     if (m->info->kind == MODEL_KIND_LATE &&
