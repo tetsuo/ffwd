@@ -83,8 +83,8 @@ Late-interaction reranking endpoint:
 
 For Qwen3-Embedding models, `/v1/embeddings` accepts `dimensions` from 32 up to
 the model's output size (1024 for `Qwen3-Embedding-0.6B`, 2560 for
-`Qwen3-Embedding-4B`). Truncated Matryoshka embeddings are re-normalized before
-encoding.
+`Qwen3-Embedding-4B`, 4096 for `Qwen3-Embedding-8B`). Truncated Matryoshka
+embeddings are re-normalized before encoding.
 
 Example:
 
