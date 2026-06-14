@@ -1,0 +1,270 @@
+openapi: 3.0.3
+info:
+  title: embed.c server API
+  version: "1.0.0"
+  description: >
+    HTTP API served by `embed-server` for pplx-embed and Qwen3-Embedding models.
+    The endpoints follow the Perplexity API (pplx-embed) and the Qwen/DashScope
+    OpenAI-compatible API (Qwen3-Embedding). How an embedding is encoded on the
+    wire depends on the model family; see `encoding_format`. Always compare
+    embeddings with cosine similarity.
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:8000
+# Auth is optional: it applies only when the server is started with --api-key
+# (or EMBED_API_KEY). The empty requirement allows unauthenticated calls.
+security:
+  - {}
+  - bearerAuth: []
+paths:
+  /v1/embeddings:
+    post:
+      summary: Create pooled embeddings
+      operationId: createEmbeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmbeddingsRequest" }
+      responses:
+        "200":
+          description: One embedding per input, in request order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmbeddingsResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503": { $ref: "#/components/responses/ModelNotLoaded" }
+  /v1/contextualizedembeddings:
+    post:
+      summary: Create contextual (late-chunking) document embeddings
+      operationId: createContextualizedEmbeddings
+      description: >
+        Each document is a list of chunk strings. Chunks are embedded with
+        document-level context and returned per document, per chunk, in order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ContextualRequest" }
+      responses:
+        "200":
+          description: One list of chunk embeddings per document, in order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContextualResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503": { $ref: "#/components/responses/ModelNotLoaded" }
+  /v1/rerank:
+    post:
+      summary: Late-interaction (MaxSim) reranking
+      operationId: rerank
+      description: >
+        Scores each document against the query with token-level MaxSim and
+        returns documents ranked by raw score (not a probability).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RerankRequest" }
+      responses:
+        "200":
+          description: Documents ranked by descending relevance score.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RerankResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "503": { $ref: "#/components/responses/ModelNotLoaded" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Single shared token set with --api-key. Not a real auth system;
+        terminate TLS and authenticate at a reverse proxy in production.
+  schemas:
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          example: Qwen3-Embedding-0.6B
+        input:
+          description: A single string or an array of up to 512 strings.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+              minItems: 1
+              maxItems: 512
+        encoding_format:
+          type: string
+          description: >
+            Output encoding, validated against the model's API family.
+            Qwen3-Embedding accepts `float` (default; true float32) and `base64`
+            (base64 of little-endian float32). pplx-embed accepts `base64_int8`
+            (default), `base64_binary` (sign bits, needs `dimensions` divisible
+            by 8), and `float` (the int8-decoded view). A format outside the
+            model's family returns 422.
+          enum: [float, base64, base64_int8, base64_binary]
+        dimensions:
+          type: integer
+          description: >
+            Matryoshka truncation, from the model minimum (32 for Qwen3, 128 for
+            pplx) up to the model's native dimension. Truncated vectors are
+            re-normalized.
+    EmbeddingsResponse:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Embedding" }
+        model: { type: string }
+        usage: { $ref: "#/components/schemas/Usage" }
+    Embedding:
+      type: object
+      properties:
+        object: { type: string, example: embedding }
+        index: { type: integer }
+        embedding:
+          description: >
+            A float array when `encoding_format` is `float`, otherwise a base64
+            string (`base64`, `base64_int8`, or `base64_binary`).
+          oneOf:
+            - type: array
+              items: { type: number, format: float }
+            - type: string
+    ContextualRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          example: pplx-embed-context-v1-0.6b
+        input:
+          description: Array of documents; each document is an array of chunk strings.
+          type: array
+          items:
+            type: array
+            items: { type: string }
+            minItems: 1
+        encoding_format:
+          type: string
+          enum: [float, base64, base64_int8, base64_binary]
+        dimensions: { type: integer }
+    ContextualResponse:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        data:
+          type: array
+          description: One entry per document, in request order.
+          items:
+            type: object
+            properties:
+              object: { type: string, example: list }
+              index: { type: integer }
+              data:
+                type: array
+                description: One embedding per chunk, in document order.
+                items: { $ref: "#/components/schemas/Embedding" }
+        model: { type: string }
+        usage: { $ref: "#/components/schemas/Usage" }
+    RerankRequest:
+      type: object
+      required: [model, query, documents]
+      properties:
+        model:
+          type: string
+          example: pplx-embed-v1-late-0.6b
+        query: { type: string }
+        documents:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 1000
+        top_n:
+          type: integer
+          description: Number of results to return. Defaults to all. `top_k` is an alias.
+        top_k:
+          type: integer
+        return_documents:
+          type: boolean
+          default: false
+          description: Include the source document text in each result.
+      additionalProperties: false
+    RerankResponse:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        model: { type: string }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+                description: Index of the document in the request array.
+              relevance_score:
+                type: number
+                format: float
+                description: Raw MaxSim score (not a probability).
+              document:
+                type: string
+                description: Present only when `return_documents` is true.
+        usage:
+          type: object
+          properties:
+            query_tokens: { type: integer }
+            document_tokens: { type: integer }
+            total_tokens: { type: integer }
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        total_tokens: { type: integer }
+        cost:
+          type: object
+          description: pplx-embed only; Qwen3-Embedding omits it.
+          properties:
+            input_cost: { type: number }
+            total_cost: { type: number }
+            currency: { type: string, example: USD }
+    ValidationDetail:
+      type: object
+      properties:
+        loc:
+          type: array
+          description: Path to the offending field, e.g. ["body","input",0].
+          items: {}
+        msg: { type: string }
+        type: { type: string }
+    ValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items: { $ref: "#/components/schemas/ValidationDetail" }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type: { type: string }
+  responses:
+    ValidationError:
+      description: Request body failed validation.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ValidationError" }
+    ModelNotLoaded:
+      description: The model ID is valid for this build but is not loaded.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

@@ -1,20 +1,16 @@
 # embed.c
 
-`embed.c` implements inference for:
-
-- [pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed)
-  dense, contextual, and late-interaction models
-- [Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding)
-  causal, last-token pooled models
-
-Supported platforms are CUDA/cuBLAS on Linux/NVIDIA, Apple Silicon MLX, and
-CPU/BLAS.
+`embed.c` implements inference for the
+[pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed) and
+[Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding) text
+embedding models. It also serves these models via an
+OpenAI/Perplexity-compatible HTTP API.
 
 ## Building
 
 **Prerequisites**:
 
-- On Linux, install `libcjson-dev`, `libcjson1`, and `libopenblas-dev`.
+- On Linux, install `libcjson-dev`, and `libopenblas-dev`.
 - On macOS, install `cjson`, `mlx` and `mlx-c` via Homebrew.
 
 **Makefile targets**:
@@ -23,30 +19,34 @@ CPU/BLAS.
 - Run `make cpu` to build the CPU backend only (BLAS: Accelerate on macOS,
   OpenBLAS on Linux).
 
-## Usage
-
-### embed
+## embed
 
 Pass one text to get its embedding, two or more to get a cosine similarity
 matrix:
 
 ```bash
-./embed -d ./model "What is the capital of France?"
-./embed -d ./model "What is the capital of France?" \
+./embed -d ./pplx-embed-v1-0.6b "What is the capital of France?"
+./embed -d ./pplx-embed-v1-0.6b "What is the capital of France?" \
   "Paris is the capital of France." \
   "Berlin is the capital of Germany."
 ```
 
-Qwen3 retrieval queries benefit from an explicit task instruction. Documents are
-embedded directly:
+With Qwen3, prefix the retrieval query with a task instruction and embed
+documents as-is. Pass them together to rank the documents against the query (the
+query is the first row of the similarity matrix):
 
 ```bash
+# arg 1: the query, with Qwen3's instruction prefix
+# args 2+: documents
 ./embed -d ./Qwen3-Embedding-0.6B \
-  $'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: What is the capital of China?'
+  $'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: What is the capital of China?' \
+  "Beijing is the capital of China." \
+  "The Great Wall is a famous landmark."
 ```
 
-The Qwen3 tokenizer terminal token is appended automatically by the CLI and
-server. Qwen3 embeddings are L2-normalized; pplx embeddings remain unnormalized.
+> pplx-embed vectors are unnormalized, so rank them with cosine similarity.
+> Qwen3-Embedding vectors are L2-normalized, so cosine similarity and dot
+> product give the same ranking.
 
 Pipe in lines and use `--stream` to get one JSON embedding per line:
 
@@ -61,50 +61,166 @@ similarity matrix.
 Use `--mlx` or `--cuda` to select a GPU backend (build-dependent). Default is
 CPU. `-t` sets thread count, `-b` sets batch size, `-v` enables verbose output.
 
-### embed-server
+## embed-server
 
-Serves the HTTP API. Takes one or more `--model ID=DIR` pairs:
+Serves the Perplexity/OpenAI-compatible HTTP API. Takes one or more
+`--model ID=DIR` pairs:
 
 ```bash
 ./embed-server \
   --model pplx-embed-v1-0.6b=./model \
+  --model pplx-embed-context-v1-0.6b=./context-model \
   --model Qwen3-Embedding-0.6B=./qwen3-model \
   --port 8000
 ```
 
-Perplexity API compatible endpoints:
+### API
 
-- `POST /v1/embeddings` — pooled embeddings
-- `POST /v1/contextualizedembeddings` — contextual document embeddings
+Every request body takes a `model` parameter and returns results in input order.
 
-Late-interaction reranking endpoint:
+| Endpoint                            | Returns                          |
+| ----------------------------------- | -------------------------------- |
+| `POST /v1/embeddings`               | one pooled embedding per input   |
+| `POST /v1/contextualizedembeddings` | one embedding per document chunk |
+| `POST /v1/rerank`                   | documents ranked by MaxSim score |
 
-- `POST /v1/rerank` — late-interaction MaxSim reranking
-
-For Qwen3-Embedding models, `/v1/embeddings` accepts `dimensions` from 32 up to
-the model's output size (1024 for `Qwen3-Embedding-0.6B`, 2560 for
-`Qwen3-Embedding-4B`, 4096 for `Qwen3-Embedding-8B`). Truncated Matryoshka
-embeddings are re-normalized before encoding.
-
-`encoding_format` follows each model's API family. Qwen3-Embedding models are
-OpenAI-compatible: it defaults to `float` (the true float32 vector) and also
-accepts `base64` (base64-encoded float32). pplx-embed models default to
-`base64_int8` and also accept `base64_binary` and `float` (the decoded int8
-view). Always compare embeddings with cosine similarity.
-
-Example:
+#### POST /v1/embeddings
 
 ```bash
-./embed-server --model pplx-embed-v1-late-0.6b=./model
-# can be tested with:
-curl -s http://127.0.0.1:8000/v1/rerank \
-  -H 'Content-Type: application/json' \
+curl http://127.0.0.1:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
   -d '{
-    "model":"pplx-embed-v1-late-0.6b",
-    "query":"scientific curiosity",
-    "documents":["Scientists explore from curiosity.","SQLite stores data."]
+    "model": "Qwen3-Embedding-0.6B",
+    "input": [
+      "What is the capital of France?",
+      "Paris is the capital of France."
+    ]
   }'
 ```
+
+Returns a list of embeddings, one per input text:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"object": "embedding", "index": 0, "embedding": [0.013, -0.021, ...]},
+    {"object": "embedding", "index": 1, "embedding": [0.046, 0.009, ...]}
+  ],
+  "model": "Qwen3-Embedding-0.6B",
+  "usage": {"prompt_tokens": 16, "total_tokens": 16}
+}
+```
+
+| Field             | Type            | Description                                             |
+| ----------------- | --------------- | ------------------------------------------------------- |
+| `input`           | string or array | One text, or up to 512 texts. Required.                 |
+| `dimensions`      | integer         | Truncate the embedding (Matryoshka), 32 up to its size. |
+| `encoding_format` | string          | Output encoding (see below).                            |
+
+**Encoding format:**
+
+`encoding_format` follows the model family:
+
+- Qwen3-Embedding (OpenAI-compatible) defaults to `float` (the true float32
+  vector) and also accepts `base64` (base64 of float32).
+- pplx-embed (Perplexity-compatible) defaults to `base64_int8` and also accepts
+  `base64_binary` and `float` (the decoded int8 view).
+
+#### POST /v1/contextualizedembeddings
+
+`input` is a list of documents, each a list of chunk strings. Every chunk is
+embedded with its document as context, and the results are grouped the same way:
+one list per document, one embedding per chunk.
+
+```bash
+curl http://127.0.0.1:8000/v1/contextualizedembeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "pplx-embed-context-v1-0.6b",
+    "input": [
+      ["Intro paragraph.", "Methods paragraph."],
+      ["A single-chunk note."]
+    ]
+  }'
+```
+
+Returns a list of chunk embeddings per document, in order:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "list",
+      "index": 0,
+      "data": [
+        { "object": "embedding", "index": 0, "embedding": "<base64>" },
+        { "object": "embedding", "index": 1, "embedding": "<base64>" }
+      ]
+    },
+    {
+      "object": "list",
+      "index": 1,
+      "data": [{ "object": "embedding", "index": 0, "embedding": "<base64>" }]
+    }
+  ],
+  "model": "pplx-embed-context-v1-0.6b",
+  "usage": { "prompt_tokens": 12, "total_tokens": 12 }
+}
+```
+
+#### POST /v1/rerank
+
+Scores each document against the query with token-level MaxSim and returns
+documents ranked by raw score.
+
+```bash
+curl http://127.0.0.1:8000/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "pplx-embed-v1-late-0.6b",
+    "query": "scientific curiosity",
+    "documents": [
+      "Scientists explore from curiosity.",
+      "SQLite stores data."
+    ]
+  }'
+```
+
+Documents ranked by descending relevance score:
+
+```json
+{
+  "object": "list",
+  "model": "pplx-embed-v1-late-0.6b",
+  "results": [
+    { "index": 0, "relevance_score": 2.14 },
+    { "index": 1, "relevance_score": 0.87 }
+  ],
+  "usage": { "query_tokens": 3, "document_tokens": 8, "total_tokens": 11 }
+}
+```
+
+- `documents` takes up to 1000 strings. `top_n` caps the number of results
+  (default: all); `return_documents: true` echoes each document text.
+- Scores are raw MaxSim values, not probabilities.
+
+#### Limits and errors
+
+- A request allows up to 512 inputs (1000 documents for `/v1/rerank`), 32768
+  tokens per item, 120000 tokens total, and a 64 MiB body.
+- Invalid input returns `422` with a `detail` list naming the offending field; a
+  registered model that is not loaded returns `503`.
+
+#### Deployment
+
+The server runs one inference worker and serves one in-flight request per
+connection (HTTP/1.1 keep-alive).
+
+For concurrency and availability, run several processes behind a load balancer
+and route by model ID; keep one large model per process. Terminate TLS and
+authenticate requests at the proxy.
 
 ## Acknowledgements
 
@@ -120,3 +236,7 @@ curl -s http://127.0.0.1:8000/v1/rerank \
   models were developed by the Perplexity AI research team.
 - The [Qwen3-Embedding](https://qwen.ai/blog?id=qwen3-embedding) models are part
   of the Qwen model family from Alibaba.
+
+## License
+
+MIT
