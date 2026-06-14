@@ -647,7 +647,14 @@ int main(int argc, char *argv[])
         e.dim = config->hidden_size;
     }
     e.append_terminal_token = config->append_terminal_token;
-    e.terminal_token_id = config->terminal_token_id;
+    /* The appended terminal token is the tokenizer's <|endoftext|>, resolved
+     * like the contextual separator: a vocab that defines it (test models)
+     * wins; otherwise the released-model family constant applies. */
+    if (e.append_terminal_token) {
+        int eot = qwen_tokenizer_token_id(tok, "<|endoftext|>");
+        e.terminal_token_id =
+            eot >= 0 ? eot : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+    }
     if (verbose >= 1)
         fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
                 e.dim, now_ms() - t0,

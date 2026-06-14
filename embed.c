@@ -239,14 +239,12 @@ static int parse_config(embed_config_t *cfg, const char *model_dir)
     cfg->pooling_mode     = EMBED_POOL_MEAN;
     cfg->normalize_embeddings = 0;
     cfg->append_terminal_token = 0;
-    cfg->terminal_token_id = -1;
 
     if (json_string_equals(buf, "model_type", "qwen3")) {
         cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
         cfg->pooling_mode = EMBED_POOL_LAST_TOKEN;
         cfg->normalize_embeddings = 1;
         cfg->append_terminal_token = 1;
-        cfg->terminal_token_id = json_get_int(buf, "eos_token_id", -1);
     }
 
     cfg->q_dim = 0;
@@ -267,10 +265,7 @@ static int parse_config(embed_config_t *cfg, const char *model_dir)
         cfg->vocab_size <= 0 || cfg->q_dim <= 0 || cfg->kv_dim <= 0 ||
         (cfg->head_dim & 1) || cfg->n_heads % cfg->n_kv_heads != 0 ||
         !isfinite(cfg->rms_norm_eps) || cfg->rms_norm_eps <= 0.0f ||
-        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f ||
-        (cfg->append_terminal_token &&
-         (cfg->terminal_token_id < 0 ||
-          cfg->terminal_token_id >= cfg->vocab_size))) {
+        !isfinite(cfg->rope_theta) || cfg->rope_theta <= 0.0f) {
         fprintf(stderr, "embed_model_load: invalid config in %s "
                 "(hidden=%d, layers=%d, heads=%d/%d, head_dim=%d, inter=%d)\n",
                 path, cfg->hidden_size, cfg->n_layers, cfg->n_heads,

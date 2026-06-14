@@ -206,6 +206,7 @@ typedef enum {
     MODEL_STD_06,
     MODEL_STD_4,
     MODEL_QWEN3_06,
+    MODEL_QWEN3_4,
     MODEL_CTX_06,
     MODEL_CTX_4,
     MODEL_LATE_06,
@@ -237,6 +238,8 @@ static const model_info k_models[] = {
     {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, 0.030,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
     {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, 0.0,
+     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
+    {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0, 0.0,
      EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
     {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0, 0.008,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
@@ -2576,13 +2579,8 @@ static int configure_loaded_model(loaded_model *m,
                        m->info->id);
         return -1;
     }
-    if (config->append_terminal_token &&
-        (config->terminal_token_id < 0 ||
-         config->terminal_token_id >= config->vocab_size))
-        return -1;
-
     m->append_terminal_token = config->append_terminal_token;
-    m->terminal_token_id = config->terminal_token_id;
+    /* m->terminal_token_id is resolved from the tokenizer in load_one_model. */
     m->renormalize_truncated =
         config->normalize_embeddings &&
         config->pooling_mode == EMBED_POOL_LAST_TOKEN;
@@ -2769,6 +2767,10 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
     m->context_separator_id = sep_id >= 0
         ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+    /* Qwen3-Embedding pools the last token, the tokenizer's <|endoftext|>
+     * suffix - the same token as the separator, not the model's chat
+     * eos_token_id (<|im_end|>). Resolve it here from the tokenizer. */
+    m->terminal_token_id = m->context_separator_id;
     if (m->info->kind == MODEL_KIND_LATE) {
         int id = qwen_tokenizer_token_id(m->tok, "[MASK]");
         m->late_mask_id = id >= 0 ? id : EMBED_LATE_MASK_TOKEN_ID;

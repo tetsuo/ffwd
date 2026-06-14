@@ -57,8 +57,13 @@ typedef struct {
     embed_attention_mode_t attention_mode;
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;
+    /* Qwen3-Embedding pools the last token, which is the tokenizer's
+     * <|endoftext|> suffix added by its post-processor - not the model's chat
+     * eos_token_id (<|im_end|>). Text frontends append it and resolve the id
+     * from the tokenizer exactly like the contextual separator
+     * (EMBED_CONTEXT_SEPARATOR_TOKEN_ID is the released-model fallback). The
+     * model forward consumes token ids exactly and never appends. */
     int append_terminal_token;
-    int terminal_token_id;
 } embed_config_t;
 
 /* ========================================================================

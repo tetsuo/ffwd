@@ -40,8 +40,7 @@ int main(void)
     }
     if (cfg->attention_mode != EMBED_ATTENTION_CAUSAL ||
         cfg->pooling_mode != EMBED_POOL_LAST_TOKEN ||
-        !cfg->normalize_embeddings || !cfg->append_terminal_token ||
-        cfg->terminal_token_id != 15) {
+        !cfg->normalize_embeddings || !cfg->append_terminal_token) {
         fprintf(stderr, "Qwen3 config semantics were not detected\n");
         return 1;
     }

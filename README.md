@@ -81,8 +81,10 @@ Late-interaction reranking endpoint:
 
 - `POST /v1/rerank` — late-interaction MaxSim reranking
 
-For `Qwen3-Embedding-0.6B`, `/v1/embeddings` accepts `dimensions` from 32
-to 1024. Truncated Matryoshka embeddings are re-normalized before encoding.
+For Qwen3-Embedding models, `/v1/embeddings` accepts `dimensions` from 32 up to
+the model's output size (1024 for `Qwen3-Embedding-0.6B`, 2560 for
+`Qwen3-Embedding-4B`). Truncated Matryoshka embeddings are re-normalized before
+encoding.
 
 Example:
 
