@@ -221,6 +221,18 @@ typedef enum {
     MODEL_KIND_LATE
 } model_kind;
 
+/* Which embedding API a model speaks. pplx-embed models follow the Perplexity
+ * API: the canonical output is the tanh int8 quantization, so the default
+ * encoding is base64_int8 and "float" is the int8-decoded view (int8/128).
+ * Qwen3-Embedding models follow the Qwen/DashScope API, which is OpenAI-
+ * compatible: "float" is the true float32 vector and "base64" is base64 of
+ * little-endian float32. int8 quantization underuses the range of Qwen3's
+ * L2-normalized vectors, so it is never the Qwen3 wire format. */
+typedef enum {
+    EMBED_API_PERPLEXITY = 0,
+    EMBED_API_OPENAI = 1,
+} embedding_api_t;
+
 typedef struct {
     const char *id;
     model_kind kind;
@@ -231,25 +243,26 @@ typedef struct {
     embed_attention_mode_t attention_mode;
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;
+    embedding_api_t api;
 } model_info;
 
 static const model_info k_models[] = {
     {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, 0.004,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
     {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, 0.030,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
     {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, 0.0,
-     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
+     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
     {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0, 0.0,
-     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
+     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
     {"Qwen3-Embedding-8B", MODEL_KIND_STANDARD, 4096, 32, 0, 0.0,
-     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1},
+     EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
     {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0, 0.008,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
     {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, 0.050,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
     {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128, 0.0,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
 };
 
 static model_slot model_slot_for_id(const char *id) {
@@ -1102,23 +1115,34 @@ static bool cjson_is_integer(cJSON *item) {
     return d >= (double)INT_MIN && d <= (double)INT_MAX && d == (double)i;
 }
 
-static const char *encoding_from_root(cJSON *root, cJSON *detail) {
+static const char *encoding_from_root(cJSON *root, cJSON *detail,
+                                      embedding_api_t api) {
+    /* Default and accepted encodings follow the model's API family: Perplexity
+     * defaults to base64_int8 and accepts {base64_int8, base64_binary, float};
+     * OpenAI/DashScope (Qwen3) defaults to float and accepts {float, base64}. */
+    const char *dflt = api == EMBED_API_OPENAI ? "float" : "base64_int8";
     cJSON *encoding = cJSON_GetObjectItemCaseSensitive(root, "encoding_format");
-    if (!encoding) return "base64_int8";
+    if (!encoding) return dflt;
     if (!cJSON_IsString(encoding) || !encoding->valuestring) {
         ve_add(detail, "[\"body\",\"encoding_format\"]",
                "encoding_format must be a string", "type_error.string");
-        return "base64_int8";
+        return dflt;
     }
-    if (strcmp(encoding->valuestring, "base64_int8") &&
-        strcmp(encoding->valuestring, "base64_binary") &&
-        strcmp(encoding->valuestring, "float")) {
+    const char *v = encoding->valuestring;
+    int ok = api == EMBED_API_OPENAI
+                 ? (!strcmp(v, "float") || !strcmp(v, "base64"))
+                 : (!strcmp(v, "base64_int8") || !strcmp(v, "base64_binary") ||
+                    !strcmp(v, "float"));
+    if (!ok) {
         ve_add(detail, "[\"body\",\"encoding_format\"]",
-               "value is not a valid enum member; permitted: 'base64_int8', 'base64_binary', 'float'",
+               api == EMBED_API_OPENAI
+                   ? "value is not a valid enum member; permitted: 'float', 'base64'"
+                   : "value is not a valid enum member; permitted: "
+                     "'base64_int8', 'base64_binary', 'float'",
                "enum");
-        return "base64_int8";
+        return dflt;
     }
-    return encoding->valuestring;
+    return v;
 }
 
 static int dimensions_from_root(cJSON *root, cJSON *detail, int min_dim,
@@ -1175,6 +1199,18 @@ static signed char quantize_int8_tanh(float x) {
 }
 
 static char *encode_embedding(const float *emb, int dims, const char *encoding) {
+    if (!strcmp(encoding, "base64")) {
+        /* OpenAI/DashScope (Qwen3): base64 of the raw little-endian float32
+         * vector. Copy through a byte buffer instead of reinterpret-casting the
+         * float pointer; x86_64 and aarch64 are little-endian, so the bytes
+         * match the wire format with no swap. */
+        size_t nbytes = (size_t)dims * sizeof(float);
+        unsigned char *buf = xmalloc(nbytes);
+        memcpy(buf, emb, nbytes);
+        char *out = base64_encode(buf, nbytes);
+        free(buf);
+        return out;
+    }
     if (!strcmp(encoding, "base64_binary")) {
         size_t bytes = (size_t)dims / 8;
         unsigned char *bits = xcalloc(bytes, 1);
@@ -1422,15 +1458,29 @@ static void append_embedding_object(sbuf *b, int index, const char *embedding) {
     sbuf_puts(b, "\"}");
 }
 
-static void append_float_embedding_object(sbuf *b, int index,
-                                          const float *emb, int dims) {
-    sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", index);
-    for (int i = 0; i < dims; i++) {
-        if (i) sbuf_putc(b, ',');
-        float v = (float)quantize_int8_tanh(emb[i]) / 128.0f;
-        sbuf_printf(b, "%.9g", (double)v);
+/* Emit one embedding into the response, following the model's API family.
+ * "float" renders a JSON array: the true float32 vector for OpenAI/DashScope
+ * (Qwen3), or the int8-decoded view (int8/128) for Perplexity (pplx). Every
+ * other encoding renders a base64 string via encode_embedding(). */
+static void append_embedding_value(sbuf *b, int index, const float *emb,
+                                   int dims, const char *encoding,
+                                   embedding_api_t api) {
+    if (!strcmp(encoding, "float")) {
+        sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[",
+                    index);
+        for (int i = 0; i < dims; i++) {
+            if (i) sbuf_putc(b, ',');
+            float v = api == EMBED_API_OPENAI
+                          ? emb[i]
+                          : (float)quantize_int8_tanh(emb[i]) / 128.0f;
+            sbuf_printf(b, "%.9g", (double)v);
+        }
+        sbuf_puts(b, "]}");
+        return;
     }
-    sbuf_puts(b, "]}");
+    char *encoded = encode_embedding(emb, dims, encoding);
+    append_embedding_object(b, index, encoded);
+    free(encoded);
 }
 
 static void set_response_from_buf(job *j, sbuf *b) {
@@ -1460,37 +1510,33 @@ static int render_embedding_response(embedding_request *r, const float *embs) {
         render_embs = truncated;
     }
     int render_stride = truncated ? r->dims : full_dim;
-
-    char **encoded = NULL;
-    if (strcmp(r->encoding, "float")) {
-        encoded = xcalloc((size_t)r->n_inputs, sizeof(*encoded));
-        for (int i = 0; i < r->n_inputs; i++)
-            encoded[i] = encode_embedding(render_embs +
-                                          (size_t)i * render_stride,
-                                          r->dims, r->encoding);
-    }
+    embedding_api_t api = r->model->info->api;
 
     sbuf b = {0};
     sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");
     for (int i = 0; i < r->n_inputs; i++) {
         if (i) sbuf_putc(&b, ',');
-        if (encoded)
-            append_embedding_object(&b, i, encoded[i]);
-        else
-            append_float_embedding_object(&b, i,
-                render_embs + (size_t)i * render_stride, r->dims);
+        append_embedding_value(&b, i, render_embs + (size_t)i * render_stride,
+                               r->dims, r->encoding, api);
     }
-    double cost = ((double)r->total_tokens / 1000000.0) *
-                  r->model->info->price_per_mtok;
-    sbuf_printf(&b,
-        "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
-        "\"total_tokens\":%d,\"cost\":{\"input_cost\":%.10g,"
-        "\"total_cost\":%.10g,\"currency\":\"USD\"}}}",
-        r->model->info->id, r->total_tokens, r->total_tokens, cost, cost);
+    /* Perplexity reports a per-request cost block; OpenAI/DashScope (Qwen3)
+     * usage is just the token counts, so keep the Qwen3 envelope OpenAI-shaped. */
+    if (api == EMBED_API_OPENAI) {
+        sbuf_printf(&b,
+            "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
+            "\"total_tokens\":%d}}",
+            r->model->info->id, r->total_tokens, r->total_tokens);
+    } else {
+        double cost = ((double)r->total_tokens / 1000000.0) *
+                      r->model->info->price_per_mtok;
+        sbuf_printf(&b,
+            "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
+            "\"total_tokens\":%d,\"cost\":{\"input_cost\":%.10g,"
+            "\"total_cost\":%.10g,\"currency\":\"USD\"}}}",
+            r->model->info->id, r->total_tokens, r->total_tokens, cost, cost);
+    }
     set_response_from_buf(r->j, &b);
 
-    for (int i = 0; encoded && i < r->n_inputs; i++) free(encoded[i]);
-    free(encoded);
     free(truncated);
     return 0;
 }
@@ -1612,14 +1658,8 @@ static void render_contextual_response(contextual_request *r,
         for (int ci = 0; ci < r->docs[di].n_spans; ci++) {
             if (ci) sbuf_putc(&b, ',');
             const float *emb = embs + (size_t)span_offset * r->model->info->dim;
-            if (!strcmp(r->encoding, "float")) {
-                append_float_embedding_object(&b, ci,
-                                              emb, r->dims);
-            } else {
-                char *encoded = encode_embedding(emb, r->dims, r->encoding);
-                append_embedding_object(&b, ci, encoded);
-                free(encoded);
-            }
+            append_embedding_value(&b, ci, emb, r->dims, r->encoding,
+                                   r->model->info->api);
             span_offset++;
         }
         sbuf_puts(&b, "]}");
@@ -1799,8 +1839,10 @@ static int validate_common(cJSON *root, cJSON *detail, model_kind expected_kind,
             }
         }
     }
-    const char *enc = encoding_from_root(root, detail);
     model_slot slot = model_id ? model_slot_for_id(model_id) : MODEL_UNKNOWN;
+    embedding_api_t api = slot != MODEL_UNKNOWN ? k_models[slot].api
+                                                : EMBED_API_PERPLEXITY;
+    const char *enc = encoding_from_root(root, detail, api);
     int min_dim = slot != MODEL_UNKNOWN ? k_models[slot].min_dim : 128;
     int max_dim = slot != MODEL_UNKNOWN ? k_models[slot].dim : 2560;
     int dims = dimensions_from_root(root, detail, min_dim, max_dim, enc);

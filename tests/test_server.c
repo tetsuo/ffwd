@@ -82,6 +82,68 @@ static void test_encode_embedding_binary(void)
     free(want);
 }
 
+static void test_encode_embedding_base64_float32(void)
+{
+    /* OpenAI/DashScope "base64" is base64 of the raw little-endian float32
+     * vector - lossless, unlike the int8 formats. */
+    float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
+    /* Reference bytes via memcpy: a float->byte reinterpret cast confuses the
+     * static analyzer's uninitialized-read model. */
+    unsigned char bytes[sizeof emb];
+    memcpy(bytes, emb, sizeof emb);
+    char *want = base64_encode(bytes, sizeof emb);
+    char *got = encode_embedding(emb, 4, "base64");
+    TEST_ASSERT(strcmp(got, want) == 0);
+    free(got);
+    free(want);
+}
+
+static void test_append_embedding_value_float(void)
+{
+    float emb[1] = {0.5f};
+
+    /* OpenAI/DashScope (Qwen3): the true float32 value. */
+    sbuf b = {0};
+    append_embedding_value(&b, 0, emb, 1, "float", EMBED_API_OPENAI);
+    TEST_ASSERT(strstr(b.ptr, "\"embedding\":[0.5]") != NULL);
+    sbuf_free(&b);
+
+    /* Perplexity: the int8-decoded view, round(tanh(0.5)*127)/128 = 59/128. */
+    sbuf b2 = {0};
+    append_embedding_value(&b2, 0, emb, 1, "float", EMBED_API_PERPLEXITY);
+    TEST_ASSERT(strstr(b2.ptr, "0.4609375") != NULL);
+    sbuf_free(&b2);
+}
+
+static void test_encoding_from_root_family(void)
+{
+    cJSON *detail = cJSON_CreateArray();
+
+    /* Default encoding differs by family when the field is absent. */
+    cJSON *empty = cJSON_CreateObject();
+    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_OPENAI),
+                       "float") == 0);
+    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_PERPLEXITY),
+                       "base64_int8") == 0);
+    cJSON_Delete(empty);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
+
+    /* OpenAI rejects int8 formats; Perplexity rejects the OpenAI base64. */
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "encoding_format", "base64_int8");
+    encoding_from_root(o, detail, EMBED_API_OPENAI);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 1);
+    cJSON_Delete(o);
+
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddStringToObject(p, "encoding_format", "base64");
+    encoding_from_root(p, detail, EMBED_API_PERPLEXITY);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 2);
+    cJSON_Delete(p);
+
+    cJSON_Delete(detail);
+}
+
 static void test_collect_job_batch_deadline(void)
 {
     http_server s;
@@ -849,6 +911,9 @@ int main(void)
     test_quantize_int8_tanh();
     test_encode_embedding_int8();
     test_encode_embedding_binary();
+    test_encode_embedding_base64_float32();
+    test_append_embedding_value_float();
+    test_encoding_from_root_family();
     test_collect_job_batch_deadline();
     test_collect_job_batch_zero_wait();
     test_http_server();

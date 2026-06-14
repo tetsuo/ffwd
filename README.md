@@ -86,6 +86,12 @@ the model's output size (1024 for `Qwen3-Embedding-0.6B`, 2560 for
 `Qwen3-Embedding-4B`, 4096 for `Qwen3-Embedding-8B`). Truncated Matryoshka
 embeddings are re-normalized before encoding.
 
+`encoding_format` follows each model's API family. Qwen3-Embedding models are
+OpenAI-compatible: it defaults to `float` (the true float32 vector) and also
+accepts `base64` (base64-encoded float32). pplx-embed models default to
+`base64_int8` and also accept `base64_binary` and `float` (the decoded int8
+view). Always compare embeddings with cosine similarity.
+
 Example:
 
 ```bash
