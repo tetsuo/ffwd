@@ -449,32 +449,6 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
             batch_size = atoi(argv[++arg_start]);
         }
-        else if (!strcmp(f, "--backend")) {
-            const char *backend = argv[++arg_start];
-            if (!strcmp(backend, "mlx")) {
-#ifdef USE_MLX
-                use_mlx = 1;
-                use_cuda = 0;
-#else
-                fprintf(stderr, "mlx backend not available (build with: make metal)\n");
-                return 1;
-#endif
-            } else if (!strcmp(backend, "cuda")) {
-#ifdef USE_CUDA
-                use_cuda = 1;
-                use_mlx = 0;
-#else
-                fprintf(stderr, "cuda backend not available (build with: make cuda)\n");
-                return 1;
-#endif
-            } else if (!strcmp(backend, "cpu")) {
-                use_mlx = 0;
-                use_cuda = 0;
-            } else {
-                fprintf(stderr, "invalid --backend: %s\n", backend);
-                return 1;
-            }
-        }
         else if (!strcmp(f, "--mlx-quant-bits")) {
             mlx_quantize_bits = atoi(argv[++arg_start]);
             if (mlx_quantize_bits != 0 && mlx_quantize_bits != 8) {
@@ -506,7 +480,7 @@ int main(int argc, char *argv[])
             use_mlx = 1;
             use_cuda = 0;
 #else
-            fprintf(stderr, "--mlx not available (build with: make metal)\n");
+            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
             return 1;
 #endif
         }
@@ -533,7 +507,7 @@ int main(int argc, char *argv[])
     if (cuda_fast_gemm) {
 #ifdef USE_CUDA
         if (!use_cuda) {
-            fprintf(stderr, "--cuda-gemm-mode requires --cuda or --backend cuda\n");
+            fprintf(stderr, "--cuda-gemm-mode requires --cuda\n");
             return 1;
         }
         if (embed_cuda_set_fast_gemm(cuda_fast_gemm) != 0) {
@@ -549,7 +523,7 @@ int main(int argc, char *argv[])
     if (cuda_weights) {
 #ifdef USE_CUDA
         if (!use_cuda) {
-            fprintf(stderr, "--cuda-weight-dtype requires --cuda or --backend cuda\n");
+            fprintf(stderr, "--cuda-weight-dtype requires --cuda\n");
             return 1;
         }
         if (!strcmp(cuda_weights, "bf16")) {
@@ -583,7 +557,7 @@ int main(int argc, char *argv[])
     }
 
     if (mlx_quantize_bits && !use_mlx) {
-        fprintf(stderr, "--mlx-quant-bits requires --mlx or --backend mlx\n");
+        fprintf(stderr, "--mlx-quant-bits requires --mlx\n");
         return 1;
     }
 

@@ -3052,8 +3052,8 @@ static void print_usage(const char *prog)
         "\n"
         "Options:\n"
         "  --model ID=DIR            Model to serve (repeatable)\n"
-        "  --backend cpu|mlx|cuda    Execution backend (default: cpu); --mlx and\n"
-        "                            --cuda are shorthands\n"
+        "  --mlx                     Use Apple MLX GPU backend\n"
+        "  --cuda                    Use NVIDIA CUDA GPU backend\n"
         "  --host HOST               Bind host (default: 127.0.0.1)\n"
         "  --port N                  Bind port (default: 8000)\n"
         "  --api-key K               Require Authorization: Bearer K\n"
@@ -3078,7 +3078,7 @@ static void print_usage(const char *prog)
         "\n"
         "Examples:\n"
         "  %s --model pplx-embed-v1-0.6b=./model --port 8000\n"
-        "  %s --backend mlx --mlx-quant-bits 8 \\\n"
+        "  %s --mlx --mlx-quant-bits 8 \\\n"
         "      --model pplx-embed-v1-4b=./model-4b-bf16\n",
         prog, prog, prog);
 }
@@ -3157,41 +3157,12 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        else if (!strcmp(f, "--backend")) {
-            const char *backend = argv[++arg];
-            if (!strcmp(backend, "mlx")) {
-#ifdef USE_MLX
-                use_mlx = 1;
-                use_cuda = 0;
-#else
-                fprintf(stderr, "mlx backend not available (build with: make metal)\n");
-                free_model_specs(&model_specs);
-                return 1;
-#endif
-            } else if (!strcmp(backend, "cuda")) {
-#ifdef USE_CUDA
-                use_cuda = 1;
-                use_mlx = 0;
-#else
-                fprintf(stderr, "cuda backend not available (build with: make cuda)\n");
-                free_model_specs(&model_specs);
-                return 1;
-#endif
-            } else if (!strcmp(backend, "cpu")) {
-                use_mlx = 0;
-                use_cuda = 0;
-            } else {
-                fprintf(stderr, "invalid --backend: %s\n", backend);
-                free_model_specs(&model_specs);
-                return 1;
-            }
-        }
         else if (!strcmp(f, "--mlx")) {
 #ifdef USE_MLX
             use_mlx = 1;
             use_cuda = 0;
 #else
-            fprintf(stderr, "--mlx not available (build with: make metal)\n");
+            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
             free_model_specs(&model_specs);
             return 1;
 #endif
@@ -3294,7 +3265,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     if (mlx_quantize_bits && !use_mlx) {
-        fprintf(stderr, "--mlx-quant-bits requires --backend mlx\n");
+        fprintf(stderr, "--mlx-quant-bits requires --mlx\n");
         free_model_specs(&model_specs);
         return 1;
     }
@@ -3302,7 +3273,7 @@ int main(int argc, char *argv[])
     if (cuda_fast_gemm) {
 #ifdef USE_CUDA
         if (!use_cuda) {
-            fprintf(stderr, "--cuda-gemm-mode requires --backend cuda\n");
+            fprintf(stderr, "--cuda-gemm-mode requires --cuda\n");
             free_model_specs(&model_specs);
             return 1;
         }
@@ -3321,7 +3292,7 @@ int main(int argc, char *argv[])
     if (cuda_weights) {
 #ifdef USE_CUDA
         if (!use_cuda) {
-            fprintf(stderr, "--cuda-weight-dtype requires --backend cuda\n");
+            fprintf(stderr, "--cuda-weight-dtype requires --cuda\n");
             free_model_specs(&model_specs);
             return 1;
         }
