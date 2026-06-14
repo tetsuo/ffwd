@@ -3046,8 +3046,12 @@ static void print_usage(const char *prog)
         "\n"
         "Options:\n"
         "  --model ID=DIR            Model to serve (repeatable)\n"
+#ifdef USE_MLX
         "  --mlx                     Use Apple MLX GPU backend\n"
+#endif
+#ifdef USE_CUDA
         "  --cuda                    Use NVIDIA CUDA GPU backend\n"
+#endif
         "  --host HOST               Bind host (default: 127.0.0.1)\n"
         "  --port N                  Bind port (default: 8000)\n"
         "  --api-key K               Require Authorization: Bearer K\n"
@@ -3055,25 +3059,38 @@ static void print_usage(const char *prog)
         "                            (default: 32)\n"
         "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
         "  --batch-wait-us N         First-arrival micro-batch deadline in us\n"
-        "                            (default: CUDA 1000; CPU/MLX 0)\n"
+#ifdef USE_CUDA
+        "                            (default: CUDA 1000; CPU 0)\n"
+#else
+        "                            (default: 0)\n"
+#endif
+#ifdef USE_MLX
         "  --memory-utilization F    Fraction of physical memory the MLX model-set\n"
         "                            preflight may plan for (default: 0.90; values\n"
         "                            above 1.0 overcommit)\n"
         "  --mlx-quant-bits N        Quantize MLX linear weights to 8 bits at load\n"
         "  --mlx-quant-group-size N  MLX quantization group size (default: 64)\n"
+#endif
+#ifdef USE_CUDA
         "  --cuda-gemm-mode MODE     CUDA GEMM compute: f32, tf32, bf16, or 16f\n"
         "                            (default: f32, exact)\n"
         "  --cuda-weight-dtype DTYPE CUDA weight storage: f32 or bf16 (default:\n"
         "                            f32); bf16 halves weight memory\n"
+#endif
         "  -t, --threads N           CPU threads (default: all cores)\n"
         "  -v, --verbose             Verbose (-vv for debug)\n"
         "  -h, --help                Show this help\n"
         "\n"
         "Examples:\n"
         "  %s --model pplx-embed-v1-0.6b=./model --port 8000\n"
+#ifdef USE_MLX
         "  %s --mlx --mlx-quant-bits 8 \\\n"
         "      --model pplx-embed-v1-4b=./model-4b-bf16\n",
         prog, prog, prog);
+#else
+        ,
+        prog, prog);
+#endif
 }
 
 typedef struct {
@@ -3125,16 +3142,20 @@ int main(int argc, char *argv[])
 {
     int n_threads = 0;
     int verbose = 0;
-    int use_mlx = 0;
-    int use_cuda = 0;
     int batch_size = 0;
     int max_batch_tokens = 0;
     int batch_wait_us = -1;
+#ifdef USE_MLX
+    int use_mlx = 0;
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
+    double memory_utilization = 0.0;
+#endif
+#ifdef USE_CUDA
+    int use_cuda = 0;
     const char *cuda_fast_gemm = NULL;
     const char *cuda_weights = NULL;
-    double memory_utilization = 0.0;
+#endif
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
     int port = 8000;
@@ -3149,26 +3170,42 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        else if (!strcmp(f, "--mlx")) {
 #ifdef USE_MLX
-            use_mlx = 1;
-            use_cuda = 0;
-#else
-            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
-            free_model_specs(&model_specs);
-            return 1;
-#endif
+        else if (!strcmp(f, "--mlx")) { use_mlx = 1; }
+        else if (!strcmp(f, "--mlx-quant-bits")) {
+            mlx_quantize_bits = atoi(argv[++arg]);
+            if (mlx_quantize_bits != 0 && mlx_quantize_bits != 8) {
+                fprintf(stderr, "--mlx-quant-bits must be 0 or 8\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
         }
-        else if (!strcmp(f, "--cuda")) {
+        else if (!strcmp(f, "--mlx-quant-group-size")) {
+            mlx_quantize_group_size = atoi(argv[++arg]);
+            if (mlx_quantize_group_size <= 0) {
+                fprintf(stderr, "--mlx-quant-group-size must be > 0\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+        else if (!strcmp(f, "--memory-utilization")) {
+            memory_utilization = atof(argv[++arg]);
+            if (memory_utilization <= 0.0) {
+                fprintf(stderr, "--memory-utilization must be > 0\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        }
+#endif
 #ifdef USE_CUDA
-            use_cuda = 1;
-            use_mlx = 0;
-#else
-            fprintf(stderr, "--cuda not available (build with: make cuda)\n");
-            free_model_specs(&model_specs);
-            return 1;
-#endif
+        else if (!strcmp(f, "--cuda")) { use_cuda = 1; }
+        else if (!strcmp(f, "--cuda-gemm-mode")) {
+            cuda_fast_gemm = argv[++arg];
         }
+        else if (!strcmp(f, "--cuda-weight-dtype")) {
+            cuda_weights = argv[++arg];
+        }
+#endif
         else if (!strcmp(f, "--host"))    { host = argv[++arg]; }
         else if (!strcmp(f, "--port"))    { port = atoi(argv[++arg]); }
         else if (!strcmp(f, "--api-key")) { api_key = argv[++arg]; }
@@ -3190,36 +3227,6 @@ int main(int argc, char *argv[])
                 free_model_specs(&model_specs);
                 return 1;
             }
-        }
-        else if (!strcmp(f, "--memory-utilization")) {
-            memory_utilization = atof(argv[++arg]);
-            if (memory_utilization <= 0.0) {
-                fprintf(stderr, "--memory-utilization must be > 0\n");
-                free_model_specs(&model_specs);
-                return 1;
-            }
-        }
-        else if (!strcmp(f, "--mlx-quant-bits")) {
-            mlx_quantize_bits = atoi(argv[++arg]);
-            if (mlx_quantize_bits != 0 && mlx_quantize_bits != 8) {
-                fprintf(stderr, "--mlx-quant-bits must be 0 or 8\n");
-                free_model_specs(&model_specs);
-                return 1;
-            }
-        }
-        else if (!strcmp(f, "--mlx-quant-group-size")) {
-            mlx_quantize_group_size = atoi(argv[++arg]);
-            if (mlx_quantize_group_size <= 0) {
-                fprintf(stderr, "--mlx-quant-group-size must be > 0\n");
-                free_model_specs(&model_specs);
-                return 1;
-            }
-        }
-        else if (!strcmp(f, "--cuda-gemm-mode")) {
-            cuda_fast_gemm = argv[++arg];
-        }
-        else if (!strcmp(f, "--cuda-weight-dtype")) {
-            cuda_weights = argv[++arg];
         }
         else if (!strcmp(f, "-t") || !strcmp(f, "--threads")) {
             n_threads = atoi(argv[++arg]);
@@ -3255,14 +3262,15 @@ int main(int argc, char *argv[])
         free_model_specs(&model_specs);
         return 1;
     }
+#ifdef USE_MLX
     if (mlx_quantize_bits && !use_mlx) {
         fprintf(stderr, "--mlx-quant-bits requires --mlx\n");
         free_model_specs(&model_specs);
         return 1;
     }
-
-    if (cuda_fast_gemm) {
+#endif
 #ifdef USE_CUDA
+    if (cuda_fast_gemm) {
         if (!use_cuda) {
             fprintf(stderr, "--cuda-gemm-mode requires --cuda\n");
             free_model_specs(&model_specs);
@@ -3273,15 +3281,8 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
-#else
-        fprintf(stderr, "--cuda-gemm-mode requires a CUDA build\n");
-        free_model_specs(&model_specs);
-        return 1;
-#endif
     }
-
     if (cuda_weights) {
-#ifdef USE_CUDA
         if (!use_cuda) {
             fprintf(stderr, "--cuda-weight-dtype requires --cuda\n");
             free_model_specs(&model_specs);
@@ -3296,19 +3297,23 @@ int main(int argc, char *argv[])
             free_model_specs(&model_specs);
             return 1;
         }
-#else
-        fprintf(stderr, "--cuda-weight-dtype requires a CUDA build\n");
-        free_model_specs(&model_specs);
-        return 1;
-#endif
     }
+#endif
 
-    if (!use_mlx && !use_cuda) {
+#ifdef USE_MLX
+    if (use_mlx) {
+        if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
+    } else
+#endif
+#ifdef USE_CUDA
+    if (use_cuda) {
+        if (verbose >= 1) fprintf(stderr, "Using CUDA GPU backend\n");
+    } else
+#endif
+    {
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
         qwen_set_threads(n_threads);
         if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
-    } else if (verbose >= 1) {
-        fprintf(stderr, "Using %s GPU backend\n", use_mlx ? "MLX" : "CUDA");
     }
 
     embed_server_config_t scfg = {
@@ -3319,11 +3324,15 @@ int main(int argc, char *argv[])
         .batch_size = batch_size > 0 ? batch_size : EMBED_SERVER_DEFAULT_BATCH_SIZE,
         .max_batch_tokens = max_batch_tokens,
         .batch_wait_us = batch_wait_us,
+#ifdef USE_MLX
         .use_mlx = use_mlx,
-        .use_cuda = use_cuda,
         .mlx_quantize_bits = mlx_quantize_bits,
         .mlx_quantize_group_size = mlx_quantize_group_size,
         .memory_utilization = memory_utilization,
+#endif
+#ifdef USE_CUDA
+        .use_cuda = use_cuda,
+#endif
         .api_key = api_key,
     };
     int rc = embed_run_server(&scfg);

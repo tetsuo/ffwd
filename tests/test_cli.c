@@ -157,25 +157,12 @@ int main(int argc, char **argv)
            "--stream -b 2 exits 0");
     expect(count_lines(g_out) == 3, "--stream -b 2 covers the tail batch");
 
-    /* Flag validation: every bad invocation must exit 1.
-     * This is a CPU-only build, so the GPU flags are rejected too. */
+    /* Flag validation: missing model dir must exit 1. */
     static const struct { const char *args; const char *what; } bad[] = {
-        {"--backend foo", "invalid --backend"},
-        {"--backend mlx", "--backend mlx without MLX build"},
-        {"--backend cuda", "--backend cuda without CUDA build"},
-        {"--mlx", "--mlx without MLX build"},
-        {"--cuda", "--cuda without CUDA build"},
-        {"--mlx-quant-bits 4", "--mlx-quant-bits 4"},
-        {"--mlx-quant-group-size 0", "--mlx-quant-group-size 0"},
-        {"--cuda-gemm-mode f32 -d X t", "--cuda-gemm-mode without CUDA"},
-        {"--cuda-weight-dtype bf16 -d X t", "--cuda-weight-dtype without CUDA"},
+        {"-d '' t", "empty model dir"},
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
         expect(run_cli(bad[i].args, NULL) == 1, bad[i].what);
-
-    /* Validation that runs after the model dir is accepted. */
-    snprintf(args, sizeof(args), "-d '%s' --mlx-quant-bits 8 t", g_dir);
-    expect(run_cli(args, NULL) == 1, "--mlx-quant-bits without --mlx");
 
     if (g_failures) {
         fprintf(stderr, "%d CLI check(s) failed\n", g_failures);

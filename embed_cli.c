@@ -31,18 +31,26 @@ static void print_usage(const char *prog)
         "\n"
         "Options:\n"
         "  -d <dir>     Model directory (required)\n"
+#ifdef USE_MLX
         "  --mlx        Use Apple MLX GPU backend\n"
+#endif
+#ifdef USE_CUDA
         "  --cuda       Use CUDA/cuBLAS GPU backend\n"
+#endif
         "  --stream     Read lines from stdin, write one JSON embedding per line\n"
+#ifdef USE_MLX
         "  --mlx-quant-bits N\n"
         "               Quantize MLX linear weights to 8 bits at load time\n"
         "  --mlx-quant-group-size N\n"
         "               MLX quantization group size (default: 64)\n"
+#endif
+#ifdef USE_CUDA
         "  --cuda-gemm-mode MODE\n"
         "               CUDA GEMM compute mode: f32, tf32, bf16, or 16f (default: f32)\n"
         "  --cuda-weight-dtype DTYPE\n"
         "               CUDA weight storage: f32 or bf16 (default: f32). bf16 halves\n"
         "               weight memory and uses BF16 tensor cores\n"
+#endif
         "  -b, --batch-size N\n"
         "               Max texts per engine batch (default: all; --stream: 1)\n"
         "  -t, --threads N\n"
@@ -61,8 +69,13 @@ static void print_usage(const char *prog)
         "\n"
         "Examples:\n"
         "  %s -d ./model \"query: what is AI?\"\n"
+#ifdef USE_MLX
         "  %s -d ./model --mlx --stream < texts.txt\n",
         prog, prog, prog);
+#else
+        ,
+        prog, prog);
+#endif
 }
 
 /* ========================================================================
@@ -430,14 +443,18 @@ int main(int argc, char *argv[])
     int n_threads  = 0;
     int print_embs = 0;
     int verbose    = 0;
-    int use_mlx    = 0;
-    int use_cuda   = 0;
     int stdin_mode = 0;
     int batch_size = 0;
+#ifdef USE_MLX
+    int use_mlx = 0;
     int mlx_quantize_bits = 0;
     int mlx_quantize_group_size = 64;
+#endif
+#ifdef USE_CUDA
+    int use_cuda = 0;
     const char *cuda_fast_gemm = NULL;
     const char *cuda_weights = NULL;
+#endif
 
     int arg_start = 1;
     while (arg_start < argc && argv[arg_start][0] == '-') {
@@ -449,6 +466,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
             batch_size = atoi(argv[++arg_start]);
         }
+#ifdef USE_MLX
         else if (!strcmp(f, "--mlx-quant-bits")) {
             mlx_quantize_bits = atoi(argv[++arg_start]);
             if (mlx_quantize_bits != 0 && mlx_quantize_bits != 8) {
@@ -463,36 +481,27 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
+#endif
+#ifdef USE_CUDA
         else if (!strcmp(f, "--cuda-gemm-mode")) {
             cuda_fast_gemm = argv[++arg_start];
         }
         else if (!strcmp(f, "--cuda-weight-dtype")) {
             cuda_weights = argv[++arg_start];
         }
+#endif
         else if (!strcmp(f, "-e") || !strcmp(f, "--embeddings")) {
             print_embs = 1;
         }
         else if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose++; }
         else if (!strcmp(f, "-vv"))     { verbose = 2; }
         else if (!strcmp(f, "--stream")) { stdin_mode = 1; }
-        else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
-            use_mlx = 1;
-            use_cuda = 0;
-#else
-            fprintf(stderr, "--mlx not available (build with: make mlx)\n");
-            return 1;
+        else if (!strcmp(f, "--mlx"))   { use_mlx = 1; }
 #endif
-        }
-        else if (!strcmp(f, "--cuda"))   {
 #ifdef USE_CUDA
-            use_cuda = 1;
-            use_mlx = 0;
-#else
-            fprintf(stderr, "--cuda not available (build with: make cuda)\n");
-            return 1;
+        else if (!strcmp(f, "--cuda"))  { use_cuda = 1; }
 #endif
-        }
         else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
             print_usage(argv[0]);
             return 0;
@@ -504,8 +513,8 @@ int main(int argc, char *argv[])
     embed_verbose = verbose;
     qwen_verbose = verbose;
 
-    if (cuda_fast_gemm) {
 #ifdef USE_CUDA
+    if (cuda_fast_gemm) {
         if (!use_cuda) {
             fprintf(stderr, "--cuda-gemm-mode requires --cuda\n");
             return 1;
@@ -514,14 +523,8 @@ int main(int argc, char *argv[])
             fprintf(stderr, "--cuda-gemm-mode must be f32, tf32, bf16, or 16f\n");
             return 1;
         }
-#else
-        fprintf(stderr, "--cuda-gemm-mode requires a CUDA build\n");
-        return 1;
-#endif
     }
-
     if (cuda_weights) {
-#ifdef USE_CUDA
         if (!use_cuda) {
             fprintf(stderr, "--cuda-weight-dtype requires --cuda\n");
             return 1;
@@ -534,11 +537,14 @@ int main(int argc, char *argv[])
             fprintf(stderr, "--cuda-weight-dtype must be f32 or bf16\n");
             return 1;
         }
-#else
-        fprintf(stderr, "--cuda-weight-dtype requires a CUDA build\n");
-        return 1;
-#endif
     }
+#endif
+#ifdef USE_MLX
+    if (mlx_quantize_bits && !use_mlx) {
+        fprintf(stderr, "--mlx-quant-bits requires --mlx\n");
+        return 1;
+    }
+#endif
 
     if (!model_dir || !model_dir[0]) {
         fprintf(stderr, "model directory required (-d <dir>)\n");
@@ -546,19 +552,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Threads (CPU backend) */
-    if (!use_mlx && !use_cuda) {
+#ifdef USE_MLX
+    if (use_mlx) {
+        if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
+    } else
+#endif
+#ifdef USE_CUDA
+    if (use_cuda) {
+        if (verbose >= 1) fprintf(stderr, "Using CUDA GPU backend\n");
+    } else
+#endif
+    {
         if (n_threads <= 0) n_threads = qwen_get_num_cpus();
         qwen_set_threads(n_threads);
         if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
-    } else {
-        if (verbose >= 1)
-            fprintf(stderr, "Using %s GPU backend\n", use_mlx ? "MLX" : "CUDA");
-    }
-
-    if (mlx_quantize_bits && !use_mlx) {
-        fprintf(stderr, "--mlx-quant-bits requires --mlx\n");
-        return 1;
     }
 
     /* Tokenizer */
@@ -617,10 +624,15 @@ int main(int argc, char *argv[])
         e.dim = embed_model_config(e.model)->hidden_size;
     }
     if (verbose >= 1)
-        fprintf(stderr, "Model: %d-dim, %.0f ms%s%s\n",
+        fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
                 e.dim, now_ms() - t0,
-                use_mlx ? " (MLX)" : "",
-                use_cuda ? " (CUDA)" : "");
+#ifdef USE_MLX
+                use_mlx ? " (MLX)" :
+#endif
+#ifdef USE_CUDA
+                use_cuda ? " (CUDA)" :
+#endif
+                "");
 
     e.tok_ws = qwen_tokenizer_workspace_new();
     if (!e.tok_ws) {
