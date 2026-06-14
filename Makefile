@@ -293,7 +293,7 @@ bench-tokenizer:
 # =============================================================================
 # Regression microbenchmarks (see bench/bench.h). Each run records a JSON
 # sample set under bench/results/, keyed by commit; compare two records with
-# bench/benchstat.py to see if a change helped or hurt.
+# tools/benchstat.py to see if a change helped or hurt.
 # =============================================================================
 # Dirtiness ignores .gitignore so local-only ignore entries do not mark
 # every record as -dirty.
@@ -305,7 +305,7 @@ bench:
 	    bench/bench_kernels.c $(KERNEL_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	@mkdir -p bench/results
 	./bench/bench_kernels --json bench/results/kernels-$(BENCH_STAMP).json
-	@echo "compare: ./bench/benchstat.py bench/results/OLD.json bench/results/NEW.json"
+	@echo "compare: ./tools/benchstat.py bench/results/OLD.json bench/results/NEW.json"
 
 bench-model:
 	@test -n "$(MODEL_DIR)" || { echo "usage: make bench-model MODEL_DIR=/path/to/model-dir"; exit 1; }
