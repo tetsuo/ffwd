@@ -1,0 +1,209 @@
+name: release
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Impact"
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - minor
+        - patch
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    if: ${{ github.ref_name != 'master' && startsWith(github.ref_name, 'v') && endsWith(github.ref_name, '.x') }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install dependencies
+      run: |
+        set -euxo pipefail
+
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          ca-certificates \
+          ccache \
+          clang \
+          clang-tidy \
+          clang-tools \
+          libcjson-dev \
+          libopenblas-dev \
+          pkg-config \
+          valgrind
+
+        cc --version | sed -n '1,2p'
+        clang --version | sed -n '1,2p'
+        clang-tidy --version | sed -n '1,2p'
+        pkg-config --modversion libcjson 2>/dev/null || true
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ github.ref_name }}-
+          ccache-${{ runner.os }}-
+
+    - name: Configure ccache
+      run: |
+        set -euxo pipefail
+        ccache --set-config=cache_dir="$HOME/.cache/ccache"
+        ccache --set-config=max_size=1G
+        ccache --zero-stats
+
+    - name: Run tests
+      env:
+        CC: ccache gcc
+      run: make test
+
+    - name: Compute build version
+      run: |
+        set -euxo pipefail
+
+        git fetch --all --tags
+
+        REF_NAME="${GITHUB_REF_NAME:-}"
+        MAJOR="$(echo "$REF_NAME" | sed -nE 's/^v([0-9]+)\.x$/\1/p')"
+
+        if [[ -z "$MAJOR" ]]; then
+          echo "Invalid branch name format (expected vX.x)" >&2
+          exit 1
+        fi
+
+        next_version () {
+          local current impact minor patch
+          impact="${1:-patch}"
+
+          current="$(
+            git tag \
+              | grep "^v${MAJOR}\.[0-9]*\.[0-9]*$" \
+              | sort -t "." -k1,1nr -k2,2nr -k3,3nr \
+              | cut -c2- \
+              | head -1
+          )" || true
+
+          if [[ -z "$current" ]]; then
+            if [[ "$MAJOR" -eq 0 ]]; then
+              echo "0.0.1"
+            else
+              echo "$MAJOR.0.0"
+            fi
+            return
+          fi
+
+          IFS='.' read -r _ minor patch <<< "$current"
+
+          case "$impact" in
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "Invalid impact: $impact" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "$MAJOR.$minor.$patch"
+        }
+
+        BUILD_VERSION="$(next_version "${{ inputs.version }}")"
+        TAG_NAME="v${BUILD_VERSION}"
+
+        echo "BUILD_VERSION=$BUILD_VERSION" >> "$GITHUB_ENV"
+        echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+        echo "BUILD_VERSION=$BUILD_VERSION"
+        echo "TAG_NAME=$TAG_NAME"
+
+    - name: Build release artifacts
+      env:
+        CC: ccache gcc
+      run: |
+        set -euxo pipefail
+
+        rm -rf tmp
+        mkdir -p tmp
+
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64) ARCH="x86_64" ;;
+          aarch64) ARCH="aarch64" ;;
+          *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+        esac
+
+        NAME="embed-linux-${ARCH}"
+
+        make cpu \
+          ARCH_FLAGS="-march=x86-64" \
+          VERSION="$BUILD_VERSION" \
+          BUILD_COMMIT="$GITHUB_SHA" \
+          BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          BUILD_OS="linux" \
+          BUILD_ARCH="$ARCH"
+
+        mkdir -p "tmp/$NAME"
+        cp embed embed-server LICENSE README.md "tmp/$NAME/"
+        tar -C tmp -czf "tmp/${NAME}.tar.gz" "$NAME"
+
+        cd tmp
+        sha256sum *.tar.gz > SHA256SUMS
+
+    - name: Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euxo pipefail
+
+        if [[ -z "${TAG_NAME:-}" ]]; then
+          echo "No tag name computed; refusing to release" >&2
+          exit 1
+        fi
+
+        commit="$(git rev-parse HEAD)"
+
+        if git tag --points-at "$commit" | grep -q "^${TAG_NAME}$"; then
+          echo "Commit already has tag $TAG_NAME, skipping release"
+          exit 0
+        fi
+
+        if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+          echo "Tag $TAG_NAME already exists, refusing to overwrite" >&2
+          exit 1
+        fi
+
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+
+        git tag "$TAG_NAME"
+        git push origin "$TAG_NAME"
+
+        gh release create "$TAG_NAME" \
+          tmp/embed-linux-*.tar.gz \
+          tmp/SHA256SUMS \
+          --title "$TAG_NAME" \
+          --generate-notes
+
+    - name: Show ccache stats
+      if: always()
+      run: ccache --show-stats || true

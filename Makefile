@@ -1,11 +1,30 @@
-CC          = gcc
+CC ?= gcc
+AR ?= ar
+ARCH_FLAGS ?= -march=native
+
+BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+BUILD_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
+BUILD_ARCH ?= $(shell uname -m)
+
+VERSION_CFLAGS = \
+	-DEMBED_BUILD_DATE=\"$(BUILD_DATE)\" \
+	-DEMBED_BUILD_COMMIT=\"$(BUILD_COMMIT)\" \
+	-DEMBED_BUILD_OS=\"$(BUILD_OS)\" \
+	-DEMBED_BUILD_ARCH=\"$(BUILD_ARCH)\"
+
+VERSION_CFLAGS =
+ifneq ($(strip $(VERSION)),)
+VERSION_CFLAGS += -DEMBED_VERSION=\"$(VERSION)\"
+endif
+
 # Allow FP reassociation and contraction so reduction loops vectorize, but do
 # not assume finite math or approximate libm calls: full -ffast-math produced
 # NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
 # -fapprox-func are the unsafe parts and stay off).
 # -fvisibility=hidden pairs with EMBED_API in the public headers: a new
 # public function without the annotation will be missing from the shared lib.
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -fPIC -fvisibility=hidden \
+CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) $(VERSION_CFLAGS) -fPIC -fvisibility=hidden \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
 LDFLAGS     = -lm -lpthread
@@ -338,7 +357,7 @@ debug:
 # Static library and binary link
 # =============================================================================
 $(LIB): $(OBJS) $(EXTRA_OBJS)
-	ar rcs $@ $^
+	$(AR) rcs $@ $^
 
 $(TARGET): $(LIB) embed_cli.o
 	$(CC) $(CFLAGS) -o $@ embed_cli.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
