@@ -3032,7 +3032,7 @@ int embed_run_server(const embed_server_config_t *cfg) {
 }
 
 /* ====================================================================
- * pplx-embed-server entry point
+ * embed-server entry point
  * ==================================================================== */
 #ifndef EMBED_SERVER_TEST
 
@@ -3040,9 +3040,6 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s --model ID=DIR [options]\n"
-        "\n"
-        "Serves POST /v1/embeddings, /v1/contextualizedembeddings, and\n"
-        "/v1/rerank.\n"
         "\n"
         "Options:\n"
         "  --model ID=DIR            Model to serve (repeatable)\n"
