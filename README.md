@@ -97,3 +97,18 @@ curl -s http://127.0.0.1:8000/v1/rerank \
     "documents":["Scientists explore from curiosity.","SQLite stores data."]
   }'
 ```
+
+## Acknowledgements
+
+- `embed.c` was inspired by and initially forked from
+  [antirez/qwen-asr](https://github.com/antirez/qwen-asr). It has since been
+  mostly rewritten, including a major CUDA upgrade, but the kernels and some
+  structural ideas are derived from that codebase.
+- The server event loop library in `deps/ae` is extracted from
+  [Redis](https://github.com/redis/redis), credited to Salvatore Sanfilippo
+  (antirez) and Redis contributors.
+- The
+  [pplx-embed](https://research.perplexity.ai/articles/pplx-embed-state-of-the-art-embedding-models-for-web-scale-retrieval)
+  models were developed by the Perplexity AI research team.
+- The [Qwen3-Embedding](https://qwen.ai/blog?id=qwen3-embedding) models are part
+  of the Qwen model family from Alibaba.
