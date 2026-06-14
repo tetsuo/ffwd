@@ -49,17 +49,18 @@ SHARED_LIB   = libembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu metal cuda test test-bf16 test-safetensors coverage bench \
+.PHONY: all cpu mlx cuda gpu test test-bf16 test-safetensors coverage bench \
         bench-model bench-tokenizer debug clean help
 
 all: help
 
 help:
 	@echo "Targets:"
-	@echo "  make cpu      Build the CPU backend (BLAS: Accelerate on macOS, OpenBLAS on Linux)"
-	@echo "  make metal    Build the Apple GPU backend via MLX (recommended on Apple Silicon)"
-	@echo "  make cuda     Build with CUDA/cuBLAS backend (Linux/NVIDIA)"
-	@echo "  make test     Build and run the C test suite (no model files needed)"
+	@echo "  make cpu      CPU-only build"
+	@echo "  make gpu      Build with GPU backend support (mlx on macOS, cuda on Linux)"
+	@echo "  make mlx      Apple Silicon GPU via MLX"
+	@echo "  make cuda     NVIDIA GPU via CUDA"
+	@echo "  make test     Build and run the test suite (no model files needed)"
 	@echo "  make coverage Test-suite line coverage report (clang/llvm-cov)"
 	@echo "  make bench    Kernel microbenchmarks; records bench/results/*.json"
 	@echo "  make bench-model MODEL_DIR=/path/to/model"
@@ -88,25 +89,34 @@ cpu:
 	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
-# Metal build (Apple Silicon GPU via MLX - uses the mlx-c pure C API)
+# MLX build (Apple Silicon GPU via MLX - uses the mlx-c pure C API)
 # Requires: brew install mlx mlx-c
 # =============================================================================
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
 MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
 
-metal: SRCS += embed_mlx.c
-metal: OBJS  = $(SRCS:.c=.o) embed_mlx.o
+mlx: SRCS += embed_mlx.c
+mlx: OBJS  = $(SRCS:.c=.o) embed_mlx.o
 ifeq ($(UNAME_S),Darwin)
-metal: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX \
+mlx: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX \
                -I$(MLXC_PREFIX)/include
-metal: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
+mlx: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
                 -L$(MLXC_PREFIX)/lib -lmlxc \
                 -L$(MLX_PREFIX)/lib -lmlx \
                 -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
 endif
-metal:
+mlx:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_mlx.o"
+
+# =============================================================================
+# GPU convenience target (auto-selects mlx on macOS, cuda on Linux)
+# =============================================================================
+ifeq ($(UNAME_S),Darwin)
+gpu: mlx
+else
+gpu: cuda
+endif
 
 # =============================================================================
 # CUDA build (Linux NVIDIA GPU - uses CUDA Runtime + cuBLAS)
