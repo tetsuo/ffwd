@@ -279,7 +279,6 @@ typedef struct {
     int batch_size;
     int max_batch_tokens;
     int batch_wait_us;
-    int enable_cors;
     char *api_key;
     loaded_model models[MODEL_COUNT];
     int use_mlx;
@@ -466,11 +465,7 @@ static void append_http_response_ex(client *c, int status, const char *ctype,
                 c->close_after_write ? "close" : "keep-alive");
     if (ctype)
         sbuf_printf(&c->out, "Content-Type: %s\r\n", ctype);
-    if (c->srv->enable_cors) {
-        sbuf_puts(&c->out, "Access-Control-Allow-Origin: *\r\n");
-        sbuf_puts(&c->out, "Access-Control-Allow-Headers: authorization, content-type\r\n");
-        sbuf_puts(&c->out, "Access-Control-Allow-Methods: POST, OPTIONS\r\n");
-    }
+
     if (extra_headers)
         sbuf_puts(&c->out, extra_headers);
     sbuf_puts(&c->out, "\r\n");
@@ -2914,7 +2909,6 @@ int embed_run_server(const embed_server_config_t *cfg) {
         ? cfg->batch_wait_us
         : (cfg->use_cuda ? EMBED_SERVER_CUDA_BATCH_WAIT_US
                          : EMBED_SERVER_BATCH_WAIT_US);
-    s.enable_cors = cfg->enable_cors;
     s.use_mlx = cfg->use_mlx;
     s.use_cuda = cfg->use_cuda;
     s.mlx_quantize_bits = cfg->mlx_quantize_bits;
@@ -3057,7 +3051,6 @@ static void print_usage(const char *prog)
         "  --host HOST               Bind host (default: 127.0.0.1)\n"
         "  --port N                  Bind port (default: 8000)\n"
         "  --api-key K               Require Authorization: Bearer K\n"
-        "  --cors                    Enable CORS headers\n"
         "  -b, --batch-size N        Max texts or documents per inference batch\n"
         "                            (default: 32)\n"
         "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
@@ -3145,7 +3138,6 @@ int main(int argc, char *argv[])
     const char *host = "127.0.0.1";
     const char *api_key = NULL;
     int port = 8000;
-    int cors = 0;
     model_specs_t model_specs = {0};
 
     int arg = 1;
@@ -3180,7 +3172,6 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--host"))    { host = argv[++arg]; }
         else if (!strcmp(f, "--port"))    { port = atoi(argv[++arg]); }
         else if (!strcmp(f, "--api-key")) { api_key = argv[++arg]; }
-        else if (!strcmp(f, "--cors"))    { cors = 1; }
         else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
             batch_size = atoi(argv[++arg]);
         }
@@ -3333,7 +3324,6 @@ int main(int argc, char *argv[])
         .mlx_quantize_bits = mlx_quantize_bits,
         .mlx_quantize_group_size = mlx_quantize_group_size,
         .memory_utilization = memory_utilization,
-        .enable_cors = cors,
         .api_key = api_key,
     };
     int rc = embed_run_server(&scfg);

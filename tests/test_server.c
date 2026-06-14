@@ -320,7 +320,7 @@ static void test_http_embeddings(int port)
 {
     char *body = NULL;
 
-    /* CORS preflight and routing. */
+    /* Routing. */
     TEST_ASSERT(http_req(port, "OPTIONS", "/v1/embeddings", NULL, NULL, NULL,
                          NULL) == 204);
     TEST_ASSERT(http_req(port, "GET", "/v1/embeddings", TEST_API_KEY, NULL,

@@ -34,7 +34,6 @@ typedef struct {
     double memory_utilization;  /* fraction of physical memory the MLX
                                    preflight may plan for; 0 = default 0.90,
                                    values above 1.0 allow overcommit */
-    int enable_cors;
     const char *api_key;
 } embed_server_config_t;
 

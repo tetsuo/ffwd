@@ -117,10 +117,10 @@ int main(int argc, char **argv)
     expect(run_cli(args, NULL) == 0, "single text exits 0");
     expect(stdout_is_embedding(dims.hidden), "single text prints dim floats");
 
-    /* Explicit CPU backend and thread count. */
+    /* Thread count. */
     snprintf(args, sizeof(args),
-             "-d '%s' --backend cpu -t 2 -v 'hello world'", g_dir);
-    expect(run_cli(args, NULL) == 0, "--backend cpu -t 2 -v exits 0");
+             "-d '%s' -t 2 -v 'hello world'", g_dir);
+    expect(run_cli(args, NULL) == 0, "-t 2 -v exits 0");
     expect(file_contains(g_err, "Using 2 CPU thread(s)"),
            "-v reports the thread count");
 
