@@ -768,6 +768,38 @@ void qwen_rms_norm_per_head(
     }
 }
 
+/* Mean-subtracting LayerNorm with bias. Safe in place (out may alias x): each
+ * row's mean and variance are reduced before the row is rewritten. Scalar for
+ * now; LayerNorm is not GEMM-bound, so SIMD/threading is a later perf step. */
+void qwen_layer_norm(float *out,
+                     const float *x,
+                     const float *gamma,
+                     const float *beta,
+                     int seq_len,
+                     int hidden,
+                     float eps) {
+    if (seq_len <= 0 || hidden <= 0)
+        return;
+    float inv_h = 1.0f / (float)hidden;
+    for (int s = 0; s < seq_len; s++) {
+        const float *row = x + (size_t)s * hidden;
+        float *dst = out + (size_t)s * hidden;
+        float mean = 0.0f;
+        for (int d = 0; d < hidden; d++)
+            mean += row[d];
+        mean *= inv_h;
+        float var = 0.0f;
+        for (int d = 0; d < hidden; d++) {
+            float diff = row[d] - mean;
+            var += diff * diff;
+        }
+        var *= inv_h;
+        float inv_std = 1.0f / sqrtf(var + eps);
+        for (int d = 0; d < hidden; d++)
+            dst[d] = gamma[d] * (row[d] - mean) * inv_std + beta[d];
+    }
+}
+
 /* ========================================================================
  * Activation Functions
  * ======================================================================== */
@@ -797,6 +829,12 @@ void qwen_silu_mul_inplace(float *gate, const float *up, int n) {
         gate[i] = (g / (1.0f + expf(-g))) * up[i];
     }
 #endif
+}
+
+void qwen_gelu_inplace(float *x, int n) {
+    /* Exact erf GeLU; 0.70710678... = 1/sqrt(2). */
+    for (int i = 0; i < n; i++)
+        x[i] = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
 }
 
 void qwen_softmax(float *x, int rows, int cols) {

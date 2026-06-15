@@ -58,6 +58,56 @@ static void test_rms_norm(void) {
     }
 }
 
+static void test_layer_norm(void) {
+    const int seq = 2, hidden = 4;
+    const float x[8] = {1.0f, 2.0f, -3.0f, 4.0f, 0.5f, -1.0f, 2.0f, -0.5f};
+    const float g[4] = {1.0f, 0.5f, -1.0f, 2.0f};
+    const float b[4] = {0.1f, -0.2f, 0.3f, -0.4f};
+    float out[8];
+
+    qwen_layer_norm(out, x, g, b, seq, hidden, 1e-12f);
+
+    for (int s = 0; s < seq; s++) {
+        float mean = 0.0f;
+        for (int d = 0; d < hidden; d++)
+            mean += x[s * hidden + d];
+        mean /= hidden;
+        float var = 0.0f;
+        for (int d = 0; d < hidden; d++) {
+            float diff = x[s * hidden + d] - mean;
+            var += diff * diff;
+        }
+        var /= hidden;
+        float inv = 1.0f / sqrtf(var + 1e-12f);
+        for (int d = 0; d < hidden; d++) {
+            float want = g[d] * (x[s * hidden + d] - mean) * inv + b[d];
+            expect_close("layer_norm", out[s * hidden + d], want, 1e-5f);
+        }
+    }
+
+    /* In-place (out aliases x) must match the out-of-place result. */
+    float z[8];
+    memcpy(z, x, sizeof(z));
+    qwen_layer_norm(z, z, g, b, seq, hidden, 1e-12f);
+    for (int i = 0; i < 8; i++)
+        expect_close("layer_norm_inplace", z[i], out[i], 1e-6f);
+}
+
+static void test_gelu(void) {
+    float x[5] = {0.0f, 1.0f, -1.0f, 2.5f, -3.0f};
+    float out[5];
+    memcpy(out, x, sizeof(out));
+    qwen_gelu_inplace(out, 5);
+    for (int i = 0; i < 5; i++) {
+        float want = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
+        expect_close("gelu", out[i], want, 1e-6f);
+    }
+    /* Known reference values for the exact erf GeLU. */
+    expect_close("gelu0", out[0], 0.0f, 1e-7f);
+    expect_close("gelu1", out[1], 0.841344746f, 1e-5f);
+    expect_close("gelu_neg1", out[2], -0.158655254f, 1e-5f);
+}
+
 static void test_rope_neox(void) {
     const int seq = 2, heads = 1, head_dim = 4;
     const int positions[2] = {0, 3};
@@ -527,6 +577,8 @@ static void test_generic_vs_impl(void) {
 int main(void) {
     qwen_set_threads(1);
     test_rms_norm();
+    test_layer_norm();
+    test_gelu();
     test_rope_neox();
     test_packed_gqa_attention();
     test_packed_gqa_attention_long();

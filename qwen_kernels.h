@@ -88,6 +88,17 @@ void qwen_rms_norm(
 void qwen_rms_norm_per_head(
     float *x, const float *weight, int seq_len, int n_heads, int head_dim, float eps);
 
+/* Layer Normalization (BERT family): out = gamma * (x - mean) / sqrt(var + eps)
+ * + beta, with mean and biased (population) variance over the hidden axis per
+ * row. Unlike RMSNorm this subtracts the mean and adds a bias. */
+void qwen_layer_norm(float *out,
+                     const float *x,
+                     const float *gamma,
+                     const float *beta,
+                     int seq_len,
+                     int hidden,
+                     float eps);
+
 /* ========================================================================
  * Activation Functions
  * ======================================================================== */
@@ -95,6 +106,10 @@ void qwen_rms_norm_per_head(
 void qwen_softmax(float *x, int rows, int cols);
 /* gate = SiLU(gate) * up */
 void qwen_silu_mul_inplace(float *gate, const float *up, int n);
+
+/* Exact (erf) GeLU in place: x = 0.5 * x * (1 + erf(x / sqrt(2))). This is the
+ * "gelu" activation HF BERT/BGE/MiniLM use, not the tanh approximation. */
+void qwen_gelu_inplace(float *x, int n);
 
 /* ========================================================================
  * Attention Operations
