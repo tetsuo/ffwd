@@ -171,6 +171,8 @@ TEST_QWEN3_SRCS       = tests/test_qwen3.c embed.c embed_config.c qwen_safetenso
                         $(KERNEL_SRCS)
 TEST_QWEN2_SRCS       = tests/test_qwen2.c embed.c embed_config.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
+TEST_CLS_SRCS         = tests/test_cls.c embed.c embed_config.c qwen_safetensors.c \
+                        $(KERNEL_SRCS)
 TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c embed_config.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
 TEST_LATE_SRCS        = tests/test_late.c embed.c embed_config.c qwen_tokenizer.c \
@@ -203,6 +205,9 @@ test:
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen2 \
 	    $(TEST_QWEN2_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_qwen2
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_cls \
+	    $(TEST_CLS_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	./tests/test_cls
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	./tests/test_workspace

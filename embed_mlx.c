@@ -1600,7 +1600,10 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     int max_seq = 0;
     int has_padding = 0;
     int causal = c->attention_mode == EMBED_ATTENTION_CAUSAL;
-    int last_token_pool = c->pooling_mode == EMBED_POOL_LAST_TOKEN;
+    int cls_pool = c->pooling_mode == EMBED_POOL_CLS;
+    /* CLS and last-token are both single-token pooling: gather one row per
+     * sequence (the first for CLS, the last otherwise) rather than mean-pool. */
+    int single_token_pool = c->pooling_mode == EMBED_POOL_LAST_TOKEN || cls_pool;
     if (hidden <= 0 || c->vocab_size <= 0)
         return -1;
 
@@ -1617,7 +1620,7 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
         if (inputs[b].n_tokens != max_seq)
             has_padding = 1;
     }
-    int needs_pool_mask = has_padding && !last_token_pool;
+    int needs_pool_mask = has_padding && !single_token_pool;
     int needs_attn_mask = has_padding && !causal;
 
     size_t elems, ids_bytes, mask_bytes, len_bytes, out_values, out_bytes;
@@ -1628,17 +1631,17 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
         mlx_mul_size((size_t)batch, sizeof(float), &len_bytes) != 0 ||
         mlx_mul_size((size_t)batch, (size_t)hidden, &out_values) != 0 ||
         mlx_mul_size(out_values, sizeof(float), &out_bytes) != 0 ||
-        (last_token_pool && mlx_mul_size(out_values, sizeof(int), &last_index_bytes) != 0))
+        (single_token_pool && mlx_mul_size(out_values, sizeof(int), &last_index_bytes) != 0))
         return -1;
     if (ids_bytes == 0 || out_bytes == 0 ||
         (needs_pool_mask && (mask_bytes == 0 || len_bytes == 0)) ||
-        (needs_attn_mask && mask_bytes == 0) || (last_token_pool && last_index_bytes == 0))
+        (needs_attn_mask && mask_bytes == 0) || (single_token_pool && last_index_bytes == 0))
         return -1;
     int *padded_ids = (int *)malloc(ids_bytes);
     float *pool_mask_data = needs_pool_mask ? (float *)malloc(mask_bytes) : NULL;
     float *attn_mask_data = needs_attn_mask ? (float *)malloc(mask_bytes) : NULL;
     float *len_data = needs_pool_mask ? (float *)malloc(len_bytes) : NULL;
-    int *last_index_data = last_token_pool ? (int *)malloc(last_index_bytes) : NULL;
+    int *last_index_data = single_token_pool ? (int *)malloc(last_index_bytes) : NULL;
     if (!padded_ids || (needs_pool_mask && (!pool_mask_data || !len_data)) ||
         (needs_attn_mask && !attn_mask_data)) {
         free(padded_ids);
@@ -1648,7 +1651,7 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
         free(last_index_data);
         return -1;
     }
-    if (last_token_pool && !last_index_data) {
+    if (single_token_pool && !last_index_data) {
         free(padded_ids);
         free(pool_mask_data);
         free(attn_mask_data);
@@ -1659,8 +1662,8 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     for (int b = 0; b < batch; b++) {
         if (needs_pool_mask)
             len_data[b] = (float)inputs[b].n_tokens;
-        if (last_token_pool) {
-            int index = inputs[b].n_tokens - 1;
+        if (single_token_pool) {
+            int index = cls_pool ? 0 : inputs[b].n_tokens - 1;
             for (int d = 0; d < hidden; d++)
                 last_index_data[(size_t)b * hidden + d] = index;
         }
@@ -1708,8 +1711,8 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_array lengths =
         needs_pool_mask ? mlx_array_new_data(len_data, len_shape, 2, MLX_FLOAT32) : (mlx_array){0};
     mlx_array last_indices =
-        last_token_pool ? mlx_array_new_data(last_index_data, last_index_shape, 3, MLX_INT32)
-                        : (mlx_array){0};
+        single_token_pool ? mlx_array_new_data(last_index_data, last_index_shape, 3, MLX_INT32)
+                          : (mlx_array){0};
     free(padded_ids);
     free(pool_mask_data);
     free(attn_mask_data);
@@ -1717,7 +1720,7 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     free(last_index_data);
 
     if (!arr_ok(ids) || (needs_pool_mask && (!arr_ok(pool_mask) || !arr_ok(lengths))) ||
-        (needs_attn_mask && !arr_ok(attn_mask)) || (last_token_pool && !arr_ok(last_indices))) {
+        (needs_attn_mask && !arr_ok(attn_mask)) || (single_token_pool && !arr_ok(last_indices))) {
         mlx_array_free(ids);
         mlx_array_free(pool_mask);
         mlx_array_free(attn_mask);
@@ -1753,7 +1756,7 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_array_free(x);
 
     mlx_array emb = mlx_array_new();
-    if (last_token_pool) {
+    if (single_token_pool) {
         mlx_array selected = mlx_array_new();
         mlx_take_along_axis(&selected, x_normed, last_indices, 1, S);
         mlx_array_free(x_normed);

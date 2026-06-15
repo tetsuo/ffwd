@@ -618,6 +618,16 @@ last_pool_kernel(float *out, const float *x, const int *offsets, int batch, int 
         out[(size_t)b * hidden + d] = x[(size_t)last * hidden + d];
 }
 
+/* CLS pooling: gather the first token of each packed sequence. */
+__global__ static void
+first_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int first = offsets[b];
+    for (int d = tid; d < hidden; d += blockDim.x)
+        out[(size_t)b * hidden + d] = x[(size_t)first * hidden + d];
+}
+
 __global__ static void span_pool_kernel(
     float *out, const float *x, const int *starts, const int *lens, int n_spans, int hidden) {
     int s = blockIdx.x;
@@ -1420,6 +1430,9 @@ int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx,
     if (c->pooling_mode == EMBED_POOL_LAST_TOKEN)
         last_pool_kernel<<<batch, 256, 0, ctx->stream>>>(ctx->pooled_out, ctx->x, ctx->offsets,
                                                          batch, c->hidden_size);
+    else if (c->pooling_mode == EMBED_POOL_CLS)
+        first_pool_kernel<<<batch, 256, 0, ctx->stream>>>(ctx->pooled_out, ctx->x, ctx->offsets,
+                                                          batch, c->hidden_size);
     else
         mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(ctx->pooled_out, ctx->x, ctx->offsets,
                                                          batch, c->hidden_size);

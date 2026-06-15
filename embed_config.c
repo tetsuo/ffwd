@@ -123,15 +123,18 @@ static int parse_sentence_transformers_metadata(embed_config_t *cfg, const char 
             free(buf);
             return -1;
         }
-        int supported = (mean == JSON_BOOL_TRUE) + (last == JSON_BOOL_TRUE);
-        int unsupported = cls == JSON_BOOL_TRUE || max == JSON_BOOL_TRUE ||
-                          sqrt_len == JSON_BOOL_TRUE || weighted == JSON_BOOL_TRUE;
+        int supported =
+            (mean == JSON_BOOL_TRUE) + (last == JSON_BOOL_TRUE) + (cls == JSON_BOOL_TRUE);
+        int unsupported =
+            max == JSON_BOOL_TRUE || sqrt_len == JSON_BOOL_TRUE || weighted == JSON_BOOL_TRUE;
         if (supported != 1 || unsupported) {
             fprintf(stderr, "embed_config: unsupported Sentence Transformers pooling mode\n");
             free(buf);
             return -1;
         }
-        cfg->pooling_mode = last == JSON_BOOL_TRUE ? EMBED_POOL_LAST_TOKEN : EMBED_POOL_MEAN;
+        cfg->pooling_mode = cls == JSON_BOOL_TRUE    ? EMBED_POOL_CLS
+                            : last == JSON_BOOL_TRUE ? EMBED_POOL_LAST_TOKEN
+                                                     : EMBED_POOL_MEAN;
         free(buf);
         buf = NULL;
     }
@@ -270,7 +273,9 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
                 cfg->hidden_size, cfg->n_layers, cfg->n_heads, cfg->n_kv_heads,
                 cfg->intermediate_size, cfg->head_dim,
                 cfg->attention_mode == EMBED_ATTENTION_CAUSAL ? "causal" : "bidirectional",
-                cfg->pooling_mode == EMBED_POOL_LAST_TOKEN ? "last-token" : "mean",
+                cfg->pooling_mode == EMBED_POOL_LAST_TOKEN ? "last-token"
+                : cfg->pooling_mode == EMBED_POOL_CLS      ? "cls"
+                                                           : "mean",
                 cfg->qk_norm ? "yes" : "no", cfg->qkv_bias ? "yes" : "no");
 
     return 0;

@@ -40,6 +40,7 @@ typedef enum {
 typedef enum {
     EMBED_POOL_MEAN = 0,
     EMBED_POOL_LAST_TOKEN = 1,
+    EMBED_POOL_CLS = 2, /* first token; the encoder-family [CLS] sentence vector */
 } embed_pooling_mode_t;
 
 typedef struct {

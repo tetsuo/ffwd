@@ -193,8 +193,15 @@ static inline int tm_write_qwen3_model_dims(const char *dir,
     return tm_write_config(dir, d, "qwen3", eos_token_id);
 }
 
-static inline int tm_write_qwen2_model_dims(
-    const char *dir, const char *dtype, const tm_dims_t *d, int eos_token_id, int zero_bias) {
+/* Write a tiny qwen2-style model whose Sentence Transformers pooling is one of
+ * "cls", "mean", or "lasttoken". The thin tm_write_qwen2_model_dims wrapper
+ * below keeps the historical last-token default for existing callers. */
+static inline int tm_write_qwen2_model_pooling(const char *dir,
+                                               const char *dtype,
+                                               const tm_dims_t *d,
+                                               int eos_token_id,
+                                               int zero_bias,
+                                               const char *pooling_key) {
     int q = d->heads * d->head_dim, kv = d->kv_heads * d->head_dim;
     const tm_spec_t specs[] = {
         {"embed_tokens.weight", d->vocab, d->hidden},
@@ -238,10 +245,13 @@ static inline int tm_write_qwen2_model_dims(
     f = fopen(path, "w");
     if (!f)
         return -1;
-    fputs("{\"pooling_mode_cls_token\":false,\"pooling_mode_mean_tokens\":false,"
-          "\"pooling_mode_max_tokens\":false,\"pooling_mode_mean_sqrt_len_tokens\":false,"
-          "\"pooling_mode_weightedmean_tokens\":false,\"pooling_mode_lasttoken\":true}",
-          f);
+    fprintf(f,
+            "{\"pooling_mode_cls_token\":%s,\"pooling_mode_mean_tokens\":%s,"
+            "\"pooling_mode_max_tokens\":false,\"pooling_mode_mean_sqrt_len_tokens\":false,"
+            "\"pooling_mode_weightedmean_tokens\":false,\"pooling_mode_lasttoken\":%s}",
+            strcmp(pooling_key, "cls") == 0 ? "true" : "false",
+            strcmp(pooling_key, "mean") == 0 ? "true" : "false",
+            strcmp(pooling_key, "lasttoken") == 0 ? "true" : "false");
     fclose(f);
 
     snprintf(path, sizeof(path), "%s/modules.json", dir);
@@ -261,6 +271,11 @@ static inline int tm_write_qwen2_model_dims(
     fputs("{\"add_eos_token\":true}", f);
     fclose(f);
     return 0;
+}
+
+static inline int tm_write_qwen2_model_dims(
+    const char *dir, const char *dtype, const tm_dims_t *d, int eos_token_id, int zero_bias) {
+    return tm_write_qwen2_model_pooling(dir, dtype, d, eos_token_id, zero_bias, "lasttoken");
 }
 
 /* Add the 1_Dense per-token projection head that turns a base model dir into

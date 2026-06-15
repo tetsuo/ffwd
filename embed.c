@@ -1178,8 +1178,11 @@ static int pool_embeddings(const embed_model_t *model,
         float *emb = out_embeddings + (size_t)b * hidden;
 
         memset(emb, 0, (size_t)hidden * sizeof(float));
-        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN) {
-            const float *row = x + (size_t)(end - 1) * hidden;
+        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN || cfg->pooling_mode == EMBED_POOL_CLS) {
+            /* Single-token pooling: CLS takes the first token, last-token the
+             * final one. The model's final RMSNorm is applied to that one row. */
+            int idx = cfg->pooling_mode == EMBED_POOL_CLS ? start : end - 1;
+            const float *row = x + (size_t)idx * hidden;
             float sum_sq = 0.0f;
             for (int d = 0; d < hidden; d++)
                 sum_sq += row[d] * row[d];
@@ -1502,8 +1505,11 @@ int embed_pool_batch(const embed_config_t *cfg,
             return -1;
 
         float *emb = out_embeddings + (size_t)b * cfg->hidden_size;
-        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN) {
-            const float *row = states + (size_t)(offset + len - 1) * cfg->hidden_size;
+        if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN || cfg->pooling_mode == EMBED_POOL_CLS) {
+            /* CLS takes the first token, last-token the final one; these states
+             * already carry the model's final RMSNorm. */
+            int idx = cfg->pooling_mode == EMBED_POOL_CLS ? offset : offset + len - 1;
+            const float *row = states + (size_t)idx * cfg->hidden_size;
             memcpy(emb, row, (size_t)cfg->hidden_size * sizeof(float));
         } else {
             memset(emb, 0, (size_t)cfg->hidden_size * sizeof(float));
