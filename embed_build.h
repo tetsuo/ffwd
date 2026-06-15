@@ -28,9 +28,9 @@
 /* Backend label for --build-info, selected by the same macro that picks the
  * compiled inference path. */
 #if defined(USE_MLX)
-#define EMBED_BUILD_BACKENDS "accelerate, mlx"
+#define EMBED_BUILD_BACKENDS "accelerate,mlx"
 #elif defined(USE_CUDA)
-#define EMBED_BUILD_BACKENDS "openblas, cuda"
+#define EMBED_BUILD_BACKENDS "openblas,cuda"
 #elif defined(__APPLE__)
 #define EMBED_BUILD_BACKENDS "accelerate"
 #else
@@ -53,12 +53,12 @@ static inline void embed_print_version(const char *prog)
 static inline void embed_print_build_info(const char *prog)
 {
     embed_print_version(prog);
-    printf("\ntarget:   %s-%s [%s]\n"
+    printf("backend:  %s\n"
            "compiler: %s\n"
            "built:    %s\n"
            "commit:   %s\n",
-           EMBED_BUILD_OS, EMBED_BUILD_ARCH, EMBED_BUILD_BACKENDS,
-           __VERSION__, EMBED_BUILD_DATE, EMBED_BUILD_COMMIT);
+           EMBED_BUILD_BACKENDS, __VERSION__,
+           EMBED_BUILD_DATE, EMBED_BUILD_COMMIT);
 }
 
 #endif /* EMBED_BUILD_H */
