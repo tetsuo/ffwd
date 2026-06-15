@@ -423,7 +423,9 @@ static void stop_signal_handler(int sig) {
     int fd = (int)g_signal_wfd;
     if (fd >= 0) {
         const unsigned char byte = 1;
-        (void)write(fd, &byte, 1);
+        if (write(fd, &byte, 1) < 0) {
+            /* best-effort stop wakeup; a failed self-pipe write is ignored */
+        }
     }
     errno = saved;
 }
@@ -848,7 +850,9 @@ static void enqueue_done(job *j) {
     s->done_tail = j;
     pthread_mutex_unlock(&s->mu);
     const unsigned char byte = 1;
-    (void)write(s->completion_pipe[1], &byte, 1);
+    if (write(s->completion_pipe[1], &byte, 1) < 0) {
+        /* best-effort wakeup; the event loop also drains the done queue */
+    }
 }
 
 static job *pop_job_locked(http_server *s) {
@@ -2235,8 +2239,12 @@ prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_reque
                 for (ci = 0; ci < n_chunks; ci++) {
                     doc->spans[ci].start = pos;
                     doc->spans[ci].n_tokens = chunk_tokens[ci].n_tokens;
-                    memcpy(doc->ids + pos, chunk_tokens[ci].ids,
-                           (size_t)chunk_tokens[ci].n_tokens * sizeof(*doc->ids));
+                    /* n_tokens > 0 implies ids != NULL (tokenize_one sets both
+                     * together), and the guard avoids a memcpy(dst, NULL, 0) for
+                     * an empty chunk that the static analyzer reports as UB. */
+                    if (chunk_tokens[ci].n_tokens > 0)
+                        memcpy(doc->ids + pos, chunk_tokens[ci].ids,
+                               (size_t)chunk_tokens[ci].n_tokens * sizeof(*doc->ids));
                     pos += chunk_tokens[ci].n_tokens;
                     if (ci + 1 < n_chunks) {
                         doc->ids[pos++] = m->context_separator_id;
