@@ -1,10 +1,19 @@
 #include "embed_config.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef enum {
+    JSON_BOOL_MISSING = 0,
+    JSON_BOOL_FALSE = 1,
+    JSON_BOOL_TRUE = 2,
+    JSON_BOOL_INVALID = -1,
+} json_bool_t;
 
 static const char *skip_ws(const char *p) {
     while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
@@ -48,6 +57,112 @@ static int json_string_equals(const char *json, const char *key, const char *exp
     return strncmp(v, expected, len) == 0 && v[len] == '"';
 }
 
+static json_bool_t json_get_bool(const char *json, const char *key) {
+    const char *v = json_find_key(json, key);
+    if (!v)
+        return JSON_BOOL_MISSING;
+    if (strncmp(v, "true", 4) == 0 && !isalnum((unsigned char)v[4]) && v[4] != '_')
+        return JSON_BOOL_TRUE;
+    if (strncmp(v, "false", 5) == 0 && !isalnum((unsigned char)v[5]) && v[5] != '_')
+        return JSON_BOOL_FALSE;
+    return JSON_BOOL_INVALID;
+}
+
+/* Return 1 with a NUL-terminated buffer, 0 when an optional file is absent,
+ * and -1 for an existing file that could not be read. */
+static int read_optional_file(const char *model_dir, const char *relative, char **out) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", model_dir, relative);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "embed_config: model path too long\n");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f && errno == ENOENT)
+        return 0;
+    if (!f) {
+        fprintf(stderr, "embed_config: cannot open %s\n", path);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long sz = ftell(f);
+    if (sz < 0 || (size_t)sz == SIZE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+    buf[sz] = '\0';
+    *out = buf;
+    return 1;
+}
+
+static int parse_sentence_transformers_metadata(embed_config_t *cfg, const char *model_dir) {
+    char *buf = NULL;
+    int rc = read_optional_file(model_dir, "1_Pooling/config.json", &buf);
+    if (rc < 0)
+        return -1;
+    if (rc > 0) {
+        json_bool_t mean = json_get_bool(buf, "pooling_mode_mean_tokens");
+        json_bool_t last = json_get_bool(buf, "pooling_mode_lasttoken");
+        json_bool_t cls = json_get_bool(buf, "pooling_mode_cls_token");
+        json_bool_t max = json_get_bool(buf, "pooling_mode_max_tokens");
+        json_bool_t sqrt_len = json_get_bool(buf, "pooling_mode_mean_sqrt_len_tokens");
+        json_bool_t weighted = json_get_bool(buf, "pooling_mode_weightedmean_tokens");
+        if (mean < 0 || last < 0 || cls < 0 || max < 0 || sqrt_len < 0 || weighted < 0) {
+            fprintf(stderr, "embed_config: invalid pooling metadata\n");
+            free(buf);
+            return -1;
+        }
+        int supported = (mean == JSON_BOOL_TRUE) + (last == JSON_BOOL_TRUE);
+        int unsupported = cls == JSON_BOOL_TRUE || max == JSON_BOOL_TRUE ||
+                          sqrt_len == JSON_BOOL_TRUE || weighted == JSON_BOOL_TRUE;
+        if (supported != 1 || unsupported) {
+            fprintf(stderr, "embed_config: unsupported Sentence Transformers pooling mode\n");
+            free(buf);
+            return -1;
+        }
+        cfg->pooling_mode = last == JSON_BOOL_TRUE ? EMBED_POOL_LAST_TOKEN : EMBED_POOL_MEAN;
+        free(buf);
+        buf = NULL;
+    }
+
+    rc = read_optional_file(model_dir, "modules.json", &buf);
+    if (rc < 0)
+        return -1;
+    if (rc > 0) {
+        cfg->normalize_embeddings =
+            strstr(buf, "\"sentence_transformers.models.Normalize\"") != NULL;
+        free(buf);
+        buf = NULL;
+    }
+
+    rc = read_optional_file(model_dir, "tokenizer_config.json", &buf);
+    if (rc < 0)
+        return -1;
+    if (rc > 0) {
+        json_bool_t add_eos = json_get_bool(buf, "add_eos_token");
+        if (add_eos < 0) {
+            fprintf(stderr, "embed_config: invalid add_eos_token metadata\n");
+            free(buf);
+            return -1;
+        }
+        if (add_eos != JSON_BOOL_MISSING)
+            cfg->append_terminal_token = add_eos == JSON_BOOL_TRUE;
+        free(buf);
+    }
+    return 0;
+}
+
 int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/config.json", model_dir);
@@ -89,6 +204,8 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
     cfg->vocab_size = json_get_int(buf, "vocab_size", EMBED_VOCAB_SIZE);
     cfg->rms_norm_eps = (float)json_get_double(buf, "rms_norm_eps", 1e-6);
     cfg->rope_theta = (float)json_get_double(buf, "rope_theta", 1000000.0);
+    cfg->qk_norm = 1;
+    cfg->qkv_bias = 0;
     cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
     cfg->pooling_mode = EMBED_POOL_MEAN;
     cfg->normalize_embeddings = 0;
@@ -99,6 +216,21 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
         cfg->pooling_mode = EMBED_POOL_LAST_TOKEN;
         cfg->normalize_embeddings = 1;
         cfg->append_terminal_token = 1;
+    } else if (json_string_equals(buf, "model_type", "qwen2")) {
+        cfg->qk_norm = 0;
+        cfg->qkv_bias = 1;
+        cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
+    }
+
+    json_bool_t is_causal = json_get_bool(buf, "is_causal");
+    if (is_causal < 0) {
+        fprintf(stderr, "embed_config: invalid is_causal in %s\n", path);
+        free(buf);
+        return -1;
+    }
+    if (is_causal != JSON_BOOL_MISSING) {
+        cfg->attention_mode =
+            is_causal == JSON_BOOL_TRUE ? EMBED_ATTENTION_CAUSAL : EMBED_ATTENTION_BIDIRECTIONAL;
     }
 
     cfg->q_dim = 0;
@@ -109,6 +241,9 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
         cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
 
     free(buf);
+
+    if (parse_sentence_transformers_metadata(cfg, model_dir) != 0)
+        return -1;
 
     if (cfg->hidden_size <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0 || cfg->n_kv_heads <= 0 ||
         cfg->head_dim <= 0 || cfg->intermediate_size <= 0 || cfg->vocab_size <= 0 ||
@@ -131,11 +266,12 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
     if (embed_verbose >= 1)
         fprintf(stderr,
                 "config: hidden=%d, layers=%d, heads=%d/%d, "
-                "inter=%d, head_dim=%d, attention=%s, pooling=%s\n",
+                "inter=%d, head_dim=%d, attention=%s, pooling=%s, qk_norm=%s, qkv_bias=%s\n",
                 cfg->hidden_size, cfg->n_layers, cfg->n_heads, cfg->n_kv_heads,
                 cfg->intermediate_size, cfg->head_dim,
                 cfg->attention_mode == EMBED_ATTENTION_CAUSAL ? "causal" : "bidirectional",
-                cfg->pooling_mode == EMBED_POOL_LAST_TOKEN ? "last-token" : "mean");
+                cfg->pooling_mode == EMBED_POOL_LAST_TOKEN ? "last-token" : "mean",
+                cfg->qk_norm ? "yes" : "no", cfg->qkv_bias ? "yes" : "no");
 
     return 0;
 }

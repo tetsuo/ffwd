@@ -66,13 +66,14 @@
 #define EMBED_LATE_MASK_TOKEN_ID       151642
 #define EMBED_LATE_QUERY_PREFIX_ID     151669
 #define EMBED_LATE_DOCUMENT_PREFIX_ID  151670
-/* Qwen3/DashScope `text_type: query` prepends this default retrieval instruction
- * in the Qwen3-Embedding format ("Instruct: {task}\nQuery:{query}"); documents
- * and the default pass through unchanged. The task text matches the
- * Qwen3-Embedding reference default; callers needing a custom instruction still
- * prepend their own text and leave text_type at "document". */
+/* `text_type: query` prepends the model's published retrieval instruction.
+ * Documents and the default pass through unchanged. Callers needing a custom
+ * instruction prepend it themselves and leave text_type at "document". */
 #define EMBED_QWEN3_QUERY_INSTRUCT \
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+#define EMBED_GTE_QWEN2_QUERY_INSTRUCT                                                \
+    "Instruct: Given a web search query, retrieve relevant passages that answer the " \
+    "query\nQuery: "
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
@@ -227,6 +228,7 @@ typedef enum {
     MODEL_QWEN3_06,
     MODEL_QWEN3_4,
     MODEL_QWEN3_8,
+    MODEL_GTE_QWEN2_15,
     MODEL_CTX_06,
     MODEL_CTX_4,
     MODEL_LATE_06,
@@ -239,10 +241,10 @@ typedef enum { MODEL_KIND_STANDARD, MODEL_KIND_CONTEXTUAL, MODEL_KIND_LATE } mod
 /* Which embedding API a model speaks. pplx-embed models follow the Perplexity
  * API: the canonical output is the tanh int8 quantization, so the default
  * encoding is base64_int8 and "float" is the int8-decoded view (int8/128).
- * Qwen3-Embedding models follow the Qwen/DashScope API, which is OpenAI-
- * compatible: "float" is the true float32 vector and "base64" is base64 of
- * little-endian float32. int8 quantization underuses the range of Qwen3's
- * L2-normalized vectors, so it is never the Qwen3 wire format. */
+ * Instruction embedding models follow the OpenAI-compatible API: "float" is
+ * the true float32 vector and "base64" is base64 of little-endian float32.
+ * int8 quantization underuses the range of L2-normalized vectors, so it is not
+ * used for these models. */
 typedef enum {
     EMBED_API_PERPLEXITY = 0,
     EMBED_API_OPENAI = 1,
@@ -258,25 +260,28 @@ typedef struct {
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;
     embedding_api_t api;
+    const char *query_instruct;
 } model_info;
 
 static const model_info k_models[] = {
     {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
+     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
+     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
+     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
     {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
+     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
     {"Qwen3-Embedding-8B", MODEL_KIND_STANDARD, 4096, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
+     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
+    {"gte-Qwen2-1.5B-instruct", MODEL_KIND_STANDARD, 1536, 1536, 0, EMBED_ATTENTION_BIDIRECTIONAL,
+     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_GTE_QWEN2_QUERY_INSTRUCT},
     {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
+     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
+     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
 };
 
 static model_slot model_slot_for_id(const char *id) {
@@ -1242,18 +1247,16 @@ static const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_
     return v;
 }
 
-/* Parse the Qwen3/DashScope `text_type` hint. Returns 1 when the query
- * retrieval instruction should be prepended, 0 otherwise (document / absent).
- * The field belongs to the OpenAI/DashScope (Qwen3) family only; on a Perplexity
- * model it is rejected, since pplx-embed has no instruction concept. Invalid
- * values are reported into detail and treated as the no-op default. */
-static int text_type_is_query(cJSON *root, cJSON *detail, embedding_api_t api) {
+/* Parse the `text_type` hint. Returns 1 when the model's query instruction
+ * should be prepended, 0 otherwise (document / absent). Models without a
+ * published query instruction reject the field. */
+static int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct) {
     cJSON *tt = cJSON_GetObjectItemCaseSensitive(root, "text_type");
     if (!tt)
         return 0;
-    if (api != EMBED_API_OPENAI) {
+    if (!query_instruct) {
         ve_add(detail, "[\"body\",\"text_type\"]",
-               "text_type is only supported for Qwen3-Embedding models", "extra_fields");
+               "text_type is only supported for instruction embedding models", "extra_fields");
         return 0;
     }
     if (!cJSON_IsString(tt) || !tt->valuestring) {
@@ -1497,22 +1500,20 @@ static int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *ou
     return 0;
 }
 
-/* Tokenize one embedding input, prepending the Qwen3 query instruction when
- * query_instruct is set. The instruction is part of the text the model sees, so
- * it is tokenized in one pass with the input (and the terminal token, if any, is
- * appended by tokenize_one as usual). */
-static int
-tokenize_input(loaded_model *m, job *j, const char *text, int query_instruct, token_buf *out) {
+/* Tokenize one embedding input, optionally prepending the model's query
+ * instruction. The instruction and input are tokenized in one pass. */
+static int tokenize_input(
+    loaded_model *m, job *j, const char *text, const char *query_instruct, token_buf *out) {
     if (!query_instruct)
         return tokenize_one(m, j, text, out);
-    size_t plen = strlen(EMBED_QWEN3_QUERY_INSTRUCT);
+    size_t plen = strlen(query_instruct);
     size_t tlen = strlen(text);
     char *buf = (char *)malloc(plen + tlen + 1);
     if (!buf) {
         memset(out, 0, sizeof(*out));
         return -1;
     }
-    memcpy(buf, EMBED_QWEN3_QUERY_INSTRUCT, plen);
+    memcpy(buf, query_instruct, plen);
     memcpy(buf + plen, text, tlen + 1);
     int rc = tokenize_one(m, j, buf, out);
     free(buf);
@@ -2003,15 +2004,17 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s, embed
     out->dims = dims;
     out->encoding = encoding;
 
-    /* Resolve the API family from the requested model (independent of load
-     * state) to validate the Qwen3/DashScope text_type hint. query_instruct is
-     * applied to every input in the request. */
+    /* Resolve request behavior from the model registry independent of load
+     * state. The query instruction, when requested, applies to every input. */
     cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
     model_slot api_slot = (model_item && cJSON_IsString(model_item) && model_item->valuestring)
                               ? model_slot_for_id(model_item->valuestring)
                               : MODEL_UNKNOWN;
-    embedding_api_t api = api_slot != MODEL_UNKNOWN ? k_models[api_slot].api : EMBED_API_PERPLEXITY;
-    int query_instruct = text_type_is_query(root, detail, api);
+    const char *query_instruct =
+        api_slot != MODEL_UNKNOWN &&
+                text_type_is_query(root, detail, k_models[api_slot].query_instruct)
+            ? k_models[api_slot].query_instruct
+            : NULL;
 
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
     int n_inputs = 0;

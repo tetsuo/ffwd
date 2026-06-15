@@ -23,6 +23,7 @@ typedef struct {
 
 typedef struct {
     cuda_matrix_t qkv, wo;
+    float *qkv_bias;
     float *q_norm;
     float *k_norm;
     float *input_norm;
@@ -303,6 +304,26 @@ static int load_vector(float **out, const float *src, int n) {
     return 0;
 }
 
+static int load_qkv_bias(float **out, const embed_layer_t *src, const embed_config_t *c) {
+    int n = c->q_dim + 2 * c->kv_dim;
+    float *host = (float *)malloc((size_t)n * sizeof(float));
+    if (!host)
+        return -1;
+    memcpy(host, src->q_bias, (size_t)c->q_dim * sizeof(float));
+    memcpy(host + c->q_dim, src->k_bias, (size_t)c->kv_dim * sizeof(float));
+    memcpy(host + c->q_dim + c->kv_dim, src->v_bias, (size_t)c->kv_dim * sizeof(float));
+    int rc = load_vector(out, host, n);
+    free(host);
+    return rc;
+}
+
+__global__ static void add_row_bias_kernel(float *x, const float *bias, int rows, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = rows * dim;
+    if (idx < count)
+        x[idx] += bias[idx % dim];
+}
+
 __global__ static void embed_lookup_kernel(
     float *x, const int *ids, const void *emb, int emb_bf16, int total, int hidden, int vocab) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -391,6 +412,7 @@ __global__ static void rms_norm_rope_qk_kernel(float *x,
                                                int row_stride,
                                                int q_offset,
                                                int k_offset,
+                                               int qk_norm,
                                                float eps) {
     __shared__ float partial[4];
     __shared__ float total;
@@ -409,29 +431,34 @@ __global__ static void rms_norm_rope_qk_kernel(float *x,
     size_t base = (size_t)row * row_stride + base_offset + head * head_dim;
     float v = tid < head_dim ? x[base + tid] : 0.0f;
     float pair_v = tid < head_dim ? x[base + pair_d] : 0.0f;
-    float sum = v * v;
-
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    if (lane == 0)
-        partial[warp] = sum;
-    __syncthreads();
-    if (warp == 0) {
-        sum = lane < 4 ? partial[lane] : 0.0f;
+    if (qk_norm) {
+        float sum = v * v;
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(0xffffffff, sum, offset);
         if (lane == 0)
-            total = sum;
+            partial[warp] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            sum = lane < 4 ? partial[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffff, sum, offset);
+            if (lane == 0)
+                total = sum;
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     if (tid < head_dim) {
-        float inv = rsqrtf(total / (float)head_dim + eps);
         int pos = positions[row];
         float c = cosv[(size_t)pos * head_dim + tid];
         float s = sinv[(size_t)pos * head_dim + tid];
-        float a = v * inv * weight[tid];
-        float b = pair_v * inv * weight[pair_d];
+        float a = v;
+        float b = pair_v;
+        if (qk_norm) {
+            float inv = rsqrtf(total / (float)head_dim + eps);
+            a *= inv * weight[tid];
+            b *= inv * weight[pair_d];
+        }
         x[base + tid] = a * c + sign * b * s;
     }
 }
@@ -1081,8 +1108,9 @@ static int ensure_span_buffers(embed_cuda_ctx_t *ctx, int n_spans) {
 static int load_layer(cuda_layer_t *dst, const embed_layer_t *src, const embed_config_t *c) {
     return load_qkv_matrix(&dst->qkv, src, c) ||
            load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
-           load_vector(&dst->q_norm, src->q_norm, c->head_dim) ||
-           load_vector(&dst->k_norm, src->k_norm, c->head_dim) ||
+           (c->qkv_bias && load_qkv_bias(&dst->qkv_bias, src, c)) ||
+           (c->qk_norm && load_vector(&dst->q_norm, src->q_norm, c->head_dim)) ||
+           (c->qk_norm && load_vector(&dst->k_norm, src->k_norm, c->head_dim)) ||
            load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
            load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
            load_gate_up_matrix(&dst->gate_up_proj, src, c) ||
@@ -1092,6 +1120,7 @@ static int load_layer(cuda_layer_t *dst, const embed_layer_t *src, const embed_c
 static void free_layer(cuda_layer_t *l) {
     cuda_matrix_free(&l->qkv);
     cuda_matrix_free(&l->wo);
+    cudaFree(l->qkv_bias);
     cudaFree(l->q_norm);
     cudaFree(l->k_norm);
     cudaFree(l->input_norm);
@@ -1303,9 +1332,18 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
                 return -1;
         }
 
+        if (c->qkv_bias) {
+            int count = total * qkv_dim;
+            add_row_bias_kernel<<<(count + 255) / 256, 256, 0, ctx->stream>>>(ctx->qkv, l->qkv_bias,
+                                                                              total, qkv_dim);
+            if (launch_check() != 0)
+                return -1;
+        }
+
         rms_norm_rope_qk_kernel<<<dim3(total, c->n_heads + c->n_kv_heads), 128, 0, ctx->stream>>>(
             ctx->qkv, l->q_norm, l->k_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin, total,
-            c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim, q_offset, k_offset, c->rms_norm_eps);
+            c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim, q_offset, k_offset, c->qk_norm,
+            c->rms_norm_eps);
         if (launch_check() != 0)
             return -1;
 

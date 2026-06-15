@@ -54,6 +54,8 @@ typedef struct {
     int vocab_size;
     float rms_norm_eps;
     float rope_theta;
+    int qk_norm;
+    int qkv_bias;
     embed_attention_mode_t attention_mode;
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;

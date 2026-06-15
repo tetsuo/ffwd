@@ -169,6 +169,8 @@ TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c embed_config.c qwen_safe
                         $(KERNEL_SRCS)
 TEST_QWEN3_SRCS       = tests/test_qwen3.c embed.c embed_config.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
+TEST_QWEN2_SRCS       = tests/test_qwen2.c embed.c embed_config.c qwen_safetensors.c \
+                        $(KERNEL_SRCS)
 TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c embed_config.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
 TEST_LATE_SRCS        = tests/test_late.c embed.c embed_config.c qwen_tokenizer.c \
@@ -198,6 +200,9 @@ test:
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen3 \
 	    $(TEST_QWEN3_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_qwen3
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen2 \
+	    $(TEST_QWEN2_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	./tests/test_qwen2
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	./tests/test_workspace
@@ -236,7 +241,8 @@ COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
             -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
             tests/test_tokenizer tests/test_safetensors \
-            tests/test_bf16_model tests/test_qwen3 tests/test_workspace tests/test_late \
+            tests/test_bf16_model tests/test_qwen3 tests/test_qwen2 tests/test_workspace \
+            tests/test_late \
             tests/cli_under_test tests/test_server
 # Report on project sources only - not the harnesses, vendored deps, or
 # system headers (cJSON lands under /opt or /usr otherwise).
@@ -269,6 +275,9 @@ coverage:
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen3 \
 	    $(TEST_QWEN3_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	LLVM_PROFILE_FILE=$(COV_DIR)/qwen3.profraw ./tests/test_qwen3
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen2 \
+	    $(TEST_QWEN2_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/qwen2.profraw ./tests/test_qwen2
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	LLVM_PROFILE_FILE=$(COV_DIR)/workspace.profraw ./tests/test_workspace
@@ -397,7 +406,7 @@ clean:
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libembed.dylib libembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
-	      tests/test_qwen3 \
+	      tests/test_qwen3 tests/test_qwen2 \
 	      tests/test_tokenizer tests/test_workspace tests/test_cli tests/test_late \
 	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels bench/bench_model
 	rm -rf $(COV_DIR)

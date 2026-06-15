@@ -28,6 +28,7 @@ typedef struct {
 
 typedef struct {
     mlx_linear_t wq, wk, wv, wo;
+    mlx_array q_bias, k_bias, v_bias;
     mlx_array q_norm, k_norm;
     mlx_array input_norm, post_attn_norm;
     mlx_linear_t gate_proj, up_proj, down_proj;
@@ -469,8 +470,15 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
             goto fail;                                                       \
     } while (0)
 
-        LD(q_norm, "%slayers.%d.self_attn.q_norm.weight", hd);
-        LD(k_norm, "%slayers.%d.self_attn.k_norm.weight", hd);
+        if (c->qkv_bias) {
+            LD(q_bias, "%slayers.%d.self_attn.q_proj.bias", qd);
+            LD(k_bias, "%slayers.%d.self_attn.k_proj.bias", kvd);
+            LD(v_bias, "%slayers.%d.self_attn.v_proj.bias", kvd);
+        }
+        if (c->qk_norm) {
+            LD(q_norm, "%slayers.%d.self_attn.q_norm.weight", hd);
+            LD(k_norm, "%slayers.%d.self_attn.k_norm.weight", hd);
+        }
         LD(input_norm, "%slayers.%d.input_layernorm.weight", h);
         LD(post_attn_norm, "%slayers.%d.post_attention_layernorm.weight", h);
 #undef LD
@@ -509,6 +517,9 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
     if (ctx->weight_dtype == MLX_BFLOAT16 && !ctx->quantize_bits) {
         for (int i = layer_start; i < layer_end; i++) {
             mlx_layer_t *l = &ctx->layers[i];
+            upcast_f32_inplace(&l->q_bias, ctx->stream);
+            upcast_f32_inplace(&l->k_bias, ctx->stream);
+            upcast_f32_inplace(&l->v_bias, ctx->stream);
             upcast_f32_inplace(&l->q_norm, ctx->stream);
             upcast_f32_inplace(&l->k_norm, ctx->stream);
             upcast_f32_inplace(&l->input_norm, ctx->stream);
@@ -576,6 +587,9 @@ static void free_mlx_layer(mlx_layer_t *l) {
     free_linear(&l->wk);
     free_linear(&l->wv);
     free_linear(&l->wo);
+    mlx_array_free(l->q_bias);
+    mlx_array_free(l->k_bias);
+    mlx_array_free(l->v_bias);
     mlx_array_free(l->q_norm);
     mlx_array_free(l->k_norm);
     mlx_array_free(l->input_norm);
@@ -733,6 +747,20 @@ static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx,
         mlx_array k_flat = linear(xn, &l->wk, S);
         mlx_array v_flat = linear(xn, &l->wv, S);
         mlx_array_free(xn);
+        if (c->qkv_bias) {
+            mlx_array biased = mlx_array_new();
+            mlx_add(&biased, q_flat, l->q_bias, S);
+            mlx_array_free(q_flat);
+            q_flat = biased;
+            biased = mlx_array_new();
+            mlx_add(&biased, k_flat, l->k_bias, S);
+            mlx_array_free(k_flat);
+            k_flat = biased;
+            biased = mlx_array_new();
+            mlx_add(&biased, v_flat, l->v_bias, S);
+            mlx_array_free(v_flat);
+            v_flat = biased;
+        }
 
         int q_shape[] = {batch, max_seq, n_heads, head_dim};
         int k_shape[] = {batch, max_seq, n_kv_heads, head_dim};
@@ -746,12 +774,16 @@ static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx,
         mlx_array_free(k_flat);
         mlx_array_free(v_flat);
 
-        mlx_array qn = mlx_array_new();
-        mlx_array kn = mlx_array_new();
-        mlx_fast_rms_norm(&qn, q, l->q_norm, c->rms_norm_eps, S);
-        mlx_fast_rms_norm(&kn, k, l->k_norm, c->rms_norm_eps, S);
-        mlx_array_free(q);
-        mlx_array_free(k);
+        mlx_array qn = q;
+        mlx_array kn = k;
+        if (c->qk_norm) {
+            qn = mlx_array_new();
+            kn = mlx_array_new();
+            mlx_fast_rms_norm(&qn, q, l->q_norm, c->rms_norm_eps, S);
+            mlx_fast_rms_norm(&kn, k, l->k_norm, c->rms_norm_eps, S);
+            mlx_array_free(q);
+            mlx_array_free(k);
+        }
 
         /* [B, T, heads, D] -> [B, heads, T, D] for RoPE + SDPA. */
         int perm[] = {0, 2, 1, 3};

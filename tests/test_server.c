@@ -146,39 +146,52 @@ static void test_encoding_from_root_family(void) {
 static void test_text_type(void) {
     cJSON *detail = cJSON_CreateArray();
 
-    /* Absent: no-op for both families, no error. */
+    /* Absent: no-op for both model types, no error. */
     cJSON *empty = cJSON_CreateObject();
-    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_API_OPENAI) == 0);
-    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_API_PERPLEXITY) == 0);
+    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
+    TEST_ASSERT(text_type_is_query(empty, detail, NULL) == 0);
     cJSON_Delete(empty);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
 
     /* Qwen3: query -> 1, document -> 0, both accepted. */
     cJSON *q = cJSON_CreateObject();
     cJSON_AddStringToObject(q, "text_type", "query");
-    TEST_ASSERT(text_type_is_query(q, detail, EMBED_API_OPENAI) == 1);
+    TEST_ASSERT(text_type_is_query(q, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 1);
     cJSON_Delete(q);
     cJSON *d = cJSON_CreateObject();
     cJSON_AddStringToObject(d, "text_type", "document");
-    TEST_ASSERT(text_type_is_query(d, detail, EMBED_API_OPENAI) == 0);
+    TEST_ASSERT(text_type_is_query(d, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
     cJSON_Delete(d);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
 
     /* Invalid enum value on Qwen3 is reported. */
     cJSON *bad = cJSON_CreateObject();
     cJSON_AddStringToObject(bad, "text_type", "passage");
-    TEST_ASSERT(text_type_is_query(bad, detail, EMBED_API_OPENAI) == 0);
+    TEST_ASSERT(text_type_is_query(bad, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 1);
     cJSON_Delete(bad);
 
     /* text_type on a Perplexity-family model is rejected. */
     cJSON *p = cJSON_CreateObject();
     cJSON_AddStringToObject(p, "text_type", "query");
-    TEST_ASSERT(text_type_is_query(p, detail, EMBED_API_PERPLEXITY) == 0);
+    TEST_ASSERT(text_type_is_query(p, detail, NULL) == 0);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 2);
     cJSON_Delete(p);
 
     cJSON_Delete(detail);
+}
+
+static void test_model_registry(void) {
+    model_slot slot = model_slot_for_id("gte-Qwen2-1.5B-instruct");
+    TEST_ASSERT(slot == MODEL_GTE_QWEN2_15);
+    if (slot == MODEL_UNKNOWN)
+        return;
+    TEST_ASSERT(k_models[slot].dim == 1536);
+    TEST_ASSERT(k_models[slot].min_dim == 1536);
+    TEST_ASSERT(k_models[slot].attention_mode == EMBED_ATTENTION_BIDIRECTIONAL);
+    TEST_ASSERT(k_models[slot].pooling_mode == EMBED_POOL_LAST_TOKEN);
+    TEST_ASSERT(k_models[slot].normalize_embeddings == 1);
+    TEST_ASSERT(strcmp(k_models[slot].query_instruct, EMBED_GTE_QWEN2_QUERY_INSTRUCT) == 0);
 }
 
 static void test_collect_job_batch_deadline(void) {
@@ -410,7 +423,7 @@ static int http_req(int port,
 }
 
 typedef struct {
-    embed_server_model_spec_t spec[4];
+    embed_server_model_spec_t spec[5];
     embed_server_config_t cfg;
     int rc;
 } srv_ctx;
@@ -657,6 +670,45 @@ static void test_http_embeddings(int port) {
     cJSON_Delete(tt_query);
     cJSON_Delete(tt_manual);
 
+    /* GTE-Qwen2 uses the same retrieval task text but publishes a space after
+     * "Query:". Verify the registry-specific prompt through the full path. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"gte-Qwen2-1.5B-instruct\",\"input\":\"hello\","
+                         "\"text_type\":\"query\",\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *gte_query = body ? parse_embeddings_body(body, 1) : NULL;
+    free(body);
+    body = NULL;
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"gte-Qwen2-1.5B-instruct\",\"input\":\"Instruct: Given a "
+                         "web search query, retrieve relevant passages that answer the "
+                         "query\\nQuery: hello\",\"text_type\":\"document\","
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *gte_manual = body ? parse_embeddings_body(body, 1) : NULL;
+    free(body);
+    body = NULL;
+    if (gte_query && gte_manual) {
+        cJSON *qe = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(gte_query, "data"), 0),
+            "embedding");
+        cJSON *me = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(gte_manual, "data"), 0),
+            "embedding");
+        TEST_ASSERT(cJSON_IsArray(qe) && cJSON_IsArray(me));
+        TEST_ASSERT(cJSON_GetArraySize(qe) == 1536 && cJSON_GetArraySize(me) == 1536);
+        double gte_diff = 0.0;
+        for (int i = 0; i < cJSON_GetArraySize(qe); i++) {
+            double d = fabs(cJSON_GetArrayItem(qe, i)->valuedouble -
+                            cJSON_GetArrayItem(me, i)->valuedouble);
+            if (d > gte_diff)
+                gte_diff = d;
+        }
+        TEST_ASSERT(gte_diff < 1e-6);
+    }
+    cJSON_Delete(gte_query);
+    cJSON_Delete(gte_manual);
+
     /* text_type is rejected on a Perplexity-family model, and bad values 422. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello\","
@@ -897,7 +949,7 @@ static void test_http_rerank(int port) {
 }
 
 static void test_http_server(void) {
-    char dir[1024], late_dir[1024], qwen_dir[1024];
+    char dir[1024], late_dir[1024], qwen_dir[1024], gte_dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir)) {
@@ -919,14 +971,24 @@ static void test_http_server(void) {
         test_failures++;
         return;
     }
+    snprintf(gte_dir, sizeof(gte_dir), "%s/embed-srv-gte-test-XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(gte_dir)) {
+        fprintf(stderr, "FAIL: GTE mkdtemp\n");
+        test_failures++;
+        return;
+    }
     /* The 0.6b server slot requires hidden_size 1024; everything else stays
      * tiny. The model vocab covers every tokenizer fixture id. */
     tm_dims_t dims = {1024, 2, 1, 64, 8, TF_VOCAB_SIZE};
+    tm_dims_t gte_dims = {1536, 2, 1, 64, 8, TF_VOCAB_SIZE};
     if (tf_write_vocab(dir) != 0 || tm_write_model_dims(dir, "F32", &dims) != 0 ||
         tf_write_vocab(late_dir) != 0 || tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
         tm_write_late_projection(late_dir, "F32", 128, 1024) != 0 ||
         tf_write_vocab(qwen_dir) != 0 ||
-        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims, TF_EOT_ID) != 0) {
+        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims, TF_EOT_ID) != 0 ||
+        tf_write_vocab(gte_dir) != 0 ||
+        tm_write_qwen2_model_dims(gte_dir, "F32", &gte_dims, TF_EOT_ID, 0) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
         test_failures++;
         return;
@@ -947,8 +1009,10 @@ static void test_http_server(void) {
     ctx.spec[2].path = late_dir;
     ctx.spec[3].id = "Qwen3-Embedding-0.6B";
     ctx.spec[3].path = qwen_dir;
+    ctx.spec[4].id = "gte-Qwen2-1.5B-instruct";
+    ctx.spec[4].path = gte_dir;
     ctx.cfg.models = ctx.spec;
-    ctx.cfg.n_models = 4;
+    ctx.cfg.n_models = 5;
     ctx.cfg.port = port;
     ctx.cfg.batch_size = 2;
     ctx.cfg.batch_wait_us = 1000;
@@ -992,6 +1056,7 @@ int main(void) {
     test_append_embedding_value_float();
     test_encoding_from_root_family();
     test_text_type();
+    test_model_registry();
     test_collect_job_batch_deadline();
     test_collect_job_batch_zero_wait();
     test_http_server();

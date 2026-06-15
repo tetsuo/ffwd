@@ -347,6 +347,16 @@ static void linear_qkv_weight(embed_workspace_t *ws,
     linear_nobias_weight(ws, v, x, wv, seq_len, in_dim, kv_dim);
 }
 
+static void add_bias_rows(float *x, const float *bias, int rows, int dim) {
+    if (!bias)
+        return;
+    for (int row = 0; row < rows; row++) {
+        float *dst = x + (size_t)row * dim;
+        for (int d = 0; d < dim; d++)
+            dst[d] += bias[d];
+    }
+}
+
 static void linear_pair_weight(embed_workspace_t *ws,
                                float *a,
                                float *b,
@@ -576,8 +586,15 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
         LOAD2(wk, "%slayers.%d.self_attn.k_proj.weight", cfg->kv_dim, cfg->hidden_size);
         LOAD2(wv, "%slayers.%d.self_attn.v_proj.weight", cfg->kv_dim, cfg->hidden_size);
         LOAD2(wo, "%slayers.%d.self_attn.o_proj.weight", cfg->hidden_size, cfg->q_dim);
-        LOAD_NORM(q_norm, "%slayers.%d.self_attn.q_norm.weight", cfg->head_dim);
-        LOAD_NORM(k_norm, "%slayers.%d.self_attn.k_norm.weight", cfg->head_dim);
+        if (cfg->qkv_bias) {
+            LOAD_NORM(q_bias, "%slayers.%d.self_attn.q_proj.bias", cfg->q_dim);
+            LOAD_NORM(k_bias, "%slayers.%d.self_attn.k_proj.bias", cfg->kv_dim);
+            LOAD_NORM(v_bias, "%slayers.%d.self_attn.v_proj.bias", cfg->kv_dim);
+        }
+        if (cfg->qk_norm) {
+            LOAD_NORM(q_norm, "%slayers.%d.self_attn.q_norm.weight", cfg->head_dim);
+            LOAD_NORM(k_norm, "%slayers.%d.self_attn.k_norm.weight", cfg->head_dim);
+        }
         LOAD_NORM(input_norm, "%slayers.%d.input_layernorm.weight", cfg->hidden_size);
         LOAD_NORM(post_attn_norm, "%slayers.%d.post_attention_layernorm.weight", cfg->hidden_size);
         LOAD2(gate_proj, "%slayers.%d.mlp.gate_proj.weight", cfg->intermediate_size,
@@ -625,6 +642,9 @@ void embed_model_free(embed_model_t *model) {
     if (model->weights.layers) {
         for (int i = 0; i < model->config.n_layers; i++) {
             embed_layer_t *l = &model->weights.layers[i];
+            free((void *)l->q_bias);
+            free((void *)l->k_bias);
+            free((void *)l->v_bias);
             free((void *)l->q_norm);
             free((void *)l->k_norm);
             free((void *)l->input_norm);
@@ -1089,8 +1109,13 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
         linear_qkv_weight(ws, q_buf, k_buf, v_buf, x_norm, &l->wq, &l->wk, &l->wv, total_seq,
                           hidden, q_dim, kv_dim);
 
-        qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads, head_dim, eps);
-        qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
+        add_bias_rows(q_buf, l->q_bias, total_seq, q_dim);
+        add_bias_rows(k_buf, l->k_bias, total_seq, kv_dim);
+        add_bias_rows(v_buf, l->v_bias, total_seq, kv_dim);
+        if (cfg->qk_norm) {
+            qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads, head_dim, eps);
+            qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
+        }
 
         for (int b = 0; b < batch; b++) {
             int start = offsets[b];

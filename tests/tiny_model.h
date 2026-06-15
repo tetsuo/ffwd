@@ -76,8 +76,12 @@ tm_write_config(const char *dir, const tm_dims_t *d, const char *model_type, int
 
 /* Write a safetensors file holding `specs` with tm_value() contents.
  * dtype: "F32" or "BF16". Returns 0 on success. */
-static int tm_write_safetensors_with_prefix(
-    const char *path, const char *dtype, const tm_spec_t *specs, int n_specs, const char *prefix) {
+static int tm_write_safetensors_with_prefix_options(const char *path,
+                                                    const char *dtype,
+                                                    const tm_spec_t *specs,
+                                                    int n_specs,
+                                                    const char *prefix,
+                                                    int zero_bias) {
     int bf16 = strcmp(dtype, "BF16") == 0;
     size_t esize = bf16 ? 2 : 4;
 
@@ -117,7 +121,7 @@ static int tm_write_safetensors_with_prefix(
         const tm_spec_t *s = &specs[t];
         size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
         for (size_t i = 0; i < n; i++) {
-            float v = tm_value(s->name, i);
+            float v = zero_bias && strstr(s->name, ".bias") ? 0.0f : tm_value(s->name, i);
             if (bf16) {
                 uint16_t h = tm_f32_to_bf16(v);
                 fwrite(&h, sizeof(h), 1, f);
@@ -128,6 +132,11 @@ static int tm_write_safetensors_with_prefix(
     }
     fclose(f);
     return 0;
+}
+
+static int tm_write_safetensors_with_prefix(
+    const char *path, const char *dtype, const tm_spec_t *specs, int n_specs, const char *prefix) {
+    return tm_write_safetensors_with_prefix_options(path, dtype, specs, n_specs, prefix, 0);
 }
 
 static int
@@ -182,6 +191,76 @@ static inline int tm_write_qwen3_model_dims(const char *dir,
     if (tm_write_model_dims(dir, dtype, d) != 0)
         return -1;
     return tm_write_config(dir, d, "qwen3", eos_token_id);
+}
+
+static inline int tm_write_qwen2_model_dims(
+    const char *dir, const char *dtype, const tm_dims_t *d, int eos_token_id, int zero_bias) {
+    int q = d->heads * d->head_dim, kv = d->kv_heads * d->head_dim;
+    const tm_spec_t specs[] = {
+        {"embed_tokens.weight", d->vocab, d->hidden},
+        {"layers.0.self_attn.q_proj.weight", q, d->hidden},
+        {"layers.0.self_attn.q_proj.bias", q, 0},
+        {"layers.0.self_attn.k_proj.weight", kv, d->hidden},
+        {"layers.0.self_attn.k_proj.bias", kv, 0},
+        {"layers.0.self_attn.v_proj.weight", kv, d->hidden},
+        {"layers.0.self_attn.v_proj.bias", kv, 0},
+        {"layers.0.self_attn.o_proj.weight", d->hidden, q},
+        {"layers.0.input_layernorm.weight", d->hidden, 0},
+        {"layers.0.post_attention_layernorm.weight", d->hidden, 0},
+        {"layers.0.mlp.gate_proj.weight", d->intermediate, d->hidden},
+        {"layers.0.mlp.up_proj.weight", d->intermediate, d->hidden},
+        {"layers.0.mlp.down_proj.weight", d->hidden, d->intermediate},
+        {"norm.weight", d->hidden, 0},
+    };
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/config.json", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f,
+            "{\"hidden_size\":%d,\"num_hidden_layers\":1,"
+            "\"num_attention_heads\":%d,\"num_key_value_heads\":%d,"
+            "\"head_dim\":%d,\"intermediate_size\":%d,\"vocab_size\":%d,"
+            "\"rms_norm_eps\":1e-6,\"rope_theta\":10000.0,"
+            "\"model_type\":\"qwen2\",\"eos_token_id\":%d,\"is_causal\":false}",
+            d->hidden, d->heads, d->kv_heads, d->head_dim, d->intermediate, d->vocab, eos_token_id);
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
+    if (tm_write_safetensors_with_prefix_options(
+            path, dtype, specs, (int)(sizeof(specs) / sizeof(specs[0])), "model.", zero_bias) != 0)
+        return -1;
+
+    snprintf(path, sizeof(path), "%s/1_Pooling", dir);
+    if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        return -1;
+    snprintf(path, sizeof(path), "%s/1_Pooling/config.json", dir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs("{\"pooling_mode_cls_token\":false,\"pooling_mode_mean_tokens\":false,"
+          "\"pooling_mode_max_tokens\":false,\"pooling_mode_mean_sqrt_len_tokens\":false,"
+          "\"pooling_mode_weightedmean_tokens\":false,\"pooling_mode_lasttoken\":true}",
+          f);
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/modules.json", dir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs("[{\"type\":\"sentence_transformers.models.Transformer\"},"
+          "{\"type\":\"sentence_transformers.models.Pooling\"},"
+          "{\"type\":\"sentence_transformers.models.Normalize\"}]",
+          f);
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/tokenizer_config.json", dir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs("{\"add_eos_token\":true}", f);
+    fclose(f);
+    return 0;
 }
 
 /* Add the 1_Dense per-token projection head that turns a base model dir into

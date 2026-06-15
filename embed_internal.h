@@ -14,6 +14,9 @@ typedef struct {
     embed_weight_ref_t wk;        /* [kv_dim,  hidden] */
     embed_weight_ref_t wv;        /* [kv_dim,  hidden] */
     embed_weight_ref_t wo;        /* [hidden,  q_dim]  */
+    const float *q_bias;          /* [q_dim], optional */
+    const float *k_bias;          /* [kv_dim], optional */
+    const float *v_bias;          /* [kv_dim], optional */
     const float *q_norm;          /* [head_dim] */
     const float *k_norm;          /* [head_dim] */
     const float *input_norm;      /* [hidden] */
