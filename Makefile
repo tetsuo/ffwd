@@ -7,13 +7,14 @@ BUILD_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
 BUILD_ARCH ?= $(shell uname -m)
 
+# Version and build identity compiled into the embed and embed-server binaries.
+# Applied on the embed_cli.o and embed_server.o recipes. VERSION is set for
+# release builds; otherwise the C fallbacks apply.
 VERSION_CFLAGS = \
 	-DEMBED_BUILD_DATE=\"$(BUILD_DATE)\" \
 	-DEMBED_BUILD_COMMIT=\"$(BUILD_COMMIT)\" \
 	-DEMBED_BUILD_OS=\"$(BUILD_OS)\" \
 	-DEMBED_BUILD_ARCH=\"$(BUILD_ARCH)\"
-
-VERSION_CFLAGS =
 ifneq ($(strip $(VERSION)),)
 VERSION_CFLAGS += -DEMBED_VERSION=\"$(VERSION)\"
 endif
@@ -24,10 +25,9 @@ endif
 # -fapprox-func are the unsafe parts and stay off).
 # -fvisibility=hidden pairs with EMBED_API in the public headers: a new
 # public function without the annotation will be missing from the shared lib.
-CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) $(VERSION_CFLAGS) -fPIC -fvisibility=hidden \
+CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -fPIC -fvisibility=hidden \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
-LDFLAGS     = -lm -lpthread
 CJSON_CFLAGS ?= $(shell sh -c 'pkg-config --cflags libcjson 2>/dev/null')
 CJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs libcjson 2>/dev/null')
 ifeq ($(strip $(CJSON_LDFLAGS)),)
@@ -35,6 +35,42 @@ ifeq ($(strip $(CJSON_LDFLAGS)),)
 endif
 
 UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(strip $(CJSON_CFLAGS)),)
+    CJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
+endif
+ifeq ($(strip $(CJSON_LDFLAGS)),-lcjson)
+    CJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lcjson
+endif
+endif
+
+BACKEND ?= cpu
+MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
+MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+
+ifeq ($(BACKEND),mlx)
+BACKEND_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX -I$(MLXC_PREFIX)/include
+BACKEND_LDFLAGS = -framework Accelerate -framework Metal -framework Foundation \
+                  -L$(MLXC_PREFIX)/lib -lmlxc \
+                  -L$(MLX_PREFIX)/lib -lmlx \
+                  -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
+EXTRA_OBJS = embed_mlx.o
+else ifeq ($(BACKEND),cuda)
+BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
+BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
+EXTRA_OBJS = embed_cuda.o
+else ifeq ($(UNAME_S),Darwin)
+BACKEND_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+BACKEND_LDFLAGS = -framework Accelerate
+else
+BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+BACKEND_LDFLAGS = -lopenblas
+endif
+
+CFLAGS  = $(CFLAGS_BASE) $(BACKEND_CFLAGS)
+LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 
 # Source files
 SRCS = embed.c \
@@ -88,67 +124,16 @@ help:
 	@echo "  make clean    Remove build artifacts"
 
 # =============================================================================
-# CPU build (BLAS: Apple Accelerate on macOS, OpenBLAS on Linux)
+# Backend builds: clean, then build both binaries and the shared library.
 # =============================================================================
-ifeq ($(UNAME_S),Darwin)
-ifeq ($(strip $(CJSON_CFLAGS)),)
-    CJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
-endif
-ifeq ($(strip $(CJSON_LDFLAGS)),-lcjson)
-    CJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lcjson
-endif
-cpu: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-cpu: LDFLAGS += -framework Accelerate
-else
-cpu: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-cpu: LDFLAGS += -lopenblas
-endif
-cpu:
-	$(MAKE) clean
-	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+cpu mlx cuda:
+	$(MAKE) clean && $(MAKE) BACKEND=$@ $(TARGET) $(SERVER_TARGET) $(SHARED_LIB)
 
-# =============================================================================
-# MLX build (Apple Silicon GPU via MLX - uses the mlx-c pure C API)
-# Requires: brew install mlx mlx-c
-# =============================================================================
-MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
-MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
-
-mlx: SRCS += embed_mlx.c
-mlx: OBJS  = $(SRCS:.c=.o) embed_mlx.o
-ifeq ($(UNAME_S),Darwin)
-mlx: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DUSE_MLX \
-               -I$(MLXC_PREFIX)/include
-mlx: LDFLAGS += -framework Accelerate -framework Metal -framework Foundation \
-                -L$(MLXC_PREFIX)/lib -lmlxc \
-                -L$(MLX_PREFIX)/lib -lmlx \
-                -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
-endif
-mlx:
-	$(MAKE) clean
-	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_mlx.o"
-
-# =============================================================================
-# GPU convenience target (auto-selects mlx on macOS, cuda on Linux)
-# =============================================================================
 ifeq ($(UNAME_S),Darwin)
 gpu: mlx
 else
 gpu: cuda
 endif
-
-# =============================================================================
-# CUDA build (Linux NVIDIA GPU - uses CUDA Runtime + cuBLAS)
-# =============================================================================
-CUDA_HOME ?= /usr/local/cuda
-NVCC ?= $(CUDA_HOME)/bin/nvcc
-
-cuda: CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
-cuda: LDFLAGS += -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
-cuda:
-	$(MAKE) clean
-	$(MAKE) embed_cuda.o
-	$(MAKE) $(TARGET) $(SERVER_TARGET) $(SHARED_LIB) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="embed_cuda.o"
 
 # -fPIC so the same object links into both binaries and the shared library.
 # -arch=native targets the GPU present at build time (we always build CUDA
@@ -160,7 +145,7 @@ embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
 # Shared library (built by every backend target from the same objects)
 # =============================================================================
 $(SHARED_LIB): $(OBJS) $(EXTRA_OBJS)
-	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS) $(CJSON_LDFLAGS)
+	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS)
 
 
 # =============================================================================
@@ -348,7 +333,7 @@ bench-model:
 SANITIZE ?= address,undefined
 
 debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=$(SANITIZE)
-debug: LDFLAGS += -fsanitize=$(SANITIZE)
+debug: LDFLAGS  = -lm -lpthread -fsanitize=$(SANITIZE)
 debug:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
@@ -360,7 +345,7 @@ $(LIB): $(OBJS) $(EXTRA_OBJS)
 	$(AR) rcs $@ $^
 
 $(TARGET): $(LIB) embed_cli.o
-	$(CC) $(CFLAGS) -o $@ embed_cli.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ embed_cli.o $(LIB) $(LDFLAGS)
 
 $(SERVER_TARGET): $(LIB) embed_server.o
 	$(CC) $(CFLAGS) -o $@ embed_server.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
@@ -369,16 +354,16 @@ $(SERVER_TARGET): $(LIB) embed_server.o
 # Compile rules
 # =============================================================================
 embed.o: embed.c embed.h qwen_kernels.h qwen_safetensors.h
-	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
+	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
 
-embed_server.o: embed_server.c embed_server.h embed.h embed_mlx.h qwen_tokenizer.h deps/ae/ae.h deps/ae/anet.h
-	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
+embed_server.o: embed_server.c embed_server.h embed_build.h embed.h embed_mlx.h qwen_tokenizer.h deps/ae/ae.h deps/ae/anet.h
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
 embed_mlx.o: embed_mlx.c embed_mlx.h embed.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-embed_cli.o: embed_cli.c embed.h qwen_kernels.h qwen_tokenizer.h
-	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
+embed_cli.o: embed_cli.c embed_build.h embed.h qwen_kernels.h qwen_tokenizer.h
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -Ideps/ae -c -o $@ $<
 
 
 qwen_kernels.o: qwen_kernels.c qwen_kernels.h qwen_kernels_impl.h
