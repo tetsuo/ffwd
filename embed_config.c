@@ -206,7 +206,10 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
     cfg->intermediate_size = json_get_int(buf, "intermediate_size", 0);
     cfg->vocab_size = json_get_int(buf, "vocab_size", EMBED_VOCAB_SIZE);
     cfg->rms_norm_eps = (float)json_get_double(buf, "rms_norm_eps", 1e-6);
+    cfg->layer_norm_eps = (float)json_get_double(buf, "layer_norm_eps", 1e-12);
     cfg->rope_theta = (float)json_get_double(buf, "rope_theta", 1000000.0);
+    cfg->max_position_embeddings = json_get_int(buf, "max_position_embeddings", 0);
+    cfg->family = EMBED_FAMILY_QWEN3;
     cfg->qk_norm = 1;
     cfg->qkv_bias = 0;
     cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
@@ -223,6 +226,25 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
         cfg->qk_norm = 0;
         cfg->qkv_bias = 1;
         cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
+    } else if (json_string_equals(buf, "model_type", "bert")) {
+        cfg->family = EMBED_FAMILY_BERT;
+        cfg->qk_norm = 0;
+        cfg->qkv_bias = 1; /* q/k/v/o and both dense layers carry bias */
+        cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
+        cfg->n_kv_heads = cfg->n_heads; /* full multi-head attention, no GQA */
+        cfg->head_dim = cfg->n_heads > 0 ? cfg->hidden_size / cfg->n_heads : 0;
+        if (json_string_equals(buf, "hidden_act", "gelu_new") ||
+            json_string_equals(buf, "hidden_act", "gelu_pytorch_tanh")) {
+            fprintf(stderr, "embed_config: BERT tanh-GeLU is not supported yet; need exact gelu\n");
+            free(buf);
+            return -1;
+        }
+        if (cfg->max_position_embeddings <= 0 || !isfinite(cfg->layer_norm_eps) ||
+            cfg->layer_norm_eps <= 0.0f) {
+            fprintf(stderr, "embed_config: invalid BERT layer_norm_eps/max_position_embeddings\n");
+            free(buf);
+            return -1;
+        }
     }
 
     json_bool_t is_causal = json_get_bool(buf, "is_causal");

@@ -24,12 +24,28 @@ typedef struct {
     embed_weight_ref_t gate_proj; /* [intermediate, hidden] */
     embed_weight_ref_t up_proj;   /* [intermediate, hidden] */
     embed_weight_ref_t down_proj; /* [hidden, intermediate] */
+    /* BERT family (all NULL for Qwen3). The attention projections reuse
+     * wq/wk/wv/wo and q/k/v_bias; the two FFN matrices reuse up_proj
+     * (intermediate.dense) and down_proj (output.dense); the two block
+     * LayerNorm weights reuse input_norm (post-attention) and post_attn_norm
+     * (post-FFN). These fields add the biases those reused slots lack. */
+    const float *o_bias;         /* attention output dense bias [hidden] */
+    const float *attn_ln_bias;   /* post-attention LayerNorm bias [hidden] */
+    const float *ffn_inter_bias; /* intermediate.dense bias [intermediate] */
+    const float *ffn_out_bias;   /* output.dense bias [hidden] */
+    const float *ffn_ln_bias;    /* post-FFN LayerNorm bias [hidden] */
 } embed_layer_t;
 
 typedef struct {
     embed_weight_ref_t embed_tokens; /* [vocab_size, hidden] */
     embed_layer_t *layers;           /* [n_layers] heap-allocated */
-    const float *norm;               /* [hidden] */
+    const float *norm;               /* [hidden]; NULL for BERT (no final norm) */
+    /* BERT family (NULL for Qwen3): learned absolute position embeddings,
+     * token-type (segment) embeddings, and the embedding LayerNorm. */
+    const float *position_embeddings;   /* [max_position_embeddings, hidden] */
+    const float *token_type_embeddings; /* [2, hidden] */
+    const float *embed_ln_w;            /* embedding LayerNorm weight [hidden] */
+    const float *embed_ln_b;            /* embedding LayerNorm bias [hidden] */
 } embed_weights_t;
 
 typedef void (*embed_attention_fn)(float *out,

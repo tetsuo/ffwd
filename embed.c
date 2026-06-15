@@ -488,6 +488,99 @@ static int ensure_offsets(embed_workspace_t *ws, int batch) {
  * Model / workspace load and free
  * ======================================================================== */
 
+/* BERT-family weight loader. The tensor names differ entirely from the Qwen
+ * block (encoder.layer.N.*, embeddings.*), so the family gets its own entry
+ * point. Reused embed_layer_t slots carry their BERT meaning: wo is the
+ * attention output dense, input_norm/post_attn_norm are the two block LayerNorm
+ * weights, up_proj/down_proj are the two FFN matrices (see embed_internal.h). */
+static int
+load_bert_weights(embed_model_t *model, multi_safetensors_t *ms, int layer_start, int layer_end) {
+    const embed_config_t *cfg = &model->config;
+    embed_weights_t *w = &model->weights;
+    char name[256];
+
+    /* sentence-transformers checkpoints store the BERT submodule unprefixed;
+     * raw HF checkpoints prefix every tensor with "bert.". */
+    const char *p;
+    if (multi_safetensors_find(ms, "embeddings.word_embeddings.weight", NULL))
+        p = "";
+    else if (multi_safetensors_find(ms, "bert.embeddings.word_embeddings.weight", NULL))
+        p = "bert.";
+    else {
+        fprintf(stderr, "embed_model_load: BERT word embeddings not found\n");
+        return -1;
+    }
+
+    int hidden = cfg->hidden_size, inter = cfg->intermediate_size;
+
+    if (layer_start == 0) {
+        const int64_t emb_shape[2] = {cfg->vocab_size, hidden};
+        snprintf(name, sizeof(name), "%sembeddings.word_embeddings.weight", p);
+        w->embed_tokens = load_weight_direct(ms, name, emb_shape, 2);
+        const int64_t pos_shape[2] = {cfg->max_position_embeddings, hidden};
+        snprintf(name, sizeof(name), "%sembeddings.position_embeddings.weight", p);
+        w->position_embeddings = load_norm_f32(ms, name, pos_shape, 2);
+        const int64_t type_shape[2] = {2, hidden};
+        snprintf(name, sizeof(name), "%sembeddings.token_type_embeddings.weight", p);
+        w->token_type_embeddings = load_norm_f32(ms, name, type_shape, 2);
+        const int64_t ln_shape[1] = {hidden};
+        snprintf(name, sizeof(name), "%sembeddings.LayerNorm.weight", p);
+        w->embed_ln_w = load_norm_f32(ms, name, ln_shape, 1);
+        snprintf(name, sizeof(name), "%sembeddings.LayerNorm.bias", p);
+        w->embed_ln_b = load_norm_f32(ms, name, ln_shape, 1);
+        if (!w->embed_tokens.data || !w->position_embeddings || !w->token_type_embeddings ||
+            !w->embed_ln_w || !w->embed_ln_b)
+            return -1;
+    }
+
+    w->layers = (embed_layer_t *)calloc(cfg->n_layers, sizeof(embed_layer_t));
+    if (!w->layers)
+        return -1;
+
+    for (int i = layer_start; i < layer_end; i++) {
+        embed_layer_t *l = &w->layers[i];
+
+#define BERT_W(field, suffix, d0, d1)                                     \
+    do {                                                                  \
+        const int64_t e[2] = {(d0), (d1)};                                \
+        snprintf(name, sizeof(name), "%sencoder.layer.%d." suffix, p, i); \
+        l->field = load_weight_direct(ms, name, e, 2);                    \
+        if (!l->field.data)                                               \
+            return -1;                                                    \
+    } while (0)
+#define BERT_V(field, suffix, d0)                                         \
+    do {                                                                  \
+        const int64_t e[1] = {(d0)};                                      \
+        snprintf(name, sizeof(name), "%sencoder.layer.%d." suffix, p, i); \
+        l->field = load_norm_f32(ms, name, e, 1);                         \
+        if (!l->field)                                                    \
+            return -1;                                                    \
+    } while (0)
+
+        BERT_W(wq, "attention.self.query.weight", hidden, hidden);
+        BERT_V(q_bias, "attention.self.query.bias", hidden);
+        BERT_W(wk, "attention.self.key.weight", hidden, hidden);
+        BERT_V(k_bias, "attention.self.key.bias", hidden);
+        BERT_W(wv, "attention.self.value.weight", hidden, hidden);
+        BERT_V(v_bias, "attention.self.value.bias", hidden);
+        BERT_W(wo, "attention.output.dense.weight", hidden, hidden);
+        BERT_V(o_bias, "attention.output.dense.bias", hidden);
+        BERT_V(input_norm, "attention.output.LayerNorm.weight", hidden);
+        BERT_V(attn_ln_bias, "attention.output.LayerNorm.bias", hidden);
+        BERT_W(up_proj, "intermediate.dense.weight", inter, hidden);
+        BERT_V(ffn_inter_bias, "intermediate.dense.bias", inter);
+        BERT_W(down_proj, "output.dense.weight", hidden, inter);
+        BERT_V(ffn_out_bias, "output.dense.bias", hidden);
+        BERT_V(post_attn_norm, "output.LayerNorm.weight", hidden);
+        BERT_V(ffn_ln_bias, "output.LayerNorm.bias", hidden);
+
+#undef BERT_W
+#undef BERT_V
+    }
+    /* BERT has no final norm: w->norm stays NULL, and pooling skips it. */
+    return 0;
+}
+
 static embed_model_t *
 model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int allow_late) {
     if (!allow_late && model_dir_has_late_projection(model_dir)) {
@@ -532,6 +625,15 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
         return NULL;
     }
     model->safetensors = ms;
+
+    if (cfg->family == EMBED_FAMILY_BERT) {
+        if (load_bert_weights(model, ms, layer_start, layer_end) != 0)
+            goto fail;
+        if (embed_verbose >= 1)
+            fprintf(stderr, "embed_model_load: BERT layers [%d, %d) loaded (%d-dim)\n", layer_start,
+                    layer_end, cfg->hidden_size);
+        return model;
+    }
 
     const char *weight_prefix = multi_safetensors_weight_prefix(ms, "embed_tokens.weight");
     if (!weight_prefix) {
@@ -649,9 +751,18 @@ void embed_model_free(embed_model_t *model) {
             free((void *)l->k_norm);
             free((void *)l->input_norm);
             free((void *)l->post_attn_norm);
+            free((void *)l->o_bias);
+            free((void *)l->attn_ln_bias);
+            free((void *)l->ffn_inter_bias);
+            free((void *)l->ffn_out_bias);
+            free((void *)l->ffn_ln_bias);
         }
     }
     free((void *)model->weights.norm);
+    free((void *)model->weights.position_embeddings);
+    free((void *)model->weights.token_type_embeddings);
+    free((void *)model->weights.embed_ln_w);
+    free((void *)model->weights.embed_ln_b);
     if (model->safetensors)
         multi_safetensors_close((multi_safetensors_t *)model->safetensors);
     free(model->weights.layers);
@@ -1158,6 +1269,97 @@ static int forward_packed_inplace(const embed_model_t *model,
                                         0, model->config.n_layers, apply_final_norm);
 }
 
+/* BERT-family forward: token + learned-position + token-type embeddings and an
+ * embedding LayerNorm, then post-norm encoder layers (bias on every projection,
+ * GeLU feed-forward, no RoPE, no per-head norm). Bidirectional attention is
+ * block-diagonal over the packed batch, so each sequence's positions restart at
+ * 0. Leaves the final hidden states in ws->x; pooling reads them as-is because
+ * the last layer's LayerNorm is already the model's final normalization. */
+static int forward_packed_bert(const embed_model_t *model,
+                               embed_workspace_t *ws,
+                               const embed_input_t *inputs,
+                               int batch,
+                               const int *offsets,
+                               int total_seq,
+                               int max_seq) {
+    if (!model || !ws || ws->model != model || !inputs || batch <= 0 || !offsets ||
+        total_seq <= 0 || max_seq <= 0)
+        return -1;
+
+    const embed_config_t *cfg = &model->config;
+    const embed_weights_t *w = &model->weights;
+    int hidden = cfg->hidden_size;
+    int n_heads = cfg->n_heads;
+    int head_dim = cfg->head_dim;
+    int inter = cfg->intermediate_size;
+    float eps = cfg->layer_norm_eps;
+
+    if (!w->embed_tokens.data || !w->position_embeddings || !w->token_type_embeddings ||
+        !w->embed_ln_w || !w->embed_ln_b)
+        return -1;
+    if (max_seq > cfg->max_position_embeddings) {
+        fprintf(stderr, "embed: sequence length %d exceeds max_position_embeddings %d\n", max_seq,
+                cfg->max_position_embeddings);
+        return -1;
+    }
+    if (ensure_buffers(ws, cfg, total_seq) != 0)
+        return -1;
+    ensure_attention_scores(ws, offsets, batch);
+
+    float *x = ws->x;
+    float *q_buf = ws->q, *k_buf = ws->k, *v_buf = ws->v;
+    float *attn_out = ws->attn_out, *proj_out = ws->proj_out, *ffn_up = ws->ffn_up;
+
+    /* Embeddings: token + learned absolute position + token-type[0], then the
+     * embedding LayerNorm over every packed token. */
+    for (int b = 0; b < batch; b++) {
+        int start = offsets[b];
+        for (int i = 0; i < inputs[b].n_tokens; i++) {
+            int id = inputs[b].ids[i];
+            if (id < 0 || id >= cfg->vocab_size) {
+                fprintf(stderr, "embed: invalid token id %d at input %d position %d\n", id, b, i);
+                return -1;
+            }
+            float *row = x + (size_t)(start + i) * hidden;
+            copy_weight_row(row, &w->embed_tokens, (size_t)id, hidden);
+            qwen_add_inplace(row, w->position_embeddings + (size_t)i * hidden, hidden);
+            qwen_add_inplace(row, w->token_type_embeddings, hidden);
+        }
+    }
+    qwen_layer_norm(x, x, w->embed_ln_w, w->embed_ln_b, total_seq, hidden, eps);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    for (int layer = 0; layer < cfg->n_layers; layer++) {
+        const embed_layer_t *l = &w->layers[layer];
+
+        /* Self-attention (post-norm): projections read x directly. */
+        linear_qkv_weight(ws, q_buf, k_buf, v_buf, x, &l->wq, &l->wk, &l->wv, total_seq, hidden,
+                          hidden, hidden);
+        add_bias_rows(q_buf, l->q_bias, total_seq, hidden);
+        add_bias_rows(k_buf, l->k_bias, total_seq, hidden);
+        add_bias_rows(v_buf, l->v_bias, total_seq, hidden);
+
+        model->attention(attn_out, q_buf, k_buf, v_buf, offsets, batch, n_heads, n_heads, head_dim,
+                         scale, ws->attn_scores, ws->attn_scores_bytes);
+
+        linear_nobias_weight(ws, proj_out, attn_out, &l->wo, total_seq, hidden, hidden);
+        add_bias_rows(proj_out, l->o_bias, total_seq, hidden);
+        qwen_add_inplace(x, proj_out, total_seq * hidden);
+        qwen_layer_norm(x, x, l->input_norm, l->attn_ln_bias, total_seq, hidden, eps);
+
+        /* Feed-forward (post-norm): dense -> GeLU -> dense. */
+        linear_nobias_weight(ws, ffn_up, x, &l->up_proj, total_seq, hidden, inter);
+        add_bias_rows(ffn_up, l->ffn_inter_bias, total_seq, inter);
+        qwen_gelu_inplace(ffn_up, total_seq * inter);
+        linear_nobias_weight(ws, proj_out, ffn_up, &l->down_proj, total_seq, inter, hidden);
+        add_bias_rows(proj_out, l->ffn_out_bias, total_seq, hidden);
+        qwen_add_inplace(x, proj_out, total_seq * hidden);
+        qwen_layer_norm(x, x, l->post_attn_norm, l->ffn_ln_bias, total_seq, hidden, eps);
+    }
+    return 0;
+}
+
 static int pool_embeddings(const embed_model_t *model,
                            const embed_workspace_t *ws,
                            const int *offsets,
@@ -1166,9 +1368,11 @@ static int pool_embeddings(const embed_model_t *model,
     const embed_config_t *cfg = &model->config;
     int hidden = cfg->hidden_size;
     float eps = cfg->rms_norm_eps;
+    /* Qwen pools pre-final-norm states and applies the final RMSNorm here; BERT
+     * pools already-normed states (no final norm), signalled by a NULL norm. */
     const float *norm_weight = model->weights.norm;
     const float *x = ws->x;
-    if (hidden <= 0 || !norm_weight || !x)
+    if (hidden <= 0 || !x)
         return -1;
 
     for (int b = 0; b < batch; b++) {
@@ -1177,29 +1381,36 @@ static int pool_embeddings(const embed_model_t *model,
         int len = end - start;
         float *emb = out_embeddings + (size_t)b * hidden;
 
-        memset(emb, 0, (size_t)hidden * sizeof(float));
         if (cfg->pooling_mode == EMBED_POOL_LAST_TOKEN || cfg->pooling_mode == EMBED_POOL_CLS) {
             /* Single-token pooling: CLS takes the first token, last-token the
-             * final one. The model's final RMSNorm is applied to that one row. */
+             * final one. */
             int idx = cfg->pooling_mode == EMBED_POOL_CLS ? start : end - 1;
             const float *row = x + (size_t)idx * hidden;
-            float sum_sq = 0.0f;
-            for (int d = 0; d < hidden; d++)
-                sum_sq += row[d] * row[d];
-            float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
-            for (int d = 0; d < hidden; d++)
-                emb[d] = row[d] * rms_inv * norm_weight[d];
-        } else {
-            for (int i = start; i < end; i++) {
-                const float *row = x + (size_t)i * hidden;
-
+            if (norm_weight) {
                 float sum_sq = 0.0f;
                 for (int d = 0; d < hidden; d++)
                     sum_sq += row[d] * row[d];
-
                 float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
                 for (int d = 0; d < hidden; d++)
-                    emb[d] += row[d] * rms_inv * norm_weight[d];
+                    emb[d] = row[d] * rms_inv * norm_weight[d];
+            } else {
+                memcpy(emb, row, (size_t)hidden * sizeof(float));
+            }
+        } else {
+            memset(emb, 0, (size_t)hidden * sizeof(float));
+            for (int i = start; i < end; i++) {
+                const float *row = x + (size_t)i * hidden;
+                if (norm_weight) {
+                    float sum_sq = 0.0f;
+                    for (int d = 0; d < hidden; d++)
+                        sum_sq += row[d] * row[d];
+                    float rms_inv = 1.0f / sqrtf(sum_sq / (float)hidden + eps);
+                    for (int d = 0; d < hidden; d++)
+                        emb[d] += row[d] * rms_inv * norm_weight[d];
+                } else {
+                    for (int d = 0; d < hidden; d++)
+                        emb[d] += row[d];
+                }
             }
             float inv_len = 1.0f / (float)len;
             for (int d = 0; d < hidden; d++)
@@ -1391,7 +1602,9 @@ int embed_model_encode_batch(const embed_model_t *model,
     if (build_offsets(inputs, batch, 1, offsets, &total_seq, &max_seq) != 0)
         return -1;
 
-    int rc = forward_packed_inplace(model, ws, inputs, batch, offsets, total_seq, max_seq, 0);
+    int rc = model->config.family == EMBED_FAMILY_BERT
+                 ? forward_packed_bert(model, ws, inputs, batch, offsets, total_seq, max_seq)
+                 : forward_packed_inplace(model, ws, inputs, batch, offsets, total_seq, max_seq, 0);
     if (rc == 0)
         rc = pool_embeddings(model, ws, offsets, batch, out_embeddings);
 

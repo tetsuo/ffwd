@@ -43,7 +43,13 @@ typedef enum {
     EMBED_POOL_CLS = 2, /* first token; the encoder-family [CLS] sentence vector */
 } embed_pooling_mode_t;
 
+typedef enum {
+    EMBED_FAMILY_QWEN3 = 0, /* RMSNorm + RoPE + SwiGLU decoder block (pplx, Qwen2/3) */
+    EMBED_FAMILY_BERT = 1,  /* LayerNorm + learned positions + GeLU encoder block */
+} embed_family_t;
+
 typedef struct {
+    embed_family_t family;
     int hidden_size;
     int n_layers;
     int n_heads;
@@ -53,7 +59,9 @@ typedef struct {
     int kv_dim; /* n_kv_heads * head_dim */
     int intermediate_size;
     int vocab_size;
+    int max_position_embeddings; /* BERT learned position table size */
     float rms_norm_eps;
+    float layer_norm_eps; /* BERT LayerNorm epsilon */
     float rope_theta;
     int qk_norm;
     int qkv_bias;
