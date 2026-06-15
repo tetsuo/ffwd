@@ -227,13 +227,6 @@ components:
       properties:
         prompt_tokens: { type: integer }
         total_tokens: { type: integer }
-        cost:
-          type: object
-          description: pplx-embed only; Qwen3-Embedding omits it.
-          properties:
-            input_cost: { type: number }
-            total_cost: { type: number }
-            currency: { type: string, example: USD }
     ValidationDetail:
       type: object
       properties:

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "embed_build.h"
 #include "embed_server.h"
 #include "embed.h"
 #include "qwen_safetensors.h"
@@ -70,6 +71,10 @@
  * was no faster and inflated long-document tail latency. */
 #define EMBED_SERVER_DEFAULT_BATCH_SIZE 32
 #define EMBED_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
+/* Microseconds the worker waits for more requests before dispatching a batch.
+ * CUDA uses a 1 ms window so arrivals group into one launch and keep the GPU
+ * busy; MLX and CPU dispatch immediately, where waiting only adds latency.
+ * Override with --batch-wait-us. */
 #define EMBED_SERVER_BATCH_WAIT_US 0
 #define EMBED_SERVER_CUDA_BATCH_WAIT_US 1000
 #define EMBED_SERVER_MICROBATCH_MAX_JOBS 128
@@ -239,7 +244,6 @@ typedef struct {
     int dim;
     int min_dim;
     int token_dim;
-    double price_per_mtok;
     embed_attention_mode_t attention_mode;
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;
@@ -247,21 +251,21 @@ typedef struct {
 } model_info;
 
 static const model_info k_models[] = {
-    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, 0.004,
+    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
-    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, 0.030,
+    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
-    {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, 0.0,
+    {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0,
      EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
-    {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0, 0.0,
+    {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0,
      EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
-    {"Qwen3-Embedding-8B", MODEL_KIND_STANDARD, 4096, 32, 0, 0.0,
+    {"Qwen3-Embedding-8B", MODEL_KIND_STANDARD, 4096, 32, 0,
      EMBED_ATTENTION_CAUSAL, EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI},
-    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0, 0.008,
+    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
-    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, 0.050,
+    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
-    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128, 0.0,
+    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY},
 };
 
@@ -1519,22 +1523,10 @@ static int render_embedding_response(embedding_request *r, const float *embs) {
         append_embedding_value(&b, i, render_embs + (size_t)i * render_stride,
                                r->dims, r->encoding, api);
     }
-    /* Perplexity reports a per-request cost block; OpenAI/DashScope (Qwen3)
-     * usage is just the token counts, so keep the Qwen3 envelope OpenAI-shaped. */
-    if (api == EMBED_API_OPENAI) {
-        sbuf_printf(&b,
-            "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
-            "\"total_tokens\":%d}}",
-            r->model->info->id, r->total_tokens, r->total_tokens);
-    } else {
-        double cost = ((double)r->total_tokens / 1000000.0) *
-                      r->model->info->price_per_mtok;
-        sbuf_printf(&b,
-            "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
-            "\"total_tokens\":%d,\"cost\":{\"input_cost\":%.10g,"
-            "\"total_cost\":%.10g,\"currency\":\"USD\"}}}",
-            r->model->info->id, r->total_tokens, r->total_tokens, cost, cost);
-    }
+    sbuf_printf(&b,
+        "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,"
+        "\"total_tokens\":%d}}",
+        r->model->info->id, r->total_tokens, r->total_tokens);
     set_response_from_buf(r->j, &b);
 
     free(truncated);
@@ -3203,6 +3195,8 @@ static void print_usage(const char *prog)
 #endif
         "  -t, --threads N           CPU threads (default: all cores)\n"
         "  -v, --verbose             Verbose (-vv for debug)\n"
+        "  -V, --version             Print version and exit\n"
+        "  --build-info              Print build details and exit\n"
         "  -h, --help                Show this help\n"
         "\n"
         "Examples:\n"
@@ -3285,10 +3279,21 @@ int main(int argc, char *argv[])
     int port = 8000;
     model_specs_t model_specs = {0};
 
+    const char *prog = embed_prog_name(argv[0]);
     int arg = 1;
     while (arg < argc && argv[arg][0] == '-') {
         const char *f = argv[arg];
-        if (!strcmp(f, "--model")) {
+        if (!strcmp(f, "-V") || !strcmp(f, "--version")) {
+            embed_print_version(prog);
+            free_model_specs(&model_specs);
+            return 0;
+        }
+        else if (!strcmp(f, "--build-info")) {
+            embed_print_build_info(prog);
+            free_model_specs(&model_specs);
+            return 0;
+        }
+        else if (!strcmp(f, "--model")) {
             if (append_model_spec(&model_specs, argv[++arg]) != 0) {
                 free_model_specs(&model_specs);
                 return 1;
@@ -3358,13 +3363,13 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose++; }
         else if (!strcmp(f, "-vv")) { verbose = 2; }
         else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
-            print_usage(argv[0]);
+            print_usage(prog);
             free_model_specs(&model_specs);
             return 0;
         }
         else {
             fprintf(stderr, "unknown option: %s\n", f);
-            print_usage(argv[0]);
+            print_usage(prog);
             free_model_specs(&model_specs);
             return 1;
         }
@@ -3376,13 +3381,13 @@ int main(int argc, char *argv[])
 
     if (arg < argc) {
         fprintf(stderr, "unexpected argument: %s\n", argv[arg]);
-        print_usage(argv[0]);
+        print_usage(prog);
         free_model_specs(&model_specs);
         return 1;
     }
     if (model_specs.n == 0) {
         fprintf(stderr, "at least one --model MODEL_ID=DIR is required\n");
-        print_usage(argv[0]);
+        print_usage(prog);
         free_model_specs(&model_specs);
         return 1;
     }
