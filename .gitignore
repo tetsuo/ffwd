@@ -13,6 +13,7 @@ tests/test_qwen2
 tests/test_qwen3
 tests/test_cli
 tests/test_cls
+tests/test_wordpiece
 tests/cli_under_test
 bench/bench_tokenizer
 bench/bench_kernels
