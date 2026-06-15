@@ -1494,6 +1494,98 @@ int embed_model_encode_batch(const embed_model_t *model,
     return rc;
 }
 
+/* Late-interaction batch encoder. Lives here, beside the packed/ragged batch
+ * machinery it reuses, rather than next to embed_late_model_encode_tokens. */
+int embed_late_model_encode_docs(const embed_late_model_t *model,
+                                 embed_late_workspace_t *ws,
+                                 const int *const *doc_ids,
+                                 const int *n_tokens,
+                                 const int *const *keep,
+                                 const int *n_keep,
+                                 int n_docs,
+                                 int normalize,
+                                 float *out_vectors,
+                                 int *out_offsets) {
+    if (!model || !ws || ws->model != model || !doc_ids || !n_tokens || !keep || !n_keep ||
+        n_docs <= 0 || !out_vectors || !out_offsets || model->token_dim <= 0)
+        return -1;
+
+    int hidden = model->base->config.hidden_size;
+    int dim = model->token_dim;
+
+    /* Pack all candidates for one block-diagonal forward. inputs/offsets index
+     * the full token stream; out_offsets is the prefix sum of kept tokens. */
+    embed_input_t *inputs = (embed_input_t *)malloc((size_t)n_docs * sizeof(*inputs));
+    int *offsets = (int *)malloc((size_t)(n_docs + 1) * sizeof(*offsets));
+    if (!inputs || !offsets) {
+        free(inputs);
+        free(offsets);
+        return -1;
+    }
+
+    int total_keep = 0;
+    out_offsets[0] = 0;
+    for (int d = 0; d < n_docs; d++) {
+        if (!doc_ids[d] || n_tokens[d] <= 0 || !keep[d] || n_keep[d] <= 0 ||
+            n_keep[d] > n_tokens[d] || total_keep > INT_MAX - n_keep[d]) {
+            free(inputs);
+            free(offsets);
+            return -1;
+        }
+        for (int k = 0; k < n_keep[d]; k++) {
+            if (keep[d][k] < 0 || keep[d][k] >= n_tokens[d]) {
+                free(inputs);
+                free(offsets);
+                return -1;
+            }
+        }
+        inputs[d].ids = doc_ids[d];
+        inputs[d].n_tokens = n_tokens[d];
+        total_keep += n_keep[d];
+        out_offsets[d + 1] = total_keep;
+    }
+
+    int total_seq = 0, max_seq = 0;
+    int rc = build_offsets(inputs, n_docs, 1, offsets, &total_seq, &max_seq);
+    if (rc == 0)
+        rc = forward_packed_inplace(model->base, ws->base_ws, inputs, n_docs, offsets, total_seq,
+                                    max_seq, 1);
+    free(inputs);
+    if (rc != 0) {
+        free(offsets);
+        return -1;
+    }
+
+    /* Gather each document's kept hidden rows into ws->states (its natural
+     * [seq, hidden] shape), then project the packed [total_keep, hidden] block
+     * to [total_keep, dim] in one GEMM, matching the per-document path. */
+    if (ensure_late_state_buffer(ws, total_keep) != 0) {
+        free(offsets);
+        return -1;
+    }
+    const float *states = ws->base_ws->x;
+    int pos = 0;
+    for (int d = 0; d < n_docs; d++) {
+        int start = offsets[d];
+        for (int k = 0; k < n_keep[d]; k++) {
+            memcpy(ws->states + (size_t)pos * hidden,
+                   states + (size_t)(start + keep[d][k]) * hidden, (size_t)hidden * sizeof(float));
+            pos++;
+        }
+    }
+    free(offsets);
+
+    linear_nobias_weight(ws->base_ws, out_vectors, ws->states, &model->projection, total_keep,
+                         hidden, dim);
+    if (normalize) {
+        for (int i = 0; i < total_keep; i++) {
+            if (embed_l2_normalize(out_vectors + (size_t)i * dim, dim) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 int embed_pool_batch(const embed_config_t *cfg,
                      const float *states,
                      const int *seq_lengths,

@@ -2360,37 +2360,40 @@ static int execute_rerank_cpu(rerank_request *r, float *scores) {
     loaded_model *m = r->model;
     int dim = m->info->token_dim;
     int total_doc_vecs = 0;
-    int max_doc_tokens = 0;
-    for (int i = 0; i < r->n_documents; i++) {
+    for (int i = 0; i < r->n_documents; i++)
         total_doc_vecs += r->documents[i].n_keep;
-        if (r->documents[i].n_tokens > max_doc_tokens)
-            max_doc_tokens = r->documents[i].n_tokens;
-    }
 
     float *query = xmalloc((size_t)r->query.n_tokens * dim * sizeof(*query));
     float *docs = xmalloc((size_t)total_doc_vecs * dim * sizeof(*docs));
-    float *all = xmalloc((size_t)max_doc_tokens * dim * sizeof(*all));
     int *offsets = xmalloc((size_t)(r->n_documents + 1) * sizeof(*offsets));
+
+    /* Encode every candidate in one block-diagonal forward. The encoder packs
+     * each document's kept token vectors back-to-back and fills offsets, so the
+     * cost of N short documents collapses to a single packed forward. */
+    const int **doc_ids = xmalloc((size_t)r->n_documents * sizeof(*doc_ids));
+    const int **keep = xmalloc((size_t)r->n_documents * sizeof(*keep));
+    int *n_tokens = xmalloc((size_t)r->n_documents * sizeof(*n_tokens));
+    int *n_keep = xmalloc((size_t)r->n_documents * sizeof(*n_keep));
+    for (int i = 0; i < r->n_documents; i++) {
+        doc_ids[i] = r->documents[i].ids;
+        keep[i] = r->documents[i].keep;
+        n_tokens[i] = r->documents[i].n_tokens;
+        n_keep[i] = r->documents[i].n_keep;
+    }
+
     int rc = embed_late_model_encode_tokens(m->cpu_late_model, m->cpu_late_ws, r->query.ids,
                                             r->query.n_tokens, 1, query);
-    int pos = 0;
-    offsets[0] = 0;
-    for (int i = 0; rc == 0 && i < r->n_documents; i++) {
-        late_tokens *doc = &r->documents[i];
-        rc = embed_late_model_encode_tokens(m->cpu_late_model, m->cpu_late_ws, doc->ids,
-                                            doc->n_tokens, 1, all);
-        for (int k = 0; rc == 0 && k < doc->n_keep; k++) {
-            memcpy(docs + (size_t)pos * dim, all + (size_t)doc->keep[k] * dim,
-                   (size_t)dim * sizeof(*docs));
-            pos++;
-        }
-        offsets[i + 1] = pos;
-    }
+    if (rc == 0)
+        rc = embed_late_model_encode_docs(m->cpu_late_model, m->cpu_late_ws, doc_ids, n_tokens,
+                                          keep, n_keep, r->n_documents, 1, docs, offsets);
     if (rc == 0)
         rc = embed_late_maxsim_batch(query, r->query.n_keep, docs, offsets, r->n_documents, dim,
                                      scores);
+    free(n_keep);
+    free(n_tokens);
+    free(keep);
+    free(doc_ids);
     free(offsets);
-    free(all);
     free(docs);
     free(query);
     return rc;

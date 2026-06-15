@@ -71,8 +71,10 @@ int main(void) {
     int *ids = NULL;
     float *states = NULL, *raw = NULL, *vecs = NULL, *expected = NULL;
     float *doc_vecs = NULL;
+    float *batched = NULL;
     float *big_q = NULL, *big_d = NULL;
     int *doc_ids[3] = {0};
+    int *keep_arrs[3] = {0};
 
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-late-test-XXXXXX",
@@ -276,6 +278,85 @@ int main(void) {
             fprintf(stderr, "maxsim_batch accepted invalid arguments\n");
             goto fail;
         }
+
+        /* Batched encoder parity: encoding all three docs in one packed forward
+         * (keep = every token) must reproduce the per-document vectors and the
+         * same offsets. */
+        int batch_offsets[4] = {0};
+        batched = (float *)calloc((size_t)offsets[3] * TOKEN_DIM, sizeof(float));
+        if (!batched) {
+            fprintf(stderr, "allocation failure\n");
+            goto fail;
+        }
+        for (int i = 0; i < 3; i++) {
+            keep_arrs[i] = (int *)malloc((size_t)lens[i] * sizeof(int));
+            if (!keep_arrs[i]) {
+                fprintf(stderr, "allocation failure\n");
+                goto fail;
+            }
+            for (int t = 0; t < lens[i]; t++)
+                keep_arrs[i][t] = t;
+        }
+        if (embed_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
+                                         (const int *const *)keep_arrs, lens, 3, 1, batched,
+                                         batch_offsets) != 0) {
+            fprintf(stderr, "encode_docs failed\n");
+            goto fail;
+        }
+        for (int i = 0; i <= 3; i++) {
+            if (batch_offsets[i] != offsets[i]) {
+                fprintf(stderr, "encode_docs offsets[%d]: %d vs %d\n", i, batch_offsets[i],
+                        offsets[i]);
+                goto fail;
+            }
+        }
+        if (max_abs_diff(batched, doc_vecs, (size_t)offsets[3] * TOKEN_DIM) > 0.0001f) {
+            fprintf(stderr, "encode_docs vs per-doc mismatch: %g\n",
+                    max_abs_diff(batched, doc_vecs, (size_t)offsets[3] * TOKEN_DIM));
+            goto fail;
+        }
+
+        /* Keep filtering: drop doc 0's first token; the packed result must equal
+         * doc 0's per-document rows gathered from the kept indices. */
+        {
+            int keep0[8];
+            int nk0 = lens[0] - 1;
+            if (nk0 <= 0 || nk0 > (int)(sizeof(keep0) / sizeof(keep0[0])))
+                goto fail;
+            for (int t = 0; t < nk0; t++)
+                keep0[t] = t + 1;
+            const int *one_ids[1] = {doc_ids[0]};
+            const int *one_keep[1] = {keep0};
+            int one_len[1] = {lens[0]};
+            int one_nkeep[1] = {nk0};
+            int one_off[2] = {0};
+            float *filtered = (float *)calloc((size_t)nk0 * TOKEN_DIM, sizeof(float));
+            if (!filtered)
+                goto fail;
+            if (embed_late_model_encode_docs(late, ws, one_ids, one_len, one_keep, one_nkeep, 1, 1,
+                                             filtered, one_off) != 0 ||
+                one_off[1] != nk0 ||
+                max_abs_diff(filtered, doc_vecs + TOKEN_DIM, (size_t)nk0 * TOKEN_DIM) > 0.0001f) {
+                fprintf(stderr, "encode_docs keep-filter mismatch\n");
+                free(filtered);
+                goto fail;
+            }
+            free(filtered);
+        }
+
+        /* Invalid arguments must be rejected. */
+        if (embed_late_model_encode_docs(NULL, ws, (const int *const *)doc_ids, lens,
+                                         (const int *const *)keep_arrs, lens, 3, 1, batched,
+                                         batch_offsets) == 0 ||
+            embed_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
+                                         (const int *const *)keep_arrs, lens, 0, 1, batched,
+                                         batch_offsets) == 0 ||
+            embed_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
+                                         (const int *const *)keep_arrs, lens, 3, 1, NULL,
+                                         batch_offsets) == 0) {
+            fprintf(stderr, "encode_docs accepted invalid arguments\n");
+            goto fail;
+        }
     }
 
     /* One document larger than the similarity-GEMM token budget must score
@@ -309,9 +390,12 @@ int main(void) {
 fail:
     free(big_d);
     free(big_q);
+    free(batched);
     free(doc_vecs);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         free(doc_ids[i]);
+        free(keep_arrs[i]);
+    }
     free(expected);
     free(vecs);
     free(raw);

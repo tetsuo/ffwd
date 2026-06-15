@@ -287,6 +287,25 @@ EMBED_API int embed_late_model_encode_tokens(const embed_late_model_t *model,
                                              float *out_vectors);
 
 /*
+ * Encode n_docs documents in one block-diagonal forward and pack each
+ * document's kept token vectors back-to-back into out_vectors[total_keep,
+ * token_dim] in document order, where total_keep is the sum of n_keep.
+ * out_offsets[n_docs + 1] receives the prefix sum of kept counts, the layout
+ * embed_late_maxsim_batch consumes. keep[d] lists the n_keep[d] token indices to
+ * retain from document d. Returns 0 on success, -1 on error.
+ */
+EMBED_API int embed_late_model_encode_docs(const embed_late_model_t *model,
+                                           embed_late_workspace_t *ws,
+                                           const int *const *doc_ids,
+                                           const int *n_tokens,
+                                           const int *const *keep,
+                                           const int *n_keep,
+                                           int n_docs,
+                                           int normalize,
+                                           float *out_vectors,
+                                           int *out_offsets);
+
+/*
  * Sum over query tokens of max dot product against document tokens.
  */
 EMBED_API float embed_late_maxsim(const float *query_vectors,
