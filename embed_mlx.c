@@ -32,6 +32,10 @@ typedef struct {
     mlx_array q_norm, k_norm;
     mlx_array input_norm, post_attn_norm;
     mlx_linear_t gate_proj, up_proj, down_proj;
+    /* BERT family (unset for Qwen3; see embed_internal.h). wo/up_proj/down_proj
+     * and input_norm/post_attn_norm are reused as the BERT attention output,
+     * FFN matrices, and the two block LayerNorm weights. */
+    mlx_array o_bias, attn_ln_bias, ffn_inter_bias, ffn_out_bias, ffn_ln_bias;
 } mlx_layer_t;
 
 struct embed_mlx_ctx {
@@ -39,6 +43,8 @@ struct embed_mlx_ctx {
     mlx_array embed_tokens;
     mlx_layer_t *layers; /* heap-allocated [n_layers] */
     mlx_array norm;
+    /* BERT family (unset for Qwen3): learned positions, token-type, embed LN. */
+    mlx_array position_embeddings, token_type_embeddings, embed_ln_w, embed_ln_b;
     mlx_stream stream;
     multi_safetensors_t *ms;
     int layer_start; /* loaded transformer range, inclusive */
@@ -373,6 +379,90 @@ static int prepare_layer_transposes(mlx_layer_t *l, mlx_stream s) {
            prepare_linear_transpose(&l->down_proj, s);
 }
 
+/* BERT-family MLX loader, mirroring load_bert_weights on the CPU side. The
+ * shared post-load below (stream, transposes, optional BF16 upcast) runs after
+ * either family fills ctx->layers. */
+static int load_mlx_bert_weights(embed_mlx_ctx_t *ctx, int layer_start, int layer_end) {
+    const embed_config_t *c = &ctx->config;
+    int h = c->hidden_size, inter = c->intermediate_size;
+    char name[256];
+
+    const char *p;
+    if (multi_safetensors_find(ctx->ms, "embeddings.word_embeddings.weight", NULL))
+        p = "";
+    else if (multi_safetensors_find(ctx->ms, "bert.embeddings.word_embeddings.weight", NULL))
+        p = "bert.";
+    else {
+        fprintf(stderr, "mlx: BERT word embeddings not found\n");
+        return -1;
+    }
+
+    if (layer_start == 0) {
+        int emb_shape[] = {c->vocab_size, h};
+        snprintf(name, sizeof(name), "%sembeddings.word_embeddings.weight", p);
+        ctx->embed_tokens = load_tensor(ctx->ms, name, emb_shape, 2);
+        int pos_shape[] = {c->max_position_embeddings, h};
+        snprintf(name, sizeof(name), "%sembeddings.position_embeddings.weight", p);
+        ctx->position_embeddings = load_tensor(ctx->ms, name, pos_shape, 2);
+        int type_shape[] = {2, h};
+        snprintf(name, sizeof(name), "%sembeddings.token_type_embeddings.weight", p);
+        ctx->token_type_embeddings = load_tensor(ctx->ms, name, type_shape, 2);
+        int ln_shape[] = {h};
+        snprintf(name, sizeof(name), "%sembeddings.LayerNorm.weight", p);
+        ctx->embed_ln_w = load_tensor(ctx->ms, name, ln_shape, 1);
+        snprintf(name, sizeof(name), "%sembeddings.LayerNorm.bias", p);
+        ctx->embed_ln_b = load_tensor(ctx->ms, name, ln_shape, 1);
+        if (!arr_ok(ctx->embed_tokens) || !arr_ok(ctx->position_embeddings) ||
+            !arr_ok(ctx->token_type_embeddings) || !arr_ok(ctx->embed_ln_w) ||
+            !arr_ok(ctx->embed_ln_b))
+            return -1;
+    }
+
+    ctx->layers = calloc(c->n_layers, sizeof(mlx_layer_t));
+    if (!ctx->layers)
+        return -1;
+
+    for (int i = layer_start; i < layer_end; i++) {
+        mlx_layer_t *l = &ctx->layers[i];
+#define LDL(fld, suffix, ...)                                                       \
+    do {                                                                            \
+        snprintf(name, sizeof(name), "%sencoder.layer.%d." suffix, p, i);           \
+        int sh[] = {__VA_ARGS__};                                                   \
+        l->fld = load_linear_tensor(ctx->ms, name, sh, sizeof(sh) / sizeof(sh[0])); \
+        if (!linear_ok(l->fld))                                                     \
+            return -1;                                                              \
+    } while (0)
+#define LDV(fld, suffix, ...)                                                \
+    do {                                                                     \
+        snprintf(name, sizeof(name), "%sencoder.layer.%d." suffix, p, i);    \
+        int sh[] = {__VA_ARGS__};                                            \
+        l->fld = load_tensor(ctx->ms, name, sh, sizeof(sh) / sizeof(sh[0])); \
+        if (!arr_ok(l->fld))                                                 \
+            return -1;                                                       \
+    } while (0)
+
+        LDL(wq, "attention.self.query.weight", h, h);
+        LDV(q_bias, "attention.self.query.bias", h);
+        LDL(wk, "attention.self.key.weight", h, h);
+        LDV(k_bias, "attention.self.key.bias", h);
+        LDL(wv, "attention.self.value.weight", h, h);
+        LDV(v_bias, "attention.self.value.bias", h);
+        LDL(wo, "attention.output.dense.weight", h, h);
+        LDV(o_bias, "attention.output.dense.bias", h);
+        LDV(input_norm, "attention.output.LayerNorm.weight", h);
+        LDV(attn_ln_bias, "attention.output.LayerNorm.bias", h);
+        LDL(up_proj, "intermediate.dense.weight", inter, h);
+        LDV(ffn_inter_bias, "intermediate.dense.bias", inter);
+        LDL(down_proj, "output.dense.weight", h, inter);
+        LDV(ffn_out_bias, "output.dense.bias", h);
+        LDV(post_attn_norm, "output.LayerNorm.weight", h);
+        LDV(ffn_ln_bias, "output.LayerNorm.bias", h);
+#undef LDL
+#undef LDV
+    }
+    return 0;
+}
+
 static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
                                           int layer_start,
                                           int layer_end,
@@ -416,6 +506,12 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         fprintf(stderr, "mlx: failed to open safetensors in %s\n", model_dir);
         free(ctx);
         return NULL;
+    }
+
+    if (c->family == EMBED_FAMILY_BERT) {
+        if (load_mlx_bert_weights(ctx, layer_start, layer_end) != 0)
+            goto fail;
+        goto loaded;
     }
 
     const char *weight_prefix = multi_safetensors_weight_prefix(ctx->ms, "embed_tokens.weight");
@@ -509,6 +605,7 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
             goto fail;
     }
 
+loaded:
     ctx->stream = mlx_default_gpu_stream_new();
     ctx->weight_dtype = mlx_array_dtype(ctx->layers[layer_start].wq.w);
     /* Non-quantized BF16: run RMSNorm and the residual stream in F32. Upcast the
@@ -597,6 +694,11 @@ static void free_mlx_layer(mlx_layer_t *l) {
     free_linear(&l->gate_proj);
     free_linear(&l->up_proj);
     free_linear(&l->down_proj);
+    mlx_array_free(l->o_bias);
+    mlx_array_free(l->attn_ln_bias);
+    mlx_array_free(l->ffn_inter_bias);
+    mlx_array_free(l->ffn_out_bias);
+    mlx_array_free(l->ffn_ln_bias);
 }
 
 void embed_mlx_free(embed_mlx_ctx_t *ctx) {
@@ -609,6 +711,10 @@ void embed_mlx_free(embed_mlx_ctx_t *ctx) {
         free(ctx->layers);
     }
     mlx_array_free(ctx->norm);
+    mlx_array_free(ctx->position_embeddings);
+    mlx_array_free(ctx->token_type_embeddings);
+    mlx_array_free(ctx->embed_ln_w);
+    mlx_array_free(ctx->embed_ln_b);
     if (ctx->stream.ctx)
         mlx_stream_free(ctx->stream);
     if (ctx->ms)
@@ -695,6 +801,138 @@ int embed_mlx_late_token_dim(const embed_mlx_late_ctx_t *ctx) { return ctx ? ctx
 /* ========================================================================
  * Forward pass
  * ======================================================================== */
+
+/* Exact erf GeLU: 0.5 * x * (1 + erf(x / sqrt(2))). Frees nothing it is given. */
+static mlx_array mlx_gelu_erf(mlx_array x, mlx_stream S) {
+    mlx_array c = mlx_array_new_float32(0.70710678118654752f);
+    mlx_array scaled = mlx_array_new();
+    mlx_multiply(&scaled, x, c, S);
+    mlx_array_free(c);
+    mlx_array e = mlx_array_new();
+    mlx_erf(&e, scaled, S);
+    mlx_array_free(scaled);
+    mlx_array one = mlx_array_new_float32(1.0f);
+    mlx_array e1 = mlx_array_new();
+    mlx_add(&e1, e, one, S);
+    mlx_array_free(e);
+    mlx_array_free(one);
+    mlx_array half = mlx_array_new_float32(0.5f);
+    mlx_array xh = mlx_array_new();
+    mlx_multiply(&xh, x, half, S);
+    mlx_array_free(half);
+    mlx_array g = mlx_array_new();
+    mlx_multiply(&g, xh, e1, S);
+    mlx_array_free(xh);
+    mlx_array_free(e1);
+    return g;
+}
+
+/* BERT-family forward: post-norm encoder layers (bias on every projection, GeLU
+ * feed-forward, no RoPE, no per-head norm) over an already-embedded x. Frees the
+ * x it is given and returns the new hidden states. */
+static mlx_array mlx_forward_bert(embed_mlx_ctx_t *ctx,
+                                  mlx_array x,
+                                  int batch,
+                                  int max_seq,
+                                  int has_padding,
+                                  mlx_array attn_mask,
+                                  int layer_start,
+                                  int layer_end) {
+    const embed_config_t *c = &ctx->config;
+    mlx_stream S = ctx->stream;
+    int n_heads = c->n_heads, head_dim = c->head_dim, q_dim = c->q_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float eps = c->layer_norm_eps;
+    mlx_array null_arr = (mlx_array){0};
+
+    for (int layer = layer_start; layer < layer_end; layer++) {
+        mlx_layer_t *l = &ctx->layers[layer];
+
+        /* Self-attention reads x directly (post-norm). */
+        mlx_array q_flat = linear(x, &l->wq, S);
+        mlx_array k_flat = linear(x, &l->wk, S);
+        mlx_array v_flat = linear(x, &l->wv, S);
+        mlx_array t = mlx_array_new();
+        mlx_add(&t, q_flat, l->q_bias, S);
+        mlx_array_free(q_flat);
+        q_flat = t;
+        t = mlx_array_new();
+        mlx_add(&t, k_flat, l->k_bias, S);
+        mlx_array_free(k_flat);
+        k_flat = t;
+        t = mlx_array_new();
+        mlx_add(&t, v_flat, l->v_bias, S);
+        mlx_array_free(v_flat);
+        v_flat = t;
+
+        int s4[] = {batch, max_seq, n_heads, head_dim};
+        mlx_array q = mlx_array_new(), k = mlx_array_new(), v = mlx_array_new();
+        mlx_reshape(&q, q_flat, s4, 4, S);
+        mlx_reshape(&k, k_flat, s4, 4, S);
+        mlx_reshape(&v, v_flat, s4, 4, S);
+        mlx_array_free(q_flat);
+        mlx_array_free(k_flat);
+        mlx_array_free(v_flat);
+
+        int perm[] = {0, 2, 1, 3};
+        mlx_array qt = mlx_array_new(), kt = mlx_array_new(), vt = mlx_array_new();
+        mlx_transpose_axes(&qt, q, perm, 4, S);
+        mlx_transpose_axes(&kt, k, perm, 4, S);
+        mlx_transpose_axes(&vt, v, perm, 4, S);
+        mlx_array_free(q);
+        mlx_array_free(k);
+        mlx_array_free(v);
+
+        mlx_array attn = mlx_array_new();
+        mlx_fast_scaled_dot_product_attention(&attn, qt, kt, vt, scale, "",
+                                              has_padding ? attn_mask : null_arr, null_arr, S);
+        mlx_array_free(qt);
+        mlx_array_free(kt);
+        mlx_array_free(vt);
+
+        mlx_array attn_t = mlx_array_new();
+        mlx_transpose_axes(&attn_t, attn, perm, 4, S);
+        mlx_array_free(attn);
+        int s3[] = {batch, max_seq, q_dim};
+        mlx_array attn_flat = mlx_array_new();
+        mlx_reshape(&attn_flat, attn_t, s3, 3, S);
+        mlx_array_free(attn_t);
+
+        mlx_array proj = linear(attn_flat, &l->wo, S);
+        mlx_array_free(attn_flat);
+        mlx_array proj_b = mlx_array_new();
+        mlx_add(&proj_b, proj, l->o_bias, S);
+        mlx_array_free(proj);
+        mlx_array res = mlx_array_new();
+        mlx_add(&res, x, proj_b, S);
+        mlx_array_free(x);
+        mlx_array_free(proj_b);
+        x = mlx_array_new();
+        mlx_fast_layer_norm(&x, res, l->input_norm, l->attn_ln_bias, eps, S);
+        mlx_array_free(res);
+
+        /* Feed-forward: dense -> GeLU -> dense. */
+        mlx_array mid = linear(x, &l->up_proj, S);
+        mlx_array mid_b = mlx_array_new();
+        mlx_add(&mid_b, mid, l->ffn_inter_bias, S);
+        mlx_array_free(mid);
+        mlx_array g = mlx_gelu_erf(mid_b, S);
+        mlx_array_free(mid_b);
+        mlx_array out = linear(g, &l->down_proj, S);
+        mlx_array_free(g);
+        mlx_array out_b = mlx_array_new();
+        mlx_add(&out_b, out, l->ffn_out_bias, S);
+        mlx_array_free(out);
+        mlx_array res2 = mlx_array_new();
+        mlx_add(&res2, x, out_b, S);
+        mlx_array_free(x);
+        mlx_array_free(out_b);
+        x = mlx_array_new();
+        mlx_fast_layer_norm(&x, res2, l->post_attn_norm, l->ffn_ln_bias, eps, S);
+        mlx_array_free(res2);
+    }
+    return x;
+}
 
 static mlx_array mlx_forward_layers(embed_mlx_ctx_t *ctx,
                                     mlx_array x,
@@ -1747,13 +1985,37 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_take_axis(&x, ctx->embed_tokens, ids, 0, S);
     mlx_array_free(ids);
 
-    /* 2. Transformer layers. */
-    x = mlx_forward_layers(ctx, x, batch, max_seq, needs_attn_mask, attn_mask, 0, c->n_layers);
-
-    /* 3. Final RMSNorm. */
-    mlx_array x_normed = mlx_array_new();
-    mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
-    mlx_array_free(x);
+    /* 2. Family forward. BERT adds learned positions + token-type[0] and an
+     * embedding LayerNorm, then runs post-norm encoder layers; its states are
+     * already final, so pooling uses them directly. Qwen runs the decoder block
+     * and applies the final RMSNorm here. */
+    mlx_array x_normed;
+    if (c->family == EMBED_FAMILY_BERT) {
+        int start2[] = {0, 0}, stride2[] = {1, 1};
+        int pos_stop[] = {max_seq, hidden}, type_stop[] = {1, hidden};
+        mlx_array pos = mlx_array_new();
+        mlx_slice(&pos, ctx->position_embeddings, start2, 2, pos_stop, 2, stride2, 2, S);
+        mlx_array xp = mlx_array_new();
+        mlx_add(&xp, x, pos, S);
+        mlx_array_free(x);
+        mlx_array_free(pos);
+        mlx_array tt = mlx_array_new();
+        mlx_slice(&tt, ctx->token_type_embeddings, start2, 2, type_stop, 2, stride2, 2, S);
+        mlx_array xt = mlx_array_new();
+        mlx_add(&xt, xp, tt, S);
+        mlx_array_free(xp);
+        mlx_array_free(tt);
+        mlx_array xe = mlx_array_new();
+        mlx_fast_layer_norm(&xe, xt, ctx->embed_ln_w, ctx->embed_ln_b, c->layer_norm_eps, S);
+        mlx_array_free(xt);
+        x_normed =
+            mlx_forward_bert(ctx, xe, batch, max_seq, needs_attn_mask, attn_mask, 0, c->n_layers);
+    } else {
+        x = mlx_forward_layers(ctx, x, batch, max_seq, needs_attn_mask, attn_mask, 0, c->n_layers);
+        x_normed = mlx_array_new();
+        mlx_fast_rms_norm(&x_normed, x, ctx->norm, c->rms_norm_eps, S);
+        mlx_array_free(x);
+    }
 
     mlx_array emb = mlx_array_new();
     if (single_token_pool) {
