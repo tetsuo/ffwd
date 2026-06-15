@@ -74,6 +74,7 @@ LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 
 # Source files
 SRCS = embed.c \
+       embed_config.c \
        qwen_kernels.c \
        qwen_kernels_generic.c \
        qwen_kernels_neon.c \
@@ -164,19 +165,19 @@ TEST_CC_FLAGS         = -Wall -Wextra -O2 -I.
 TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
 TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
 TEST_SAFETENSORS_SRCS = tests/test_safetensors.c qwen_safetensors.c
-TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c qwen_safetensors.c \
+TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c embed_config.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
-TEST_QWEN3_SRCS       = tests/test_qwen3.c embed.c qwen_safetensors.c \
+TEST_QWEN3_SRCS       = tests/test_qwen3.c embed.c embed_config.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
-TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c qwen_tokenizer.c \
+TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c embed_config.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
-TEST_LATE_SRCS        = tests/test_late.c embed.c qwen_tokenizer.c \
+TEST_LATE_SRCS        = tests/test_late.c embed.c embed_config.c qwen_tokenizer.c \
                         qwen_safetensors.c $(KERNEL_SRCS)
-TEST_SERVER_SRCS      = tests/test_server.c embed.c \
+TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_config.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 # The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
-TEST_CLI_BIN_SRCS     = embed_cli.c embed.c \
+TEST_CLI_BIN_SRCS     = embed_cli.c embed.c embed_config.c \
                         qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
 
 test:
@@ -322,7 +323,7 @@ bench:
 bench-model:
 	@test -n "$(MODEL_DIR)" || { echo "usage: make bench-model MODEL_DIR=/path/to/model-dir"; exit 1; }
 	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_model \
-	    bench/bench_model.c embed.c qwen_safetensors.c $(KERNEL_SRCS) \
+	    bench/bench_model.c embed.c embed_config.c qwen_safetensors.c $(KERNEL_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	@mkdir -p bench/results
 	./bench/bench_model "$(MODEL_DIR)" --json bench/results/model-$(BENCH_STAMP).json
@@ -353,13 +354,13 @@ $(SERVER_TARGET): $(LIB) embed_server.o
 # =============================================================================
 # Compile rules
 # =============================================================================
-embed.o: embed.c embed.h qwen_kernels.h qwen_safetensors.h
+embed.o: embed.c embed.h embed_config.h qwen_kernels.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
 
 embed_server.o: embed_server.c embed_server.h embed_build.h embed.h embed_mlx.h qwen_tokenizer.h deps/ae/ae.h deps/ae/anet.h
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
 
-embed_mlx.o: embed_mlx.c embed_mlx.h embed.h qwen_safetensors.h
+embed_mlx.o: embed_mlx.c embed_mlx.h embed_config.h embed.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 embed_cli.o: embed_cli.c embed_build.h embed.h qwen_kernels.h qwen_tokenizer.h
@@ -382,6 +383,9 @@ qwen_tokenizer.o: qwen_tokenizer.c qwen_tokenizer.h qwen_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 qwen_safetensors.o: qwen_safetensors.c qwen_safetensors.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+embed_config.o: embed_config.c embed_config.h embed.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
