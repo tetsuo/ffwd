@@ -1,6 +1,7 @@
 /* embed_cli.c - embed command-line tool */
 
 #include "embed.h"
+#include "embed_build.h"
 #include "qwen_kernels.h"
 #include "qwen_tokenizer.h"
 
@@ -14,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include <time.h>
 #include <limits.h>
 
@@ -39,6 +39,7 @@ static void print_usage(const char *prog)
         "  --cuda       Use CUDA/cuBLAS GPU backend\n"
 #endif
         "  --stream     Read lines from stdin, write one JSON embedding per line\n"
+        "  --json       Emit JSON instead of plain text (embedding or matrix)\n"
 #ifdef USE_MLX
         "  --mlx-quant-bits N\n"
         "               Quantize MLX linear weights to 8 bits at load time\n"
@@ -60,16 +61,19 @@ static void print_usage(const char *prog)
         "               Print raw embeddings (with multiple texts)\n"
         "  -v, --verbose\n"
         "               Verbose (-vv for debug)\n"
+        "  -V, --version\n"
+        "               Print version and exit\n"
+        "  --build-info Print build details and exit\n"
         "  -h           Show this help\n"
         "\n"
         "Modes:\n"
-        "  1  text arg     Print embedding as space-separated floats\n"
-        "  2+ text args    Print cosine similarity matrix\n"
+        "  1  text arg     Embedding as space-separated floats (JSON with --json)\n"
+        "  2+ text args    Cosine similarity matrix, one row per line (JSON with --json)\n"
         "  no args         Batch: read all stdin lines, then similarity matrix\n"
         "  --stream        Streaming: read stdin lines, write JSON per line\n"
         "\n"
         "Examples:\n"
-        "  %s -d ./model \"query: what is AI?\"\n"
+        "  %s -d ./model \"what is AI?\"\n"
 #ifdef USE_MLX
         "  %s -d ./model --mlx --stream < texts.txt\n",
         prog, prog, prog);
@@ -176,6 +180,17 @@ static void print_embedding_raw(const float *emb, int dim)
         printf("%.8f", (double)emb[i]);
     }
     putchar('\n');
+}
+
+/* Single embedding as a JSON array of floats. */
+static void print_embedding_array(const float *emb, int dim)
+{
+    putchar('[');
+    for (int i = 0; i < dim; i++) {
+        if (i) putchar(',');
+        printf("%.8f", (double)emb[i]);
+    }
+    puts("]");
 }
 
 static size_t engine_workspace_nbytes(const engine_t *e)
@@ -346,8 +361,45 @@ static int append_text(char ***texts, int *n_texts, int *cap, const char *s)
     return 0;
 }
 
+/* Cosine similarity matrix. --json emits a JSON array of rows; otherwise one
+ * row of space-separated values per line. With print_embs the raw embeddings
+ * follow, one per line after a blank line (plain-text output only). */
+static void print_matrix(const float *embs, int n, int dim,
+                         int json, int print_embs)
+{
+    if (json) {
+        putchar('[');
+        for (int i = 0; i < n; i++) {
+            if (i) putchar(',');
+            putchar('[');
+            for (int j = 0; j < n; j++) {
+                if (j) putchar(',');
+                printf("%.6f", (double)embed_cosine_similarity(
+                    embs + (size_t)i * dim, embs + (size_t)j * dim, dim));
+            }
+            putchar(']');
+        }
+        puts("]");
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            if (j) putchar(' ');
+            printf("%.6f", (double)embed_cosine_similarity(
+                embs + (size_t)i * dim, embs + (size_t)j * dim, dim));
+        }
+        putchar('\n');
+    }
+    if (print_embs) {
+        putchar('\n');
+        for (int i = 0; i < n; i++)
+            print_embedding_raw(embs + (size_t)i * dim, dim);
+    }
+}
+
 static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
-                     int print_embs, int batch_size)
+                     int print_embs, int batch_size, int json)
 {
     int     n_texts = 0, cap = 0;
     char  **texts = NULL;
@@ -417,26 +469,10 @@ static int run_batch(engine_t *e, int argc, char **argv, int arg_start,
     }
 
     if (n_texts == 1) {
-        print_embedding_raw(embs, dim);
+        if (json) print_embedding_array(embs, dim);
+        else      print_embedding_raw(embs, dim);
     } else {
-        printf("Cosine similarity matrix (%d texts):\n", n_texts);
-        printf("%-4s", "");
-        for (int j = 0; j < n_texts; j++) printf("  [%d]  ", j);
-        printf("\n");
-        for (int i = 0; i < n_texts; i++) {
-            printf("[%d] ", i);
-            for (int j = 0; j < n_texts; j++)
-                printf("  %.4f", (double)embed_cosine_similarity(
-                    embs + (size_t)i * dim, embs + (size_t)j * dim, dim));
-            printf("  \"%s\"\n", texts[i]);
-        }
-        if (print_embs) {
-            printf("\nEmbeddings:\n");
-            for (int i = 0; i < n_texts; i++) {
-                printf("[%d] ", i);
-                print_embedding_raw(embs + (size_t)i * dim, dim);
-            }
-        }
+        print_matrix(embs, n_texts, dim, json, print_embs);
     }
 
 done:
@@ -464,6 +500,8 @@ int main(int argc, char *argv[])
     int verbose    = 0;
     int stdin_mode = 0;
     int batch_size = 0;
+    int json       = 0;
+    const char *prog = embed_prog_name(argv[0]);
 #ifdef USE_MLX
     int use_mlx = 0;
     int mlx_quantize_bits = 0;
@@ -479,12 +517,21 @@ int main(int argc, char *argv[])
     while (arg_start < argc && argv[arg_start][0] == '-') {
         const char *f = argv[arg_start];
         if      (!strcmp(f, "-d"))      { model_dir = argv[++arg_start]; }
+        else if (!strcmp(f, "-V") || !strcmp(f, "--version")) {
+            embed_print_version(prog);
+            return 0;
+        }
+        else if (!strcmp(f, "--build-info")) {
+            embed_print_build_info(prog);
+            return 0;
+        }
         else if (!strcmp(f, "-t") || !strcmp(f, "--threads")) {
             n_threads = atoi(argv[++arg_start]);
         }
         else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
             batch_size = atoi(argv[++arg_start]);
         }
+        else if (!strcmp(f, "--json")) { json = 1; }
 #ifdef USE_MLX
         else if (!strcmp(f, "--mlx-quant-bits")) {
             mlx_quantize_bits = atoi(argv[++arg_start]);
@@ -522,7 +569,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(f, "--cuda"))  { use_cuda = 1; }
 #endif
         else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
-            print_usage(argv[0]);
+            print_usage(prog);
             return 0;
         }
         else break;
@@ -567,7 +614,7 @@ int main(int argc, char *argv[])
 
     if (!model_dir || !model_dir[0]) {
         fprintf(stderr, "model directory required (-d <dir>)\n");
-        print_usage(argv[0]);
+        print_usage(prog);
         return 1;
     }
 
@@ -686,7 +733,7 @@ int main(int argc, char *argv[])
     if (stdin_mode)
         rc = run_stdin(&e, batch_size > 0 ? batch_size : 1);
     else
-        rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size);
+        rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size, json);
 
     /* Cleanup */
     if (e.workspace) embed_workspace_free(e.workspace);

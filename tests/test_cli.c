@@ -112,6 +112,11 @@ int main(int argc, char **argv)
     expect(run_cli("-d /nonexistent-embed-dir hi", NULL) == 1,
            "missing model dir exits 1");
 
+    /* -V reports the program's base name, not the path it was invoked by. */
+    expect(run_cli("-V", NULL) == 0, "-V exits 0");
+    expect(!file_contains(g_out, "tests/"),
+           "-V strips the directory from the program name");
+
     /* Mode 1: one text prints one embedding line. */
     snprintf(args, sizeof(args), "-d '%s' 'hello world'", g_dir);
     expect(run_cli(args, NULL) == 0, "single text exits 0");
@@ -124,25 +129,38 @@ int main(int argc, char **argv)
     expect(file_contains(g_err, "Using 2 CPU thread(s)"),
            "-v reports the thread count");
 
-    /* Mode 2+: several texts print a similarity matrix. */
+    /* Mode 2+: several texts print a bare numeric matrix, one row per line,
+     * with no titles or labels. Two texts give a 2x2 with a 1.0 diagonal. */
     snprintf(args, sizeof(args), "-d '%s' 'hello world' 'held'", g_dir);
     expect(run_cli(args, NULL) == 0, "two texts exit 0");
-    expect(file_contains(g_out, "Cosine similarity matrix (2 texts):"),
-           "two texts print a similarity matrix");
-    expect(file_contains(g_out, "1.0000"), "matrix diagonal is 1.0000");
+    expect(count_lines(g_out) == 2, "two texts print a 2-row matrix");
+    expect(file_contains(g_out, "1.000000"), "matrix diagonal is 1.000000");
+    expect(!file_contains(g_out, "Cosine"), "matrix has no title line");
 
+    /* --json on a matrix emits a bare JSON array of rows, no labels. */
+    snprintf(args, sizeof(args), "-d '%s' --json 'hello world' 'held'", g_dir);
+    expect(run_cli(args, NULL) == 0, "two texts --json exits 0");
+    expect(file_contains(g_out, "[[") && file_contains(g_out, "1.000000"),
+           "--json matrix is a bare array of rows");
+    expect(!file_contains(g_out, "{"), "--json matrix has no object or labels");
+
+    /* --json on a single text emits a bare JSON array of floats. */
+    snprintf(args, sizeof(args), "-d '%s' --json 'hello world'", g_dir);
+    expect(run_cli(args, NULL) == 0, "single text --json exits 0");
+    expect(file_contains(g_out, "[") && !file_contains(g_out, "{"),
+           "--json single text is a bare array");
+
+    /* -e appends the raw embeddings (label-free) after the matrix: three
+     * matrix rows, a blank separator, then three embedding rows. */
     snprintf(args, sizeof(args),
              "-d '%s' -e -b 1 'hello' 'world' 'held'", g_dir);
     expect(run_cli(args, NULL) == 0, "-e -b 1 with three texts exits 0");
-    expect(file_contains(g_out, "Cosine similarity matrix (3 texts):"),
-           "-b 1 still prints the full matrix");
-    expect(file_contains(g_out, "Embeddings:"), "-e prints raw embeddings");
+    expect(count_lines(g_out) == 7, "-e prints matrix then raw embeddings");
 
     /* Batch mode reads stdin when no texts are given. */
     snprintf(args, sizeof(args), "-d '%s'", g_dir);
     expect(run_cli(args, "hello world\nheld\n") == 0, "stdin batch exits 0");
-    expect(file_contains(g_out, "Cosine similarity matrix (2 texts):"),
-           "stdin batch prints a similarity matrix");
+    expect(count_lines(g_out) == 2, "stdin batch prints a 2-row matrix");
     expect(run_cli(args, "\n\n") == 1, "blank stdin exits 1");
 
     /* Streaming mode writes one JSON object per input line. */

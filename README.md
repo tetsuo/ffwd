@@ -10,8 +10,11 @@ OpenAI/Perplexity-compatible HTTP API.
 
 **Prerequisites**:
 
-- On Linux, install `libcjson-dev`, and `libopenblas-dev`.
-- On macOS, install `cjson`, `mlx` and `mlx-c` via Homebrew.
+- On Linux, install `libopenblas-dev`.
+- On macOS, install `mlx` and `mlx-c` via Homebrew.
+
+You also need `libcjson-dev`/`cjson` to build the server; the CLI and the shared
+library can be built without it.
 
 **Makefile targets**:
 
@@ -25,10 +28,16 @@ Pass one text to get its embedding, two or more to get a cosine similarity
 matrix:
 
 ```bash
+# one text: the embedding as a line of space-separated floats
 ./embed -d ./pplx-embed-v1-0.6b "What is the capital of France?"
+
+# two or more: a cosine similarity matrix, one row per line, no labels
 ./embed -d ./pplx-embed-v1-0.6b "What is the capital of France?" \
   "Paris is the capital of France." \
   "Berlin is the capital of Germany."
+# 1.000000 0.719822 0.422054
+# 0.719822 1.000000 0.601722
+# 0.422054 0.601722 1.000000
 ```
 
 With Qwen3, prefix the retrieval query with a task instruction and embed
@@ -58,8 +67,18 @@ cat texts.txt | ./embed -d ./model --stream -b 8
 Without `--stream`, reading from stdin accumulates all lines then prints the
 similarity matrix.
 
+Add `--json` to emit JSON. One text prints an array of floats; two or more print
+an array of rows (the matrix):
+
+```bash
+./embed -d ./model --json "cat" "dog"
+# [[1.000000,0.380861],[0.380861,1.000000]]
+```
+
 Use `--mlx` or `--cuda` to select a GPU backend (build-dependent). Default is
 CPU. `-t` sets thread count, `-b` sets batch size, `-v` enables verbose output.
+`-V`/`--version` prints the version; `--build-info` also reports the commit,
+build date, target, and compiler.
 
 ## embed-server
 
