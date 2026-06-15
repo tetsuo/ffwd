@@ -143,6 +143,44 @@ static void test_encoding_from_root_family(void) {
     cJSON_Delete(detail);
 }
 
+static void test_text_type(void) {
+    cJSON *detail = cJSON_CreateArray();
+
+    /* Absent: no-op for both families, no error. */
+    cJSON *empty = cJSON_CreateObject();
+    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_API_OPENAI) == 0);
+    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_API_PERPLEXITY) == 0);
+    cJSON_Delete(empty);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
+
+    /* Qwen3: query -> 1, document -> 0, both accepted. */
+    cJSON *q = cJSON_CreateObject();
+    cJSON_AddStringToObject(q, "text_type", "query");
+    TEST_ASSERT(text_type_is_query(q, detail, EMBED_API_OPENAI) == 1);
+    cJSON_Delete(q);
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "text_type", "document");
+    TEST_ASSERT(text_type_is_query(d, detail, EMBED_API_OPENAI) == 0);
+    cJSON_Delete(d);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
+
+    /* Invalid enum value on Qwen3 is reported. */
+    cJSON *bad = cJSON_CreateObject();
+    cJSON_AddStringToObject(bad, "text_type", "passage");
+    TEST_ASSERT(text_type_is_query(bad, detail, EMBED_API_OPENAI) == 0);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 1);
+    cJSON_Delete(bad);
+
+    /* text_type on a Perplexity-family model is rejected. */
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddStringToObject(p, "text_type", "query");
+    TEST_ASSERT(text_type_is_query(p, detail, EMBED_API_PERPLEXITY) == 0);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 2);
+    cJSON_Delete(p);
+
+    cJSON_Delete(detail);
+}
+
 static void test_collect_job_batch_deadline(void) {
     http_server s;
     memset(&s, 0, sizeof(s));
@@ -580,6 +618,59 @@ static void test_http_embeddings(int port) {
     free(body);
     body = NULL;
 
+    /* text_type=query must equal manually prepending the Qwen3 instruction with
+     * text_type=document: both produce the same tokens, hence the same vector. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"hello\","
+                         "\"text_type\":\"query\",\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *tt_query = body ? parse_embeddings_body(body, 1) : NULL;
+    free(body);
+    body = NULL;
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"Instruct: Given a web "
+                         "search query, retrieve relevant passages that answer the "
+                         "query\\nQuery:hello\",\"text_type\":\"document\","
+                         "\"encoding_format\":\"float\"}",
+                         NULL, &body) == 200);
+    cJSON *tt_manual = body ? parse_embeddings_body(body, 1) : NULL;
+    free(body);
+    body = NULL;
+    if (tt_query && tt_manual) {
+        cJSON *qe = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(tt_query, "data"), 0), "embedding");
+        cJSON *me = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(tt_manual, "data"), 0),
+            "embedding");
+        TEST_ASSERT(cJSON_IsArray(qe) && cJSON_IsArray(me) &&
+                    cJSON_GetArraySize(qe) == cJSON_GetArraySize(me));
+        double tt_diff = 0.0;
+        int n = cJSON_GetArraySize(qe);
+        for (int i = 0; i < n; i++) {
+            double d = fabs(cJSON_GetArrayItem(qe, i)->valuedouble -
+                            cJSON_GetArrayItem(me, i)->valuedouble);
+            if (d > tt_diff)
+                tt_diff = d;
+        }
+        TEST_ASSERT(tt_diff < 1e-6);
+    }
+    cJSON_Delete(tt_query);
+    cJSON_Delete(tt_manual);
+
+    /* text_type is rejected on a Perplexity-family model, and bad values 422. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello\","
+                         "\"text_type\":\"query\"}",
+                         NULL, &body) == 422);
+    free(body);
+    body = NULL;
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"hello\","
+                         "\"text_type\":\"passage\"}",
+                         NULL, &body) == 422);
+    free(body);
+    body = NULL;
+
     /* Concurrent clients: more requests in flight than the micro-batch cap
      * (-b 2) so the worker has to assemble several batches. */
     enum { N_CONC = 6 };
@@ -900,6 +991,7 @@ int main(void) {
     test_encode_embedding_base64_float32();
     test_append_embedding_value_float();
     test_encoding_from_root_family();
+    test_text_type();
     test_collect_job_batch_deadline();
     test_collect_job_batch_zero_wait();
     test_http_server();

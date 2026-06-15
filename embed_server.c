@@ -66,6 +66,13 @@
 #define EMBED_LATE_MASK_TOKEN_ID       151642
 #define EMBED_LATE_QUERY_PREFIX_ID     151669
 #define EMBED_LATE_DOCUMENT_PREFIX_ID  151670
+/* Qwen3/DashScope `text_type: query` prepends this default retrieval instruction
+ * in the Qwen3-Embedding format ("Instruct: {task}\nQuery:{query}"); documents
+ * and the default pass through unchanged. The task text matches the
+ * Qwen3-Embedding reference default; callers needing a custom instruction still
+ * prepend their own text and leave text_type at "document". */
+#define EMBED_QWEN3_QUERY_INSTRUCT \
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
@@ -1235,6 +1242,35 @@ static const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_
     return v;
 }
 
+/* Parse the Qwen3/DashScope `text_type` hint. Returns 1 when the query
+ * retrieval instruction should be prepended, 0 otherwise (document / absent).
+ * The field belongs to the OpenAI/DashScope (Qwen3) family only; on a Perplexity
+ * model it is rejected, since pplx-embed has no instruction concept. Invalid
+ * values are reported into detail and treated as the no-op default. */
+static int text_type_is_query(cJSON *root, cJSON *detail, embedding_api_t api) {
+    cJSON *tt = cJSON_GetObjectItemCaseSensitive(root, "text_type");
+    if (!tt)
+        return 0;
+    if (api != EMBED_API_OPENAI) {
+        ve_add(detail, "[\"body\",\"text_type\"]",
+               "text_type is only supported for Qwen3-Embedding models", "extra_fields");
+        return 0;
+    }
+    if (!cJSON_IsString(tt) || !tt->valuestring) {
+        ve_add(detail, "[\"body\",\"text_type\"]", "text_type must be a string",
+               "type_error.string");
+        return 0;
+    }
+    const char *v = tt->valuestring;
+    if (!strcmp(v, "query"))
+        return 1;
+    if (!strcmp(v, "document"))
+        return 0;
+    ve_add(detail, "[\"body\",\"text_type\"]",
+           "value is not a valid enum member; permitted: 'query', 'document'", "enum");
+    return 0;
+}
+
 static int
 dimensions_from_root(cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding) {
     int dims = max_dim;
@@ -1459,6 +1495,28 @@ static int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *ou
         out->ids[out->n_tokens++] = m->terminal_token_id;
     }
     return 0;
+}
+
+/* Tokenize one embedding input, prepending the Qwen3 query instruction when
+ * query_instruct is set. The instruction is part of the text the model sees, so
+ * it is tokenized in one pass with the input (and the terminal token, if any, is
+ * appended by tokenize_one as usual). */
+static int
+tokenize_input(loaded_model *m, job *j, const char *text, int query_instruct, token_buf *out) {
+    if (!query_instruct)
+        return tokenize_one(m, j, text, out);
+    size_t plen = strlen(EMBED_QWEN3_QUERY_INSTRUCT);
+    size_t tlen = strlen(text);
+    char *buf = (char *)malloc(plen + tlen + 1);
+    if (!buf) {
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+    memcpy(buf, EMBED_QWEN3_QUERY_INSTRUCT, plen);
+    memcpy(buf + plen, text, tlen + 1);
+    int rc = tokenize_one(m, j, buf, out);
+    free(buf);
+    return rc;
 }
 
 static int late_id_is_skipped(const loaded_model *m, int id) {
@@ -1945,6 +2003,16 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s, embed
     out->dims = dims;
     out->encoding = encoding;
 
+    /* Resolve the API family from the requested model (independent of load
+     * state) to validate the Qwen3/DashScope text_type hint. query_instruct is
+     * applied to every input in the request. */
+    cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
+    model_slot api_slot = (model_item && cJSON_IsString(model_item) && model_item->valuestring)
+                              ? model_slot_for_id(model_item->valuestring)
+                              : MODEL_UNKNOWN;
+    embedding_api_t api = api_slot != MODEL_UNKNOWN ? k_models[api_slot].api : EMBED_API_PERPLEXITY;
+    int query_instruct = text_type_is_query(root, detail, api);
+
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
     int n_inputs = 0;
     if (!input) {
@@ -1991,7 +2059,7 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s, embed
 
         int idx = 0;
         if (input && cJSON_IsString(input) && input->valuestring) {
-            if (tokenize_one(m, j, input->valuestring, &out->tokens[0]) != 0) {
+            if (tokenize_input(m, j, input->valuestring, query_instruct, &out->tokens[0]) != 0) {
                 ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
                        "value_error.tokenization");
             } else {
@@ -2012,7 +2080,8 @@ static void prepare_embedding_request(job *j, cJSON *root, http_server *s, embed
                     idx++;
                     continue;
                 }
-                if (tokenize_one(m, j, item->valuestring, &out->tokens[idx]) != 0) {
+                if (tokenize_input(m, j, item->valuestring, query_instruct, &out->tokens[idx]) !=
+                    0) {
                     ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
                 } else {
                     out->inputs[idx].ids = out->tokens[idx].ids;
