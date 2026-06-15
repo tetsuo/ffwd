@@ -545,3 +545,15 @@ const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
     }
     return NULL;
 }
+
+const char *multi_safetensors_weight_prefix(const multi_safetensors_t *ms,
+                                            const char *tensor_name) {
+    if (multi_safetensors_find(ms, tensor_name, NULL))
+        return "";
+
+    char prefixed[sizeof(((safetensor_t *)0)->name)];
+    int n = snprintf(prefixed, sizeof(prefixed), "model.%s", tensor_name);
+    if (n < 0 || (size_t)n >= sizeof(prefixed))
+        return NULL;
+    return multi_safetensors_find(ms, prefixed, NULL) ? "model." : NULL;
+}

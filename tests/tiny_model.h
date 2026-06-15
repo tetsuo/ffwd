@@ -76,8 +76,8 @@ tm_write_config(const char *dir, const tm_dims_t *d, const char *model_type, int
 
 /* Write a safetensors file holding `specs` with tm_value() contents.
  * dtype: "F32" or "BF16". Returns 0 on success. */
-static int
-tm_write_safetensors(const char *path, const char *dtype, const tm_spec_t *specs, int n_specs) {
+static int tm_write_safetensors_with_prefix(
+    const char *path, const char *dtype, const tm_spec_t *specs, int n_specs, const char *prefix) {
     int bf16 = strcmp(dtype, "BF16") == 0;
     size_t esize = bf16 ? 2 : 4;
 
@@ -89,15 +89,16 @@ tm_write_safetensors(const char *path, const char *dtype, const tm_spec_t *specs
         size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
         size_t end = doff + n * esize;
         if (s->cols)
-            hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
-                                     "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d,%d],"
-                                     "\"data_offsets\":[%zu,%zu]}",
-                                     t ? "," : "", s->name, dtype, s->rows, s->cols, doff, end);
+            hoff +=
+                (size_t)snprintf(header + hoff, sizeof(header) - hoff,
+                                 "%s\"%s%s\":{\"dtype\":\"%s\",\"shape\":[%d,%d],"
+                                 "\"data_offsets\":[%zu,%zu]}",
+                                 t ? "," : "", prefix, s->name, dtype, s->rows, s->cols, doff, end);
         else
             hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff,
-                                     "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%d],"
+                                     "%s\"%s%s\":{\"dtype\":\"%s\",\"shape\":[%d],"
                                      "\"data_offsets\":[%zu,%zu]}",
-                                     t ? "," : "", s->name, dtype, s->rows, doff, end);
+                                     t ? "," : "", prefix, s->name, dtype, s->rows, doff, end);
         doff = end;
     }
     hoff += (size_t)snprintf(header + hoff, sizeof(header) - hoff, "}");
@@ -129,9 +130,17 @@ tm_write_safetensors(const char *path, const char *dtype, const tm_spec_t *specs
     return 0;
 }
 
+static int
+tm_write_safetensors(const char *path, const char *dtype, const tm_spec_t *specs, int n_specs) {
+    return tm_write_safetensors_with_prefix(path, dtype, specs, n_specs, "");
+}
+
 /* Write config.json + model.safetensors with the given dimensions into dir.
  * dtype: "F32" or "BF16". Returns 0 on success. */
-static int tm_write_model_dims(const char *dir, const char *dtype, const tm_dims_t *d) {
+static int tm_write_model_dims_with_prefix(const char *dir,
+                                           const char *dtype,
+                                           const tm_dims_t *d,
+                                           const char *prefix) {
     int q = d->heads * d->head_dim, kv = d->kv_heads * d->head_dim;
     const tm_spec_t specs[TM_N_SPECS] = {
         {"embed_tokens.weight", d->vocab, d->hidden},
@@ -154,7 +163,16 @@ static int tm_write_model_dims(const char *dir, const char *dtype, const tm_dims
         return -1;
 
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
-    return tm_write_safetensors(path, dtype, specs, TM_N_SPECS);
+    return tm_write_safetensors_with_prefix(path, dtype, specs, TM_N_SPECS, prefix);
+}
+
+static int tm_write_model_dims(const char *dir, const char *dtype, const tm_dims_t *d) {
+    return tm_write_model_dims_with_prefix(dir, dtype, d, "");
+}
+
+static inline int
+tm_write_prefixed_model_dims(const char *dir, const char *dtype, const tm_dims_t *d) {
+    return tm_write_model_dims_with_prefix(dir, dtype, d, "model.");
 }
 
 static inline int tm_write_qwen3_model_dims(const char *dir,

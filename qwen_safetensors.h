@@ -61,6 +61,10 @@ const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
                                            const char *name,
                                            safetensors_file_t **out_sf);
 
+/* Resolve an optional Hugging Face "model." namespace for a backbone tensor.
+ * Returns "", "model.", or NULL when neither form exists. */
+const char *multi_safetensors_weight_prefix(const multi_safetensors_t *ms, const char *tensor_name);
+
 /* Get raw pointer to tensor data (within mmap'd region) */
 const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t);
 

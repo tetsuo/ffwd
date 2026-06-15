@@ -540,13 +540,22 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         return NULL;
     }
 
+    const char *weight_prefix = multi_safetensors_weight_prefix(ctx->ms, "embed_tokens.weight");
+    if (!weight_prefix) {
+        fprintf(stderr, "mlx: neither embed_tokens.weight nor "
+                        "model.embed_tokens.weight was found\n");
+        goto fail;
+    }
+
     int h = c->hidden_size, qd = c->q_dim, kvd = c->kv_dim;
     int inter = c->intermediate_size, hd = c->head_dim;
+    char name[256];
 
     /* Only the first stage needs token embeddings. */
     if (layer_start == 0) {
         int emb_shape[] = {c->vocab_size, h};
-        ctx->embed_tokens = load_tensor(ctx->ms, "embed_tokens.weight", emb_shape, 2);
+        snprintf(name, sizeof(name), "%sembed_tokens.weight", weight_prefix);
+        ctx->embed_tokens = load_tensor(ctx->ms, name, emb_shape, 2);
         if (!arr_ok(ctx->embed_tokens))
             goto fail;
     }
@@ -556,52 +565,51 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
     if (!ctx->layers)
         goto fail;
 
-    char name[256];
     for (int i = layer_start; i < layer_end; i++) {
         mlx_layer_t *l = &ctx->layers[i];
 
 #define LD(fld, fmt, ...)                                                           \
     do {                                                                            \
-        snprintf(name, sizeof(name), fmt, i);                                       \
+        snprintf(name, sizeof(name), fmt, weight_prefix, i);                        \
         int sh[] = {__VA_ARGS__};                                                   \
         l->fld = load_linear_tensor(ctx->ms, name, sh, sizeof(sh) / sizeof(sh[0])); \
         if (!linear_ok(l->fld))                                                     \
             goto fail;                                                              \
     } while (0)
 
-        LD(wq, "layers.%d.self_attn.q_proj.weight", qd, h);
-        LD(wk, "layers.%d.self_attn.k_proj.weight", kvd, h);
-        LD(wv, "layers.%d.self_attn.v_proj.weight", kvd, h);
-        LD(wo, "layers.%d.self_attn.o_proj.weight", h, qd);
+        LD(wq, "%slayers.%d.self_attn.q_proj.weight", qd, h);
+        LD(wk, "%slayers.%d.self_attn.k_proj.weight", kvd, h);
+        LD(wv, "%slayers.%d.self_attn.v_proj.weight", kvd, h);
+        LD(wo, "%slayers.%d.self_attn.o_proj.weight", h, qd);
 #undef LD
 
 #define LD(fld, fmt, ...)                                                    \
     do {                                                                     \
-        snprintf(name, sizeof(name), fmt, i);                                \
+        snprintf(name, sizeof(name), fmt, weight_prefix, i);                 \
         int sh[] = {__VA_ARGS__};                                            \
         l->fld = load_tensor(ctx->ms, name, sh, sizeof(sh) / sizeof(sh[0])); \
         if (!arr_ok(l->fld))                                                 \
             goto fail;                                                       \
     } while (0)
 
-        LD(q_norm, "layers.%d.self_attn.q_norm.weight", hd);
-        LD(k_norm, "layers.%d.self_attn.k_norm.weight", hd);
-        LD(input_norm, "layers.%d.input_layernorm.weight", h);
-        LD(post_attn_norm, "layers.%d.post_attention_layernorm.weight", h);
+        LD(q_norm, "%slayers.%d.self_attn.q_norm.weight", hd);
+        LD(k_norm, "%slayers.%d.self_attn.k_norm.weight", hd);
+        LD(input_norm, "%slayers.%d.input_layernorm.weight", h);
+        LD(post_attn_norm, "%slayers.%d.post_attention_layernorm.weight", h);
 #undef LD
 
 #define LD(fld, fmt, ...)                                                           \
     do {                                                                            \
-        snprintf(name, sizeof(name), fmt, i);                                       \
+        snprintf(name, sizeof(name), fmt, weight_prefix, i);                        \
         int sh[] = {__VA_ARGS__};                                                   \
         l->fld = load_linear_tensor(ctx->ms, name, sh, sizeof(sh) / sizeof(sh[0])); \
         if (!linear_ok(l->fld))                                                     \
             goto fail;                                                              \
     } while (0)
 
-        LD(gate_proj, "layers.%d.mlp.gate_proj.weight", inter, h);
-        LD(up_proj, "layers.%d.mlp.up_proj.weight", inter, h);
-        LD(down_proj, "layers.%d.mlp.down_proj.weight", h, inter);
+        LD(gate_proj, "%slayers.%d.mlp.gate_proj.weight", inter, h);
+        LD(up_proj, "%slayers.%d.mlp.up_proj.weight", inter, h);
+        LD(down_proj, "%slayers.%d.mlp.down_proj.weight", h, inter);
 #undef LD
 
         if (embed_verbose >= 2)
@@ -610,7 +618,8 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
 
     if (layer_end == c->n_layers) {
         int ns[] = {h};
-        ctx->norm = load_tensor(ctx->ms, "norm.weight", ns, 1);
+        snprintf(name, sizeof(name), "%snorm.weight", weight_prefix);
+        ctx->norm = load_tensor(ctx->ms, name, ns, 1);
         if (!arr_ok(ctx->norm))
             goto fail;
     }

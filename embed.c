@@ -667,14 +667,24 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
     }
     model->safetensors = ms;
 
+    const char *weight_prefix = multi_safetensors_weight_prefix(ms, "embed_tokens.weight");
+    if (!weight_prefix) {
+        fprintf(stderr, "embed_model_load: neither embed_tokens.weight nor "
+                        "model.embed_tokens.weight was found\n");
+        goto fail;
+    }
+
     if (embed_verbose >= 1)
         fprintf(stderr, "embed_model_load: loading weights from %s\n", model_dir);
+
+    char name[256];
 
     /* Only the first stage needs token embeddings. */
     embed_weights_t *w = &model->weights;
     if (layer_start == 0) {
         const int64_t embed_shape[2] = {cfg->vocab_size, cfg->hidden_size};
-        w->embed_tokens = load_weight_direct(ms, "embed_tokens.weight", embed_shape, 2);
+        snprintf(name, sizeof(name), "%sembed_tokens.weight", weight_prefix);
+        w->embed_tokens = load_weight_direct(ms, name, embed_shape, 2);
         if (!w->embed_tokens.data)
             goto fail;
     }
@@ -685,40 +695,39 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
         goto fail;
 
     /* Per-layer weights */
-    char name[256];
     for (int i = layer_start; i < layer_end; i++) {
         embed_layer_t *l = &w->layers[i];
 
-#define LOAD_NORM(field, fmt, d0)                      \
-    do {                                               \
-        const int64_t expect[1] = {(d0)};              \
-        snprintf(name, sizeof(name), fmt, i);          \
-        l->field = load_norm_f32(ms, name, expect, 1); \
-        if (!l->field)                                 \
-            goto fail;                                 \
+#define LOAD_NORM(field, fmt, d0)                            \
+    do {                                                     \
+        const int64_t expect[1] = {(d0)};                    \
+        snprintf(name, sizeof(name), fmt, weight_prefix, i); \
+        l->field = load_norm_f32(ms, name, expect, 1);       \
+        if (!l->field)                                       \
+            goto fail;                                       \
     } while (0)
 
-#define LOAD2(field, fmt, d0, d1)                           \
-    do {                                                    \
-        const int64_t expect[2] = {(d0), (d1)};             \
-        snprintf(name, sizeof(name), fmt, i);               \
-        l->field = load_weight_direct(ms, name, expect, 2); \
-        if (!l->field.data)                                 \
-            goto fail;                                      \
+#define LOAD2(field, fmt, d0, d1)                            \
+    do {                                                     \
+        const int64_t expect[2] = {(d0), (d1)};              \
+        snprintf(name, sizeof(name), fmt, weight_prefix, i); \
+        l->field = load_weight_direct(ms, name, expect, 2);  \
+        if (!l->field.data)                                  \
+            goto fail;                                       \
     } while (0)
 
-        LOAD2(wq, "layers.%d.self_attn.q_proj.weight", cfg->q_dim, cfg->hidden_size);
-        LOAD2(wk, "layers.%d.self_attn.k_proj.weight", cfg->kv_dim, cfg->hidden_size);
-        LOAD2(wv, "layers.%d.self_attn.v_proj.weight", cfg->kv_dim, cfg->hidden_size);
-        LOAD2(wo, "layers.%d.self_attn.o_proj.weight", cfg->hidden_size, cfg->q_dim);
-        LOAD_NORM(q_norm, "layers.%d.self_attn.q_norm.weight", cfg->head_dim);
-        LOAD_NORM(k_norm, "layers.%d.self_attn.k_norm.weight", cfg->head_dim);
-        LOAD_NORM(input_norm, "layers.%d.input_layernorm.weight", cfg->hidden_size);
-        LOAD_NORM(post_attn_norm, "layers.%d.post_attention_layernorm.weight", cfg->hidden_size);
-        LOAD2(gate_proj, "layers.%d.mlp.gate_proj.weight", cfg->intermediate_size,
+        LOAD2(wq, "%slayers.%d.self_attn.q_proj.weight", cfg->q_dim, cfg->hidden_size);
+        LOAD2(wk, "%slayers.%d.self_attn.k_proj.weight", cfg->kv_dim, cfg->hidden_size);
+        LOAD2(wv, "%slayers.%d.self_attn.v_proj.weight", cfg->kv_dim, cfg->hidden_size);
+        LOAD2(wo, "%slayers.%d.self_attn.o_proj.weight", cfg->hidden_size, cfg->q_dim);
+        LOAD_NORM(q_norm, "%slayers.%d.self_attn.q_norm.weight", cfg->head_dim);
+        LOAD_NORM(k_norm, "%slayers.%d.self_attn.k_norm.weight", cfg->head_dim);
+        LOAD_NORM(input_norm, "%slayers.%d.input_layernorm.weight", cfg->hidden_size);
+        LOAD_NORM(post_attn_norm, "%slayers.%d.post_attention_layernorm.weight", cfg->hidden_size);
+        LOAD2(gate_proj, "%slayers.%d.mlp.gate_proj.weight", cfg->intermediate_size,
               cfg->hidden_size);
-        LOAD2(up_proj, "layers.%d.mlp.up_proj.weight", cfg->intermediate_size, cfg->hidden_size);
-        LOAD2(down_proj, "layers.%d.mlp.down_proj.weight", cfg->hidden_size,
+        LOAD2(up_proj, "%slayers.%d.mlp.up_proj.weight", cfg->intermediate_size, cfg->hidden_size);
+        LOAD2(down_proj, "%slayers.%d.mlp.down_proj.weight", cfg->hidden_size,
               cfg->intermediate_size);
 
 #undef LOAD2
@@ -731,7 +740,8 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
     /* Only the final stage applies the output RMSNorm. */
     if (layer_end == cfg->n_layers) {
         const int64_t norm_shape[1] = {cfg->hidden_size};
-        w->norm = load_norm_f32(ms, "norm.weight", norm_shape, 1);
+        snprintf(name, sizeof(name), "%snorm.weight", weight_prefix);
+        w->norm = load_norm_f32(ms, name, norm_shape, 1);
         if (!w->norm)
             goto fail;
     }

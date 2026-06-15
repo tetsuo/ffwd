@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 int main(void) {
-    char root[1024], f32_dir[1088], bf16_dir[1088];
+    char root[1024], f32_dir[1088], bf16_dir[1088], prefixed_dir[1088];
     snprintf(root, sizeof(root), "%s/embed-bf16-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(root)) {
@@ -21,8 +21,11 @@ int main(void) {
     }
     snprintf(f32_dir, sizeof(f32_dir), "%s/f32", root);
     snprintf(bf16_dir, sizeof(bf16_dir), "%s/bf16", root);
-    if (mkdir(f32_dir, 0755) != 0 || mkdir(bf16_dir, 0755) != 0 ||
-        tm_write_model(f32_dir, "F32") != 0 || tm_write_model(bf16_dir, "BF16") != 0) {
+    snprintf(prefixed_dir, sizeof(prefixed_dir), "%s/prefixed", root);
+    static const tm_dims_t dims = {4, 2, 1, 2, 8, 16};
+    if (mkdir(f32_dir, 0755) != 0 || mkdir(bf16_dir, 0755) != 0 || mkdir(prefixed_dir, 0755) != 0 ||
+        tm_write_model(f32_dir, "F32") != 0 || tm_write_model(bf16_dir, "BF16") != 0 ||
+        tm_write_prefixed_model_dims(prefixed_dir, "F32", &dims) != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
@@ -30,7 +33,8 @@ int main(void) {
     int ids[] = {1, 2, 3, 4};
     embed_model_t *mf32 = embed_model_load(f32_dir);
     embed_model_t *mbf16 = embed_model_load(bf16_dir);
-    if (!mf32 || !mbf16) {
+    embed_model_t *mprefixed = embed_model_load(prefixed_dir);
+    if (!mf32 || !mbf16 || !mprefixed) {
         fprintf(stderr, "model load failed\n");
         return 1;
     }
@@ -39,36 +43,44 @@ int main(void) {
     int dim = cfg->hidden_size;
     float *a = (float *)malloc((size_t)dim * sizeof(float));
     float *b = (float *)malloc((size_t)dim * sizeof(float));
+    float *c = (float *)malloc((size_t)dim * sizeof(float));
     embed_workspace_t *wf32 = embed_workspace_new(mf32);
     embed_workspace_t *wbf16 = embed_workspace_new(mbf16);
-    if (!a || !b || !wf32 || !wbf16) {
+    embed_workspace_t *wprefixed = embed_workspace_new(mprefixed);
+    if (!a || !b || !c || !wf32 || !wbf16 || !wprefixed) {
         fprintf(stderr, "allocation failed\n");
         return 1;
     }
 
     if (embed_model_encode_into(mf32, wf32, ids, 4, a) != 0 ||
-        embed_model_encode_into(mbf16, wbf16, ids, 4, b) != 0) {
+        embed_model_encode_into(mbf16, wbf16, ids, 4, b) != 0 ||
+        embed_model_encode_into(mprefixed, wprefixed, ids, 4, c) != 0) {
         fprintf(stderr, "embedding failed\n");
         return 1;
     }
 
     float max_diff = 0.0f;
+    float prefix_diff = 0.0f;
     float norm = 0.0f;
     for (int i = 0; i < dim; i++) {
-        if (!isfinite(a[i]) || !isfinite(b[i])) {
+        if (!isfinite(a[i]) || !isfinite(b[i]) || !isfinite(c[i])) {
             fprintf(stderr, "non-finite embedding value\n");
             return 1;
         }
         float d = fabsf(a[i] - b[i]);
         if (d > max_diff)
             max_diff = d;
+        d = fabsf(a[i] - c[i]);
+        if (d > prefix_diff)
+            prefix_diff = d;
         norm += b[i] * b[i];
     }
     norm = sqrtf(norm);
     /* Embeddings are intentionally unnormalized; require a sane nonzero
      * magnitude and tight F32-vs-BF16 parity, not unit norm. */
-    if (norm <= 1e-6f || max_diff > 2e-5f) {
-        fprintf(stderr, "bad parity: norm=%.9g max_diff=%.9g\n", norm, max_diff);
+    if (norm <= 1e-6f || max_diff > 2e-5f || prefix_diff != 0.0f) {
+        fprintf(stderr, "bad parity: norm=%.9g max_diff=%.9g prefix_diff=%.9g\n", norm, max_diff,
+                prefix_diff);
         return 1;
     }
 
@@ -98,13 +110,17 @@ int main(void) {
         return 1;
     }
 
-    printf("ok: bf16 model parity dim=%d max_abs_diff=%.9g norm=%.9g\n", dim, max_diff, norm);
+    printf("ok: bf16 and model-prefix parity dim=%d max_abs_diff=%.9g norm=%.9g\n", dim, max_diff,
+           norm);
 
     embed_workspace_free(wf32);
     embed_workspace_free(wbf16);
+    embed_workspace_free(wprefixed);
     embed_model_free(mf32);
     embed_model_free(mbf16);
+    embed_model_free(mprefixed);
     free(a);
     free(b);
+    free(c);
     return 0;
 }
