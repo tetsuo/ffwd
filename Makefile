@@ -164,6 +164,7 @@ endif
 TEST_CC_FLAGS         = -Wall -Wextra -O2 -I.
 TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
 TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
+TEST_WORDPIECE_SRCS   = tests/test_wordpiece.c wordpiece_tokenizer.c
 TEST_SAFETENSORS_SRCS = tests/test_safetensors.c qwen_safetensors.c
 TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c embed_config.c qwen_safetensors.c \
                         $(KERNEL_SRCS)
@@ -194,6 +195,8 @@ test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_tokenizer \
 	    $(TEST_TOKENIZER_SRCS) -lm -lpthread
 	./tests/test_tokenizer
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_wordpiece $(TEST_WORDPIECE_SRCS)
+	./tests/test_wordpiece
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_safetensors $(TEST_SAFETENSORS_SRCS)
 	./tests/test_safetensors
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_bf16_model \
