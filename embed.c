@@ -906,6 +906,16 @@ int embed_late_model_token_dim(const embed_late_model_t *model) {
     return model ? model->token_dim : 0;
 }
 
+/* Internal (embed_internal.h): expose the base model and projection so GPU
+ * backends can upload them to device without seeing struct embed_late_model. */
+embed_model_t *embed_late_model_base(const embed_late_model_t *model) {
+    return model ? model->base : NULL;
+}
+
+const embed_weight_ref_t *embed_late_model_projection(const embed_late_model_t *model) {
+    return model ? &model->projection : NULL;
+}
+
 int embed_late_model_encode_tokens(const embed_late_model_t *model,
                                    embed_late_workspace_t *ws,
                                    const int *token_ids,

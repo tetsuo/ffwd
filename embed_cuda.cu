@@ -32,6 +32,7 @@ typedef struct {
 
 struct embed_cuda_ctx {
     embed_model_t *cpu;
+    int own_cpu; // free ctx->cpu in embed_cuda_free only when this context owns it
     embed_config_t config;
     cudaStream_t stream;
     cublasHandle_t blas;
@@ -1099,17 +1100,22 @@ static void free_layer(cuda_layer_t *l) {
     cuda_matrix_free(&l->down_proj);
 }
 
-embed_cuda_ctx_t *embed_cuda_load(const char *model_dir) {
-    embed_model_t *cpu = embed_model_load(model_dir);
+/* Build a device context from an already-loaded CPU model. own_cpu records
+ * whether embed_cuda_free should release that CPU model: embed_cuda_load owns
+ * the model it loaded; the late path passes a model owned by its CPU late
+ * model and sets own_cpu = 0. */
+static embed_cuda_ctx_t *cuda_ctx_from_model(embed_model_t *cpu, int own_cpu) {
     if (!cpu)
         return NULL;
 
     embed_cuda_ctx_t *ctx = (embed_cuda_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx) {
-        embed_model_free(cpu);
+        if (own_cpu)
+            embed_model_free(cpu);
         return NULL;
     }
     ctx->cpu = cpu;
+    ctx->own_cpu = own_cpu;
     ctx->config = cpu->config;
 
     /* Without an explicit --cuda-weight-dtype, store weights in the model
@@ -1152,6 +1158,10 @@ embed_cuda_ctx_t *embed_cuda_load(const char *model_dir) {
     return ctx;
 }
 
+embed_cuda_ctx_t *embed_cuda_load(const char *model_dir) {
+    return cuda_ctx_from_model(embed_model_load(model_dir), 1);
+}
+
 void embed_cuda_free(embed_cuda_ctx_t *ctx) {
     if (!ctx)
         return;
@@ -1187,7 +1197,8 @@ void embed_cuda_free(embed_cuda_ctx_t *ctx) {
         cublasDestroy(ctx->blas);
     if (ctx->stream)
         cudaStreamDestroy(ctx->stream);
-    embed_model_free(ctx->cpu);
+    if (ctx->own_cpu)
+        embed_model_free(ctx->cpu);
     free(ctx);
 }
 
@@ -1500,4 +1511,208 @@ float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids, int n_toke
         return NULL;
     }
     return out;
+}
+
+/* ========================================================================
+ * Late-interaction CUDA path
+ *
+ * The transformer forward and the 1_Dense projection run on the GPU; MaxSim
+ * scoring stays on the host, where the grouped-GEMM scorer is far faster than a
+ * device graph for this small op. So the encoders copy the projected token
+ * vectors back to host memory and the caller runs embed_late_maxsim_batch there.
+ * ======================================================================== */
+
+struct embed_cuda_late_ctx {
+    embed_cuda_ctx_t *base;       // device base model; does not own its CPU model
+    embed_late_model_t *cpu_late; // owns the CPU base model + projection host data
+    cuda_matrix_t projection;     // device [token_dim, hidden]
+    float *proj_dev;              // device scratch [total_tokens, token_dim], grown on demand
+    size_t proj_cap;              // capacity of proj_dev in floats
+    int token_dim;
+};
+
+embed_cuda_late_ctx_t *embed_cuda_late_load(const char *model_dir) {
+    embed_late_model_t *cpu_late = embed_late_model_load(model_dir);
+    if (!cpu_late)
+        return NULL;
+
+    embed_cuda_late_ctx_t *ctx = (embed_cuda_late_ctx_t *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        embed_late_model_free(cpu_late);
+        return NULL;
+    }
+    ctx->cpu_late = cpu_late;
+    ctx->token_dim = embed_late_model_token_dim(cpu_late);
+
+    // Upload the base transformer weights; the CPU late model keeps ownership.
+    ctx->base = cuda_ctx_from_model(embed_late_model_base(cpu_late), 0);
+    if (!ctx->base) {
+        embed_cuda_late_free(ctx);
+        return NULL;
+    }
+
+    // Upload the 1_Dense projection [token_dim, hidden].
+    const embed_weight_ref_t *proj = embed_late_model_projection(cpu_late);
+    if (!proj || ctx->token_dim <= 0 ||
+        load_matrix(&ctx->projection, proj, ctx->token_dim, ctx->base->config.hidden_size) != 0) {
+        embed_cuda_late_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+void embed_cuda_late_free(embed_cuda_late_ctx_t *ctx) {
+    if (!ctx)
+        return;
+    cuda_matrix_free(&ctx->projection);
+    cudaFree(ctx->proj_dev);
+    embed_cuda_free(ctx->base);           // own_cpu = 0, so this keeps the CPU model
+    embed_late_model_free(ctx->cpu_late); // frees the CPU base model + projection
+    free(ctx);
+}
+
+const embed_config_t *embed_cuda_late_config(const embed_cuda_late_ctx_t *ctx) {
+    return ctx ? &ctx->base->config : NULL;
+}
+
+int embed_cuda_late_token_dim(const embed_cuda_late_ctx_t *ctx) { return ctx ? ctx->token_dim : 0; }
+
+static int ensure_late_proj(embed_cuda_late_ctx_t *ctx, int total) {
+    size_t need = (size_t)total * (size_t)ctx->token_dim;
+    if (need <= ctx->proj_cap)
+        return 0;
+    cudaFree(ctx->proj_dev);
+    ctx->proj_dev = NULL;
+    ctx->proj_cap = 0;
+    if (cudaMalloc((void **)&ctx->proj_dev, need * sizeof(float)) != cudaSuccess)
+        return -1;
+    ctx->proj_cap = need;
+    return 0;
+}
+
+/* Forward all inputs, project every token to token_dim, and copy the packed
+ * [total, token_dim] F32 result to a freshly malloc'd host buffer (caller frees).
+ * On success *proj_host and *total_out are set; base->offsets_host holds the
+ * packed per-document token offsets. */
+static int cuda_late_forward_project(embed_cuda_late_ctx_t *ctx,
+                                     const embed_input_t *inputs,
+                                     int n_docs,
+                                     float **proj_host,
+                                     int *total_out) {
+    embed_cuda_ctx_t *base = ctx->base;
+    const embed_config_t *c = &base->config;
+    if (cuda_forward_batch(base, inputs, n_docs) != 0)
+        return -1;
+    int total = base->offsets_host[n_docs];
+    if (total <= 0 || ensure_late_proj(ctx, total) != 0)
+        return -1;
+    if (linear(base, &ctx->projection, base->x, ctx->proj_dev, total, c->hidden_size,
+               ctx->token_dim) != 0)
+        return -1;
+    float *host = (float *)malloc((size_t)total * (size_t)ctx->token_dim * sizeof(float));
+    if (!host)
+        return -1;
+    cudaError_t ce =
+        cudaMemcpyAsync(host, ctx->proj_dev, (size_t)total * (size_t)ctx->token_dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, base->stream);
+    if (ce == cudaSuccess)
+        ce = cudaStreamSynchronize(base->stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "cuda late output copy failed: %s\n", cudaGetErrorString(ce));
+        free(host);
+        return -1;
+    }
+    *proj_host = host;
+    *total_out = total;
+    return 0;
+}
+
+int embed_cuda_late_encode_tokens(embed_cuda_late_ctx_t *ctx,
+                                  const int *token_ids,
+                                  int n_tokens,
+                                  int normalize,
+                                  float *out_vectors) {
+    if (!ctx || !token_ids || n_tokens <= 0 || !out_vectors || ctx->token_dim <= 0)
+        return -1;
+    embed_input_t input = {token_ids, n_tokens};
+    float *proj_host = NULL;
+    int total = 0;
+    if (cuda_late_forward_project(ctx, &input, 1, &proj_host, &total) != 0)
+        return -1;
+    memcpy(out_vectors, proj_host, (size_t)total * (size_t)ctx->token_dim * sizeof(float));
+    free(proj_host);
+    if (normalize) {
+        for (int i = 0; i < total; i++)
+            if (embed_l2_normalize(out_vectors + (size_t)i * ctx->token_dim, ctx->token_dim) != 0)
+                return -1;
+    }
+    return 0;
+}
+
+int embed_cuda_late_encode_docs(embed_cuda_late_ctx_t *ctx,
+                                const int *const *doc_ids,
+                                const int *n_tokens,
+                                const int *const *keep,
+                                const int *n_keep,
+                                int n_docs,
+                                int normalize,
+                                float *out_vectors,
+                                int *out_offsets) {
+    if (!ctx || !doc_ids || !n_tokens || !keep || !n_keep || n_docs <= 0 || !out_vectors ||
+        !out_offsets || ctx->token_dim <= 0)
+        return -1;
+    int dim = ctx->token_dim;
+
+    embed_input_t *inputs = (embed_input_t *)malloc((size_t)n_docs * sizeof(*inputs));
+    if (!inputs)
+        return -1;
+
+    int total_keep = 0;
+    out_offsets[0] = 0;
+    for (int d = 0; d < n_docs; d++) {
+        if (!doc_ids[d] || n_tokens[d] <= 0 || !keep[d] || n_keep[d] <= 0 ||
+            n_keep[d] > n_tokens[d] || total_keep > INT_MAX - n_keep[d]) {
+            free(inputs);
+            return -1;
+        }
+        for (int k = 0; k < n_keep[d]; k++) {
+            if (keep[d][k] < 0 || keep[d][k] >= n_tokens[d]) {
+                free(inputs);
+                return -1;
+            }
+        }
+        inputs[d].ids = doc_ids[d];
+        inputs[d].n_tokens = n_tokens[d];
+        total_keep += n_keep[d];
+        out_offsets[d + 1] = total_keep;
+    }
+
+    float *proj_host = NULL;
+    int total = 0;
+    if (cuda_late_forward_project(ctx, inputs, n_docs, &proj_host, &total) != 0) {
+        free(inputs);
+        return -1;
+    }
+
+    /* Gather each document's kept token rows (in packed forward order) into the
+     * output, the layout MaxSim consumes - matching the CPU/MLX paths. */
+    const int *off = ctx->base->offsets_host;
+    int pos = 0;
+    for (int d = 0; d < n_docs; d++) {
+        int start = off[d];
+        for (int k = 0; k < n_keep[d]; k++) {
+            memcpy(out_vectors + (size_t)pos * dim, proj_host + (size_t)(start + keep[d][k]) * dim,
+                   (size_t)dim * sizeof(float));
+            pos++;
+        }
+    }
+    free(proj_host);
+    free(inputs);
+
+    if (normalize) {
+        for (int i = 0; i < total_keep; i++)
+            if (embed_l2_normalize(out_vectors + (size_t)i * dim, dim) != 0)
+                return -1;
+    }
+    return 0;
 }

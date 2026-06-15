@@ -306,6 +306,7 @@ typedef struct {
 #endif
 #ifdef USE_CUDA
     embed_cuda_ctx_t *cuda_ctx;
+    embed_cuda_late_ctx_t *cuda_late_ctx;
 #endif
 } loaded_model;
 
@@ -2437,6 +2438,50 @@ static int execute_rerank_mlx(rerank_request *r, float *scores) {
 }
 #endif
 
+#ifdef USE_CUDA
+static int execute_rerank_cuda(rerank_request *r, float *scores) {
+    loaded_model *m = r->model;
+    int dim = m->info->token_dim;
+    int total_doc_vecs = 0;
+    for (int i = 0; i < r->n_documents; i++)
+        total_doc_vecs += r->documents[i].n_keep;
+
+    float *query = xmalloc((size_t)r->query.n_tokens * dim * sizeof(*query));
+    float *docs = xmalloc((size_t)total_doc_vecs * dim * sizeof(*docs));
+    int *offsets = xmalloc((size_t)(r->n_documents + 1) * sizeof(*offsets));
+
+    /* GPU encodes the query and every candidate (one packed forward); MaxSim
+     * runs on the host, where the grouped-GEMM scorer beats a device graph. */
+    const int **doc_ids = xmalloc((size_t)r->n_documents * sizeof(*doc_ids));
+    const int **keep = xmalloc((size_t)r->n_documents * sizeof(*keep));
+    int *n_tokens = xmalloc((size_t)r->n_documents * sizeof(*n_tokens));
+    int *n_keep = xmalloc((size_t)r->n_documents * sizeof(*n_keep));
+    for (int i = 0; i < r->n_documents; i++) {
+        doc_ids[i] = r->documents[i].ids;
+        keep[i] = r->documents[i].keep;
+        n_tokens[i] = r->documents[i].n_tokens;
+        n_keep[i] = r->documents[i].n_keep;
+    }
+
+    int rc =
+        embed_cuda_late_encode_tokens(m->cuda_late_ctx, r->query.ids, r->query.n_tokens, 1, query);
+    if (rc == 0)
+        rc = embed_cuda_late_encode_docs(m->cuda_late_ctx, doc_ids, n_tokens, keep, n_keep,
+                                         r->n_documents, 1, docs, offsets);
+    if (rc == 0)
+        rc = embed_late_maxsim_batch(query, r->query.n_keep, docs, offsets, r->n_documents, dim,
+                                     scores);
+    free(n_keep);
+    free(n_tokens);
+    free(keep);
+    free(doc_ids);
+    free(offsets);
+    free(docs);
+    free(query);
+    return rc;
+}
+#endif
+
 static void execute_rerank_request(rerank_request *r) {
     if (!r || !r->model) {
         if (r && r->j)
@@ -2445,8 +2490,11 @@ static void execute_rerank_request(rerank_request *r) {
     }
     float *scores = xmalloc((size_t)r->n_documents * sizeof(*scores));
     uint64_t t0 = nstime();
-#ifdef USE_MLX
+#if defined(USE_MLX)
     int rc = r->model->mlx_late_ctx ? execute_rerank_mlx(r, scores) : execute_rerank_cpu(r, scores);
+#elif defined(USE_CUDA)
+    int rc =
+        r->model->cuda_late_ctx ? execute_rerank_cuda(r, scores) : execute_rerank_cpu(r, scores);
 #else
     int rc = execute_rerank_cpu(r, scores);
 #endif
@@ -2721,13 +2769,26 @@ static void *worker_main(void *arg) {
             loaded_model *m = &s->models[i];
             if (!m->info)
                 continue;
-            m->cuda_ctx = embed_cuda_load(m->path);
-            if (!m->cuda_ctx) {
+            if (m->info->kind == MODEL_KIND_LATE)
+                m->cuda_late_ctx = embed_cuda_late_load(m->path);
+            else
+                m->cuda_ctx = embed_cuda_load(m->path);
+            if ((!m->cuda_ctx && m->info->kind != MODEL_KIND_LATE) ||
+                (!m->cuda_late_ctx && m->info->kind == MODEL_KIND_LATE)) {
                 server_log("embed-server: failed to load CUDA model on worker: %s", m->path);
                 rc = 1;
                 break;
             }
-            if (configure_loaded_model(m, embed_cuda_config(m->cuda_ctx), 0) != 0) {
+            const embed_config_t *config = m->info->kind == MODEL_KIND_LATE
+                                               ? embed_cuda_late_config(m->cuda_late_ctx)
+                                               : embed_cuda_config(m->cuda_ctx);
+            int token_dim =
+                m->info->kind == MODEL_KIND_LATE ? embed_cuda_late_token_dim(m->cuda_late_ctx) : 0;
+            if (configure_loaded_model(m, config, token_dim) != 0 ||
+                (m->info->kind == MODEL_KIND_LATE &&
+                 (m->late_mask_id >= config->vocab_size ||
+                  m->late_query_prefix_id >= config->vocab_size ||
+                  m->late_document_prefix_id >= config->vocab_size))) {
                 rc = 1;
                 break;
             }
@@ -2745,6 +2806,10 @@ static void *worker_main(void *arg) {
                 if (m->cuda_ctx) {
                     embed_cuda_free(m->cuda_ctx);
                     m->cuda_ctx = NULL;
+                }
+                if (m->cuda_late_ctx) {
+                    embed_cuda_late_free(m->cuda_late_ctx);
+                    m->cuda_late_ctx = NULL;
                 }
             }
             return NULL;
@@ -2787,6 +2852,10 @@ static void *worker_main(void *arg) {
             if (m->cuda_ctx) {
                 embed_cuda_free(m->cuda_ctx);
                 m->cuda_ctx = NULL;
+            }
+            if (m->cuda_late_ctx) {
+                embed_cuda_late_free(m->cuda_late_ctx);
+                m->cuda_late_ctx = NULL;
             }
         }
     }
@@ -2934,6 +3003,8 @@ static void free_models(http_server *s) {
 #ifdef USE_CUDA
         if (m->cuda_ctx)
             embed_cuda_free(m->cuda_ctx);
+        if (m->cuda_late_ctx)
+            embed_cuda_late_free(m->cuda_late_ctx);
 #endif
     }
 }
@@ -2967,11 +3038,6 @@ static int validate_model_specs(const embed_server_config_t *cfg) {
         }
         if (seen[slot]) {
             fprintf(stderr, "embed-server: duplicate model id: %s\n", spec->id);
-            return -1;
-        }
-        if (cfg->use_cuda && k_models[slot].kind == MODEL_KIND_LATE) {
-            fprintf(stderr, "embed-server: model %s has no CUDA late-interaction backend\n",
-                    spec->id);
             return -1;
         }
         seen[slot] = 1;

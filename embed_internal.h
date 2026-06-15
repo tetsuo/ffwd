@@ -81,4 +81,11 @@ struct embed_workspace {
     size_t bf16_widen_count;
 };
 
+/* Internal accessors for the late-interaction model. GPU backends build a device
+ * context from an already-loaded CPU late model because the model dir is a late
+ * snapshot that the pooled loader rejects; these expose the base model and the
+ * projection weight without making struct embed_late_model public. */
+embed_model_t *embed_late_model_base(const embed_late_model_t *model);
+const embed_weight_ref_t *embed_late_model_projection(const embed_late_model_t *model);
+
 #endif /* EMBED_INTERNAL_H */
