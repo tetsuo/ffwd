@@ -82,13 +82,21 @@ EMBED_API void embed_mlx_late_vectors_free(embed_mlx_late_vectors_t *vecs);
 EMBED_API int embed_mlx_late_vectors_token_count(const embed_mlx_late_vectors_t *vecs);
 EMBED_API int embed_mlx_late_vectors_dim(const embed_mlx_late_vectors_t *vecs);
 EMBED_API int embed_mlx_late_vectors_copy(const embed_mlx_late_vectors_t *vecs, float *out_vectors);
-EMBED_API embed_mlx_late_vectors_t *embed_mlx_late_vectors_concat(
-    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *const *items, int count);
-EMBED_API embed_mlx_late_vectors_t *
-embed_mlx_late_vectors_select(embed_mlx_late_ctx_t *ctx,
-                              const embed_mlx_late_vectors_t *vecs,
-                              const int *token_indices,
-                              int count);
+/*
+ * Encode n_docs documents in one padded transformer pass and pack each
+ * document's kept token vectors back-to-back into [total_keep, token_dim] in
+ * document order. out_offsets[n_docs + 1] receives the prefix sum of kept
+ * counts, so the result feeds embed_mlx_late_maxsim_batch_device directly.
+ * Returns NULL on error; the handle must not outlive ctx.
+ */
+EMBED_API embed_mlx_late_vectors_t *embed_mlx_late_encode_docs_device(embed_mlx_late_ctx_t *ctx,
+                                                                      const int *const *doc_ids,
+                                                                      const int *n_tokens,
+                                                                      const int *const *keep,
+                                                                      const int *n_keep,
+                                                                      int n_docs,
+                                                                      int normalize,
+                                                                      int *out_offsets);
 EMBED_API int embed_mlx_late_maxsim_batch_device(embed_mlx_late_ctx_t *ctx,
                                                  const embed_mlx_late_vectors_t *query,
                                                  const embed_mlx_late_vectors_t *docs,

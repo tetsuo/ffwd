@@ -1105,101 +1105,243 @@ int embed_mlx_late_vectors_copy(const embed_mlx_late_vectors_t *vecs, float *out
     return rc;
 }
 
-embed_mlx_late_vectors_t *embed_mlx_late_vectors_concat(
-    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *const *items, int count) {
-    if (!ctx || !ctx->base || !items || count <= 0)
+/*
+ * Batched late-interaction document encoder.
+ *
+ * Encodes every candidate in one padded transformer pass, then gathers each
+ * document's kept token vectors into a single packed [total_keep, token_dim]
+ * array in document order. out_offsets receives the prefix sum of kept counts
+ * (out_offsets[i + 1] - out_offsets[i] == n_keep[i]), the exact layout
+ * embed_mlx_late_maxsim_batch_device consumes. This collapses N per-candidate
+ * transformer calls into one forward.
+ *
+ * Right-padding keeps real tokens at positions 0..n_tokens[d]-1 so RoPE
+ * positions are unchanged; a bidirectional model gets a padding attention mask
+ * so real tokens never attend to pad slots (the same masking the dense pooled
+ * batch path uses). Kept-token vectors therefore match per-document encoding to
+ * within MLX's batched-GEMM rounding.
+ */
+embed_mlx_late_vectors_t *embed_mlx_late_encode_docs_device(embed_mlx_late_ctx_t *ctx,
+                                                            const int *const *doc_ids,
+                                                            const int *n_tokens,
+                                                            const int *const *keep,
+                                                            const int *n_keep,
+                                                            int n_docs,
+                                                            int normalize,
+                                                            int *out_offsets) {
+    if (!ctx || !ctx->base || !doc_ids || !n_tokens || !keep || !n_keep || !out_offsets ||
+        n_docs <= 0 || ctx->token_dim <= 0 || !linear_ok(ctx->projection))
         return NULL;
-    int dim = 0;
-    int total = 0;
-    for (int i = 0; i < count; i++) {
-        const embed_mlx_late_vectors_t *v = items[i];
-        if (!v || v->owner != ctx || !arr_ok(v->vectors) || v->tokens <= 0 || v->dim <= 0)
+
+    embed_mlx_ctx_t *base = ctx->base;
+    if (base->layer_start != 0 || base->layer_end != base->config.n_layers ||
+        !arr_ok(base->embed_tokens) || !arr_ok(base->norm))
+        return NULL;
+
+    const embed_config_t *c = &base->config;
+    mlx_stream S = base->stream;
+    int causal = c->attention_mode == EMBED_ATTENTION_CAUSAL;
+
+    /* Validate inputs and size the batch: longest sequence and total kept
+     * tokens. out_offsets is the running prefix sum of kept counts. */
+    int max_seq = 0;
+    int total_keep = 0;
+    out_offsets[0] = 0;
+    for (int d = 0; d < n_docs; d++) {
+        if (!doc_ids[d] || n_tokens[d] <= 0 || !keep[d] || n_keep[d] <= 0 ||
+            n_keep[d] > n_tokens[d] || total_keep > INT_MAX - n_keep[d])
             return NULL;
-        if (i == 0)
-            dim = v->dim;
-        if (v->dim != dim || total > INT_MAX - v->tokens)
+        if (n_tokens[d] > max_seq)
+            max_seq = n_tokens[d];
+        for (int k = 0; k < n_keep[d]; k++) {
+            if (keep[d][k] < 0 || keep[d][k] >= n_tokens[d])
+                return NULL;
+        }
+        total_keep += n_keep[d];
+        out_offsets[d + 1] = total_keep;
+    }
+
+    /* The gather index lives in an MLX int32 array, so the flattened
+     * [n_docs * max_seq, dim] row count must stay within int range. */
+    size_t elems, ids_bytes, mask_bytes, gather_bytes;
+    if (mlx_mul_size((size_t)n_docs, (size_t)max_seq, &elems) != 0 || elems > INT_MAX ||
+        mlx_mul_size(elems, sizeof(int), &ids_bytes) != 0 ||
+        mlx_mul_size(elems, sizeof(float), &mask_bytes) != 0 ||
+        mlx_mul_size((size_t)total_keep, sizeof(int), &gather_bytes) != 0)
+        return NULL;
+
+    int has_padding = 0;
+    for (int d = 0; d < n_docs; d++)
+        if (n_tokens[d] != max_seq)
+            has_padding = 1;
+    int needs_attn_mask = has_padding && !causal;
+    if (ids_bytes == 0 || gather_bytes == 0 || (needs_attn_mask && mask_bytes == 0))
+        return NULL;
+
+    int *padded_ids = (int *)malloc(ids_bytes);
+    float *attn_mask_data = needs_attn_mask ? (float *)malloc(mask_bytes) : NULL;
+    int *gather_idx = (int *)malloc(gather_bytes);
+    if (!padded_ids || (needs_attn_mask && !attn_mask_data) || !gather_idx) {
+        free(padded_ids);
+        free(attn_mask_data);
+        free(gather_idx);
+        return NULL;
+    }
+
+    int gpos = 0;
+    for (int d = 0; d < n_docs; d++) {
+        for (int t = 0; t < max_seq; t++) {
+            size_t idx = (size_t)d * max_seq + t;
+            if (t < n_tokens[d]) {
+                int id = doc_ids[d][t];
+                if (id < 0 || id >= c->vocab_size) {
+                    fprintf(stderr, "mlx late: invalid token id %d at doc %d position %d\n", id, d,
+                            t);
+                    free(padded_ids);
+                    free(attn_mask_data);
+                    free(gather_idx);
+                    return NULL;
+                }
+                padded_ids[idx] = id;
+                if (needs_attn_mask)
+                    attn_mask_data[idx] = 0.0f;
+            } else {
+                padded_ids[idx] = 0;
+                if (needs_attn_mask)
+                    attn_mask_data[idx] = -1.0e9f;
+            }
+        }
+        /* Map each kept token to its row in the flattened projection. */
+        for (int k = 0; k < n_keep[d]; k++)
+            gather_idx[gpos++] = d * max_seq + keep[d][k];
+    }
+
+    int ids_shape[] = {n_docs, max_seq};
+    int attn_mask_shape[] = {n_docs, 1, 1, max_seq};
+    int gather_shape[] = {total_keep};
+    mlx_array ids = mlx_array_new_data(padded_ids, ids_shape, 2, MLX_INT32);
+    mlx_array attn_mask = needs_attn_mask
+                              ? mlx_array_new_data(attn_mask_data, attn_mask_shape, 4, MLX_FLOAT32)
+                              : (mlx_array){0};
+    mlx_array gather = mlx_array_new_data(gather_idx, gather_shape, 1, MLX_INT32);
+    free(padded_ids);
+    free(attn_mask_data);
+    free(gather_idx);
+    if (!arr_ok(ids) || (needs_attn_mask && !arr_ok(attn_mask)) || !arr_ok(gather)) {
+        mlx_array_free(ids);
+        mlx_array_free(attn_mask);
+        mlx_array_free(gather);
+        return NULL;
+    }
+    if (needs_attn_mask && mlx_weight_dtype(base) == MLX_BFLOAT16) {
+        mlx_array attn_mask_bf16 = mlx_array_new();
+        mlx_astype(&attn_mask_bf16, attn_mask, MLX_BFLOAT16, S);
+        mlx_array_free(attn_mask);
+        attn_mask = attn_mask_bf16;
+        if (!arr_ok(attn_mask)) {
+            mlx_array_free(ids);
+            mlx_array_free(gather);
             return NULL;
-        total += v->tokens;
+        }
     }
 
-    mlx_array *parts = (mlx_array *)malloc((size_t)count * sizeof(*parts));
-    if (!parts)
-        return NULL;
-    for (int i = 0; i < count; i++)
-        parts[i] = items[i]->vectors;
+    embed_mlx_late_vectors_t *result = NULL;
+    mlx_array x = mlx_array_new();
+    mlx_array x_normed = (mlx_array){0};
+    mlx_array projected = (mlx_array){0};
+    mlx_array flat = (mlx_array){0};
+    mlx_array gathered = (mlx_array){0};
 
-    mlx_stream S = ctx->base->stream;
-    mlx_vector_array vec = mlx_vector_array_new_data(parts, (size_t)count);
-    free(parts);
-    if (!vec.ctx)
-        return NULL;
+    mlx_take_axis(&x, base->embed_tokens, ids, 0, S);
+    mlx_array_free(ids);
+    if (!arr_ok(x))
+        goto cleanup;
 
-    mlx_array joined = mlx_array_new();
-    mlx_concatenate_axis(&joined, vec, 0, S);
-    mlx_vector_array_free(vec);
-    if (!arr_ok(joined)) {
-        mlx_array_free(joined);
-        return NULL;
+    x = mlx_forward_layers(base, x, n_docs, max_seq, needs_attn_mask, attn_mask, 0, c->n_layers);
+    if (!arr_ok(x))
+        goto cleanup;
+
+    x_normed = mlx_array_new();
+    mlx_fast_rms_norm(&x_normed, x, base->norm, c->rms_norm_eps, S);
+    mlx_array_free(x);
+    x = (mlx_array){0};
+    if (!arr_ok(x_normed))
+        goto cleanup;
+
+    projected = linear(x_normed, &ctx->projection, S);
+    mlx_array_free(x_normed);
+    x_normed = (mlx_array){0};
+    if (!arr_ok(projected))
+        goto cleanup;
+
+    /* Flatten [n_docs, max_seq, dim] -> [n_docs * max_seq, dim] and gather the
+     * kept tokens in document order into one packed [total_keep, dim] array. */
+    int flat_shape[] = {(int)elems, ctx->token_dim};
+    flat = mlx_array_new();
+    mlx_reshape(&flat, projected, flat_shape, 2, S);
+    mlx_array_free(projected);
+    projected = (mlx_array){0};
+    if (!arr_ok(flat))
+        goto cleanup;
+
+    gathered = mlx_array_new();
+    mlx_take_axis(&gathered, flat, gather, 0, S);
+    mlx_array_free(flat);
+    flat = (mlx_array){0};
+    if (!arr_ok(gathered))
+        goto cleanup;
+
+    /* Normalize after gathering: per-token L2 is row-independent, so this is
+     * identical to normalizing the full batch but skips the dropped and padded
+     * rows entirely. */
+    if (normalize) {
+        mlx_array sq = mlx_array_new();
+        mlx_square(&sq, gathered, S);
+        if (!arr_ok(sq)) {
+            mlx_array_free(sq);
+            goto cleanup;
+        }
+        mlx_array norm2 = mlx_array_new();
+        mlx_sum_axis(&norm2, sq, 1, true, S);
+        mlx_array_free(sq);
+        if (!arr_ok(norm2)) {
+            mlx_array_free(norm2);
+            goto cleanup;
+        }
+        mlx_array inv_norm = mlx_array_new();
+        mlx_rsqrt(&inv_norm, norm2, S);
+        mlx_array_free(norm2);
+        if (!arr_ok(inv_norm)) {
+            mlx_array_free(inv_norm);
+            goto cleanup;
+        }
+        mlx_array normalized = mlx_array_new();
+        mlx_multiply(&normalized, gathered, inv_norm, S);
+        mlx_array_free(inv_norm);
+        mlx_array_free(gathered);
+        gathered = normalized;
+        if (!arr_ok(gathered))
+            goto cleanup;
     }
 
-    embed_mlx_late_vectors_t *out = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
-    if (!out) {
-        mlx_array_free(joined);
-        return NULL;
-    }
-    out->owner = ctx;
-    out->vectors = joined;
-    out->tokens = total;
-    out->dim = dim;
-    return out;
-}
+    result = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*result));
+    if (!result)
+        goto cleanup;
+    result->owner = ctx;
+    result->vectors = gathered;
+    result->tokens = total_keep;
+    result->dim = ctx->token_dim;
+    gathered = (mlx_array){0};
 
-embed_mlx_late_vectors_t *embed_mlx_late_vectors_select(embed_mlx_late_ctx_t *ctx,
-                                                        const embed_mlx_late_vectors_t *vecs,
-                                                        const int *token_indices,
-                                                        int count) {
-    if (!ctx || !ctx->base || !vecs || vecs->owner != ctx || !arr_ok(vecs->vectors) ||
-        !token_indices || count <= 0 || vecs->tokens <= 0 || vecs->dim <= 0)
-        return NULL;
-
-    for (int i = 0; i < count; i++) {
-        if (token_indices[i] < 0 || token_indices[i] >= vecs->tokens)
-            return NULL;
-    }
-
-    size_t idx_bytes;
-    if (mlx_mul_size((size_t)count, sizeof(int), &idx_bytes) != 0)
-        return NULL;
-    int *idx_data = (int *)malloc(idx_bytes);
-    if (!idx_data)
-        return NULL;
-    memcpy(idx_data, token_indices, idx_bytes);
-
-    int idx_shape[] = {count};
-    mlx_array idx = mlx_array_new_data(idx_data, idx_shape, 1, MLX_INT32);
-    free(idx_data);
-    if (!arr_ok(idx))
-        return NULL;
-
-    mlx_stream S = ctx->base->stream;
-    mlx_array selected = mlx_array_new();
-    mlx_take_axis(&selected, vecs->vectors, idx, 0, S);
-    mlx_array_free(idx);
-    if (!arr_ok(selected)) {
-        mlx_array_free(selected);
-        return NULL;
-    }
-
-    embed_mlx_late_vectors_t *out = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
-    if (!out) {
-        mlx_array_free(selected);
-        return NULL;
-    }
-    out->owner = ctx;
-    out->vectors = selected;
-    out->tokens = count;
-    out->dim = vecs->dim;
-    return out;
+cleanup:
+    mlx_array_free(gathered);
+    mlx_array_free(flat);
+    mlx_array_free(projected);
+    mlx_array_free(x_normed);
+    mlx_array_free(x);
+    mlx_array_free(gather);
+    mlx_array_free(attn_mask);
+    return result;
 }
 
 int embed_mlx_late_maxsim_batch_device(embed_mlx_late_ctx_t *ctx,

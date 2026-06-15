@@ -2401,42 +2401,35 @@ static int execute_rerank_mlx(rerank_request *r, float *scores) {
     loaded_model *m = r->model;
     embed_mlx_late_vectors_t *query =
         embed_mlx_late_encode_tokens_device(m->mlx_late_ctx, r->query.ids, r->query.n_tokens, 1);
-    embed_mlx_late_vectors_t **docs = xcalloc((size_t)r->n_documents, sizeof(*docs));
-    const embed_mlx_late_vectors_t **doc_refs = xcalloc((size_t)r->n_documents, sizeof(*doc_refs));
+
+    /* Encode every candidate in one padded transformer pass. The encoder packs
+     * each document's kept token vectors back-to-back and fills offsets, so the
+     * cost of N short documents collapses to a single batched forward. */
+    const int **doc_ids = xmalloc((size_t)r->n_documents * sizeof(*doc_ids));
+    const int **keep = xmalloc((size_t)r->n_documents * sizeof(*keep));
+    int *n_tokens = xmalloc((size_t)r->n_documents * sizeof(*n_tokens));
+    int *n_keep = xmalloc((size_t)r->n_documents * sizeof(*n_keep));
     int *offsets = xmalloc((size_t)(r->n_documents + 1) * sizeof(*offsets));
-    int rc = query ? 0 : -1;
-    offsets[0] = 0;
-    for (int i = 0; rc == 0 && i < r->n_documents; i++) {
-        late_tokens *doc = &r->documents[i];
-        embed_mlx_late_vectors_t *all =
-            embed_mlx_late_encode_tokens_device(m->mlx_late_ctx, doc->ids, doc->n_tokens, 1);
-        if (!all) {
-            rc = -1;
-            break;
-        }
-        docs[i] = embed_mlx_late_vectors_select(m->mlx_late_ctx, all, doc->keep, doc->n_keep);
-        embed_mlx_late_vectors_free(all);
-        if (!docs[i]) {
-            rc = -1;
-            break;
-        }
-        doc_refs[i] = docs[i];
-        offsets[i + 1] = offsets[i] + doc->n_keep;
+    for (int i = 0; i < r->n_documents; i++) {
+        doc_ids[i] = r->documents[i].ids;
+        keep[i] = r->documents[i].keep;
+        n_tokens[i] = r->documents[i].n_tokens;
+        n_keep[i] = r->documents[i].n_keep;
     }
     embed_mlx_late_vectors_t *packed =
-        rc == 0 ? embed_mlx_late_vectors_concat(m->mlx_late_ctx, doc_refs, r->n_documents) : NULL;
-    if (!packed)
-        rc = -1;
-    if (rc == 0)
-        rc = embed_mlx_late_maxsim_batch_device(m->mlx_late_ctx, query, packed, offsets,
-                                                r->n_documents, scores);
+        query ? embed_mlx_late_encode_docs_device(m->mlx_late_ctx, doc_ids, n_tokens, keep, n_keep,
+                                                  r->n_documents, 1, offsets)
+              : NULL;
+    int rc = packed ? embed_mlx_late_maxsim_batch_device(m->mlx_late_ctx, query, packed, offsets,
+                                                         r->n_documents, scores)
+                    : -1;
     embed_mlx_late_vectors_free(packed);
-    for (int i = 0; i < r->n_documents; i++)
-        embed_mlx_late_vectors_free(docs[i]);
     embed_mlx_late_vectors_free(query);
     free(offsets);
-    free(doc_refs);
-    free(docs);
+    free(n_keep);
+    free(n_tokens);
+    free(keep);
+    free(doc_ids);
     return rc;
 }
 #endif
