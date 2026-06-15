@@ -8,6 +8,7 @@
 #include "qwen_safetensors.h"
 #include "qwen_kernels.h"
 #include "qwen_tokenizer.h"
+#include "wordpiece_tokenizer.h"
 
 #ifdef USE_MLX
 #include "embed_mlx.h"
@@ -229,6 +230,8 @@ typedef enum {
     MODEL_QWEN3_4,
     MODEL_QWEN3_8,
     MODEL_GTE_QWEN2_15,
+    MODEL_MINILM_L6,
+    MODEL_BGE_SMALL,
     MODEL_CTX_06,
     MODEL_CTX_4,
     MODEL_LATE_06,
@@ -276,6 +279,13 @@ static const model_info k_models[] = {
      EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
     {"gte-Qwen2-1.5B-instruct", MODEL_KIND_STANDARD, 1536, 1536, 0, EMBED_ATTENTION_BIDIRECTIONAL,
      EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_GTE_QWEN2_QUERY_INSTRUCT},
+    /* BERT encoders: WordPiece tokenizer, learned positions, no instruction
+     * prefix. all-MiniLM-L6-v2 mean-pools; bge-small-en-v1.5 pools the [CLS]
+     * token. Both emit L2-normalized float32, so they speak the OpenAI API. */
+    {"all-MiniLM-L6-v2", MODEL_KIND_STANDARD, 384, 384, 0, EMBED_ATTENTION_BIDIRECTIONAL,
+     EMBED_POOL_MEAN, 1, EMBED_API_OPENAI, NULL},
+    {"bge-small-en-v1.5", MODEL_KIND_STANDARD, 384, 384, 0, EMBED_ATTENTION_BIDIRECTIONAL,
+     EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
     {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
@@ -299,6 +309,13 @@ typedef struct {
     char *path;
     qwen_tokenizer_t *tok;
     qwen_tokenizer_workspace_t *tok_ws;
+    /* BERT-family WordPiece tokenizer, selected by file probe in load_one_model.
+     * When wp_tok is set, tokenize_one wraps the ids with [CLS]/[SEP] and the
+     * Qwen byte-level BPE fields above stay NULL. */
+    wordpiece_tokenizer_t *wp_tok;
+    wordpiece_workspace_t *wp_tok_ws;
+    int cls_id;
+    int sep_id;
     int context_separator_id;
     int late_mask_id;
     int late_query_prefix_id;
@@ -1478,6 +1495,34 @@ static void rerank_request_free(rerank_request *r) {
 static int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *out) {
     memset(out, 0, sizeof(*out));
     uint64_t t0 = nstime();
+    if (m->wp_tok) {
+        int n = 0;
+        int *core = wordpiece_tokenizer_encode_with_workspace(m->wp_tok, m->wp_tok_ws, text, &n);
+        if (j)
+            j->tokenize_ns += nstime() - t0;
+        /* BERT wraps the WordPiece ids with [CLS] ... [SEP], exactly as the BPE
+         * branch below appends its terminal token. A whitespace-only input
+         * cleans to zero core tokens (core == NULL, n == 0); the bare
+         * [CLS][SEP] pair is what Hugging Face produces for it too. Grow the
+         * returned buffer in place so only one allocation is touched. */
+        if (n < 0 || n > INT_MAX - 2) {
+            free(core);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        int *ids = realloc(core, (size_t)(n + 2) * sizeof(*ids));
+        if (!ids) {
+            free(core);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        memmove(ids + 1, ids, (size_t)n * sizeof(*ids));
+        ids[0] = m->cls_id;
+        ids[n + 1] = m->sep_id;
+        out->ids = ids;
+        out->n_tokens = n + 2;
+        return 0;
+    }
     out->ids = qwen_tokenizer_encode_with_workspace(m->tok, m->tok_ws, text, &out->n_tokens);
     if (j)
         j->tokenize_ns += nstime() - t0;
@@ -2962,47 +3007,75 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     m->info = &k_models[slot];
     m->path = xstrdup(path);
     m->terminal_token_id = -1;
-    char vocab_path[1024];
-    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
-    m->tok = qwen_tokenizer_load(vocab_path);
-    if (!m->tok) {
-        server_log("embed-server: failed to load tokenizer: %s", vocab_path);
-        return -1;
-    }
-    m->tok_ws = qwen_tokenizer_workspace_new();
-    if (!m->tok_ws) {
-        server_log("embed-server: failed to allocate tokenizer workspace: %s", path);
-        return -1;
-    }
-    /* The contextual chunk separator is the tokenizer's <|endoftext|>. The
-     * released models keep added special tokens out of vocab.json, so the
-     * family constant is the normal case; a vocab that does define the
-     * token (e.g. small test models) takes precedence so the id stays
-     * inside that model's embedding table. */
-    int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
-    m->context_separator_id = sep_id >= 0 ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
-    /* Qwen3-Embedding pools the last token, the tokenizer's <|endoftext|>
-     * suffix - the same token as the separator, not the model's chat
-     * eos_token_id (<|im_end|>). Resolve it here from the tokenizer. */
-    m->terminal_token_id = m->context_separator_id;
-    if (m->info->kind == MODEL_KIND_LATE) {
-        int id = qwen_tokenizer_token_id(m->tok, "[MASK]");
-        m->late_mask_id = id >= 0 ? id : EMBED_LATE_MASK_TOKEN_ID;
-        id = qwen_tokenizer_token_id(m->tok, "[Q]");
-        m->late_query_prefix_id = id >= 0 ? id : EMBED_LATE_QUERY_PREFIX_ID;
-        id = qwen_tokenizer_token_id(m->tok, "[D]");
-        m->late_document_prefix_id = id >= 0 ? id : EMBED_LATE_DOCUMENT_PREFIX_ID;
+    m->cls_id = -1;
+    m->sep_id = -1;
+    /* Pick the tokenizer by the files present: a WordPiece vocab.txt marks a
+     * BERT encoder; otherwise the Qwen byte-level BPE vocab.json. The two never
+     * coexist in a model directory, so the probe is unambiguous. */
+    char wp_path[1024];
+    snprintf(wp_path, sizeof(wp_path), "%s/vocab.txt", path);
+    if (access(wp_path, R_OK) == 0) {
+        m->wp_tok = wordpiece_tokenizer_load(path);
+        if (!m->wp_tok) {
+            server_log("embed-server: failed to load WordPiece tokenizer: %s", wp_path);
+            return -1;
+        }
+        m->wp_tok_ws = wordpiece_workspace_new();
+        if (!m->wp_tok_ws) {
+            server_log("embed-server: failed to allocate WordPiece workspace: %s", path);
+            return -1;
+        }
+        /* [CLS]/[SEP] wrap every input; resolve their ids once from the vocab. */
+        m->cls_id = wordpiece_tokenizer_token_id(m->wp_tok, "[CLS]");
+        m->sep_id = wordpiece_tokenizer_token_id(m->wp_tok, "[SEP]");
+        if (m->cls_id < 0 || m->sep_id < 0) {
+            server_log("embed-server: WordPiece vocab missing [CLS]/[SEP]: %s", path);
+            return -1;
+        }
+    } else {
+        char vocab_path[1024];
+        snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
+        m->tok = qwen_tokenizer_load(vocab_path);
+        if (!m->tok) {
+            server_log("embed-server: failed to load tokenizer: %s", vocab_path);
+            return -1;
+        }
+        m->tok_ws = qwen_tokenizer_workspace_new();
+        if (!m->tok_ws) {
+            server_log("embed-server: failed to allocate tokenizer workspace: %s", path);
+            return -1;
+        }
+        /* The contextual chunk separator is the tokenizer's <|endoftext|>. The
+         * released models keep added special tokens out of vocab.json, so the
+         * family constant is the normal case; a vocab that does define the
+         * token (e.g. small test models) takes precedence so the id stays
+         * inside that model's embedding table. */
+        int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
+        m->context_separator_id = sep_id >= 0 ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+        /* Qwen3-Embedding pools the last token, the tokenizer's <|endoftext|>
+         * suffix - the same token as the separator, not the model's chat
+         * eos_token_id (<|im_end|>). Resolve it here from the tokenizer. */
+        m->terminal_token_id = m->context_separator_id;
+        if (m->info->kind == MODEL_KIND_LATE) {
+            int id = qwen_tokenizer_token_id(m->tok, "[MASK]");
+            m->late_mask_id = id >= 0 ? id : EMBED_LATE_MASK_TOKEN_ID;
+            id = qwen_tokenizer_token_id(m->tok, "[Q]");
+            m->late_query_prefix_id = id >= 0 ? id : EMBED_LATE_QUERY_PREFIX_ID;
+            id = qwen_tokenizer_token_id(m->tok, "[D]");
+            m->late_document_prefix_id = id >= 0 ? id : EMBED_LATE_DOCUMENT_PREFIX_ID;
 
-        const char *punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
-        for (const char *p = punct; *p && m->n_late_skip_ids < (int)(sizeof(m->late_skip_ids) /
-                                                                     sizeof(m->late_skip_ids[0]));
-             p++) {
-            char text[2] = {*p, '\0'};
-            int n_ids = 0;
-            int *ids = qwen_tokenizer_encode(m->tok, text, &n_ids);
-            if (ids && n_ids == 1)
-                m->late_skip_ids[m->n_late_skip_ids++] = ids[0];
-            free(ids);
+            const char *punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+            for (const char *p = punct;
+                 *p &&
+                 m->n_late_skip_ids < (int)(sizeof(m->late_skip_ids) / sizeof(m->late_skip_ids[0]));
+                 p++) {
+                char text[2] = {*p, '\0'};
+                int n_ids = 0;
+                int *ids = qwen_tokenizer_encode(m->tok, text, &n_ids);
+                if (ids && n_ids == 1)
+                    m->late_skip_ids[m->n_late_skip_ids++] = ids[0];
+                free(ids);
+            }
         }
     }
 #ifdef USE_MLX
@@ -3066,6 +3139,10 @@ static void free_models(http_server *s) {
             qwen_tokenizer_workspace_free(m->tok_ws);
         if (m->tok)
             qwen_tokenizer_free(m->tok);
+        if (m->wp_tok_ws)
+            wordpiece_workspace_free(m->wp_tok_ws);
+        if (m->wp_tok)
+            wordpiece_tokenizer_free(m->wp_tok);
         if (m->cpu_ws)
             embed_workspace_free(m->cpu_ws);
         if (m->cpu_model)
