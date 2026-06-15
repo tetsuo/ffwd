@@ -15,12 +15,14 @@ int main(void) {
     char root[1024], f32_dir[1088], bf16_dir[1088];
     snprintf(root, sizeof(root), "%s/embed-bf16-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
+    if (!mkdtemp(root)) {
+        perror("mkdtemp");
+        return 2;
+    }
     snprintf(f32_dir, sizeof(f32_dir), "%s/f32", root);
     snprintf(bf16_dir, sizeof(bf16_dir), "%s/bf16", root);
     if (mkdir(f32_dir, 0755) != 0 || mkdir(bf16_dir, 0755) != 0 ||
-        tm_write_model(f32_dir, "F32") != 0 ||
-        tm_write_model(bf16_dir, "BF16") != 0) {
+        tm_write_model(f32_dir, "F32") != 0 || tm_write_model(bf16_dir, "BF16") != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
@@ -58,7 +60,8 @@ int main(void) {
             return 1;
         }
         float d = fabsf(a[i] - b[i]);
-        if (d > max_diff) max_diff = d;
+        if (d > max_diff)
+            max_diff = d;
         norm += b[i] * b[i];
     }
     norm = sqrtf(norm);
@@ -73,7 +76,8 @@ int main(void) {
      * (linear_nobias_weight); parity must hold there too. */
     enum { LONG_N = 24 };
     int long_ids[LONG_N];
-    for (int i = 0; i < LONG_N; i++) long_ids[i] = (i % 14) + 1;
+    for (int i = 0; i < LONG_N; i++)
+        long_ids[i] = (i % 14) + 1;
     if (embed_model_encode_into(mf32, wf32, long_ids, LONG_N, a) != 0 ||
         embed_model_encode_into(mbf16, wbf16, long_ids, LONG_N, b) != 0) {
         fprintf(stderr, "long-sequence embedding failed\n");
@@ -86,15 +90,15 @@ int main(void) {
             return 1;
         }
         float d = fabsf(a[i] - b[i]);
-        if (d > long_diff) long_diff = d;
+        if (d > long_diff)
+            long_diff = d;
     }
     if (long_diff > 2e-5f) {
         fprintf(stderr, "bad widen-path parity: max_diff=%.9g\n", long_diff);
         return 1;
     }
 
-    printf("ok: bf16 model parity dim=%d max_abs_diff=%.9g norm=%.9g\n",
-           dim, max_diff, norm);
+    printf("ok: bf16 model parity dim=%d max_abs_diff=%.9g norm=%.9g\n", dim, max_diff, norm);
 
     embed_workspace_free(wf32);
     embed_workspace_free(wbf16);

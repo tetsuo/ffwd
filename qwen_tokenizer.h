@@ -21,8 +21,8 @@
 #endif
 
 typedef struct {
-    char **id_to_text;   /* [vocab_size] decoded text strings */
-    char **id_to_bpe;    /* [vocab_size] raw BPE token strings from vocab.json */
+    char **id_to_text; /* [vocab_size] decoded text strings */
+    char **id_to_bpe;  /* [vocab_size] raw BPE token strings from vocab.json */
     int vocab_size;
 
     /* Internal hash maps (opaque to callers) */
@@ -55,7 +55,8 @@ EMBED_API int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *t
 /* Encode UTF-8 text into token IDs using BPE.
  * Returns malloc'd array of token IDs and sets *out_n_tokens.
  * Returns NULL on error (and sets *out_n_tokens to 0). */
-EMBED_API int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens);
+EMBED_API int *
+qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens);
 
 /* Reusable scratch for allocation-light repeated encoding. */
 EMBED_API qwen_tokenizer_workspace_t *qwen_tokenizer_workspace_new(void);
@@ -66,17 +67,18 @@ EMBED_API void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws);
  * In all cases *out_n_tokens is set to the number of tokens needed/emitted
  * when out_n_tokens is non-NULL. */
 EMBED_API int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
-                               qwen_tokenizer_workspace_t *ws,
-                               const char *text,
-                               int *out_ids, int out_cap,
-                               int *out_n_tokens);
+                                         qwen_tokenizer_workspace_t *ws,
+                                         const char *text,
+                                         int *out_ids,
+                                         int out_cap,
+                                         int *out_n_tokens);
 
 /* Same tokenization as qwen_tokenizer_encode(), but reuses ws internally and
  * performs only the final returned int[] allocation. */
 EMBED_API int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
-                                          qwen_tokenizer_workspace_t *ws,
-                                          const char *text,
-                                          int *out_n_tokens);
+                                                    qwen_tokenizer_workspace_t *ws,
+                                                    const char *text,
+                                                    int *out_n_tokens);
 
 /* Free tokenizer */
 EMBED_API void qwen_tokenizer_free(qwen_tokenizer_t *tok);

@@ -23,9 +23,9 @@
  * Shared constants and family defaults
  * ======================================================================== */
 
-#define EMBED_VOCAB_SIZE     151936
-#define EMBED_HEAD_DIM       128
-#define EMBED_MAX_LAYERS     64      /* upper bound for stack arrays */
+#define EMBED_VOCAB_SIZE                 151936
+#define EMBED_HEAD_DIM                   128
+#define EMBED_MAX_LAYERS                 64     /* upper bound for stack arrays */
 #define EMBED_CONTEXT_SEPARATOR_TOKEN_ID 151643 /* <|endoftext|> */
 
 /* ========================================================================
@@ -48,8 +48,8 @@ typedef struct {
     int n_heads;
     int n_kv_heads;
     int head_dim;
-    int q_dim;              /* n_heads    * head_dim */
-    int kv_dim;             /* n_kv_heads * head_dim */
+    int q_dim;  /* n_heads    * head_dim */
+    int kv_dim; /* n_kv_heads * head_dim */
     int intermediate_size;
     int vocab_size;
     float rms_norm_eps;
@@ -141,16 +141,20 @@ EMBED_API size_t embed_workspace_nbytes(const embed_workspace_t *ws);
  *
  * Returns malloc'd float[hidden_size] (caller frees). NULL on error.
  */
-EMBED_API float *embed_model_encode(const embed_model_t *model, embed_workspace_t *ws,
-                        const int *token_ids, int n_tokens);
+EMBED_API float *embed_model_encode(const embed_model_t *model,
+                                    embed_workspace_t *ws,
+                                    const int *token_ids,
+                                    int n_tokens);
 
 /*
  * Compute one embedding into caller-provided out[hidden_size].
  * Returns 0 on success, -1 on error.
  */
-EMBED_API int embed_model_encode_into(const embed_model_t *model, embed_workspace_t *ws,
-                          const int *token_ids, int n_tokens,
-                          float *out_embedding);
+EMBED_API int embed_model_encode_into(const embed_model_t *model,
+                                      embed_workspace_t *ws,
+                                      const int *token_ids,
+                                      int n_tokens,
+                                      float *out_embedding);
 
 /*
  * Compute embeddings for a true packed/ragged batch.
@@ -161,9 +165,11 @@ EMBED_API int embed_model_encode_into(const embed_model_t *model, embed_workspac
  *
  * Returns 0 on success, -1 on error.
  */
-EMBED_API int embed_model_encode_batch(const embed_model_t *model, embed_workspace_t *ws,
-                           const embed_input_t *inputs, int batch,
-                           float *out_embeddings);
+EMBED_API int embed_model_encode_batch(const embed_model_t *model,
+                                       embed_workspace_t *ws,
+                                       const embed_input_t *inputs,
+                                       int batch,
+                                       float *out_embeddings);
 
 /*
  * Apply the config's pooling mode to packed final hidden states.
@@ -171,9 +177,11 @@ EMBED_API int embed_model_encode_batch(const embed_model_t *model, embed_workspa
  * states is [sum(n_tokens), hidden_size]. seq_lengths contains one positive
  * token count per sequence. The states must already include final RMSNorm.
  */
-EMBED_API int embed_pool_batch(const embed_config_t *cfg, const float *states,
-                    const int *seq_lengths, int batch,
-                    float *out_embeddings);
+EMBED_API int embed_pool_batch(const embed_config_t *cfg,
+                               const float *states,
+                               const int *seq_lengths,
+                               int batch,
+                               float *out_embeddings);
 
 /*
  * Run the transformer forward pass WITHOUT pooling.
@@ -183,16 +191,20 @@ EMBED_API int embed_pool_batch(const embed_config_t *cfg, const float *states,
  * Useful for contextual (late-chunking) models where you need
  * per-token embeddings before splitting by separator positions.
  */
-EMBED_API float *embed_model_forward(const embed_model_t *model, embed_workspace_t *ws,
-                          const int *token_ids, int n_tokens);
+EMBED_API float *embed_model_forward(const embed_model_t *model,
+                                     embed_workspace_t *ws,
+                                     const int *token_ids,
+                                     int n_tokens);
 
 /*
  * Run the transformer forward pass into caller-provided
  * out_states[n_tokens * hidden_size]. Returns 0 on success, -1 on error.
  */
-EMBED_API int embed_model_forward_into(const embed_model_t *model, embed_workspace_t *ws,
-                            const int *token_ids, int n_tokens,
-                            float *out_states);
+EMBED_API int embed_model_forward_into(const embed_model_t *model,
+                                       embed_workspace_t *ws,
+                                       const int *token_ids,
+                                       int n_tokens,
+                                       float *out_states);
 
 /*
  * Pool embeddings from final hidden states.
@@ -201,18 +213,24 @@ EMBED_API int embed_model_forward_into(const embed_model_t *model, embed_workspa
  * embed_model_forward_into(). Each span is mean pooled into
  * out_embeddings[n_spans, hidden_size] without L2 normalization.
  */
-EMBED_API int embed_pool_spans(const embed_config_t *cfg, const float *states, int n_tokens,
-                    const embed_span_t *spans, int n_spans,
-                    float *out_embeddings);
+EMBED_API int embed_pool_spans(const embed_config_t *cfg,
+                               const float *states,
+                               int n_tokens,
+                               const embed_span_t *spans,
+                               int n_spans,
+                               float *out_embeddings);
 
 /*
  * Run one contextual sequence and pool selected token spans.
  * Returns 0 on success, -1 on error.
  */
-EMBED_API int embed_model_encode_spans(const embed_model_t *model, embed_workspace_t *ws,
-                           const int *token_ids, int n_tokens,
-                           const embed_span_t *spans, int n_spans,
-                           float *out_embeddings);
+EMBED_API int embed_model_encode_spans(const embed_model_t *model,
+                                       embed_workspace_t *ws,
+                                       const int *token_ids,
+                                       int n_tokens,
+                                       const embed_span_t *spans,
+                                       int n_spans,
+                                       float *out_embeddings);
 
 /*
  * Run a packed/ragged contextual document batch and pool every selected span.
@@ -221,9 +239,10 @@ EMBED_API int embed_model_encode_spans(const embed_model_t *model, embed_workspa
  * and out_embeddings contains spans in document order.
  */
 EMBED_API int embed_model_encode_spans_batch(const embed_model_t *model,
-                                 embed_workspace_t *ws,
-                                 const embed_context_input_t *inputs, int batch,
-                                 float *out_embeddings);
+                                             embed_workspace_t *ws,
+                                             const embed_context_input_t *inputs,
+                                             int batch,
+                                             float *out_embeddings);
 
 /*
  * L2-normalize vec[dim] in place.
@@ -261,16 +280,20 @@ EMBED_API int embed_late_model_token_dim(const embed_late_model_t *model);
  * If normalize is non-zero, every non-zero token vector is L2-normalized.
  */
 EMBED_API int embed_late_model_encode_tokens(const embed_late_model_t *model,
-                                  embed_late_workspace_t *ws,
-                                  const int *token_ids, int n_tokens,
-                                  int normalize, float *out_vectors);
+                                             embed_late_workspace_t *ws,
+                                             const int *token_ids,
+                                             int n_tokens,
+                                             int normalize,
+                                             float *out_vectors);
 
 /*
  * Sum over query tokens of max dot product against document tokens.
  */
-EMBED_API float embed_late_maxsim(const float *query_vectors, int query_tokens,
-                       const float *doc_vectors, int doc_tokens,
-                       int dim);
+EMBED_API float embed_late_maxsim(const float *query_vectors,
+                                  int query_tokens,
+                                  const float *doc_vectors,
+                                  int doc_tokens,
+                                  int dim);
 
 /*
  * Score one query against a packed/ragged batch of documents.
@@ -279,10 +302,13 @@ EMBED_API float embed_late_maxsim(const float *query_vectors, int query_tokens,
  * doc_vectors[doc_offsets[i] * dim .. doc_offsets[i + 1] * dim).
  * scores is caller-provided [docs].
  */
-EMBED_API int embed_late_maxsim_batch(const float *query_vectors, int query_tokens,
-                           const float *doc_vectors,
-                           const int *doc_offsets, int docs,
-                           int dim, float *scores);
+EMBED_API int embed_late_maxsim_batch(const float *query_vectors,
+                                      int query_tokens,
+                                      const float *doc_vectors,
+                                      const int *doc_offsets,
+                                      int docs,
+                                      int dim,
+                                      float *scores);
 
 /* Verbose level: 0=quiet, 1=info, 2=debug */
 EMBED_API extern int embed_verbose;

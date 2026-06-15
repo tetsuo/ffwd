@@ -13,29 +13,37 @@
  * ======================================================================== */
 
 static void skip_whitespace(const char **p) {
-    while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
+    while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t')
+        (*p)++;
 }
 
 static int parse_string(const char **p, char *out, size_t max_len) {
     skip_whitespace(p);
-    if (**p != '"') return -1;
+    if (**p != '"')
+        return -1;
     (*p)++;
     size_t i = 0;
     while (**p && **p != '"' && i < max_len - 1) {
         if (**p == '\\') {
             (*p)++;
-            if (**p == 'n') out[i++] = '\n';
-            else if (**p == 't') out[i++] = '\t';
-            else if (**p == '"') out[i++] = '"';
-            else if (**p == '\\') out[i++] = '\\';
-            else out[i++] = **p;
+            if (**p == 'n')
+                out[i++] = '\n';
+            else if (**p == 't')
+                out[i++] = '\t';
+            else if (**p == '"')
+                out[i++] = '"';
+            else if (**p == '\\')
+                out[i++] = '\\';
+            else
+                out[i++] = **p;
         } else {
             out[i++] = **p;
         }
         (*p)++;
     }
     out[i] = '\0';
-    if (**p != '"') return -1;
+    if (**p != '"')
+        return -1;
     (*p)++;
     return 0;
 }
@@ -44,8 +52,12 @@ static int parse_int(const char **p, int64_t *out) {
     skip_whitespace(p);
     int64_t val = 0;
     int neg = 0;
-    if (**p == '-') { neg = 1; (*p)++; }
-    if (**p < '0' || **p > '9') return -1;
+    if (**p == '-') {
+        neg = 1;
+        (*p)++;
+    }
+    if (**p < '0' || **p > '9')
+        return -1;
     while (**p >= '0' && **p <= '9') {
         val = val * 10 + (**p - '0');
         (*p)++;
@@ -55,18 +67,25 @@ static int parse_int(const char **p, int64_t *out) {
 }
 
 static safetensor_dtype_t parse_dtype(const char *s) {
-    if (strcmp(s, "F32") == 0) return DTYPE_F32;
-    if (strcmp(s, "F16") == 0) return DTYPE_F16;
-    if (strcmp(s, "BF16") == 0) return DTYPE_BF16;
-    if (strcmp(s, "I32") == 0) return DTYPE_I32;
-    if (strcmp(s, "I64") == 0) return DTYPE_I64;
-    if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "F32") == 0)
+        return DTYPE_F32;
+    if (strcmp(s, "F16") == 0)
+        return DTYPE_F16;
+    if (strcmp(s, "BF16") == 0)
+        return DTYPE_BF16;
+    if (strcmp(s, "I32") == 0)
+        return DTYPE_I32;
+    if (strcmp(s, "I64") == 0)
+        return DTYPE_I64;
+    if (strcmp(s, "BOOL") == 0)
+        return DTYPE_BOOL;
     return DTYPE_UNKNOWN;
 }
 
 static int parse_tensor_entry(const char **p, safetensor_t *t) {
     skip_whitespace(p);
-    if (**p != '{') return -1;
+    if (**p != '{')
+        return -1;
     (*p)++;
 
     t->dtype = DTYPE_UNKNOWN;
@@ -76,79 +95,109 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
 
     while (**p && **p != '}') {
         skip_whitespace(p);
-        if (**p == ',') { (*p)++; continue; }
+        if (**p == ',') {
+            (*p)++;
+            continue;
+        }
 
         char key[64];
-        if (parse_string(p, key, sizeof(key)) != 0) return -1;
+        if (parse_string(p, key, sizeof(key)) != 0)
+            return -1;
         skip_whitespace(p);
-        if (**p != ':') return -1;
+        if (**p != ':')
+            return -1;
         (*p)++;
         skip_whitespace(p);
 
         if (strcmp(key, "dtype") == 0) {
             char dtype_str[32];
-            if (parse_string(p, dtype_str, sizeof(dtype_str)) != 0) return -1;
+            if (parse_string(p, dtype_str, sizeof(dtype_str)) != 0)
+                return -1;
             t->dtype = parse_dtype(dtype_str);
         } else if (strcmp(key, "shape") == 0) {
-            if (**p != '[') return -1;
+            if (**p != '[')
+                return -1;
             (*p)++;
             t->ndim = 0;
             while (**p && **p != ']') {
                 skip_whitespace(p);
-                if (**p == ',') { (*p)++; continue; }
-                if (t->ndim >= 8) return -1;
-                if (parse_int(p, &t->shape[t->ndim]) != 0) return -1;
+                if (**p == ',') {
+                    (*p)++;
+                    continue;
+                }
+                if (t->ndim >= 8)
+                    return -1;
+                if (parse_int(p, &t->shape[t->ndim]) != 0)
+                    return -1;
                 t->ndim++;
             }
-            if (**p != ']') return -1;
+            if (**p != ']')
+                return -1;
             (*p)++;
         } else if (strcmp(key, "data_offsets") == 0) {
-            if (**p != '[') return -1;
+            if (**p != '[')
+                return -1;
             (*p)++;
             skip_whitespace(p);
             int64_t start_i;
-            if (parse_int(p, &start_i) != 0) return -1;
+            if (parse_int(p, &start_i) != 0)
+                return -1;
             skip_whitespace(p);
-            if (**p != ',') return -1;
+            if (**p != ',')
+                return -1;
             (*p)++;
             skip_whitespace(p);
             int64_t end_i;
-            if (parse_int(p, &end_i) != 0) return -1;
-            if (start_i < 0 || end_i < start_i) return -1;
+            if (parse_int(p, &end_i) != 0)
+                return -1;
+            if (start_i < 0 || end_i < start_i)
+                return -1;
             t->data_offset = (size_t)start_i;
             t->data_size = (size_t)(end_i - start_i);
             skip_whitespace(p);
-            if (**p != ']') return -1;
+            if (**p != ']')
+                return -1;
             (*p)++;
         } else {
             /* Skip unknown value */
             if (**p == '"') {
                 (*p)++;
                 while (**p && **p != '"') {
-                    if (**p == '\\') (*p)++;
-                    if (**p) (*p)++;
+                    if (**p == '\\')
+                        (*p)++;
+                    if (**p)
+                        (*p)++;
                 }
-                if (**p == '"') (*p)++;
+                if (**p == '"')
+                    (*p)++;
             } else if (**p == '[') {
-                int depth = 1; (*p)++;
+                int depth = 1;
+                (*p)++;
                 while (**p && depth > 0) {
-                    if (**p == '[') depth++;
-                    else if (**p == ']') depth--;
+                    if (**p == '[')
+                        depth++;
+                    else if (**p == ']')
+                        depth--;
                     (*p)++;
                 }
             } else if (**p == '{') {
-                int depth = 1; (*p)++;
+                int depth = 1;
+                (*p)++;
                 while (**p && depth > 0) {
-                    if (**p == '{') depth++;
-                    else if (**p == '}') depth--;
+                    if (**p == '{')
+                        depth++;
+                    else if (**p == '}')
+                        depth--;
                     (*p)++;
                 }
             } else {
-                while (**p && **p != ',' && **p != '}') (*p)++;
+                while (**p && **p != ',' && **p != '}')
+                    (*p)++;
             }
         }
     }
-    if (**p != '}') return -1;
+    if (**p != '}')
+        return -1;
     (*p)++;
     return 0;
 }
@@ -156,29 +205,39 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
 static int parse_header(safetensors_file_t *sf) {
     const char *p = sf->header_json;
     skip_whitespace(&p);
-    if (*p != '{') return -1;
+    if (*p != '{')
+        return -1;
     p++;
 
     sf->num_tensors = 0;
 
     while (*p && *p != '}') {
         skip_whitespace(&p);
-        if (*p == ',') { p++; continue; }
-        if (*p == '}') break;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == '}')
+            break;
 
         char name[256];
-        if (parse_string(&p, name, sizeof(name)) != 0) return -1;
+        if (parse_string(&p, name, sizeof(name)) != 0)
+            return -1;
         skip_whitespace(&p);
-        if (*p != ':') return -1;
+        if (*p != ':')
+            return -1;
         p++;
 
         if (strcmp(name, "__metadata__") == 0) {
             skip_whitespace(&p);
             if (*p == '{') {
-                int depth = 1; p++;
+                int depth = 1;
+                p++;
                 while (*p && depth > 0) {
-                    if (*p == '{') depth++;
-                    else if (*p == '}') depth--;
+                    if (*p == '{')
+                        depth++;
+                    else if (*p == '}')
+                        depth--;
                     p++;
                 }
             }
@@ -193,10 +252,12 @@ static int parse_header(safetensors_file_t *sf) {
 
         safetensor_t *t = &sf->tensors[sf->num_tensors];
         snprintf(t->name, sizeof(t->name), "%s", name);
-        if (parse_tensor_entry(&p, t) != 0) return -1;
+        if (parse_tensor_entry(&p, t) != 0)
+            return -1;
         sf->num_tensors++;
     }
-    if (*p != '}') return -1;
+    if (*p != '}')
+        return -1;
     return 0;
 }
 
@@ -206,24 +267,38 @@ static int parse_header(safetensors_file_t *sf) {
 
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0)
+        return NULL;
 
     struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return NULL; }
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
 
     size_t file_size = (size_t)st.st_size;
-    if (file_size < 8) { close(fd); return NULL; }
+    if (file_size < 8) {
+        close(fd);
+        return NULL;
+    }
 
     void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (data == MAP_FAILED) return NULL;
+    if (data == MAP_FAILED)
+        return NULL;
 
     uint64_t header_size = 0;
     memcpy(&header_size, data, 8);
-    if (header_size > file_size - 8) { munmap(data, file_size); return NULL; }
+    if (header_size > file_size - 8) {
+        munmap(data, file_size);
+        return NULL;
+    }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
-    if (!sf) { munmap(data, file_size); return NULL; }
+    if (!sf) {
+        munmap(data, file_size);
+        return NULL;
+    }
 
     sf->path = strdup(path);
     sf->data = data;
@@ -231,18 +306,26 @@ safetensors_file_t *safetensors_open(const char *path) {
     sf->header_size = (size_t)header_size;
 
     sf->header_json = malloc(header_size + 1);
-    if (!sf->header_json) { safetensors_close(sf); return NULL; }
+    if (!sf->header_json) {
+        safetensors_close(sf);
+        return NULL;
+    }
     memcpy(sf->header_json, (char *)data + 8, header_size);
     sf->header_json[header_size] = '\0';
 
-    if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
+    if (parse_header(sf) != 0) {
+        safetensors_close(sf);
+        return NULL;
+    }
 
     return sf;
 }
 
 void safetensors_close(safetensors_file_t *sf) {
-    if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+    if (!sf)
+        return;
+    if (sf->data)
+        munmap(sf->data, sf->file_size);
     free(sf->path);
     free(sf->header_json);
     free(sf);
@@ -254,7 +337,8 @@ const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t
 
 int64_t safetensor_numel(const safetensor_t *t) {
     int64_t n = 1;
-    for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
+    for (int i = 0; i < t->ndim; i++)
+        n *= t->shape[i];
     return n;
 }
 
@@ -267,25 +351,28 @@ static float bf16_to_f32(uint16_t bf16) {
 
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
     int64_t n = safetensor_numel(t);
-    if (n <= 0) return NULL;
+    if (n <= 0)
+        return NULL;
 
     float *out = malloc(n * sizeof(float));
-    if (!out) return NULL;
+    if (!out)
+        return NULL;
 
     const void *data = safetensors_data(sf, t);
 
     switch (t->dtype) {
-        case DTYPE_F32:
-            memcpy(out, data, n * sizeof(float));
-            break;
-        case DTYPE_BF16: {
-            const uint16_t *src = (const uint16_t *)data;
-            for (int64_t i = 0; i < n; i++) out[i] = bf16_to_f32(src[i]);
-            break;
-        }
-        default:
-            free(out);
-            return NULL;
+    case DTYPE_F32:
+        memcpy(out, data, n * sizeof(float));
+        break;
+    case DTYPE_BF16: {
+        const uint16_t *src = (const uint16_t *)data;
+        for (int64_t i = 0; i < n; i++)
+            out[i] = bf16_to_f32(src[i]);
+        break;
+    }
+    default:
+        free(out);
+        return NULL;
     }
     return out;
 }
@@ -313,7 +400,8 @@ static int parse_shard_name(const char *name, int *idx, int *total) {
 
 multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     multi_safetensors_t *ms = calloc(1, sizeof(multi_safetensors_t));
-    if (!ms) return NULL;
+    if (!ms)
+        return NULL;
 
     char path[4096];
 
@@ -328,7 +416,10 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
 
     /* Scan directory for shard files */
     DIR *dir = opendir(model_dir);
-    if (!dir) { free(ms); return NULL; }
+    if (!dir) {
+        free(ms);
+        return NULL;
+    }
 
     struct dirent *entry;
     char shard_names[SAFETENSORS_MAX_SHARDS][256];
@@ -341,15 +432,14 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
             strstr(entry->d_name, ".safetensors") != NULL) {
             int shard_idx = 0, shard_total = 0;
             if (parse_shard_name(entry->d_name, &shard_idx, &shard_total) != 0) {
-                fprintf(stderr, "multi_safetensors_open: bad shard name: %s\n",
-                        entry->d_name);
+                fprintf(stderr, "multi_safetensors_open: bad shard name: %s\n", entry->d_name);
                 closedir(dir);
                 free(ms);
                 return NULL;
             }
             if (shard_total > SAFETENSORS_MAX_SHARDS) {
-                fprintf(stderr, "multi_safetensors_open: too many shards (%d > %d)\n",
-                        shard_total, SAFETENSORS_MAX_SHARDS);
+                fprintf(stderr, "multi_safetensors_open: too many shards (%d > %d)\n", shard_total,
+                        SAFETENSORS_MAX_SHARDS);
                 closedir(dir);
                 free(ms);
                 return NULL;
@@ -364,16 +454,14 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
                 return NULL;
             }
             if (seen[shard_idx - 1]) {
-                fprintf(stderr, "multi_safetensors_open: duplicate shard index %d\n",
-                        shard_idx);
+                fprintf(stderr, "multi_safetensors_open: duplicate shard index %d\n", shard_idx);
                 closedir(dir);
                 free(ms);
                 return NULL;
             }
             seen[shard_idx - 1] = 1;
 
-            snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]),
-                     "%s", entry->d_name);
+            snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]), "%s", entry->d_name);
             n_shards++;
         }
     }
@@ -392,8 +480,8 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     }
     for (int i = 0; i < expected_total; i++) {
         if (!seen[i]) {
-            fprintf(stderr, "multi_safetensors_open: missing shard %d of %d in %s\n",
-                    i + 1, expected_total, model_dir);
+            fprintf(stderr, "multi_safetensors_open: missing shard %d of %d in %s\n", i + 1,
+                    expected_total, model_dir);
             free(ms);
             return NULL;
         }
@@ -417,22 +505,24 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
 }
 
 void multi_safetensors_close(multi_safetensors_t *ms) {
-    if (!ms) return;
+    if (!ms)
+        return;
     for (int i = 0; i < ms->num_shards; i++) {
         safetensors_close(ms->shards[i]);
     }
     free(ms);
 }
 
-int multi_safetensors_data_nbytes(const multi_safetensors_t *ms,
-                                  size_t *out_nbytes) {
-    if (!ms || !out_nbytes) return -1;
+int multi_safetensors_data_nbytes(const multi_safetensors_t *ms, size_t *out_nbytes) {
+    if (!ms || !out_nbytes)
+        return -1;
     size_t total = 0;
     for (int s = 0; s < ms->num_shards; s++) {
         const safetensors_file_t *sf = ms->shards[s];
         for (int i = 0; i < sf->num_tensors; i++) {
             size_t n = sf->tensors[i].data_size;
-            if (n > SIZE_MAX - total) return -1;
+            if (n > SIZE_MAX - total)
+                return -1;
             total += n;
         }
     }
@@ -441,13 +531,14 @@ int multi_safetensors_data_nbytes(const multi_safetensors_t *ms,
 }
 
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
-                                            const char *name,
-                                            safetensors_file_t **out_sf) {
+                                           const char *name,
+                                           safetensors_file_t **out_sf) {
     for (int s = 0; s < ms->num_shards; s++) {
         safetensors_file_t *sf = ms->shards[s];
         for (int i = 0; i < sf->num_tensors; i++) {
             if (strcmp(sf->tensors[i].name, name) == 0) {
-                if (out_sf) *out_sf = sf;
+                if (out_sf)
+                    *out_sf = sf;
                 return &sf->tensors[i];
             }
         }

@@ -12,12 +12,12 @@
 
 #include <stdint.h>
 
-int qwen_verbose = 0;   /* defined by embed.c in full builds */
+int qwen_verbose = 0; /* defined by embed.c in full builds */
 
 enum {
     HIDDEN = 1024,
-    Q_DIM = 2048,        /* 16 heads * 128 */
-    KV_DIM = 1024,       /*  8 heads * 128 */
+    Q_DIM = 2048,  /* 16 heads * 128 */
+    KV_DIM = 1024, /*  8 heads * 128 */
     HEAD_DIM = 128,
     INTER = 3072,
     SEQ = 8,
@@ -25,8 +25,7 @@ enum {
 };
 
 /* Deterministic fill in [-1, 1]; small values keep softmax/silu sane. */
-static void fill_f32(float *x, size_t n, unsigned seed)
-{
+static void fill_f32(float *x, size_t n, unsigned seed) {
     unsigned s = seed * 2654435761u + 1u;
     for (size_t i = 0; i < n; i++) {
         s = s * 1664525u + 1013904223u;
@@ -34,15 +33,13 @@ static void fill_f32(float *x, size_t n, unsigned seed)
     }
 }
 
-static uint16_t f32_to_bf16(float x)
-{
+static uint16_t f32_to_bf16(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof(u));
     return (uint16_t)(u >> 16);
 }
 
-static void fill_bf16(uint16_t *x, size_t n, unsigned seed)
-{
+static void fill_bf16(uint16_t *x, size_t n, unsigned seed) {
     unsigned s = seed * 2654435761u + 1u;
     for (size_t i = 0; i < n; i++) {
         s = s * 1664525u + 1013904223u;
@@ -50,26 +47,25 @@ static void fill_bf16(uint16_t *x, size_t n, unsigned seed)
     }
 }
 
-static float *alloc_f32(size_t n, unsigned seed)
-{
+static float *alloc_f32(size_t n, unsigned seed) {
     float *x = (float *)malloc(n * sizeof(float));
-    if (!x) exit(2);
+    if (!x)
+        exit(2);
     fill_f32(x, n, seed);
     return x;
 }
 
-static uint16_t *alloc_bf16(size_t n, unsigned seed)
-{
+static uint16_t *alloc_bf16(size_t n, unsigned seed) {
     uint16_t *x = (uint16_t *)malloc(n * sizeof(uint16_t));
-    if (!x) exit(2);
+    if (!x)
+        exit(2);
     fill_bf16(x, n, seed);
     return x;
 }
 
 /* ---- F32 projections (matvec at seq 1, GEMM at seq 8) ---- */
 
-static void bm_linear_f32(bench_state_t *b, int seq, int in, int out)
-{
+static void bm_linear_f32(bench_state_t *b, int seq, int in, int out) {
     float *x = alloc_f32((size_t)seq * in, 1);
     float *w = alloc_f32((size_t)out * in, 2);
     float *y = alloc_f32((size_t)seq * out, 3);
@@ -77,18 +73,19 @@ static void bm_linear_f32(bench_state_t *b, int seq, int in, int out)
     for (long i = 0; i < b->n; i++)
         qwen_linear_nobias(y, x, w, seq, in, out);
     bench_sink += y[0];
-    free(y); free(w); free(x);
+    free(y);
+    free(w);
+    free(x);
 }
 
-static void bm_linear_f32_s1_qproj(bench_state_t *b)  { bm_linear_f32(b, 1, HIDDEN, Q_DIM); }
-static void bm_linear_f32_s1_gate(bench_state_t *b)   { bm_linear_f32(b, 1, HIDDEN, INTER); }
-static void bm_linear_f32_s1_down(bench_state_t *b)   { bm_linear_f32(b, 1, INTER, HIDDEN); }
-static void bm_linear_f32_s8_gate(bench_state_t *b)   { bm_linear_f32(b, SEQ, HIDDEN, INTER); }
+static void bm_linear_f32_s1_qproj(bench_state_t *b) { bm_linear_f32(b, 1, HIDDEN, Q_DIM); }
+static void bm_linear_f32_s1_gate(bench_state_t *b) { bm_linear_f32(b, 1, HIDDEN, INTER); }
+static void bm_linear_f32_s1_down(bench_state_t *b) { bm_linear_f32(b, 1, INTER, HIDDEN); }
+static void bm_linear_f32_s8_gate(bench_state_t *b) { bm_linear_f32(b, SEQ, HIDDEN, INTER); }
 
 /* ---- BF16 weights ---- */
 
-static void bm_linear_bf16(bench_state_t *b, int seq, int in, int out)
-{
+static void bm_linear_bf16(bench_state_t *b, int seq, int in, int out) {
     float *x = alloc_f32((size_t)seq * in, 4);
     uint16_t *w = alloc_bf16((size_t)out * in, 5);
     float *y = alloc_f32((size_t)seq * out, 6);
@@ -96,14 +93,15 @@ static void bm_linear_bf16(bench_state_t *b, int seq, int in, int out)
     for (long i = 0; i < b->n; i++)
         qwen_linear_nobias_bf16(y, x, w, seq, in, out);
     bench_sink += y[0];
-    free(y); free(w); free(x);
+    free(y);
+    free(w);
+    free(x);
 }
 
 static void bm_linear_bf16_s1_gate(bench_state_t *b) { bm_linear_bf16(b, 1, HIDDEN, INTER); }
 static void bm_linear_bf16_s8_gate(bench_state_t *b) { bm_linear_bf16(b, SEQ, HIDDEN, INTER); }
 
-static void bm_qkv_bf16(bench_state_t *b)
-{
+static void bm_qkv_bf16(bench_state_t *b) {
     float *x = alloc_f32((size_t)SEQ * HIDDEN, 7);
     uint16_t *wq = alloc_bf16((size_t)Q_DIM * HIDDEN, 8);
     uint16_t *wk = alloc_bf16((size_t)KV_DIM * HIDDEN, 9);
@@ -113,14 +111,18 @@ static void bm_qkv_bf16(bench_state_t *b)
     float *v = alloc_f32((size_t)SEQ * KV_DIM, 13);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        qwen_linear_nobias_bf16_qkv(q, k, v, x, wq, wk, wv,
-                                    SEQ, HIDDEN, Q_DIM, KV_DIM);
+        qwen_linear_nobias_bf16_qkv(q, k, v, x, wq, wk, wv, SEQ, HIDDEN, Q_DIM, KV_DIM);
     bench_sink += q[0] + k[0] + v[0];
-    free(v); free(k); free(q); free(wv); free(wk); free(wq); free(x);
+    free(v);
+    free(k);
+    free(q);
+    free(wv);
+    free(wk);
+    free(wq);
+    free(x);
 }
 
-static void bm_bf16_widen(bench_state_t *b)
-{
+static void bm_bf16_widen(bench_state_t *b) {
     size_t n = (size_t)INTER * HIDDEN;
     uint16_t *src = alloc_bf16(n, 14);
     float *dst = alloc_f32(n, 15);
@@ -128,13 +130,13 @@ static void bm_bf16_widen(bench_state_t *b)
     for (long i = 0; i < b->n; i++)
         qwen_bf16_to_f32_buf(dst, src, n);
     bench_sink += dst[0];
-    free(dst); free(src);
+    free(dst);
+    free(src);
 }
 
 /* ---- attention pieces ---- */
 
-static void bm_attn_scores(bench_state_t *b)
-{
+static void bm_attn_scores(bench_state_t *b) {
     /* one head: scores[seq,seq] = Q[seq,hd] @ K[seq,hd]^T */
     float *qm = alloc_f32((size_t)ATTN_SEQ * HEAD_DIM, 16);
     float *km = alloc_f32((size_t)ATTN_SEQ * HEAD_DIM, 17);
@@ -143,11 +145,12 @@ static void bm_attn_scores(bench_state_t *b)
     for (long i = 0; i < b->n; i++)
         qwen_matmul_t(s, qm, km, ATTN_SEQ, HEAD_DIM, ATTN_SEQ);
     bench_sink += s[0];
-    free(s); free(km); free(qm);
+    free(s);
+    free(km);
+    free(qm);
 }
 
-static void bm_softmax(bench_state_t *b)
-{
+static void bm_softmax(bench_state_t *b) {
     float *x = alloc_f32((size_t)ATTN_SEQ * ATTN_SEQ, 19);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
@@ -156,23 +159,22 @@ static void bm_softmax(bench_state_t *b)
     free(x);
 }
 
-static void bm_rope(bench_state_t *b)
-{
+static void bm_rope(bench_state_t *b) {
     float *x = alloc_f32((size_t)ATTN_SEQ * Q_DIM, 20);
     float *cosv = alloc_f32((size_t)ATTN_SEQ * HEAD_DIM, 21);
     float *sinv = alloc_f32((size_t)ATTN_SEQ * HEAD_DIM, 22);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        qwen_apply_rope_neox(x, cosv, sinv, ATTN_SEQ, Q_DIM / HEAD_DIM,
-                             HEAD_DIM);
+        qwen_apply_rope_neox(x, cosv, sinv, ATTN_SEQ, Q_DIM / HEAD_DIM, HEAD_DIM);
     bench_sink += x[0];
-    free(sinv); free(cosv); free(x);
+    free(sinv);
+    free(cosv);
+    free(x);
 }
 
 /* ---- norms, activations, reductions ---- */
 
-static void bm_rms_norm(bench_state_t *b)
-{
+static void bm_rms_norm(bench_state_t *b) {
     float *x = alloc_f32((size_t)SEQ * HIDDEN, 23);
     float *w = alloc_f32(HIDDEN, 24);
     float *y = alloc_f32((size_t)SEQ * HIDDEN, 25);
@@ -180,13 +182,14 @@ static void bm_rms_norm(bench_state_t *b)
     for (long i = 0; i < b->n; i++)
         qwen_rms_norm(y, x, w, SEQ, HIDDEN, 1e-6f);
     bench_sink += y[0];
-    free(y); free(w); free(x);
+    free(y);
+    free(w);
+    free(x);
 }
 
 /* The engine's SwiGLU op mutates gate in place, so each iteration restores
  * it first; the memcpy is a constant part of the measured loop. */
-static void bm_silu_mul(bench_state_t *b)
-{
+static void bm_silu_mul(bench_state_t *b) {
     size_t n = (size_t)SEQ * INTER;
     float *gate0 = alloc_f32(n, 26);
     float *gate = alloc_f32(n, 26);
@@ -197,17 +200,19 @@ static void bm_silu_mul(bench_state_t *b)
         qwen_silu_mul_inplace(gate, up, (int)n);
     }
     bench_sink += gate[0];
-    free(up); free(gate); free(gate0);
+    free(up);
+    free(gate);
+    free(gate0);
 }
 
-static void bm_dot(bench_state_t *b)
-{
+static void bm_dot(bench_state_t *b) {
     float *x = alloc_f32(HIDDEN, 28);
     float *y = alloc_f32(HIDDEN, 29);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
         bench_sink += qwen_dot_f32(x, y, HIDDEN);
-    free(y); free(x);
+    free(y);
+    free(x);
 }
 
 static const bench_case_t CASES[] = {
@@ -227,14 +232,14 @@ static const bench_case_t CASES[] = {
     {"reduce/dot_1024", bm_dot},
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     int threads = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc)
             threads = atoi(argv[i + 1]);
     }
-    if (threads < 1) threads = 1;
+    if (threads < 1)
+        threads = 1;
     qwen_set_threads(threads);
 
     char meta[128];

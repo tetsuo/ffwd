@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define SAFETENSORS_MAX_TENSORS 1024
-#define SAFETENSORS_MAX_SHARDS 8
+#define SAFETENSORS_MAX_SHARDS  8
 
 typedef enum {
     DTYPE_F32 = 0,
@@ -54,13 +54,12 @@ void safetensors_close(safetensors_file_t *sf);
 /* Open model from directory (auto-detects single file or multi-shard) */
 multi_safetensors_t *multi_safetensors_open(const char *model_dir);
 void multi_safetensors_close(multi_safetensors_t *ms);
-int multi_safetensors_data_nbytes(const multi_safetensors_t *ms,
-                                  size_t *out_nbytes);
+int multi_safetensors_data_nbytes(const multi_safetensors_t *ms, size_t *out_nbytes);
 
 /* Find a tensor by name across all shards */
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
-                                            const char *name,
-                                            safetensors_file_t **out_sf);
+                                           const char *name,
+                                           safetensors_file_t **out_sf);
 
 /* Get raw pointer to tensor data (within mmap'd region) */
 const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t);

@@ -18,8 +18,7 @@ static void expect_close(const char *name, float got, float want, float tol) {
     float diff = fabsf(got - want);
     float scale = fmaxf(1.0f, fmaxf(fabsf(got), fabsf(want)));
     if (diff > tol * scale) {
-        fprintf(stderr, "%s: got %.9g want %.9g diff %.9g\n",
-                name, got, want, diff);
+        fprintf(stderr, "%s: got %.9g want %.9g diff %.9g\n", name, got, want, diff);
         failures++;
     }
 }
@@ -39,10 +38,7 @@ static float bf16_to_f32(uint16_t x) {
 
 static void test_rms_norm(void) {
     const int seq = 2, hidden = 4;
-    const float x[8] = {
-        1.0f, 2.0f, -3.0f, 4.0f,
-        0.5f, -1.0f, 2.0f, -0.5f
-    };
+    const float x[8] = {1.0f, 2.0f, -3.0f, 4.0f, 0.5f, -1.0f, 2.0f, -0.5f};
     const float w[4] = {1.0f, 0.5f, -1.0f, 2.0f};
     float out[8];
 
@@ -66,10 +62,7 @@ static void test_rope_neox(void) {
     const int seq = 2, heads = 1, head_dim = 4;
     const int positions[2] = {0, 3};
     float cosv[8], sinv[8];
-    float x[8] = {
-        1.0f, 2.0f, 3.0f, 4.0f,
-        -1.0f, 0.5f, 2.0f, -0.25f
-    };
+    float x[8] = {1.0f, 2.0f, 3.0f, 4.0f, -1.0f, 0.5f, 2.0f, -0.25f};
     float orig[8];
     memcpy(orig, x, sizeof(x));
 
@@ -92,10 +85,17 @@ static void test_rope_neox(void) {
     }
 }
 
-static void reference_packed_gqa(float *out, const float *Q, const float *K,
-                                 const float *V, const int *offsets, int batch,
-                                 int n_heads, int n_kv_heads, int head_dim,
-                                 float scale, int causal) {
+static void reference_packed_gqa(float *out,
+                                 const float *Q,
+                                 const float *K,
+                                 const float *V,
+                                 const int *offsets,
+                                 int batch,
+                                 int n_heads,
+                                 int n_kv_heads,
+                                 int head_dim,
+                                 float scale,
+                                 int causal) {
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
     int heads_per_kv = n_heads / n_kv_heads;
@@ -112,22 +112,28 @@ static void reference_packed_gqa(float *out, const float *Q, const float *K,
                 for (int j = start; j < key_end; j++) {
                     const float *k = K + j * kv_hidden + kv_h * head_dim;
                     float score = 0.0f;
-                    for (int d = 0; d < head_dim; d++) score += q[d] * k[d];
+                    for (int d = 0; d < head_dim; d++)
+                        score += q[d] * k[d];
                     score *= scale;
-                    if (score > max_score) max_score = score;
+                    if (score > max_score)
+                        max_score = score;
                 }
                 float denom = 0.0f;
-                for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
+                for (int d = 0; d < head_dim; d++)
+                    o[d] = 0.0f;
                 for (int j = start; j < key_end; j++) {
                     const float *k = K + j * kv_hidden + kv_h * head_dim;
                     const float *v = V + j * kv_hidden + kv_h * head_dim;
                     float score = 0.0f;
-                    for (int d = 0; d < head_dim; d++) score += q[d] * k[d];
+                    for (int d = 0; d < head_dim; d++)
+                        score += q[d] * k[d];
                     float wt = expf(score * scale - max_score);
                     denom += wt;
-                    for (int d = 0; d < head_dim; d++) o[d] += wt * v[d];
+                    for (int d = 0; d < head_dim; d++)
+                        o[d] += wt * v[d];
                 }
-                for (int d = 0; d < head_dim; d++) o[d] /= denom;
+                for (int d = 0; d < head_dim; d++)
+                    o[d] /= denom;
             }
         }
     }
@@ -151,11 +157,9 @@ static void test_packed_gqa_attention(void) {
         V[i] = sinf((float)i * 0.07f) - cosf((float)i * 0.13f);
     }
 
-    qwen_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2,
-                                            n_heads, n_kv_heads, head_dim,
+    qwen_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                                             1.0f / sqrtf((float)head_dim));
-    reference_packed_gqa(want, Q, K, V, offsets, 2,
-                         n_heads, n_kv_heads, head_dim,
+    reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 0);
 
     for (int i = 0; i < total * q_hidden; i++)
@@ -172,7 +176,8 @@ static void test_packed_gqa_attention_long(void) {
     float *V = malloc((size_t)total * kv_hidden * sizeof(*V));
     float *got = malloc((size_t)total * q_hidden * sizeof(*got));
     float *want = malloc((size_t)total * q_hidden * sizeof(*want));
-    if (!Q || !K || !V || !got || !want) exit(2);
+    if (!Q || !K || !V || !got || !want)
+        exit(2);
 
     for (int i = 0; i < total * q_hidden; i++)
         Q[i] = sinf((float)i * 0.017f) - 0.25f;
@@ -182,11 +187,9 @@ static void test_packed_gqa_attention_long(void) {
     }
 
     qwen_set_threads(4);
-    qwen_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2,
-                                            n_heads, n_kv_heads, head_dim,
+    qwen_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                                             1.0f / sqrtf((float)head_dim));
-    reference_packed_gqa(want, Q, K, V, offsets, 2,
-                         n_heads, n_kv_heads, head_dim,
+    reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 0);
     qwen_set_threads(1);
 
@@ -209,7 +212,8 @@ static void test_packed_causal_gqa_attention(void) {
     float *V = malloc((size_t)total * kv_hidden * sizeof(*V));
     float *got = malloc((size_t)total * q_hidden * sizeof(*got));
     float *want = malloc((size_t)total * q_hidden * sizeof(*want));
-    if (!Q || !K || !V || !got || !want) exit(2);
+    if (!Q || !K || !V || !got || !want)
+        exit(2);
 
     for (int i = 0; i < total * q_hidden; i++)
         Q[i] = sinf((float)i * 0.019f) - 0.2f;
@@ -219,11 +223,9 @@ static void test_packed_causal_gqa_attention(void) {
     }
 
     qwen_set_threads(4);
-    qwen_causal_gqa_attention_packed(got, Q, K, V, offsets, 2,
-                                     n_heads, n_kv_heads, head_dim,
+    qwen_causal_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                                      1.0f / sqrtf((float)head_dim));
-    reference_packed_gqa(want, Q, K, V, offsets, 2,
-                         n_heads, n_kv_heads, head_dim,
+    reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 1);
     qwen_set_threads(1);
 
@@ -238,18 +240,13 @@ static void test_packed_causal_gqa_attention(void) {
 
 static void test_bf16_linear(void) {
     enum { seq = 2, in_dim = 3, out_dim = 2 };
-    const float x[6] = {
-        1.0f, -2.0f, 0.5f,
-        -1.0f, 0.25f, 2.0f
-    };
-    const float wf32[6] = {
-        0.5f, -1.0f, 2.0f,
-        -0.25f, 0.75f, 1.5f
-    };
+    const float x[6] = {1.0f, -2.0f, 0.5f, -1.0f, 0.25f, 2.0f};
+    const float wf32[6] = {0.5f, -1.0f, 2.0f, -0.25f, 0.75f, 1.5f};
     uint16_t wbf16[6];
     float got[seq * out_dim];
 
-    for (int i = 0; i < 6; i++) wbf16[i] = f32_to_bf16(wf32[i]);
+    for (int i = 0; i < 6; i++)
+        wbf16[i] = f32_to_bf16(wf32[i]);
     qwen_linear_nobias_bf16(got, x, wbf16, seq, in_dim, out_dim);
 
     for (int s = 0; s < seq; s++) {
@@ -287,8 +284,7 @@ static void check_bf16_qkv(int n_threads) {
     }
 
     qwen_set_threads(n_threads);
-    qwen_linear_nobias_bf16_qkv(got_q, got_k, got_v, x, wq, wk, wv,
-                                seq, in_dim, q_dim, kv_dim);
+    qwen_linear_nobias_bf16_qkv(got_q, got_k, got_v, x, wq, wk, wv, seq, in_dim, q_dim, kv_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int o = 0; o < q_dim; o++) {
@@ -349,7 +345,7 @@ static void test_bf16_matvec(void) {
  * rms_norm_worker; row-wise math is identical, so results must match the
  * single-thread run exactly. */
 static void test_rms_norm_threaded(void) {
-    enum { seq = 96, hidden = 3072 };   /* 294912 elements */
+    enum { seq = 96, hidden = 3072 }; /* 294912 elements */
     size_t elems = (size_t)seq * hidden;
     float *x = (float *)malloc(elems * sizeof(float));
     float *w = (float *)malloc((size_t)hidden * sizeof(float));
@@ -358,7 +354,10 @@ static void test_rms_norm_threaded(void) {
     if (!x || !w || !one || !many) {
         fprintf(stderr, "rms_norm_threaded: allocation failure\n");
         failures++;
-        free(many); free(one); free(w); free(x);
+        free(many);
+        free(one);
+        free(w);
+        free(x);
         return;
     }
     unsigned s = 7u;
@@ -377,13 +376,15 @@ static void test_rms_norm_threaded(void) {
 
     for (size_t i = 0; i < elems; i++) {
         if (one[i] != many[i]) {
-            fprintf(stderr, "rms_norm_threaded: mismatch at %zu: %.9g %.9g\n",
-                    i, one[i], many[i]);
+            fprintf(stderr, "rms_norm_threaded: mismatch at %zu: %.9g %.9g\n", i, one[i], many[i]);
             failures++;
             break;
         }
     }
-    free(many); free(one); free(w); free(x);
+    free(many);
+    free(one);
+    free(w);
+    free(x);
 }
 
 /* bf16->f32 widening is an exact bit shift; check the SIMD body and the
@@ -407,8 +408,7 @@ static void test_bf16_widen_buf(void) {
             memcpy(&got_bits, &got[i], sizeof(got_bits));
             memcpy(&want_bits, &want, sizeof(want_bits));
             if (got_bits != want_bits) {
-                fprintf(stderr, "bf16_widen n=%d at %d: %.9g want %.9g\n",
-                        n, i, got[i], want);
+                fprintf(stderr, "bf16_widen n=%d at %d: %.9g want %.9g\n", n, i, got[i], want);
                 failures++;
             }
         }
@@ -436,8 +436,7 @@ static void check_bf16_pair(int n_threads) {
     }
 
     qwen_set_threads(n_threads);
-    qwen_linear_nobias_bf16_pair(got_a, got_b, x, wa, wb,
-                                 seq, in_dim, a_dim, b_dim);
+    qwen_linear_nobias_bf16_pair(got_a, got_b, x, wa, wb, seq, in_dim, a_dim, b_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int o = 0; o < a_dim; o++) {
@@ -477,8 +476,10 @@ static void test_generic_vs_impl(void) {
         s = s * 1664525u + 1013904223u;
         b[i] = (float)(int32_t)s * 1e-9f;
     }
-    for (int i = 0; i < IN; i++) x[i] = a[i];
-    for (int o = 0; o < OUT; o++) bias[o] = b[o];
+    for (int i = 0; i < IN; i++)
+        x[i] = a[i];
+    for (int o = 0; o < OUT; o++)
+        bias[o] = b[o];
     for (size_t i = 0; i < sizeof(W) / sizeof(W[0]); i++) {
         s = s * 1664525u + 1013904223u;
         W[i] = f32_to_bf16((float)(int32_t)s * 1e-9f);
@@ -497,8 +498,7 @@ static void test_generic_vs_impl(void) {
     const int sizes[] = {1, 7, 64, NMAX};
     for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
         int n = sizes[t];
-        expect_close("dot generic-vs-impl",
-                     qwen_dot_f32_generic(a, b, n),
+        expect_close("dot generic-vs-impl", qwen_dot_f32_generic(a, b, n),
                      qwen_dot_f32_impl(a, b, n), 1e-5f);
 
         memcpy(d0, a, (size_t)n * sizeof(float));
@@ -538,7 +538,8 @@ int main(void) {
     test_bf16_widen_buf();
     test_bf16_pair();
     test_generic_vs_impl();
-    if (failures != 0) return 1;
+    if (failures != 0)
+        return 1;
     puts("ok: kernel golden tests passed");
     return 0;
 }

@@ -15,50 +15,50 @@
 
 enum { TOKEN_DIM = 6 };
 
-static float max_abs_diff(const float *a, const float *b, size_t n)
-{
+static float max_abs_diff(const float *a, const float *b, size_t n) {
     float m = 0.0f;
     for (size_t i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
-        if (d > m) m = d;
+        if (d > m)
+            m = d;
     }
     return m;
 }
 
-static float row_norm(const float *v, int n)
-{
+static float row_norm(const float *v, int n) {
     float s = 0.0f;
-    for (int i = 0; i < n; i++) s += v[i] * v[i];
+    for (int i = 0; i < n; i++)
+        s += v[i] * v[i];
     return sqrtf(s);
 }
 
 /* Parity between the grouped batch scorer and per-document MaxSim. */
-static int check_maxsim_batch_parity(const float *query, int query_tokens,
-                                     const float *docs, const int *offsets,
-                                     int n_docs, int dim, const char *what)
-{
+static int check_maxsim_batch_parity(const float *query,
+                                     int query_tokens,
+                                     const float *docs,
+                                     const int *offsets,
+                                     int n_docs,
+                                     int dim,
+                                     const char *what) {
     float scores[8];
-    if (n_docs > (int)(sizeof(scores) / sizeof(scores[0]))) return 1;
-    if (embed_late_maxsim_batch(query, query_tokens, docs, offsets, n_docs,
-                               dim, scores) != 0) {
+    if (n_docs > (int)(sizeof(scores) / sizeof(scores[0])))
+        return 1;
+    if (embed_late_maxsim_batch(query, query_tokens, docs, offsets, n_docs, dim, scores) != 0) {
         fprintf(stderr, "maxsim_batch (%s) failed\n", what);
         return 1;
     }
     for (int i = 0; i < n_docs; i++) {
-        float one = embed_late_maxsim(query, query_tokens,
-                                     docs + (size_t)offsets[i] * dim,
-                                     offsets[i + 1] - offsets[i], dim);
+        float one = embed_late_maxsim(query, query_tokens, docs + (size_t)offsets[i] * dim,
+                                      offsets[i + 1] - offsets[i], dim);
         if (fabsf(scores[i] - one) > 0.0001f) {
-            fprintf(stderr, "maxsim_batch (%s) doc %d: %g vs %g\n",
-                    what, i, scores[i], one);
+            fprintf(stderr, "maxsim_batch (%s) doc %d: %g vs %g\n", what, i, scores[i], one);
             return 1;
         }
     }
     return 0;
 }
 
-int main(void)
-{
+int main(void) {
     int rc = 1;
     tm_dims_t dims = {4, 2, 1, 2, 8, TF_VOCAB_SIZE};
     int hidden = dims.hidden;
@@ -77,8 +77,7 @@ int main(void)
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-late-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(dir) || tf_write_vocab(dir) != 0 ||
-        tm_write_model_dims(dir, "F32", &dims) != 0) {
+    if (!mkdtemp(dir) || tf_write_vocab(dir) != 0 || tm_write_model_dims(dir, "F32", &dims) != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
@@ -96,8 +95,7 @@ int main(void)
         fprintf(stderr, "late load succeeded without 1_Dense\n");
         goto fail;
     }
-    if (embed_late_model_config(NULL) != NULL ||
-        embed_late_model_token_dim(NULL) != 0 ||
+    if (embed_late_model_config(NULL) != NULL || embed_late_model_token_dim(NULL) != 0 ||
         embed_late_workspace_new(NULL) != NULL) {
         fprintf(stderr, "NULL-argument handling failed\n");
         goto fail;
@@ -106,8 +104,7 @@ int main(void)
     embed_late_model_free(NULL);
 
     /* A head whose tensor is not named linear.weight must be rejected. */
-    if (tm_write_late_projection_named(dir, "F32", TOKEN_DIM, hidden,
-                                       "dense.weight") != 0) {
+    if (tm_write_late_projection_named(dir, "F32", TOKEN_DIM, hidden, "dense.weight") != 0) {
         fprintf(stderr, "failed to write malformed projection\n");
         goto fail;
     }
@@ -133,8 +130,7 @@ int main(void)
     }
 
     const embed_config_t *cfg = embed_late_model_config(late);
-    if (!cfg || cfg->hidden_size != hidden ||
-        embed_late_model_token_dim(late) != TOKEN_DIM) {
+    if (!cfg || cfg->hidden_size != hidden || embed_late_model_token_dim(late) != TOKEN_DIM) {
         fprintf(stderr, "late config/token_dim mismatch\n");
         goto fail;
     }
@@ -253,33 +249,30 @@ int main(void)
             }
             offsets[i + 1] = offsets[i] + lens[i];
         }
-        doc_vecs = (float *)calloc((size_t)offsets[3] * TOKEN_DIM,
-                                   sizeof(float));
+        doc_vecs = (float *)calloc((size_t)offsets[3] * TOKEN_DIM, sizeof(float));
         if (!doc_vecs) {
             fprintf(stderr, "allocation failure\n");
             goto fail;
         }
         for (int i = 0; i < 3; i++) {
-            if (embed_late_model_encode_tokens(
-                    late, ws, doc_ids[i], lens[i], 1,
-                    doc_vecs + (size_t)offsets[i] * TOKEN_DIM) != 0) {
+            if (embed_late_model_encode_tokens(late, ws, doc_ids[i], lens[i], 1,
+                                               doc_vecs + (size_t)offsets[i] * TOKEN_DIM) != 0) {
                 fprintf(stderr, "doc encode failed\n");
                 goto fail;
             }
         }
-        if (check_maxsim_batch_parity(vecs, n_tokens, doc_vecs, offsets, 3,
-                                      TOKEN_DIM, "encoded docs") != 0)
+        if (check_maxsim_batch_parity(vecs, n_tokens, doc_vecs, offsets, 3, TOKEN_DIM,
+                                      "encoded docs") != 0)
             goto fail;
 
         float scores[3];
         int bad_first[4] = {1, 2, 3, 4};
         int empty_doc[3] = {0, 2, 2};
-        if (embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3,
-                                   TOKEN_DIM, scores) == 0 ||
-            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2,
-                                   TOKEN_DIM, scores) == 0 ||
-            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, offsets, 3,
-                                   TOKEN_DIM, NULL) == 0) {
+        if (embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3, TOKEN_DIM, scores) ==
+                0 ||
+            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2, TOKEN_DIM, scores) ==
+                0 ||
+            embed_late_maxsim_batch(vecs, n_tokens, doc_vecs, offsets, 3, TOKEN_DIM, NULL) == 0) {
             fprintf(stderr, "maxsim_batch accepted invalid arguments\n");
             goto fail;
         }
@@ -305,20 +298,20 @@ int main(void)
             s = s * 1664525u + 1013904223u;
             big_d[i] = (float)((s >> 8) & 0xFFFF) / 32768.0f - 1.0f;
         }
-        if (check_maxsim_batch_parity(big_q, BIG_Q, big_d, offsets, 2,
-                                      BIG_DIM, "oversized doc") != 0)
+        if (check_maxsim_batch_parity(big_q, BIG_Q, big_d, offsets, 2, BIG_DIM, "oversized doc") !=
+            0)
             goto fail;
     }
 
-    printf("ok: late API token_dim=%d tokens=%d hidden=%d\n",
-           TOKEN_DIM, n_tokens, hidden);
+    printf("ok: late API token_dim=%d tokens=%d hidden=%d\n", TOKEN_DIM, n_tokens, hidden);
     rc = 0;
 
 fail:
     free(big_d);
     free(big_q);
     free(doc_vecs);
-    for (int i = 0; i < 3; i++) free(doc_ids[i]);
+    for (int i = 0; i < 3; i++)
+        free(doc_ids[i]);
     free(expected);
     free(vecs);
     free(raw);

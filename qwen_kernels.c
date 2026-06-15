@@ -5,7 +5,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
-#if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+#if (defined(__AVX512F__) || defined(__AVX2__)) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -92,8 +93,10 @@ static void *worker_loop(void *arg) {
 }
 
 void qwen_set_threads(int n) {
-    if (n < 1) n = 1;
-    if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
+    if (n < 1)
+        n = 1;
+    if (n > QWEN_MAX_THREADS)
+        n = QWEN_MAX_THREADS;
 
 #if defined(USE_OPENBLAS)
     /* OpenBLAS owns the heavy F32 GEMM parallelism on Linux. Keep the
@@ -119,8 +122,7 @@ void qwen_set_threads(int n) {
     if (n <= 1) {
         if (qwen_verbose >= 2) {
 #if defined(USE_OPENBLAS)
-            fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n",
-                    n, blas_threads);
+            fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n", n, blas_threads);
 #else
             fprintf(stderr, "Thread pool: %d threads\n", n);
 #endif
@@ -135,8 +137,7 @@ void qwen_set_threads(int n) {
 
     if (qwen_verbose >= 2) {
 #if defined(USE_OPENBLAS)
-        fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n",
-                n, blas_threads);
+        fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n", n, blas_threads);
 #else
         fprintf(stderr, "Thread pool: %d threads\n", n);
 #endif
@@ -183,7 +184,8 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
  * ======================================================================== */
 
 void qwen_add_inplace(float *a, const float *b, int n) {
-    for (int i = 0; i < n; i++) a[i] += b[i];
+    for (int i = 0; i < n; i++)
+        a[i] += b[i];
 }
 
 /* ========================================================================
@@ -192,8 +194,7 @@ void qwen_add_inplace(float *a, const float *b, int n) {
 
 void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
@@ -207,18 +208,20 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
 #endif
 }
 
-void qwen_linear(float *y, const float *x, const float *W, const float *b,
-                 int seq_len, int in_dim, int out_dim) {
+void qwen_linear(float *y,
+                 const float *x,
+                 const float *W,
+                 const float *b,
+                 int seq_len,
+                 int in_dim,
+                 int out_dim) {
 #ifdef USE_BLAS
     if (seq_len == 1) {
-        cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                    out_dim, in_dim, 1.0f, W, in_dim, x, 1,
-                    0.0f, y, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, in_dim, 1.0f, W, in_dim, x, 1, 0.0f, y,
+                    1);
     } else {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq_len, out_dim, in_dim,
-                    1.0f, x, in_dim, W, in_dim,
-                    0.0f, y, out_dim);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, seq_len, out_dim, in_dim, 1.0f, x,
+                    in_dim, W, in_dim, 0.0f, y, out_dim);
     }
     if (b != NULL) {
         for (int s = 0; s < seq_len; s++) {
@@ -243,8 +246,8 @@ void qwen_linear(float *y, const float *x, const float *W, const float *b,
 #endif
 }
 
-void qwen_linear_nobias(float *y, const float *x, const float *W,
-                         int seq_len, int in_dim, int out_dim) {
+void qwen_linear_nobias(
+    float *y, const float *x, const float *W, int seq_len, int in_dim, int out_dim) {
     qwen_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
@@ -273,8 +276,8 @@ void qwen_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
  * Fused BF16 matvec: y[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim] + bias
  * Processes 2 output rows at a time to amortize x vector loads.
  */
-static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
-                               const float *bias, int in_dim, int out_dim) {
+static void bf16_matvec_fused(
+    float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
     qwen_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
 }
 
@@ -293,22 +296,22 @@ static void matvec_worker(int tid, int n_threads, void *arg) {
     int chunk = (t->out_dim + n_threads - 1) / n_threads;
     int start = tid * chunk;
     int end = start + chunk;
-    if (end > t->out_dim) end = t->out_dim;
-    if (start >= end) return;
+    if (end > t->out_dim)
+        end = t->out_dim;
+    if (start >= end)
+        return;
 
-    bf16_matvec_fused(t->y + start, t->x,
-                      t->W_bf16 + (size_t)start * t->in_dim,
-                      t->bias ? t->bias + start : NULL,
-                      t->in_dim, end - start);
+    bf16_matvec_fused(t->y + start, t->x, t->W_bf16 + (size_t)start * t->in_dim,
+                      t->bias ? t->bias + start : NULL, t->in_dim, end - start);
 }
 
-static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf16,
-                                  const float *bias, int in_dim, int out_dim) {
+static void bf16_matvec_threaded(
+    float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
     if (tp.n_threads <= 1) {
         bf16_matvec_fused(y, x, W_bf16, bias, in_dim, out_dim);
         return;
     }
-    matvec_task_t task = { y, x, W_bf16, bias, in_dim, out_dim };
+    matvec_task_t task = {y, x, W_bf16, bias, in_dim, out_dim};
     parallel_for(matvec_worker, &task);
 }
 
@@ -327,18 +330,23 @@ static void bf16_linear_rows_worker(int tid, int n_threads, void *arg) {
     int chunk = (t->seq_len + n_threads - 1) / n_threads;
     int start = tid * chunk;
     int end = start + chunk;
-    if (end > t->seq_len) end = t->seq_len;
-    if (start >= end) return;
+    if (end > t->seq_len)
+        end = t->seq_len;
+    if (start >= end)
+        return;
 
     for (int s = start; s < end; s++) {
-        bf16_matvec_fused(t->y + (size_t)s * t->out_dim,
-                          t->x + (size_t)s * t->in_dim,
-                          t->W_bf16, t->bias, t->in_dim, t->out_dim);
+        bf16_matvec_fused(t->y + (size_t)s * t->out_dim, t->x + (size_t)s * t->in_dim, t->W_bf16,
+                          t->bias, t->in_dim, t->out_dim);
     }
 }
 
-static void bf16_linear_rows(float *y, const float *x, const uint16_t *W_bf16,
-                             const float *bias, int seq_len, int in_dim,
+static void bf16_linear_rows(float *y,
+                             const float *x,
+                             const uint16_t *W_bf16,
+                             const float *bias,
+                             int seq_len,
+                             int in_dim,
                              int out_dim) {
     bf16_linear_rows_task_t task = {
         .y = y,
@@ -369,8 +377,7 @@ typedef struct {
     int total_dim;
 } pair_matvec_task_t;
 
-static void pair_matvec_range(const pair_matvec_task_t *t, int row,
-                              int start, int end) {
+static void pair_matvec_range(const pair_matvec_task_t *t, int row, int start, int end) {
     const float *x_row = t->x + (size_t)row * t->in_dim;
     int a_end = t->a_dim;
     int b_end = a_end + t->b_dim;
@@ -380,8 +387,7 @@ static void pair_matvec_range(const pair_matvec_task_t *t, int row,
         int e = end < a_end ? end : a_end;
         if (s < e) {
             bf16_matvec_fused(t->a + (size_t)row * t->a_dim + s, x_row,
-                              t->Wa_bf16 + (size_t)s * t->in_dim,
-                              NULL, t->in_dim, e - s);
+                              t->Wa_bf16 + (size_t)s * t->in_dim, NULL, t->in_dim, e - s);
         }
     }
 
@@ -391,8 +397,7 @@ static void pair_matvec_range(const pair_matvec_task_t *t, int row,
         int e = e_abs - a_end;
         if (s < e) {
             bf16_matvec_fused(t->b + (size_t)row * t->b_dim + s, x_row,
-                              t->Wb_bf16 + (size_t)s * t->in_dim,
-                              NULL, t->in_dim, e - s);
+                              t->Wb_bf16 + (size_t)s * t->in_dim, NULL, t->in_dim, e - s);
         }
     }
 }
@@ -403,8 +408,10 @@ static void pair_matvec_worker(int tid, int n_threads, void *arg) {
     int chunk = (total_work + n_threads - 1) / n_threads;
     int start = tid * chunk;
     int end = start + chunk;
-    if (end > total_work) end = total_work;
-    if (start >= end) return;
+    if (end > total_work)
+        end = total_work;
+    if (start >= end)
+        return;
 
     while (start < end) {
         int row = start / t->total_dim;
@@ -416,20 +423,23 @@ static void pair_matvec_worker(int tid, int n_threads, void *arg) {
     }
 }
 
-void qwen_linear_nobias_bf16_pair(float *a, float *b, const float *x,
+void qwen_linear_nobias_bf16_pair(float *a,
+                                  float *b,
+                                  const float *x,
                                   const uint16_t *Wa_bf16,
                                   const uint16_t *Wb_bf16,
-                                  int seq_len, int in_dim, int a_dim,
+                                  int seq_len,
+                                  int in_dim,
+                                  int a_dim,
                                   int b_dim) {
-    if (seq_len <= 0) return;
+    if (seq_len <= 0)
+        return;
 
     if (tp.n_threads <= 1) {
         for (int s = 0; s < seq_len; s++) {
             const float *x_row = x + (size_t)s * in_dim;
-            bf16_matvec_fused(a + (size_t)s * a_dim, x_row,
-                              Wa_bf16, NULL, in_dim, a_dim);
-            bf16_matvec_fused(b + (size_t)s * b_dim, x_row,
-                              Wb_bf16, NULL, in_dim, b_dim);
+            bf16_matvec_fused(a + (size_t)s * a_dim, x_row, Wa_bf16, NULL, in_dim, a_dim);
+            bf16_matvec_fused(b + (size_t)s * b_dim, x_row, Wb_bf16, NULL, in_dim, b_dim);
         }
         return;
     }
@@ -464,8 +474,7 @@ typedef struct {
     int total_dim;
 } qkv_matvec_task_t;
 
-static void qkv_matvec_range(const qkv_matvec_task_t *t, int row,
-                             int start, int end) {
+static void qkv_matvec_range(const qkv_matvec_task_t *t, int row, int start, int end) {
     const float *x_row = t->x + (size_t)row * t->in_dim;
     int q_end = t->q_dim;
     int k_end = q_end + t->kv_dim;
@@ -476,8 +485,7 @@ static void qkv_matvec_range(const qkv_matvec_task_t *t, int row,
         int e = end < q_end ? end : q_end;
         if (s < e) {
             bf16_matvec_fused(t->q + (size_t)row * t->q_dim + s, x_row,
-                              t->Wq_bf16 + (size_t)s * t->in_dim,
-                              NULL, t->in_dim, e - s);
+                              t->Wq_bf16 + (size_t)s * t->in_dim, NULL, t->in_dim, e - s);
         }
     }
 
@@ -487,8 +495,7 @@ static void qkv_matvec_range(const qkv_matvec_task_t *t, int row,
         int e = e_abs - q_end;
         if (s < e) {
             bf16_matvec_fused(t->k + (size_t)row * t->kv_dim + s, x_row,
-                              t->Wk_bf16 + (size_t)s * t->in_dim,
-                              NULL, t->in_dim, e - s);
+                              t->Wk_bf16 + (size_t)s * t->in_dim, NULL, t->in_dim, e - s);
         }
     }
 
@@ -498,8 +505,7 @@ static void qkv_matvec_range(const qkv_matvec_task_t *t, int row,
         int e = e_abs - k_end;
         if (s < e) {
             bf16_matvec_fused(t->v + (size_t)row * t->kv_dim + s, x_row,
-                              t->Wv_bf16 + (size_t)s * t->in_dim,
-                              NULL, t->in_dim, e - s);
+                              t->Wv_bf16 + (size_t)s * t->in_dim, NULL, t->in_dim, e - s);
         }
     }
 }
@@ -510,8 +516,10 @@ static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
     int chunk = (total_work + n_threads - 1) / n_threads;
     int start = tid * chunk;
     int end = start + chunk;
-    if (end > total_work) end = total_work;
-    if (start >= end) return;
+    if (end > total_work)
+        end = total_work;
+    if (start >= end)
+        return;
 
     while (start < end) {
         int row = start / t->total_dim;
@@ -523,23 +531,26 @@ static void qkv_matvec_worker(int tid, int n_threads, void *arg) {
     }
 }
 
-void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
+void qwen_linear_nobias_bf16_qkv(float *q,
+                                 float *k,
+                                 float *v,
+                                 const float *x,
                                  const uint16_t *Wq_bf16,
                                  const uint16_t *Wk_bf16,
                                  const uint16_t *Wv_bf16,
-                                 int seq_len, int in_dim, int q_dim,
+                                 int seq_len,
+                                 int in_dim,
+                                 int q_dim,
                                  int kv_dim) {
-    if (seq_len <= 0) return;
+    if (seq_len <= 0)
+        return;
 
     if (tp.n_threads <= 1) {
         for (int s = 0; s < seq_len; s++) {
             const float *x_row = x + (size_t)s * in_dim;
-            bf16_matvec_fused(q + (size_t)s * q_dim, x_row,
-                              Wq_bf16, NULL, in_dim, q_dim);
-            bf16_matvec_fused(k + (size_t)s * kv_dim, x_row,
-                              Wk_bf16, NULL, in_dim, kv_dim);
-            bf16_matvec_fused(v + (size_t)s * kv_dim, x_row,
-                              Wv_bf16, NULL, in_dim, kv_dim);
+            bf16_matvec_fused(q + (size_t)s * q_dim, x_row, Wq_bf16, NULL, in_dim, q_dim);
+            bf16_matvec_fused(k + (size_t)s * kv_dim, x_row, Wk_bf16, NULL, in_dim, kv_dim);
+            bf16_matvec_fused(v + (size_t)s * kv_dim, x_row, Wv_bf16, NULL, in_dim, kv_dim);
         }
         return;
     }
@@ -561,8 +572,8 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
     parallel_for(qkv_matvec_worker, &task);
 }
 
-void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
-                              int seq_len, int in_dim, int out_dim) {
+void qwen_linear_nobias_bf16(
+    float *y, const float *x, const uint16_t *W_bf16, int seq_len, int in_dim, int out_dim) {
     if (seq_len == 1) {
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
@@ -573,7 +584,6 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     bf16_linear_rows(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
 }
 
-
 /* ========================================================================
  * Normalization
  * ======================================================================== */
@@ -582,9 +592,8 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
  * for the dispatch. */
 #define QWEN_RMS_NORM_PARALLEL_ELEMS 262144
 
-static void qwen_rms_norm_range(float *out, const float *x,
-                                const float *weight, int start, int end,
-                                int hidden, float eps) {
+static void qwen_rms_norm_range(
+    float *out, const float *x, const float *weight, int start, int end, int hidden, float eps) {
     for (int s = start; s < end; s++) {
         const float *x_row = x + (size_t)s * hidden;
         float *out_row = out + (size_t)s * hidden;
@@ -597,7 +606,8 @@ static void qwen_rms_norm_range(float *out, const float *x,
             accv = _mm512_fmadd_ps(v, v, accv);
         }
         float sum_sq = _mm512_reduce_add_ps(accv);
-        for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
+        for (; i < hidden; i++)
+            sum_sq += x_row[i] * x_row[i];
 #elif defined(__AVX2__) && defined(__FMA__)
         __m256 accv = _mm256_setzero_ps();
         int i = 0;
@@ -609,7 +619,8 @@ static void qwen_rms_norm_range(float *out, const float *x,
         acc128 = _mm_hadd_ps(acc128, acc128);
         acc128 = _mm_hadd_ps(acc128, acc128);
         float sum_sq = _mm_cvtss_f32(acc128);
-        for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
+        for (; i < hidden; i++)
+            sum_sq += x_row[i] * x_row[i];
 #else
         float sum_sq = 0.0f;
         for (int i = 0; i < hidden; i++) {
@@ -626,7 +637,8 @@ static void qwen_rms_norm_range(float *out, const float *x,
             __m512 vw = _mm512_loadu_ps(weight + j);
             _mm512_storeu_ps(out_row + j, _mm512_mul_ps(_mm512_mul_ps(vx, vw), scale));
         }
-        for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
+        for (; j < hidden; j++)
+            out_row[j] = x_row[j] * rms_inv * weight[j];
 #elif defined(__AVX2__)
         __m256 scale = _mm256_set1_ps(rms_inv);
         int j = 0;
@@ -635,7 +647,8 @@ static void qwen_rms_norm_range(float *out, const float *x,
             __m256 vw = _mm256_loadu_ps(weight + j);
             _mm256_storeu_ps(out_row + j, _mm256_mul_ps(_mm256_mul_ps(vx, vw), scale));
         }
-        for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
+        for (; j < hidden; j++)
+            out_row[j] = x_row[j] * rms_inv * weight[j];
 #else
         for (int i = 0; i < hidden; i++) {
             out_row[i] = x_row[i] * rms_inv * weight[i];
@@ -658,15 +671,17 @@ static void rms_norm_worker(int tid, int n_threads, void *arg) {
     int chunk = (t->seq_len + n_threads - 1) / n_threads;
     int start = tid * chunk;
     int end = start + chunk;
-    if (end > t->seq_len) end = t->seq_len;
-    if (start >= end) return;
-    qwen_rms_norm_range(t->out, t->x, t->weight, start, end, t->hidden,
-                        t->eps);
+    if (end > t->seq_len)
+        end = t->seq_len;
+    if (start >= end)
+        return;
+    qwen_rms_norm_range(t->out, t->x, t->weight, start, end, t->hidden, t->eps);
 }
 
-void qwen_rms_norm(float *out, const float *x, const float *weight,
-                   int seq_len, int hidden, float eps) {
-    if (seq_len <= 0 || hidden <= 0) return;
+void qwen_rms_norm(
+    float *out, const float *x, const float *weight, int seq_len, int hidden, float eps) {
+    if (seq_len <= 0 || hidden <= 0)
+        return;
 
     long long elems = (long long)seq_len * hidden;
     if (tp.n_threads > 1 && elems >= QWEN_RMS_NORM_PARALLEL_ELEMS) {
@@ -684,8 +699,8 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
-void qwen_rms_norm_per_head(float *x, const float *weight,
-                             int seq_len, int n_heads, int head_dim, float eps) {
+void qwen_rms_norm_per_head(
+    float *x, const float *weight, int seq_len, int n_heads, int head_dim, float eps) {
     /* x is [seq, n_heads * head_dim] - normalize each [head_dim] segment */
     int hidden = n_heads * head_dim;
     for (int s = 0; s < seq_len; s++) {
@@ -700,7 +715,8 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 accv = _mm512_fmadd_ps(v, v, accv);
             }
             float sum_sq = _mm512_reduce_add_ps(accv);
-            for (; d < head_dim; d++) sum_sq += vec[d] * vec[d];
+            for (; d < head_dim; d++)
+                sum_sq += vec[d] * vec[d];
 #elif defined(__AVX2__) && defined(__FMA__)
             __m256 accv = _mm256_setzero_ps();
             int d = 0;
@@ -708,11 +724,13 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 __m256 v = _mm256_loadu_ps(vec + d);
                 accv = _mm256_fmadd_ps(v, v, accv);
             }
-            __m128 acc128 = _mm_add_ps(_mm256_castps256_ps128(accv), _mm256_extractf128_ps(accv, 1));
+            __m128 acc128 =
+                _mm_add_ps(_mm256_castps256_ps128(accv), _mm256_extractf128_ps(accv, 1));
             acc128 = _mm_hadd_ps(acc128, acc128);
             acc128 = _mm_hadd_ps(acc128, acc128);
             float sum_sq = _mm_cvtss_f32(acc128);
-            for (; d < head_dim; d++) sum_sq += vec[d] * vec[d];
+            for (; d < head_dim; d++)
+                sum_sq += vec[d] * vec[d];
 #else
             float sum_sq = 0.0f;
             for (int d = 0; d < head_dim; d++) {
@@ -729,7 +747,8 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 __m512 w = _mm512_loadu_ps(weight + j);
                 _mm512_storeu_ps(vec + j, _mm512_mul_ps(_mm512_mul_ps(v, w), scale));
             }
-            for (; j < head_dim; j++) vec[j] = vec[j] * rms_inv * weight[j];
+            for (; j < head_dim; j++)
+                vec[j] = vec[j] * rms_inv * weight[j];
 #elif defined(__AVX2__)
             __m256 scale = _mm256_set1_ps(rms_inv);
             int j = 0;
@@ -738,7 +757,8 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 __m256 w = _mm256_loadu_ps(weight + j);
                 _mm256_storeu_ps(vec + j, _mm256_mul_ps(_mm256_mul_ps(v, w), scale));
             }
-            for (; j < head_dim; j++) vec[j] = vec[j] * rms_inv * weight[j];
+            for (; j < head_dim; j++)
+                vec[j] = vec[j] * rms_inv * weight[j];
 #else
             for (int d = 0; d < head_dim; d++) {
                 vec[d] = vec[d] * rms_inv * weight[d];
@@ -759,7 +779,8 @@ void qwen_silu_mul_inplace(float *gate, const float *up, int n) {
 
     for (int base = 0; base < n; base += CHUNK) {
         int len = n - base;
-        if (len > CHUNK) len = CHUNK;
+        if (len > CHUNK)
+            len = CHUNK;
 
         for (int i = 0; i < len; i++)
             exp_neg[i] = -gate[base + i];
@@ -783,7 +804,8 @@ void qwen_softmax(float *x, int rows, int cols) {
         float *row = x + r * cols;
         float max_val = row[0];
         for (int c = 1; c < cols; c++) {
-            if (row[c] > max_val) max_val = row[c];
+            if (row[c] > max_val)
+                max_val = row[c];
         }
         float sum = 0.0f;
         for (int c = 0; c < cols; c++) {
@@ -801,9 +823,7 @@ void qwen_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
-float qwen_dot_f32(const float *a, const float *b, int n) {
-    return qwen_dot_f32_impl(a, b, n);
-}
+float qwen_dot_f32(const float *a, const float *b, int n) { return qwen_dot_f32_impl(a, b, n); }
 
 static inline float qwen_dot_f32_fast(const float *a, const float *b, int n) {
     return qwen_dot_f32_impl(a, b, n);
@@ -824,13 +844,22 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
-#define QWEN_PACKED_ATTN_QUERY_TILE 32
+#define QWEN_PACKED_ATTN_QUERY_TILE   32
 #define QWEN_PACKED_ATTN_BLAS_MIN_SEQ 128
 
-static void qwen_bidirectional_gqa_attention_packed_online_rows(
-        float *out, const float *Q, const float *K, const float *V,
-        int start, int end, int n_heads, int n_kv_heads, int head_dim,
-        float scale, int h, int query_start, int query_end) {
+static void qwen_bidirectional_gqa_attention_packed_online_rows(float *out,
+                                                                const float *Q,
+                                                                const float *K,
+                                                                const float *V,
+                                                                int start,
+                                                                int end,
+                                                                int n_heads,
+                                                                int n_kv_heads,
+                                                                int head_dim,
+                                                                float scale,
+                                                                int h,
+                                                                int query_start,
+                                                                int query_end) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
@@ -842,7 +871,8 @@ static void qwen_bidirectional_gqa_attention_packed_online_rows(
 
         float max_score = -1e30f;
         float sum_exp = 0.0f;
-        for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            o_row[d] = 0.0f;
 
         for (int j = start; j < end; j++) {
             const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
@@ -870,10 +900,20 @@ static void qwen_bidirectional_gqa_attention_packed_online_rows(
 }
 
 #ifdef USE_BLAS
-static void qwen_bidirectional_gqa_attention_packed_blas_rows(
-        float *out, const float *Q, const float *K, const float *V,
-        int start, int end, int n_heads, int n_kv_heads, int head_dim,
-        float scale, int h, int query_start, int query_end, float *scores) {
+static void qwen_bidirectional_gqa_attention_packed_blas_rows(float *out,
+                                                              const float *Q,
+                                                              const float *K,
+                                                              const float *V,
+                                                              int start,
+                                                              int end,
+                                                              int n_heads,
+                                                              int n_kv_heads,
+                                                              int head_dim,
+                                                              float scale,
+                                                              int h,
+                                                              int query_start,
+                                                              int query_end,
+                                                              float *scores) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
@@ -886,13 +926,11 @@ static void qwen_bidirectional_gqa_attention_packed_blas_rows(
     const float *v = V + (size_t)start * kv_hidden + kv_h * head_dim;
     float *o = out + (size_t)query_start * q_hidden + h * head_dim;
 
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                rows, keys, head_dim, scale, q, q_hidden, k, kv_hidden,
-                0.0f, scores, keys);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rows, keys, head_dim, scale, q, q_hidden,
+                k, kv_hidden, 0.0f, scores, keys);
     qwen_softmax(scores, rows, keys);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                rows, head_dim, keys, 1.0f, scores, keys, v, kv_hidden,
-                0.0f, o, q_hidden);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, rows, head_dim, keys, 1.0f, scores, keys,
+                v, kv_hidden, 0.0f, o, q_hidden);
 }
 #endif
 
@@ -914,9 +952,8 @@ static void packed_gqa_attn_worker(int tid, int n_threads, void *arg) {
     packed_gqa_attn_task_t *t = (packed_gqa_attn_task_t *)arg;
     int task_id = 0;
 #ifdef USE_BLAS
-    float *scores = t->scores
-        ? t->scores + (size_t)tid * QWEN_PACKED_ATTN_QUERY_TILE * t->max_seq
-        : NULL;
+    float *scores =
+        t->scores ? t->scores + (size_t)tid * QWEN_PACKED_ATTN_QUERY_TILE * t->max_seq : NULL;
 #endif
 
     for (int h = 0; h < t->n_heads; h++) {
@@ -925,41 +962,43 @@ static void packed_gqa_attn_worker(int tid, int n_threads, void *arg) {
             int end = t->offsets[b + 1];
             for (int q0 = start; q0 < end; q0 += QWEN_PACKED_ATTN_QUERY_TILE) {
                 int q1 = q0 + QWEN_PACKED_ATTN_QUERY_TILE;
-                if (q1 > end) q1 = end;
-                if (task_id++ % n_threads != tid) continue;
+                if (q1 > end)
+                    q1 = end;
+                if (task_id++ % n_threads != tid)
+                    continue;
 #ifdef USE_BLAS
                 if (scores && end - start >= QWEN_PACKED_ATTN_BLAS_MIN_SEQ) {
                     qwen_bidirectional_gqa_attention_packed_blas_rows(
-                        t->out, t->Q, t->K, t->V, start, end, t->n_heads,
-                        t->n_kv_heads, t->head_dim, t->scale, h, q0, q1,
-                        scores);
+                        t->out, t->Q, t->K, t->V, start, end, t->n_heads, t->n_kv_heads,
+                        t->head_dim, t->scale, h, q0, q1, scores);
                     continue;
                 }
 #endif
                 qwen_bidirectional_gqa_attention_packed_online_rows(
-                    t->out, t->Q, t->K, t->V, start, end, t->n_heads,
-                    t->n_kv_heads, t->head_dim, t->scale, h, q0, q1);
+                    t->out, t->Q, t->K, t->V, start, end, t->n_heads, t->n_kv_heads, t->head_dim,
+                    t->scale, h, q0, q1);
             }
         }
     }
 }
 
-size_t qwen_bidirectional_gqa_attention_packed_scratch_bytes(
-        const int *offsets, int batch) {
+size_t qwen_bidirectional_gqa_attention_packed_scratch_bytes(const int *offsets, int batch) {
 #ifdef USE_BLAS
-    if (!offsets || batch <= 0) return 0;
+    if (!offsets || batch <= 0)
+        return 0;
 
     int max_seq = 0;
     for (int b = 0; b < batch; b++) {
         int len = offsets[b + 1] - offsets[b];
-        if (len > max_seq) max_seq = len;
+        if (len > max_seq)
+            max_seq = len;
     }
-    if (max_seq < QWEN_PACKED_ATTN_BLAS_MIN_SEQ) return 0;
-    if ((size_t)max_seq > SIZE_MAX / (sizeof(float) *
-            QWEN_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads))
+    if (max_seq < QWEN_PACKED_ATTN_BLAS_MIN_SEQ)
         return 0;
-    return (size_t)tp.n_threads * QWEN_PACKED_ATTN_QUERY_TILE *
-        (size_t)max_seq * sizeof(float);
+    if ((size_t)max_seq >
+        SIZE_MAX / (sizeof(float) * QWEN_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads))
+        return 0;
+    return (size_t)tp.n_threads * QWEN_PACKED_ATTN_QUERY_TILE * (size_t)max_seq * sizeof(float);
 #else
     (void)offsets;
     (void)batch;
@@ -967,33 +1006,48 @@ size_t qwen_bidirectional_gqa_attention_packed_scratch_bytes(
 #endif
 }
 
-void qwen_bidirectional_gqa_attention_packed_with_scratch(
-        float *out, const float *Q, const float *K, const float *V,
-        const int *offsets, int batch, int n_heads, int n_kv_heads,
-        int head_dim, float scale, float *scratch, size_t scratch_bytes) {
+void qwen_bidirectional_gqa_attention_packed_with_scratch(float *out,
+                                                          const float *Q,
+                                                          const float *K,
+                                                          const float *V,
+                                                          const int *offsets,
+                                                          int batch,
+                                                          int n_heads,
+                                                          int n_kv_heads,
+                                                          int head_dim,
+                                                          float scale,
+                                                          float *scratch,
+                                                          size_t scratch_bytes) {
     long long qk_work = 0;
     int max_seq = 0;
     for (int b = 0; b < batch; b++) {
         int len = offsets[b + 1] - offsets[b];
         qk_work += (long long)len * len * n_heads;
-        if (len > max_seq) max_seq = len;
+        if (len > max_seq)
+            max_seq = len;
     }
 
     float *scores = NULL;
 #ifdef USE_BLAS
-    size_t required = qwen_bidirectional_gqa_attention_packed_scratch_bytes(
-        offsets, batch);
-    if (required != 0 && scratch && scratch_bytes >= required) scores = scratch;
+    size_t required = qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+    if (required != 0 && scratch && scratch_bytes >= required)
+        scores = scratch;
 #else
     (void)scratch;
     (void)scratch_bytes;
 #endif
-    packed_gqa_attn_task_t task = {
-        .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
-        .batch = batch, .n_heads = n_heads, .n_kv_heads = n_kv_heads,
-        .head_dim = head_dim, .scale = scale, .scores = scores,
-        .max_seq = max_seq
-    };
+    packed_gqa_attn_task_t task = {.out = out,
+                                   .Q = Q,
+                                   .K = K,
+                                   .V = V,
+                                   .offsets = offsets,
+                                   .batch = batch,
+                                   .n_heads = n_heads,
+                                   .n_kv_heads = n_kv_heads,
+                                   .head_dim = head_dim,
+                                   .scale = scale,
+                                   .scores = scores,
+                                   .max_seq = max_seq};
     if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096) {
         parallel_for(packed_gqa_attn_worker, &task);
     } else {
@@ -1001,24 +1055,35 @@ void qwen_bidirectional_gqa_attention_packed_with_scratch(
     }
 }
 
-void qwen_bidirectional_gqa_attention_packed(float *out, const float *Q,
-                                             const float *K, const float *V,
-                                             const int *offsets, int batch,
-                                             int n_heads, int n_kv_heads,
-                                             int head_dim, float scale) {
-    size_t scratch_bytes =
-        qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+void qwen_bidirectional_gqa_attention_packed(float *out,
+                                             const float *Q,
+                                             const float *K,
+                                             const float *V,
+                                             const int *offsets,
+                                             int batch,
+                                             int n_heads,
+                                             int n_kv_heads,
+                                             int head_dim,
+                                             float scale) {
+    size_t scratch_bytes = qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
     float *scores = scratch_bytes ? malloc(scratch_bytes) : NULL;
     qwen_bidirectional_gqa_attention_packed_with_scratch(
-        out, Q, K, V, offsets, batch, n_heads, n_kv_heads, head_dim, scale,
-        scores, scratch_bytes);
+        out, Q, K, V, offsets, batch, n_heads, n_kv_heads, head_dim, scale, scores, scratch_bytes);
     free(scores);
 }
 
-static void qwen_causal_gqa_attention_packed_online_rows(
-        float *out, const float *Q, const float *K, const float *V,
-        int start, int n_heads, int n_kv_heads, int head_dim,
-        float scale, int h, int query_start, int query_end) {
+static void qwen_causal_gqa_attention_packed_online_rows(float *out,
+                                                         const float *Q,
+                                                         const float *K,
+                                                         const float *V,
+                                                         int start,
+                                                         int n_heads,
+                                                         int n_kv_heads,
+                                                         int head_dim,
+                                                         float scale,
+                                                         int h,
+                                                         int query_start,
+                                                         int query_end) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
@@ -1030,7 +1095,8 @@ static void qwen_causal_gqa_attention_packed_online_rows(
 
         float max_score = -1e30f;
         float sum_exp = 0.0f;
-        for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            o_row[d] = 0.0f;
 
         for (int j = start; j <= i; j++) {
             const float *k_row = K + (size_t)j * kv_hidden + kv_h * head_dim;
@@ -1055,10 +1121,19 @@ static void qwen_causal_gqa_attention_packed_online_rows(
 }
 
 #ifdef USE_BLAS
-static void qwen_causal_gqa_attention_packed_blas_rows(
-        float *out, const float *Q, const float *K, const float *V,
-        int start, int n_heads, int n_kv_heads, int head_dim,
-        float scale, int h, int query_start, int query_end, float *scores) {
+static void qwen_causal_gqa_attention_packed_blas_rows(float *out,
+                                                       const float *Q,
+                                                       const float *K,
+                                                       const float *V,
+                                                       int start,
+                                                       int n_heads,
+                                                       int n_kv_heads,
+                                                       int head_dim,
+                                                       float scale,
+                                                       int h,
+                                                       int query_start,
+                                                       int query_end,
+                                                       float *scores) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
@@ -1071,18 +1146,17 @@ static void qwen_causal_gqa_attention_packed_blas_rows(
     const float *v = V + (size_t)start * kv_hidden + kv_h * head_dim;
     float *o = out + (size_t)query_start * q_hidden + h * head_dim;
 
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                rows, keys, head_dim, scale, q, q_hidden, k, kv_hidden,
-                0.0f, scores, keys);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rows, keys, head_dim, scale, q, q_hidden,
+                k, kv_hidden, 0.0f, scores, keys);
     for (int r = 0; r < rows; r++) {
         int allowed = query_start + r - start + 1;
         float *row = scores + (size_t)r * keys;
-        for (int j = allowed; j < keys; j++) row[j] = -INFINITY;
+        for (int j = allowed; j < keys; j++)
+            row[j] = -INFINITY;
     }
     qwen_softmax(scores, rows, keys);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                rows, head_dim, keys, 1.0f, scores, keys, v, kv_hidden,
-                0.0f, o, q_hidden);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, rows, head_dim, keys, 1.0f, scores, keys,
+                v, kv_hidden, 0.0f, o, q_hidden);
 }
 #endif
 
@@ -1090,9 +1164,8 @@ static void packed_causal_gqa_attn_worker(int tid, int n_threads, void *arg) {
     packed_gqa_attn_task_t *t = (packed_gqa_attn_task_t *)arg;
     int task_id = 0;
 #ifdef USE_BLAS
-    float *scores = t->scores
-        ? t->scores + (size_t)tid * QWEN_PACKED_ATTN_QUERY_TILE * t->max_seq
-        : NULL;
+    float *scores =
+        t->scores ? t->scores + (size_t)tid * QWEN_PACKED_ATTN_QUERY_TILE * t->max_seq : NULL;
 #endif
 
     for (int h = 0; h < t->n_heads; h++) {
@@ -1101,69 +1174,88 @@ static void packed_causal_gqa_attn_worker(int tid, int n_threads, void *arg) {
             int end = t->offsets[b + 1];
             for (int q0 = start; q0 < end; q0 += QWEN_PACKED_ATTN_QUERY_TILE) {
                 int q1 = q0 + QWEN_PACKED_ATTN_QUERY_TILE;
-                if (q1 > end) q1 = end;
-                if (task_id++ % n_threads != tid) continue;
+                if (q1 > end)
+                    q1 = end;
+                if (task_id++ % n_threads != tid)
+                    continue;
 #ifdef USE_BLAS
                 if (scores && end - start >= QWEN_PACKED_ATTN_BLAS_MIN_SEQ) {
                     qwen_causal_gqa_attention_packed_blas_rows(
-                        t->out, t->Q, t->K, t->V, start, t->n_heads,
-                        t->n_kv_heads, t->head_dim, t->scale, h, q0, q1,
-                        scores);
+                        t->out, t->Q, t->K, t->V, start, t->n_heads, t->n_kv_heads, t->head_dim,
+                        t->scale, h, q0, q1, scores);
                     continue;
                 }
 #endif
-                qwen_causal_gqa_attention_packed_online_rows(
-                    t->out, t->Q, t->K, t->V, start, t->n_heads,
-                    t->n_kv_heads, t->head_dim, t->scale, h, q0, q1);
+                qwen_causal_gqa_attention_packed_online_rows(t->out, t->Q, t->K, t->V, start,
+                                                             t->n_heads, t->n_kv_heads, t->head_dim,
+                                                             t->scale, h, q0, q1);
             }
         }
     }
 }
 
-void qwen_causal_gqa_attention_packed_with_scratch(
-        float *out, const float *Q, const float *K, const float *V,
-        const int *offsets, int batch, int n_heads, int n_kv_heads,
-        int head_dim, float scale, float *scratch, size_t scratch_bytes) {
+void qwen_causal_gqa_attention_packed_with_scratch(float *out,
+                                                   const float *Q,
+                                                   const float *K,
+                                                   const float *V,
+                                                   const int *offsets,
+                                                   int batch,
+                                                   int n_heads,
+                                                   int n_kv_heads,
+                                                   int head_dim,
+                                                   float scale,
+                                                   float *scratch,
+                                                   size_t scratch_bytes) {
     long long qk_work = 0;
     int max_seq = 0;
     for (int b = 0; b < batch; b++) {
         int len = offsets[b + 1] - offsets[b];
         qk_work += (long long)len * (len + 1) / 2 * n_heads;
-        if (len > max_seq) max_seq = len;
+        if (len > max_seq)
+            max_seq = len;
     }
 
     float *scores = NULL;
 #ifdef USE_BLAS
-    size_t required = qwen_bidirectional_gqa_attention_packed_scratch_bytes(
-        offsets, batch);
-    if (required != 0 && scratch && scratch_bytes >= required) scores = scratch;
+    size_t required = qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+    if (required != 0 && scratch && scratch_bytes >= required)
+        scores = scratch;
 #else
     (void)scratch;
     (void)scratch_bytes;
 #endif
-    packed_gqa_attn_task_t task = {
-        .out = out, .Q = Q, .K = K, .V = V, .offsets = offsets,
-        .batch = batch, .n_heads = n_heads, .n_kv_heads = n_kv_heads,
-        .head_dim = head_dim, .scale = scale, .scores = scores,
-        .max_seq = max_seq
-    };
+    packed_gqa_attn_task_t task = {.out = out,
+                                   .Q = Q,
+                                   .K = K,
+                                   .V = V,
+                                   .offsets = offsets,
+                                   .batch = batch,
+                                   .n_heads = n_heads,
+                                   .n_kv_heads = n_kv_heads,
+                                   .head_dim = head_dim,
+                                   .scale = scale,
+                                   .scores = scores,
+                                   .max_seq = max_seq};
     if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096)
         parallel_for(packed_causal_gqa_attn_worker, &task);
     else
         packed_causal_gqa_attn_worker(0, 1, &task);
 }
 
-void qwen_causal_gqa_attention_packed(float *out, const float *Q,
-                                      const float *K, const float *V,
-                                      const int *offsets, int batch,
-                                      int n_heads, int n_kv_heads,
-                                      int head_dim, float scale) {
-    size_t scratch_bytes =
-        qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+void qwen_causal_gqa_attention_packed(float *out,
+                                      const float *Q,
+                                      const float *K,
+                                      const float *V,
+                                      const int *offsets,
+                                      int batch,
+                                      int n_heads,
+                                      int n_kv_heads,
+                                      int head_dim,
+                                      float scale) {
+    size_t scratch_bytes = qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
     float *scores = scratch_bytes ? malloc(scratch_bytes) : NULL;
-    qwen_causal_gqa_attention_packed_with_scratch(
-        out, Q, K, V, offsets, batch, n_heads, n_kv_heads, head_dim, scale,
-        scores, scratch_bytes);
+    qwen_causal_gqa_attention_packed_with_scratch(out, Q, K, V, offsets, batch, n_heads, n_kv_heads,
+                                                  head_dim, scale, scores, scratch_bytes);
     free(scores);
 }
 
@@ -1171,8 +1263,8 @@ void qwen_causal_gqa_attention_packed(float *out, const float *Q,
  * Position Embeddings
  * ======================================================================== */
 
-void qwen_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
-                              int seq, int head_dim, float theta) {
+void qwen_compute_rope_neox(
+    float *cos_out, float *sin_out, const int *positions, int seq, int head_dim, float theta) {
     int half = head_dim / 2;
 
     for (int s = 0; s < seq; s++) {
@@ -1191,8 +1283,8 @@ void qwen_compute_rope_neox(float *cos_out, float *sin_out, const int *positions
     }
 }
 
-void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
-                            int seq, int n_heads, int head_dim) {
+void qwen_apply_rope_neox(
+    float *x, const float *cos_vals, const float *sin_vals, int seq, int n_heads, int head_dim) {
     /*
      * NeoX split-half style:
      *   x1 = x[..., :half], x2 = x[..., half:]
@@ -1225,7 +1317,7 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
             for (; d < half; d++) {
                 float x1 = vec[d];
                 float x2 = vec[half + d];
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[d] = x1 * c[d] + (-x2) * sn[d];
                 vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
             }
 #elif defined(__AVX2__) && defined(__FMA__)
@@ -1243,7 +1335,7 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
             for (; d < half; d++) {
                 float x1 = vec[d];
                 float x2 = vec[half + d];
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[d] = x1 * c[d] + (-x2) * sn[d];
                 vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
             }
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -1261,14 +1353,14 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
             for (; d < half; d++) {
                 float x1 = vec[d];
                 float x2 = vec[half + d];
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[d] = x1 * c[d] + (-x2) * sn[d];
                 vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
             }
 #else
             for (int d = 0; d < half; d++) {
-                float x1 = vec[d];           /* first half */
-                float x2 = vec[half + d];    /* second half */
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                float x1 = vec[d];        /* first half */
+                float x2 = vec[half + d]; /* second half */
+                vec[d] = x1 * c[d] + (-x2) * sn[d];
                 vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
             }
 #endif

@@ -28,14 +28,18 @@ EMBED_API void embed_cuda_free(embed_cuda_ctx_t *ctx);
 
 EMBED_API const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx);
 
-EMBED_API int embed_cuda_encode_into(embed_cuda_ctx_t *ctx, const int *token_ids,
-                         int n_tokens, float *out_embedding);
-EMBED_API float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids,
-                       int n_tokens);
-EMBED_API int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
-                          int batch, float *out_embeddings);
+EMBED_API int embed_cuda_encode_into(embed_cuda_ctx_t *ctx,
+                                     const int *token_ids,
+                                     int n_tokens,
+                                     float *out_embedding);
+EMBED_API float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids, int n_tokens);
+EMBED_API int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx,
+                                      const embed_input_t *inputs,
+                                      int batch,
+                                      float *out_embeddings);
 EMBED_API int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
-                                const embed_context_input_t *inputs,
-                                int batch, float *out_embeddings);
+                                            const embed_context_input_t *inputs,
+                                            int batch,
+                                            float *out_embeddings);
 
 #endif /* EMBED_CUDA_H */

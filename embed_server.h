@@ -31,7 +31,7 @@ typedef struct {
     int use_cuda;
     int mlx_quantize_bits;
     int mlx_quantize_group_size;
-    double memory_utilization;  /* fraction of physical memory the MLX
+    double memory_utilization; /* fraction of physical memory the MLX
                                    preflight may plan for; 0 = default 0.90,
                                    values above 1.0 allow overcommit */
     const char *api_key;

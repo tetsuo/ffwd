@@ -14,12 +14,12 @@
 #include <string.h>
 #include <unistd.h>
 
-static float max_abs_diff(const float *a, const float *b, int n)
-{
+static float max_abs_diff(const float *a, const float *b, int n) {
     float m = 0.0f;
     for (int i = 0; i < n; i++) {
         float d = fabsf(a[i] - b[i]);
-        if (d > m) m = d;
+        if (d > m)
+            m = d;
     }
     return m;
 }
@@ -28,11 +28,11 @@ static float max_abs_diff(const float *a, const float *b, int n)
  * results validated in main. reference is the batched row for ids0. */
 static int check_alloc_and_pooling_variants(const embed_model_t *model,
                                             embed_workspace_t *ws,
-                                            const int *ids0, int n0,
+                                            const int *ids0,
+                                            int n0,
                                             const float *states,
                                             const float *reference,
-                                            const embed_config_t *cfg)
-{
+                                            const embed_config_t *cfg) {
     int rc = 1;
     int dim = cfg->hidden_size;
     float *emb = NULL, *fwd = NULL, *pooled = NULL, *span_out = NULL;
@@ -73,22 +73,19 @@ static int check_alloc_and_pooling_variants(const embed_model_t *model,
     /* One span covering the whole sequence pools to the embedding, and
      * two halves recombine into it by token-count weighting. */
     embed_span_t whole = {0, n0};
-    if (embed_model_encode_spans(model, ws, ids0, n0, &whole, 1,
-                               span_out) != 0 ||
+    if (embed_model_encode_spans(model, ws, ids0, n0, &whole, 1, span_out) != 0 ||
         max_abs_diff(span_out, reference, dim) > 0.00005f) {
         fprintf(stderr, "whole-sequence span disagrees with embedding\n");
         goto done;
     }
     int h = n0 / 2;
     embed_span_t halves[2] = {{0, h}, {h, n0 - h}};
-    if (embed_model_encode_spans(model, ws, ids0, n0, halves, 2,
-                               span_out) != 0) {
+    if (embed_model_encode_spans(model, ws, ids0, n0, halves, 2, span_out) != 0) {
         fprintf(stderr, "embed_model_encode_spans failed for two spans\n");
         goto done;
     }
     for (int d = 0; d < dim; d++) {
-        float combined = ((float)h * span_out[d] +
-                          (float)(n0 - h) * span_out[dim + d]) / (float)n0;
+        float combined = ((float)h * span_out[d] + (float)(n0 - h) * span_out[dim + d]) / (float)n0;
         if (fabsf(combined - reference[d]) > 0.00005f) {
             fprintf(stderr, "half spans do not recombine into embedding\n");
             goto done;
@@ -108,10 +105,10 @@ done:
  * doc0 is chunks 0 and 1 joined by a separator token; doc1 is chunk 2. */
 static int check_spans_batch_parity(const embed_model_t *model,
                                     embed_workspace_t *ws,
-                                    int *const ids[], const int *ntok,
+                                    int *const ids[],
+                                    const int *ntok,
                                     int separator_id,
-                                    const embed_config_t *cfg)
-{
+                                    const embed_config_t *cfg) {
     int rc = 1;
     int dim = cfg->hidden_size;
     int n0 = ntok[0] + 1 + ntok[1];
@@ -128,10 +125,9 @@ static int check_spans_batch_parity(const embed_model_t *model,
 
     embed_span_t spans0[2] = {{0, ntok[0]}, {ntok[0] + 1, ntok[1]}};
     embed_span_t span1 = {0, ntok[2]};
-    if (embed_model_encode_spans(model, ws, doc0, n0, spans0, 2,
-                               expected) != 0 ||
+    if (embed_model_encode_spans(model, ws, doc0, n0, spans0, 2, expected) != 0 ||
         embed_model_encode_spans(model, ws, ids[2], ntok[2], &span1, 1,
-                               expected + (size_t)2 * dim) != 0) {
+                                 expected + (size_t)2 * dim) != 0) {
         fprintf(stderr, "singleton contextual embedding failed\n");
         goto done;
     }
@@ -164,8 +160,7 @@ done:
     return rc;
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     char fixture_dir[1024];
     const char *model_dir;
     if (argc == 2) {
@@ -214,12 +209,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const char *texts[] = {
-        "query: what is the capital of France?",
-        "document: Paris is the capital of France.",
-        "document: Berlin is the capital of Germany.",
-        "document: Istanbul is a major city in Turkey."
-    };
+    const char *texts[] = {"query: what is the capital of France?",
+                           "document: Paris is the capital of France.",
+                           "document: Berlin is the capital of Germany.",
+                           "document: Istanbul is a major city in Turkey."};
     const int batch = (int)(sizeof(texts) / sizeof(texts[0]));
     /* Initialized before the first `goto fail` so the cleanup loop never
      * sees indeterminate pointers. */
@@ -291,8 +284,10 @@ int main(int argc, char **argv)
         const float *row = batched + (size_t)i * dim;
         float diff = max_abs_diff(row, single, dim);
         float cos = embed_cosine_similarity(row, single, dim);
-        if (diff > worst_diff) worst_diff = diff;
-        if (cos < worst_cos) worst_cos = cos;
+        if (diff > worst_diff)
+            worst_diff = diff;
+        if (cos < worst_cos)
+            worst_cos = cos;
     }
 
     memcpy(normalized, batched, (size_t)dim * sizeof(float));
@@ -308,8 +303,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < dim; i++)
         normalized_norm_sq += normalized[i] * normalized[i];
     if (fabsf(normalized_norm_sq - 1.0f) > 0.00005f) {
-        fprintf(stderr, "embed_l2_normalize produced norm_sq=%g\n",
-                normalized_norm_sq);
+        fprintf(stderr, "embed_l2_normalize produced norm_sq=%g\n", normalized_norm_sq);
         free(states);
         free(normalized);
         free(single);
@@ -326,8 +320,8 @@ int main(int argc, char **argv)
         goto fail;
     }
 
-    if (check_alloc_and_pooling_variants(model, batch_ws, ids[0], ntok[0],
-                                         states, batched, cfg) != 0) {
+    if (check_alloc_and_pooling_variants(model, batch_ws, ids[0], ntok[0], states, batched, cfg) !=
+        0) {
         free(states);
         free(normalized);
         free(single);
@@ -338,9 +332,9 @@ int main(int argc, char **argv)
     /* Same separator resolution as the server: the fixture vocab defines
      * <|endoftext|>, real snapshots use the reserved id. */
     int sep_id = qwen_tokenizer_token_id(tok, "<|endoftext|>");
-    if (sep_id < 0) sep_id = EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
-    if (check_spans_batch_parity(model, batch_ws, ids, ntok, sep_id,
-                                 cfg) != 0) {
+    if (sep_id < 0)
+        sep_id = EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+    if (check_spans_batch_parity(model, batch_ws, ids, ntok, sep_id, cfg) != 0) {
         free(states);
         free(normalized);
         free(single);
@@ -353,24 +347,26 @@ int main(int argc, char **argv)
     free(single);
     free(batched);
 
-    for (int i = 0; i < batch; i++) free(ids[i]);
+    for (int i = 0; i < batch; i++)
+        free(ids[i]);
     qwen_tokenizer_free(tok);
     embed_workspace_free(single_ws);
     embed_workspace_free(batch_ws);
     embed_model_free(model);
 
     if (worst_diff > 0.00005f || worst_cos < 0.99999f) {
-        fprintf(stderr, "workspace API parity failed: max_abs_diff=%g cosine=%g\n",
-                worst_diff, worst_cos);
+        fprintf(stderr, "workspace API parity failed: max_abs_diff=%g cosine=%g\n", worst_diff,
+                worst_cos);
         return 1;
     }
 
-    printf("ok: workspace API dim=%d batch=%d workspace=%zu bytes max_abs_diff=%g cosine=%g\n",
-           dim, batch, batch_ws_bytes, worst_diff, worst_cos);
+    printf("ok: workspace API dim=%d batch=%d workspace=%zu bytes max_abs_diff=%g cosine=%g\n", dim,
+           batch, batch_ws_bytes, worst_diff, worst_cos);
     return 0;
 
 fail:
-    for (int i = 0; i < batch; i++) free(ids[i]);
+    for (int i = 0; i < batch; i++)
+        free(ids[i]);
     qwen_tokenizer_free(tok);
     embed_workspace_free(single_ws);
     embed_workspace_free(batch_ws);

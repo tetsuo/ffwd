@@ -15,10 +15,10 @@ extern "C" {
 #include <string.h>
 
 typedef struct {
-    float *d;       // device buffer; holds __nv_bfloat16 elements when bf16
+    float *d; // device buffer; holds __nv_bfloat16 elements when bf16
     int rows;
     int cols;
-    int bf16;       // 1 if d holds __nv_bfloat16, 0 if F32
+    int bf16; // 1 if d holds __nv_bfloat16, 0 if F32
 } cuda_matrix_t;
 
 typedef struct {
@@ -47,7 +47,7 @@ struct embed_cuda_ctx {
     float *qkv;
     float *attn_out;
     float *ffn_gate_up;
-    void *act_bf16;     // BF16 cast of a GEMM activation operand (bf16 weights)
+    void *act_bf16; // BF16 cast of a GEMM activation operand (bf16 weights)
     float *pooled_out;
     float *rope_cos;
     float *rope_sin;
@@ -58,16 +58,16 @@ struct embed_cuda_ctx {
     float *kexp;
     float *vexp;
     float *attn_scores;
-    void *attn_probs;   // BF16 softmax output (bf16 weights)
+    void *attn_probs; // BF16 softmax output (bf16 weights)
     long long attn_scores_elems;
     long long attn_probs_elems;
     // Equal-length micro-batch attention: pointer arrays for batched GEMMs,
     // built once per forward pass (layer-invariant buffer addresses).
     // attn_G is the number of sequences whose score tensors fit the scratch
     // budget at once; 0 disables the batched path for this forward.
-    const void **attn_ptrs;       // device: [K|Q|S|V|P|O] x batch x n_heads
+    const void **attn_ptrs; // device: [K|Q|S|V|P|O] x batch x n_heads
     const void **attn_ptrs_host;
-    int attn_ptrs_cap;            // capacity in pointer entries
+    int attn_ptrs_cap; // capacity in pointer entries
     int attn_G;
     int attn_L;
     int *span_starts;
@@ -83,26 +83,25 @@ enum { CUDA_ATTN_SCORES_BUDGET = 64 * 1024 * 1024 };
 // >=256; both paths are identical precision).
 enum { CUDA_ATTN_BATCHED_MAX_LEN = 192 };
 
-#define CUDA_CHECK(expr) do {                                      \
-    cudaError_t _e = (expr);                                       \
-    if (_e != cudaSuccess) {                                       \
-        fprintf(stderr, "cuda: %s failed: %s\n", #expr,            \
-                cudaGetErrorString(_e));                           \
-        return -1;                                                 \
-    }                                                             \
-} while (0)
+#define CUDA_CHECK(expr)                                                             \
+    do {                                                                             \
+        cudaError_t _e = (expr);                                                     \
+        if (_e != cudaSuccess) {                                                     \
+            fprintf(stderr, "cuda: %s failed: %s\n", #expr, cudaGetErrorString(_e)); \
+            return -1;                                                               \
+        }                                                                            \
+    } while (0)
 
-#define CUBLAS_CHECK(expr) do {                                    \
-    cublasStatus_t _s = (expr);                                    \
-    if (_s != CUBLAS_STATUS_SUCCESS) {                             \
-        fprintf(stderr, "cuda: %s failed: cublas status %d\n",     \
-                #expr, (int)_s);                                   \
-        return -1;                                                 \
-    }                                                             \
-} while (0)
+#define CUBLAS_CHECK(expr)                                                          \
+    do {                                                                            \
+        cublasStatus_t _s = (expr);                                                 \
+        if (_s != CUBLAS_STATUS_SUCCESS) {                                          \
+            fprintf(stderr, "cuda: %s failed: cublas status %d\n", #expr, (int)_s); \
+            return -1;                                                              \
+        }                                                                           \
+    } while (0)
 
-static int parse_gemm_compute(const char *mode, cublasComputeType_t *out)
-{
+static int parse_gemm_compute(const char *mode, cublasComputeType_t *out) {
     if (!mode || !mode[0] || !strcmp(mode, "f32")) {
         *out = CUBLAS_COMPUTE_32F;
         return 0;
@@ -125,8 +124,7 @@ static int parse_gemm_compute(const char *mode, cublasComputeType_t *out)
 static cublasComputeType_t g_gemm_compute = CUBLAS_COMPUTE_32F;
 static int g_gemm_compute_set = 0;
 
-int embed_cuda_set_fast_gemm(const char *mode)
-{
+int embed_cuda_set_fast_gemm(const char *mode) {
     cublasComputeType_t ct;
     if (parse_gemm_compute(mode, &ct) != 0)
         return -1;
@@ -135,15 +133,14 @@ int embed_cuda_set_fast_gemm(const char *mode)
     return 0;
 }
 
-static void cuda_matrix_free(cuda_matrix_t *m)
-{
-    if (!m) return;
+static void cuda_matrix_free(cuda_matrix_t *m) {
+    if (!m)
+        return;
     cudaFree(m->d);
     memset(m, 0, sizeof(*m));
 }
 
-static float bf16_to_f32(uint16_t v)
-{
+static float bf16_to_f32(uint16_t v) {
     uint32_t u = ((uint32_t)v) << 16;
     float f;
     memcpy(&f, &u, sizeof(f));
@@ -152,13 +149,12 @@ static float bf16_to_f32(uint16_t v)
 
 // Round F32 to BF16 (truncate the low 16 bits, round to nearest even). NaNs are
 // preserved. BF16 shares F32's 8-bit exponent, so this never overflows.
-static uint16_t f32_to_bf16(float f)
-{
+static uint16_t f32_to_bf16(float f) {
     uint32_t x;
     memcpy(&x, &f, sizeof(x));
-    if ((x & 0x7fffffffu) > 0x7f800000u)        // NaN
+    if ((x & 0x7fffffffu) > 0x7f800000u) // NaN
         return (uint16_t)((x >> 16) | 0x0040u);
-    x += 0x7fffu + ((x >> 16) & 1u);            // round to nearest even
+    x += 0x7fffu + ((x >> 16) & 1u); // round to nearest even
     return (uint16_t)(x >> 16);
 }
 
@@ -169,17 +165,15 @@ static uint16_t f32_to_bf16(float f)
 static int g_weights_bf16 = 0;
 static int g_weights_bf16_set = 0;
 
-int embed_cuda_set_weights_bf16(int on)
-{
+int embed_cuda_set_weights_bf16(int on) {
     g_weights_bf16 = on ? 1 : 0;
     g_weights_bf16_set = 1;
     return 0;
 }
 
-static int copy_weight_host_f32(float *dst, const embed_weight_ref_t *w,
-                                size_t count)
-{
-    if (!dst || !w || !w->data) return -1;
+static int copy_weight_host_f32(float *dst, const embed_weight_ref_t *w, size_t count) {
+    if (!dst || !w || !w->data)
+        return -1;
     if (w->dtype == DTYPE_F32) {
         memcpy(dst, w->data, count * sizeof(float));
         return 0;
@@ -195,13 +189,12 @@ static int copy_weight_host_f32(float *dst, const embed_weight_ref_t *w,
 
 // Upload a host F32 weight buffer to the device, as BF16 when g_weights_bf16 is
 // set (rounding each value) or as F32 otherwise. Sets m->d, rows, cols, bf16.
-static int upload_weight(cuda_matrix_t *m, const float *src, size_t count,
-                         int rows, int cols)
-{
+static int upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int cols) {
     cudaError_t e;
     if (g_weights_bf16) {
         uint16_t *tmp16 = (uint16_t *)malloc(count * sizeof(uint16_t));
-        if (!tmp16) return -1;
+        if (!tmp16)
+            return -1;
         for (size_t i = 0; i < count; i++)
             tmp16[i] = f32_to_bf16(src[i]);
         e = cudaMalloc((void **)&m->d, count * sizeof(__nv_bfloat16));
@@ -210,8 +203,7 @@ static int upload_weight(cuda_matrix_t *m, const float *src, size_t count,
             free(tmp16);
             return -1;
         }
-        e = cudaMemcpy(m->d, tmp16, count * sizeof(__nv_bfloat16),
-                       cudaMemcpyHostToDevice);
+        e = cudaMemcpy(m->d, tmp16, count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
         free(tmp16);
         m->bf16 = 1;
     } else {
@@ -233,13 +225,13 @@ static int upload_weight(cuda_matrix_t *m, const float *src, size_t count,
     return 0;
 }
 
-static int load_matrix(cuda_matrix_t *m, const embed_weight_ref_t *w,
-                       int rows, int cols)
-{
-    if (!m || !w || rows <= 0 || cols <= 0) return -1;
+static int load_matrix(cuda_matrix_t *m, const embed_weight_ref_t *w, int rows, int cols) {
+    if (!m || !w || rows <= 0 || cols <= 0)
+        return -1;
     size_t count = (size_t)rows * (size_t)cols;
     float *tmp = (float *)malloc(count * sizeof(float));
-    if (!tmp) return -1;
+    if (!tmp)
+        return -1;
     if (copy_weight_host_f32(tmp, w, count) != 0) {
         free(tmp);
         return -1;
@@ -249,17 +241,17 @@ static int load_matrix(cuda_matrix_t *m, const embed_weight_ref_t *w,
     return r;
 }
 
-static int load_qkv_matrix(cuda_matrix_t *m, const embed_layer_t *src,
-                           const embed_config_t *c)
-{
-    if (!m || !src || !c) return -1;
+static int load_qkv_matrix(cuda_matrix_t *m, const embed_layer_t *src, const embed_config_t *c) {
+    if (!m || !src || !c)
+        return -1;
     int rows = c->q_dim + 2 * c->kv_dim;
     int cols = c->hidden_size;
     size_t q_count = (size_t)c->q_dim * cols;
     size_t kv_count = (size_t)c->kv_dim * cols;
     size_t total = q_count + 2 * kv_count;
     float *tmp = (float *)malloc(total * sizeof(float));
-    if (!tmp) return -1;
+    if (!tmp)
+        return -1;
     if (copy_weight_host_f32(tmp, &src->wq, q_count) != 0 ||
         copy_weight_host_f32(tmp + q_count, &src->wk, kv_count) != 0 ||
         copy_weight_host_f32(tmp + q_count + kv_count, &src->wv, kv_count) != 0) {
@@ -271,16 +263,17 @@ static int load_qkv_matrix(cuda_matrix_t *m, const embed_layer_t *src,
     return r;
 }
 
-static int load_gate_up_matrix(cuda_matrix_t *m, const embed_layer_t *src,
-                               const embed_config_t *c)
-{
-    if (!m || !src || !c) return -1;
+static int
+load_gate_up_matrix(cuda_matrix_t *m, const embed_layer_t *src, const embed_config_t *c) {
+    if (!m || !src || !c)
+        return -1;
     int rows = 2 * c->intermediate_size;
     int cols = c->hidden_size;
     size_t proj_count = (size_t)c->intermediate_size * cols;
     size_t total = 2 * proj_count;
     float *tmp = (float *)malloc(total * sizeof(float));
-    if (!tmp) return -1;
+    if (!tmp)
+        return -1;
     if (copy_weight_host_f32(tmp, &src->gate_proj, proj_count) != 0 ||
         copy_weight_host_f32(tmp + proj_count, &src->up_proj, proj_count) != 0) {
         free(tmp);
@@ -291,9 +284,9 @@ static int load_gate_up_matrix(cuda_matrix_t *m, const embed_layer_t *src,
     return r;
 }
 
-static int load_vector(float **out, const float *src, int n)
-{
-    if (!out || !src || n <= 0) return -1;
+static int load_vector(float **out, const float *src, int n) {
+    if (!out || !src || n <= 0)
+        return -1;
     cudaError_t e = cudaMalloc((void **)out, (size_t)n * sizeof(float));
     if (e != cudaSuccess) {
         fprintf(stderr, "cudaMalloc vector failed: %s\n", cudaGetErrorString(e));
@@ -309,13 +302,12 @@ static int load_vector(float **out, const float *src, int n)
     return 0;
 }
 
-__global__ static void embed_lookup_kernel(float *x, const int *ids,
-                                           const void *emb, int emb_bf16,
-                                           int total, int hidden, int vocab)
-{
+__global__ static void embed_lookup_kernel(
+    float *x, const int *ids, const void *emb, int emb_bf16, int total, int hidden, int vocab) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int count = total * hidden;
-    if (idx >= count) return;
+    if (idx >= count)
+        return;
     int tok = idx / hidden;
     int d = idx - tok * hidden;
     int id = ids[tok];
@@ -324,20 +316,18 @@ __global__ static void embed_lookup_kernel(float *x, const int *ids,
         return;
     }
     size_t off = (size_t)id * hidden + d;
-    x[idx] = emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[off])
-                      : ((const float *)emb)[off];
+    x[idx] =
+        emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[off]) : ((const float *)emb)[off];
 }
 
 // Cast n F32 values to BF16 (used to feed BF16-weight projection GEMMs).
-__global__ static void cast_f32_to_bf16_kernel(__nv_bfloat16 *out,
-                                               const float *in, size_t n)
-{
+__global__ static void cast_f32_to_bf16_kernel(__nv_bfloat16 *out, const float *in, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2bfloat16(in[i]);
+    if (i < n)
+        out[i] = __float2bfloat16(in[i]);
 }
 
-__device__ static float block_sum(float v)
-{
+__device__ static float block_sum(float v) {
     __shared__ float partial[8];
     __shared__ float total;
     int lane = threadIdx.x & 31;
@@ -346,36 +336,32 @@ __device__ static float block_sum(float v)
 
     for (int offset = 16; offset > 0; offset >>= 1)
         v += __shfl_down_sync(0xffffffff, v, offset);
-    if (lane == 0) partial[warp] = v;
+    if (lane == 0)
+        partial[warp] = v;
     __syncthreads();
 
     if (warp == 0) {
         v = lane < warps ? partial[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
             v += __shfl_down_sync(0xffffffff, v, offset);
-        if (lane == 0) total = v;
+        if (lane == 0)
+            total = v;
     }
     __syncthreads();
     return total;
 }
 
-__device__ static inline void store_act(float *out, size_t i, float v)
-{
-    out[i] = v;
-}
+__device__ static inline void store_act(float *out, size_t i, float v) { out[i] = v; }
 
-__device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v)
-{
+__device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v) {
     out[i] = __float2bfloat16(v);
 }
 
 // OUT_T is float, or __nv_bfloat16 when the result feeds a BF16-weight
 // projection GEMM directly (same rounding as a separate cast kernel).
 template <typename OUT_T>
-__global__ static void rms_norm_kernel(OUT_T *out, const float *x,
-                                       const float *weight, int rows,
-                                       int dim, float eps)
-{
+__global__ static void
+rms_norm_kernel(OUT_T *out, const float *x, const float *weight, int rows, int dim, float eps) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
     float sum = 0.0f;
@@ -386,24 +372,25 @@ __global__ static void rms_norm_kernel(OUT_T *out, const float *x,
     float total = block_sum(sum);
     float inv = rsqrtf(total / (float)dim + eps);
     for (int d = tid; d < dim; d += blockDim.x)
-        store_act(out, (size_t)row * dim + d,
-                  x[(size_t)row * dim + d] * inv * weight[d]);
+        store_act(out, (size_t)row * dim + d, x[(size_t)row * dim + d] * inv * weight[d]);
 }
 
 // One grid covers Q and K: blockIdx.y < n_heads selects the Q head with
 // q_norm/q_offset, the remaining blocks the K head with k_norm/k_offset.
-__global__ static void rms_norm_rope_qk_kernel(float *x, const float *q_norm,
+__global__ static void rms_norm_rope_qk_kernel(float *x,
+                                               const float *q_norm,
                                                const float *k_norm,
                                                const int *positions,
                                                const float *cosv,
                                                const float *sinv,
-                                               int rows, int n_heads,
+                                               int rows,
+                                               int n_heads,
                                                int n_kv_heads,
                                                int head_dim,
                                                int row_stride,
-                                               int q_offset, int k_offset,
-                                               float eps)
-{
+                                               int q_offset,
+                                               int k_offset,
+                                               float eps) {
     __shared__ float partial[4];
     __shared__ float total;
     int row = blockIdx.x;
@@ -416,7 +403,8 @@ __global__ static void rms_norm_rope_qk_kernel(float *x, const float *q_norm,
     float sign = tid < half ? -1.0f : 1.0f;
     const float *weight = head < n_heads ? q_norm : k_norm;
     int base_offset = head < n_heads ? q_offset : k_offset;
-    if (head >= n_heads) head -= n_heads;
+    if (head >= n_heads)
+        head -= n_heads;
     size_t base = (size_t)row * row_stride + base_offset + head * head_dim;
     float v = tid < head_dim ? x[base + tid] : 0.0f;
     float pair_v = tid < head_dim ? x[base + pair_d] : 0.0f;
@@ -424,13 +412,15 @@ __global__ static void rms_norm_rope_qk_kernel(float *x, const float *q_norm,
 
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
-    if (lane == 0) partial[warp] = sum;
+    if (lane == 0)
+        partial[warp] = sum;
     __syncthreads();
     if (warp == 0) {
         sum = lane < 4 ? partial[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(0xffffffff, sum, offset);
-        if (lane == 0) total = sum;
+        if (lane == 0)
+            total = sum;
     }
     __syncthreads();
 
@@ -449,10 +439,8 @@ __global__ static void rms_norm_rope_qk_kernel(float *x, const float *q_norm,
 // over the gate half (out = gate_up, out_stride = 2*intermediate); the BF16
 // path writes a packed [rows x intermediate] BF16 matrix for the down GEMM.
 template <typename OUT_T>
-__global__ static void silu_mul_packed_kernel(OUT_T *out, int out_stride,
-                                              const float *gate_up, int rows,
-                                              int intermediate)
-{
+__global__ static void silu_mul_packed_kernel(
+    OUT_T *out, int out_stride, const float *gate_up, int rows, int intermediate) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int n = rows * intermediate;
     if (i < n) {
@@ -461,8 +449,7 @@ __global__ static void silu_mul_packed_kernel(OUT_T *out, int out_stride,
         size_t base = (size_t)row * (2 * intermediate);
         float g = gate_up[base + d];
         float u = gate_up[base + intermediate + d];
-        store_act(out, (size_t)row * out_stride + d,
-                  (g / (1.0f + expf(-g))) * u);
+        store_act(out, (size_t)row * out_stride + d, (g / (1.0f + expf(-g))) * u);
     }
 }
 
@@ -471,14 +458,21 @@ __global__ static void silu_mul_packed_kernel(OUT_T *out, int out_stride,
 // so the attention GEMMs can stride uniformly over query heads.
 // V_T is float, or __nv_bfloat16 when V feeds a BF16 @V GEMM directly.
 template <typename V_T>
-__global__ static void attn_expand_kv_kernel(
-    float *kexp, V_T *vexp, const float *qkv, int total, int n_heads,
-    int n_kv_heads, int head_dim, int qkv_dim, int k_offset, int v_offset)
-{
+__global__ static void attn_expand_kv_kernel(float *kexp,
+                                             V_T *vexp,
+                                             const float *qkv,
+                                             int total,
+                                             int n_heads,
+                                             int n_kv_heads,
+                                             int head_dim,
+                                             int qkv_dim,
+                                             int k_offset,
+                                             int v_offset) {
     int q_dim = n_heads * head_dim;
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t count = (size_t)total * q_dim;
-    if (idx >= count) return;
+    if (idx >= count)
+        return;
     int t = (int)(idx / q_dim);
     int rem = (int)(idx - (size_t)t * q_dim);
     int h = rem / head_dim;
@@ -495,19 +489,20 @@ __global__ static void attn_expand_kv_kernel(
 // P_T is float with probs == scores (in place), or __nv_bfloat16 when the
 // probabilities feed a BF16 @V GEMM.
 template <typename P_T>
-__global__ static void attn_softmax_kernel(float *scores, P_T *probs, int L)
-{
+__global__ static void attn_softmax_kernel(float *scores, P_T *probs, int L) {
     float *s = scores + (size_t)blockIdx.x * L;
     P_T *p = probs + (size_t)blockIdx.x * L;
     int tid = threadIdx.x;
     __shared__ float red[256];
 
     float m = -3.402823466e+38F;
-    for (int j = tid; j < L; j += blockDim.x) m = fmaxf(m, s[j]);
+    for (int j = tid; j < L; j += blockDim.x)
+        m = fmaxf(m, s[j]);
     red[tid] = m;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+        if (tid < o)
+            red[tid] = fmaxf(red[tid], red[tid + o]);
         __syncthreads();
     }
     m = red[0];
@@ -522,7 +517,8 @@ __global__ static void attn_softmax_kernel(float *scores, P_T *probs, int L)
     red[tid] = sum;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if (tid < o) red[tid] += red[tid + o];
+        if (tid < o)
+            red[tid] += red[tid + o];
         __syncthreads();
     }
     float inv = 1.0f / red[0];
@@ -531,9 +527,7 @@ __global__ static void attn_softmax_kernel(float *scores, P_T *probs, int L)
 }
 
 template <typename P_T>
-__global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs,
-                                                   int L)
-{
+__global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs, int L) {
     float *s = scores + (size_t)blockIdx.x * L;
     P_T *p = probs + (size_t)blockIdx.x * L;
     int query = blockIdx.x % L;
@@ -542,11 +536,13 @@ __global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs,
     __shared__ float red[256];
 
     float m = -3.402823466e+38F;
-    for (int j = tid; j < keys; j += blockDim.x) m = fmaxf(m, s[j]);
+    for (int j = tid; j < keys; j += blockDim.x)
+        m = fmaxf(m, s[j]);
     red[tid] = m;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+        if (tid < o)
+            red[tid] = fmaxf(red[tid], red[tid + o]);
         __syncthreads();
     }
     m = red[0];
@@ -561,7 +557,8 @@ __global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs,
     red[tid] = sum;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if (tid < o) red[tid] += red[tid + o];
+        if (tid < o)
+            red[tid] += red[tid + o];
         __syncthreads();
     }
     float inv = 1.0f / red[0];
@@ -569,10 +566,8 @@ __global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs,
         store_act(p, (size_t)j, j < keys ? s[j] * inv : 0.0f);
 }
 
-__global__ static void mean_pool_kernel(float *out, const float *x,
-                                        const int *offsets, int batch,
-                                        int hidden)
-{
+__global__ static void
+mean_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int start = offsets[b];
@@ -586,10 +581,8 @@ __global__ static void mean_pool_kernel(float *out, const float *x,
     }
 }
 
-__global__ static void last_pool_kernel(float *out, const float *x,
-                                        const int *offsets, int batch,
-                                        int hidden)
-{
+__global__ static void
+last_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int last = offsets[b + 1] - 1;
@@ -597,10 +590,8 @@ __global__ static void last_pool_kernel(float *out, const float *x,
         out[(size_t)b * hidden + d] = x[(size_t)last * hidden + d];
 }
 
-__global__ static void span_pool_kernel(float *out, const float *x,
-                                        const int *starts, const int *lens,
-                                        int n_spans, int hidden)
-{
+__global__ static void span_pool_kernel(
+    float *out, const float *x, const int *starts, const int *lens, int n_spans, int hidden) {
     int s = blockIdx.x;
     int tid = threadIdx.x;
     int start = starts[s];
@@ -613,8 +604,7 @@ __global__ static void span_pool_kernel(float *out, const float *x,
     }
 }
 
-static int launch_check(void)
-{
+static int launch_check(void) {
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "cuda kernel failed: %s\n", cudaGetErrorString(e));
@@ -627,8 +617,7 @@ static int launch_check(void)
 // EMBED_CUDA_GEMM_MODE={bf16,tf32,16f} selects a reduced-precision tensor-core
 // matmul that keeps F32 inputs/outputs and F32 accumulation but rounds operands
 // internally.
-static cublasComputeType_t gemm_compute(void)
-{
+static cublasComputeType_t gemm_compute(void) {
     static int env_init = 0;
     if (!g_gemm_compute_set && !env_init) {
         const char *e = getenv("EMBED_CUDA_GEMM_MODE");
@@ -644,80 +633,100 @@ static cublasComputeType_t gemm_compute(void)
 // already produced in BF16 by the upstream kernel, otherwise the F32 operand
 // is cast into ctx->act_bf16 first. With F32 weights this is the exact path,
 // honoring gemm_compute().
-static int linear_ex(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                     const void *x, int x_is_bf16, float *y, int rows,
-                     int in_dim, int out_dim, int x_stride, float beta)
-{
+static int linear_ex(embed_cuda_ctx_t *ctx,
+                     const cuda_matrix_t *w,
+                     const void *x,
+                     int x_is_bf16,
+                     float *y,
+                     int rows,
+                     int in_dim,
+                     int out_dim,
+                     int x_stride,
+                     float beta) {
     const float alpha = 1.0f;
     if (w->bf16) {
         const void *xb = x;
         if (!x_is_bf16) {
             size_t n = (size_t)rows * (size_t)x_stride;
             int threads = 256;
-            cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0,
-                                      ctx->stream>>>(
+            cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(
                 (__nv_bfloat16 *)ctx->act_bf16, (const float *)x, n);
-            if (launch_check() != 0) return -1;
+            if (launch_check() != 0)
+                return -1;
             xb = ctx->act_bf16;
         }
-        CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                  out_dim, rows, in_dim,
-                                  &alpha, w->d, CUDA_R_16BF, in_dim,
-                                  xb, CUDA_R_16BF, x_stride,
-                                  &beta, y, CUDA_R_32F, out_dim,
-                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim,
+                                  &alpha, w->d, CUDA_R_16BF, in_dim, xb, CUDA_R_16BF, x_stride,
+                                  &beta, y, CUDA_R_32F, out_dim, CUBLAS_COMPUTE_32F,
+                                  CUBLAS_GEMM_DEFAULT));
         return 0;
     }
-    CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                              out_dim, rows, in_dim,
-                              &alpha, w->d, CUDA_R_32F, in_dim,
-                              x, CUDA_R_32F, x_stride,
-                              &beta, y, CUDA_R_32F, out_dim,
-                              gemm_compute(), CUBLAS_GEMM_DEFAULT));
+    CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim, &alpha,
+                              w->d, CUDA_R_32F, in_dim, x, CUDA_R_32F, x_stride, &beta, y,
+                              CUDA_R_32F, out_dim, gemm_compute(), CUBLAS_GEMM_DEFAULT));
     return 0;
 }
 
-static int linear(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                  const float *x, float *y, int rows, int in_dim, int out_dim)
-{
+static int linear(embed_cuda_ctx_t *ctx,
+                  const cuda_matrix_t *w,
+                  const float *x,
+                  float *y,
+                  int rows,
+                  int in_dim,
+                  int out_dim) {
     return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 0.0f);
 }
 
 // x points at activations already stored as BF16 (e.g. ctx->act_bf16).
-static int linear_bf16x(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                        const void *x, float *y, int rows, int in_dim,
-                        int out_dim, int x_stride, float beta)
-{
+static int linear_bf16x(embed_cuda_ctx_t *ctx,
+                        const cuda_matrix_t *w,
+                        const void *x,
+                        float *y,
+                        int rows,
+                        int in_dim,
+                        int out_dim,
+                        int x_stride,
+                        float beta) {
     return linear_ex(ctx, w, x, 1, y, rows, in_dim, out_dim, x_stride, beta);
 }
 
-static int linear_accum(embed_cuda_ctx_t *ctx, const cuda_matrix_t *w,
-                        const float *x, float *y,
-                        int rows, int in_dim, int out_dim)
-{
+static int linear_accum(embed_cuda_ctx_t *ctx,
+                        const cuda_matrix_t *w,
+                        const float *x,
+                        float *y,
+                        int rows,
+                        int in_dim,
+                        int out_dim) {
     return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
-static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
-                                cublasOperation_t transb, int m, int n, int k,
-                                const float *alpha, const float *A, int lda,
-                                long long strideA, const float *B, int ldb,
-                                long long strideB, const float *beta,
-                                float *C, int ldc, long long strideC,
-                                int batch_count)
-{
+static int gemm_strided_batched(cublasHandle_t blas,
+                                cublasOperation_t transa,
+                                cublasOperation_t transb,
+                                int m,
+                                int n,
+                                int k,
+                                const float *alpha,
+                                const float *A,
+                                int lda,
+                                long long strideA,
+                                const float *B,
+                                int ldb,
+                                long long strideB,
+                                const float *beta,
+                                float *C,
+                                int ldc,
+                                long long strideC,
+                                int batch_count) {
     cublasComputeType_t ct = gemm_compute();
     if (ct == CUBLAS_COMPUTE_32F) {
-        CUBLAS_CHECK(cublasSgemmStridedBatched(
-            blas, transa, transb, m, n, k, alpha, A, lda, strideA, B, ldb,
-            strideB, beta, C, ldc, strideC, batch_count));
+        CUBLAS_CHECK(cublasSgemmStridedBatched(blas, transa, transb, m, n, k, alpha, A, lda,
+                                               strideA, B, ldb, strideB, beta, C, ldc, strideC,
+                                               batch_count));
     } else {
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-            blas, transa, transb, m, n, k,
-            alpha, A, CUDA_R_32F, lda, strideA,
-            B, CUDA_R_32F, ldb, strideB,
-            beta, C, CUDA_R_32F, ldc, strideC,
-            batch_count, ct, CUBLAS_GEMM_DEFAULT));
+            blas, transa, transb, m, n, k, alpha, A, CUDA_R_32F, lda, strideA, B, CUDA_R_32F, ldb,
+            strideB, beta, C, CUDA_R_32F, ldc, strideC, batch_count, ct, CUBLAS_GEMM_DEFAULT));
     }
     return 0;
 }
@@ -733,22 +742,26 @@ static int gemm_strided_batched(cublasHandle_t blas, cublasOperation_t transa,
 // layer-invariant). attn_G stays 0 - per-sequence fallback - for ragged
 // batches, single sequences, or when one sequence's scores exceed the
 // budget.
-static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
-                              int qkv_dim)
-{
+static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim) {
     const embed_config_t *c = &ctx->config;
     ctx->attn_G = 0;
-    if (batch < 2) return 0;
+    if (batch < 2)
+        return 0;
     int L = ctx->offsets_host[1] - ctx->offsets_host[0];
-    if (L > CUDA_ATTN_BATCHED_MAX_LEN) return 0;
+    if (L > CUDA_ATTN_BATCHED_MAX_LEN)
+        return 0;
     for (int b = 1; b < batch; b++)
-        if (ctx->offsets_host[b + 1] - ctx->offsets_host[b] != L) return 0;
+        if (ctx->offsets_host[b + 1] - ctx->offsets_host[b] != L)
+            return 0;
     int H = c->n_heads, hd = c->head_dim, q_dim = c->q_dim;
     long long per = (long long)H * L * L;
-    if (per <= 0 || per > CUDA_ATTN_SCORES_BUDGET / 2) return 0;
+    if (per <= 0 || per > CUDA_ATTN_SCORES_BUDGET / 2)
+        return 0;
     int G = (int)(CUDA_ATTN_SCORES_BUDGET / per);
-    if (G > batch) G = batch;
-    if (G < 2) return 0;
+    if (G > batch)
+        G = batch;
+    if (G < 2)
+        return 0;
 
     int bf16 = g_weights_bf16;
     long long want = (long long)G * per;
@@ -756,16 +769,14 @@ static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
         cudaFree(ctx->attn_scores);
         ctx->attn_scores = NULL;
         ctx->attn_scores_elems = 0;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
-                              (size_t)want * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)want * sizeof(float)));
         ctx->attn_scores_elems = want;
     }
     if (bf16 && want > ctx->attn_probs_elems) {
         cudaFree(ctx->attn_probs);
         ctx->attn_probs = NULL;
         ctx->attn_probs_elems = 0;
-        CUDA_CHECK(cudaMalloc(&ctx->attn_probs,
-                              (size_t)want * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)want * sizeof(__nv_bfloat16)));
         ctx->attn_probs_elems = want;
     }
 
@@ -775,11 +786,10 @@ static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
         free((void *)ctx->attn_ptrs_host);
         ctx->attn_ptrs = NULL;
         ctx->attn_ptrs_cap = 0;
-        ctx->attn_ptrs_host =
-            (const void **)malloc((size_t)entries * sizeof(void *));
-        if (!ctx->attn_ptrs_host) return -1;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_ptrs,
-                              (size_t)entries * sizeof(void *)));
+        ctx->attn_ptrs_host = (const void **)malloc((size_t)entries * sizeof(void *));
+        if (!ctx->attn_ptrs_host)
+            return -1;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_ptrs, (size_t)entries * sizeof(void *)));
         ctx->attn_ptrs_cap = entries;
     }
 
@@ -813,8 +823,7 @@ static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
         }
     }
     CUDA_CHECK(cudaMemcpy((void *)ctx->attn_ptrs, ctx->attn_ptrs_host,
-                          (size_t)entries * sizeof(void *),
-                          cudaMemcpyHostToDevice));
+                          (size_t)entries * sizeof(void *), cudaMemcpyHostToDevice));
     ctx->attn_G = G;
     ctx->attn_L = L;
     return 0;
@@ -823,11 +832,15 @@ static int attn_batched_setup(embed_cuda_ctx_t *ctx, int batch, int q_offset,
 // out_bf16 != NULL selects the BF16-weight layout: V and the softmax
 // probabilities are stored BF16 and the @V GEMM emits BF16 attention output
 // at out_bf16 (stride q_dim), ready for the wo projection without a cast.
-static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
-                               int batch, int q_offset, int k_offset,
-                               int v_offset, int qkv_dim, float scale,
-                               __nv_bfloat16 *out_bf16)
-{
+static int cuda_attention_gemm(embed_cuda_ctx_t *ctx,
+                               const int *h_offsets,
+                               int batch,
+                               int q_offset,
+                               int k_offset,
+                               int v_offset,
+                               int qkv_dim,
+                               float scale,
+                               __nv_bfloat16 *out_bf16) {
     const embed_config_t *c = &ctx->config;
     int q_dim = c->q_dim;
     int hd = c->head_dim;
@@ -839,17 +852,16 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
     if (out_bf16) {
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads,
-                                0, ctx->stream>>>(
-            ctx->kexp, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H,
-            c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            ctx->kexp, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim,
+            k_offset, v_offset);
     } else {
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads,
-                                0, ctx->stream>>>(
-            ctx->kexp, ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd,
-            qkv_dim, k_offset, v_offset);
+        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            ctx->kexp, ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim, k_offset,
+            v_offset);
     }
-    if (launch_check() != 0) return -1;
+    if (launch_check() != 0)
+        return -1;
 
     if (ctx->attn_G >= 2) {
         int G = ctx->attn_G, L = ctx->attn_L;
@@ -860,44 +872,37 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
         const void *const *P = V + (size_t)batch * H;
         void *const *O = (void *const *)(P + (size_t)batch * H);
         cudaDataType pv = out_bf16 ? CUDA_R_16BF : CUDA_R_32F;
-        cublasComputeType_t av_ct =
-            out_bf16 ? CUBLAS_COMPUTE_32F : gemm_compute();
+        cublasComputeType_t av_ct = out_bf16 ? CUBLAS_COMPUTE_32F : gemm_compute();
         for (int s = 0; s < batch; s += G) {
             int g = batch - s < G ? batch - s : G;
             int n = g * H;
             size_t off = (size_t)s * H;
             /* scores = scale * Q @ K^T, batched over (seq, head) */
-            CUBLAS_CHECK(cublasGemmBatchedEx(
-                ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
-                &alpha, K + off, CUDA_R_32F, q_dim,
-                Q + off, CUDA_R_32F, qkv_dim,
-                &beta, S + off, CUDA_R_32F, L,
-                n, gemm_compute(), CUBLAS_GEMM_DEFAULT));
+            CUBLAS_CHECK(cublasGemmBatchedEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd, &alpha,
+                                             K + off, CUDA_R_32F, q_dim, Q + off, CUDA_R_32F,
+                                             qkv_dim, &beta, S + off, CUDA_R_32F, L, n,
+                                             gemm_compute(), CUBLAS_GEMM_DEFAULT));
             if (out_bf16) {
                 if (causal)
                     attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                        ctx->attn_scores,
-                        (__nv_bfloat16 *)ctx->attn_probs, L);
+                        ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
                 else
                     attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                        ctx->attn_scores,
-                        (__nv_bfloat16 *)ctx->attn_probs, L);
+                        ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
             } else {
                 if (causal)
-                    attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                        ctx->attn_scores, ctx->attn_scores, L);
+                    attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(ctx->attn_scores,
+                                                                               ctx->attn_scores, L);
                 else
-                    attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
-                        ctx->attn_scores, ctx->attn_scores, L);
+                    attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(ctx->attn_scores,
+                                                                        ctx->attn_scores, L);
             }
-            if (launch_check() != 0) return -1;
+            if (launch_check() != 0)
+                return -1;
             /* O = P @ V, batched over (seq, head) */
-            CUBLAS_CHECK(cublasGemmBatchedEx(
-                ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
-                &one, V + off, pv, q_dim,
-                P + off, pv, L,
-                &beta, O + off, pv, q_dim,
-                n, av_ct, CUBLAS_GEMM_DEFAULT));
+            CUBLAS_CHECK(cublasGemmBatchedEx(ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one,
+                                             V + off, pv, q_dim, P + off, pv, L, &beta, O + off, pv,
+                                             q_dim, n, av_ct, CUBLAS_GEMM_DEFAULT));
         }
         return 0;
     }
@@ -908,53 +913,47 @@ static int cuda_attention_gemm(embed_cuda_ctx_t *ctx, const int *h_offsets,
         const float *Q = ctx->qkv + (size_t)start * qkv_dim + q_offset;
         const float *K = ctx->kexp + (size_t)start * q_dim;
         /* scores[h] = scale * Q[h] @ K[h]^T  (row-major C = A @ B^T) */
-        if (gemm_strided_batched(
-                ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd,
-                &alpha, K, q_dim, hd, Q, qkv_dim, hd,
-                &beta, ctx->attn_scores, L, (long long)L * L, H) != 0)
+        if (gemm_strided_batched(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd, &alpha, K, q_dim,
+                                 hd, Q, qkv_dim, hd, &beta, ctx->attn_scores, L, (long long)L * L,
+                                 H) != 0)
             return -1;
         if (out_bf16) {
             __nv_bfloat16 *P = (__nv_bfloat16 *)ctx->attn_probs;
-            const __nv_bfloat16 *V =
-                (const __nv_bfloat16 *)ctx->vexp + (size_t)start * q_dim;
+            const __nv_bfloat16 *V = (const __nv_bfloat16 *)ctx->vexp + (size_t)start * q_dim;
             __nv_bfloat16 *O = out_bf16 + (size_t)start * q_dim;
             if (causal)
-                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, P, L);
+                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores, P, L);
             else
-                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, P, L);
-            if (launch_check() != 0) return -1;
+                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores, P, L);
+            if (launch_check() != 0)
+                return -1;
             /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
             CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-                ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
-                &one, V, CUDA_R_16BF, q_dim, hd,
-                P, CUDA_R_16BF, L, (long long)L * L,
-                &beta, O, CUDA_R_16BF, q_dim, hd,
-                H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one, V, CUDA_R_16BF, q_dim, hd, P,
+                CUDA_R_16BF, L, (long long)L * L, &beta, O, CUDA_R_16BF, q_dim, hd, H,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         } else {
             const float *V = ctx->vexp + (size_t)start * q_dim;
             float *O = ctx->attn_out + (size_t)start * q_dim;
             if (causal)
-                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, ctx->attn_scores, L);
+                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores,
+                                                                           ctx->attn_scores, L);
             else
-                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
-                    ctx->attn_scores, ctx->attn_scores, L);
-            if (launch_check() != 0) return -1;
+                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores,
+                                                                    ctx->attn_scores, L);
+            if (launch_check() != 0)
+                return -1;
             /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
-            if (gemm_strided_batched(
-                    ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
-                    &one, V, q_dim, hd, ctx->attn_scores, L,
-                    (long long)L * L, &beta, O, q_dim, hd, H) != 0)
+            if (gemm_strided_batched(ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one, V, q_dim,
+                                     hd, ctx->attn_scores, L, (long long)L * L, &beta, O, q_dim, hd,
+                                     H) != 0)
                 return -1;
         }
     }
     return 0;
 }
 
-static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_seq)
-{
+static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_seq) {
     const embed_config_t *c = &ctx->config;
     if (total > ctx->seq_cap) {
         cudaFree(ctx->x);
@@ -972,9 +971,11 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
         ctx->token_ids = ctx->positions = NULL;
         ctx->kexp = ctx->vexp = NULL;
         ctx->act_bf16 = NULL;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->x,        (size_t)total * c->hidden_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm,   (size_t)total * c->hidden_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,      (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->x, (size_t)total * c->hidden_size * sizeof(float)));
+        CUDA_CHECK(
+            cudaMalloc((void **)&ctx->x_norm, (size_t)total * c->hidden_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,
+                              (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate_up,
                               (size_t)total * 2 * c->intermediate_size * sizeof(float)));
@@ -983,8 +984,8 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
         if (g_weights_bf16)
-            CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
-                                  (size_t)total * 2 * c->intermediate_size * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&ctx->act_bf16, (size_t)total * 2 * c->intermediate_size *
+                                                      sizeof(__nv_bfloat16)));
         ctx->seq_cap = total;
     }
     if (batch + 1 > ctx->batch_cap) {
@@ -992,7 +993,8 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
         free(ctx->offsets_host);
         CUDA_CHECK(cudaMalloc((void **)&ctx->offsets, (size_t)(batch + 1) * sizeof(int)));
         ctx->offsets_host = (int *)malloc((size_t)(batch + 1) * sizeof(int));
-        if (!ctx->offsets_host) return -1;
+        if (!ctx->offsets_host)
+            return -1;
         ctx->batch_cap = batch + 1;
     }
     if (max_seq > ctx->max_seq_cap) {
@@ -1003,17 +1005,14 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
             cudaFree(ctx->attn_scores);
             ctx->attn_scores = NULL;
             ctx->attn_scores_elems = 0;
-            CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores,
-                                  (size_t)score_elems * sizeof(float)));
+            CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)score_elems * sizeof(float)));
             ctx->attn_scores_elems = score_elems;
         }
         if (g_weights_bf16 && score_elems > ctx->attn_probs_elems) {
             cudaFree(ctx->attn_probs);
             ctx->attn_probs = NULL;
             ctx->attn_probs_elems = 0;
-            CUDA_CHECK(cudaMalloc(&ctx->attn_probs,
-                                  (size_t)score_elems *
-                                      sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)score_elems * sizeof(__nv_bfloat16)));
             ctx->attn_probs_elems = score_elems;
         }
         float *hcos = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
@@ -1026,8 +1025,7 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
         int half = c->head_dim / 2;
         for (int pos = 0; pos < max_seq; pos++) {
             for (int d = 0; d < half; d++) {
-                float inv = 1.0f / powf(c->rope_theta,
-                                        (float)(2 * d) / (float)c->head_dim);
+                float inv = 1.0f / powf(c->rope_theta, (float)(2 * d) / (float)c->head_dim);
                 float angle = (float)pos * inv;
                 float cv = cosf(angle);
                 float sv = sinf(angle);
@@ -1037,10 +1035,10 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
                 hsin[(size_t)pos * c->head_dim + half + d] = sv;
             }
         }
-        CUDA_CHECK(cudaMalloc((void **)&ctx->rope_cos,
-                              (size_t)max_seq * c->head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->rope_sin,
-                              (size_t)max_seq * c->head_dim * sizeof(float)));
+        CUDA_CHECK(
+            cudaMalloc((void **)&ctx->rope_cos, (size_t)max_seq * c->head_dim * sizeof(float)));
+        CUDA_CHECK(
+            cudaMalloc((void **)&ctx->rope_sin, (size_t)max_seq * c->head_dim * sizeof(float)));
         CUDA_CHECK(cudaMemcpyAsync(ctx->rope_cos, hcos,
                                    (size_t)max_seq * c->head_dim * sizeof(float),
                                    cudaMemcpyHostToDevice, ctx->stream));
@@ -1054,50 +1052,43 @@ static int ensure_buffers(embed_cuda_ctx_t *ctx, int total, int batch, int max_s
     return 0;
 }
 
-static int ensure_pooled_rows(embed_cuda_ctx_t *ctx, int rows)
-{
-    if (rows <= ctx->pooled_rows_cap) return 0;
+static int ensure_pooled_rows(embed_cuda_ctx_t *ctx, int rows) {
+    if (rows <= ctx->pooled_rows_cap)
+        return 0;
     const embed_config_t *c = &ctx->config;
     cudaFree(ctx->pooled_out);
     ctx->pooled_out = NULL;
-    CUDA_CHECK(cudaMalloc((void **)&ctx->pooled_out,
-                          (size_t)rows * c->hidden_size * sizeof(float)));
+    CUDA_CHECK(
+        cudaMalloc((void **)&ctx->pooled_out, (size_t)rows * c->hidden_size * sizeof(float)));
     ctx->pooled_rows_cap = rows;
     return 0;
 }
 
-static int ensure_span_buffers(embed_cuda_ctx_t *ctx, int n_spans)
-{
-    if (n_spans <= ctx->span_cap) return 0;
+static int ensure_span_buffers(embed_cuda_ctx_t *ctx, int n_spans) {
+    if (n_spans <= ctx->span_cap)
+        return 0;
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
     ctx->span_starts = NULL;
     ctx->span_lens = NULL;
-    CUDA_CHECK(cudaMalloc((void **)&ctx->span_starts,
-                          (size_t)n_spans * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void **)&ctx->span_lens,
-                          (size_t)n_spans * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void **)&ctx->span_starts, (size_t)n_spans * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void **)&ctx->span_lens, (size_t)n_spans * sizeof(int)));
     ctx->span_cap = n_spans;
     return 0;
 }
 
-static int load_layer(cuda_layer_t *dst, const embed_layer_t *src,
-                      const embed_config_t *c)
-{
-    return
-        load_qkv_matrix(&dst->qkv, src, c) ||
-        load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
-        load_vector(&dst->q_norm, src->q_norm, c->head_dim) ||
-        load_vector(&dst->k_norm, src->k_norm, c->head_dim) ||
-        load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
-        load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
-        load_gate_up_matrix(&dst->gate_up_proj, src, c) ||
-        load_matrix(&dst->down_proj, &src->down_proj,
-                    c->hidden_size, c->intermediate_size);
+static int load_layer(cuda_layer_t *dst, const embed_layer_t *src, const embed_config_t *c) {
+    return load_qkv_matrix(&dst->qkv, src, c) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
+           load_vector(&dst->q_norm, src->q_norm, c->head_dim) ||
+           load_vector(&dst->k_norm, src->k_norm, c->head_dim) ||
+           load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
+           load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
+           load_gate_up_matrix(&dst->gate_up_proj, src, c) ||
+           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size);
 }
 
-static void free_layer(cuda_layer_t *l)
-{
+static void free_layer(cuda_layer_t *l) {
     cuda_matrix_free(&l->qkv);
     cuda_matrix_free(&l->wo);
     cudaFree(l->q_norm);
@@ -1108,10 +1099,10 @@ static void free_layer(cuda_layer_t *l)
     cuda_matrix_free(&l->down_proj);
 }
 
-embed_cuda_ctx_t *embed_cuda_load(const char *model_dir)
-{
+embed_cuda_ctx_t *embed_cuda_load(const char *model_dir) {
     embed_model_t *cpu = embed_model_load(model_dir);
-    if (!cpu) return NULL;
+    if (!cpu)
+        return NULL;
 
     embed_cuda_ctx_t *ctx = (embed_cuda_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx) {
@@ -1144,8 +1135,8 @@ embed_cuda_ctx_t *embed_cuda_load(const char *model_dir)
         embed_cuda_free(ctx);
         return NULL;
     }
-    if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens,
-                    c->vocab_size, c->hidden_size) != 0 ||
+    if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size,
+                    c->hidden_size) != 0 ||
         load_vector(&ctx->norm, cpu->weights.norm, c->hidden_size) != 0) {
         embed_cuda_free(ctx);
         return NULL;
@@ -1161,9 +1152,9 @@ embed_cuda_ctx_t *embed_cuda_load(const char *model_dir)
     return ctx;
 }
 
-void embed_cuda_free(embed_cuda_ctx_t *ctx)
-{
-    if (!ctx) return;
+void embed_cuda_free(embed_cuda_ctx_t *ctx) {
+    if (!ctx)
+        return;
     cuda_matrix_free(&ctx->embed_tokens);
     if (ctx->layers) {
         for (int i = 0; i < ctx->config.n_layers; i++)
@@ -1192,24 +1183,25 @@ void embed_cuda_free(embed_cuda_ctx_t *ctx)
     free((void *)ctx->attn_ptrs_host);
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
-    if (ctx->blas) cublasDestroy(ctx->blas);
-    if (ctx->stream) cudaStreamDestroy(ctx->stream);
+    if (ctx->blas)
+        cublasDestroy(ctx->blas);
+    if (ctx->stream)
+        cudaStreamDestroy(ctx->stream);
     embed_model_free(ctx->cpu);
     free(ctx);
 }
 
-const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx)
-{
+const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx) {
     return ctx ? &ctx->config : NULL;
 }
 
-static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
-                              int batch)
-{
-    if (!ctx || !inputs || batch <= 0) return -1;
+static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs, int batch) {
+    if (!ctx || !inputs || batch <= 0)
+        return -1;
     const embed_config_t *c = &ctx->config;
     int *h_offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
-    if (!h_offsets) return -1;
+    if (!h_offsets)
+        return -1;
     int total = 0, max_seq = 0;
     for (int b = 0; b < batch; b++) {
         if (!inputs[b].ids || inputs[b].n_tokens <= 0) {
@@ -1218,40 +1210,43 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
         }
         h_offsets[b] = total;
         total += inputs[b].n_tokens;
-        if (inputs[b].n_tokens > max_seq) max_seq = inputs[b].n_tokens;
+        if (inputs[b].n_tokens > max_seq)
+            max_seq = inputs[b].n_tokens;
     }
     h_offsets[batch] = total;
     int *h_ids = (int *)malloc((size_t)total * sizeof(int));
     int *h_pos = (int *)malloc((size_t)total * sizeof(int));
     if (!h_offsets || !h_ids || !h_pos) {
-        free(h_offsets); free(h_ids); free(h_pos);
+        free(h_offsets);
+        free(h_ids);
+        free(h_pos);
         return -1;
     }
 
     for (int b = 0; b < batch; b++) {
         int off = h_offsets[b];
-        memcpy(h_ids + off, inputs[b].ids,
-               (size_t)inputs[b].n_tokens * sizeof(int));
+        memcpy(h_ids + off, inputs[b].ids, (size_t)inputs[b].n_tokens * sizeof(int));
         for (int i = 0; i < inputs[b].n_tokens; i++)
             h_pos[off + i] = i;
     }
     if (ensure_buffers(ctx, total, batch, max_seq) != 0) {
-        free(h_offsets); free(h_ids); free(h_pos);
+        free(h_offsets);
+        free(h_ids);
+        free(h_pos);
         return -1;
     }
     memcpy(ctx->offsets_host, h_offsets, (size_t)(batch + 1) * sizeof(int));
-    cudaError_t ce = cudaMemcpyAsync(ctx->token_ids, h_ids,
-                                     (size_t)total * sizeof(int),
+    cudaError_t ce = cudaMemcpyAsync(ctx->token_ids, h_ids, (size_t)total * sizeof(int),
                                      cudaMemcpyHostToDevice, ctx->stream);
     if (ce == cudaSuccess)
-        ce = cudaMemcpyAsync(ctx->positions, h_pos,
-                             (size_t)total * sizeof(int),
+        ce = cudaMemcpyAsync(ctx->positions, h_pos, (size_t)total * sizeof(int),
                              cudaMemcpyHostToDevice, ctx->stream);
     if (ce == cudaSuccess)
-        ce = cudaMemcpyAsync(ctx->offsets, h_offsets,
-                             (size_t)(batch + 1) * sizeof(int),
+        ce = cudaMemcpyAsync(ctx->offsets, h_offsets, (size_t)(batch + 1) * sizeof(int),
                              cudaMemcpyHostToDevice, ctx->stream);
-    free(h_offsets); free(h_ids); free(h_pos);
+    free(h_offsets);
+    free(h_ids);
+    free(h_pos);
     if (ce != cudaSuccess) {
         fprintf(stderr, "cuda input copy failed: %s\n", cudaGetErrorString(ce));
         return -1;
@@ -1260,9 +1255,10 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
     embed_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16,
-        total, c->hidden_size, c->vocab_size);
-    if (launch_check() != 0) return -1;
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, c->hidden_size,
+        c->vocab_size);
+    if (launch_check() != 0)
+        return -1;
 
     float scale = 1.0f / sqrtf((float)c->head_dim);
     int q_offset = 0;
@@ -1280,110 +1276,106 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
         cuda_layer_t *l = &ctx->layers[layer];
         int wbf16 = l->qkv.bf16;
         if (wbf16) {
-            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-                act, ctx->x, l->input_norm, total,
-                c->hidden_size, c->rms_norm_eps);
-            if (launch_check() != 0) return -1;
-            if (linear_bf16x(ctx, &l->qkv, act, ctx->qkv,
-                             total, c->hidden_size, qkv_dim,
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(act, ctx->x, l->input_norm, total,
+                                                            c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0)
+                return -1;
+            if (linear_bf16x(ctx, &l->qkv, act, ctx->qkv, total, c->hidden_size, qkv_dim,
                              c->hidden_size, 0.0f) != 0)
                 return -1;
         } else {
-            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-                ctx->x_norm, ctx->x, l->input_norm, total,
-                c->hidden_size, c->rms_norm_eps);
-            if (launch_check() != 0) return -1;
-            if (linear(ctx, &l->qkv, ctx->x_norm, ctx->qkv,
-                       total, c->hidden_size, qkv_dim) != 0)
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x_norm, ctx->x, l->input_norm,
+                                                            total, c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0)
+                return -1;
+            if (linear(ctx, &l->qkv, ctx->x_norm, ctx->qkv, total, c->hidden_size, qkv_dim) != 0)
                 return -1;
         }
 
-        rms_norm_rope_qk_kernel<<<dim3(total, c->n_heads + c->n_kv_heads),
-                                  128, 0, ctx->stream>>>(
-            ctx->qkv, l->q_norm, l->k_norm, ctx->positions, ctx->rope_cos,
-            ctx->rope_sin, total, c->n_heads, c->n_kv_heads, c->head_dim,
-            qkv_dim, q_offset, k_offset, c->rms_norm_eps);
-        if (launch_check() != 0) return -1;
+        rms_norm_rope_qk_kernel<<<dim3(total, c->n_heads + c->n_kv_heads), 128, 0, ctx->stream>>>(
+            ctx->qkv, l->q_norm, l->k_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin, total,
+            c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim, q_offset, k_offset, c->rms_norm_eps);
+        if (launch_check() != 0)
+            return -1;
 
-        if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset,
-                                k_offset, v_offset, qkv_dim, scale,
-                                wbf16 ? act : NULL) != 0)
+        if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset,
+                                qkv_dim, scale, wbf16 ? act : NULL) != 0)
             return -1;
 
         if (wbf16) {
-            if (linear_bf16x(ctx, &l->wo, act, ctx->x,
-                             total, c->q_dim, c->hidden_size,
-                             c->q_dim, 1.0f) != 0)
+            if (linear_bf16x(ctx, &l->wo, act, ctx->x, total, c->q_dim, c->hidden_size, c->q_dim,
+                             1.0f) != 0)
                 return -1;
         } else {
-            if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x,
-                             total, c->q_dim, c->hidden_size) != 0)
+            if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, c->hidden_size) !=
+                0)
                 return -1;
         }
 
         int inter_count = total * c->intermediate_size;
         if (wbf16) {
-            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-                act, ctx->x, l->post_attn_norm, total,
-                c->hidden_size, c->rms_norm_eps);
-            if (launch_check() != 0) return -1;
-            if (linear_bf16x(ctx, &l->gate_up_proj, act, ctx->ffn_gate_up,
-                             total, c->hidden_size, 2 * c->intermediate_size,
-                             c->hidden_size, 0.0f) != 0)
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(act, ctx->x, l->post_attn_norm, total,
+                                                            c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0)
                 return -1;
-            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads,
-                                     threads, 0, ctx->stream>>>(
-                act, c->intermediate_size, ctx->ffn_gate_up, total,
-                c->intermediate_size);
-            if (launch_check() != 0) return -1;
-            if (linear_bf16x(ctx, &l->down_proj, act, ctx->x,
-                             total, c->intermediate_size, c->hidden_size,
-                             c->intermediate_size, 1.0f) != 0)
+            if (linear_bf16x(ctx, &l->gate_up_proj, act, ctx->ffn_gate_up, total, c->hidden_size,
+                             2 * c->intermediate_size, c->hidden_size, 0.0f) != 0)
+                return -1;
+            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                     ctx->stream>>>(act, c->intermediate_size, ctx->ffn_gate_up,
+                                                    total, c->intermediate_size);
+            if (launch_check() != 0)
+                return -1;
+            if (linear_bf16x(ctx, &l->down_proj, act, ctx->x, total, c->intermediate_size,
+                             c->hidden_size, c->intermediate_size, 1.0f) != 0)
                 return -1;
         } else {
-            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-                ctx->x_norm, ctx->x, l->post_attn_norm, total,
-                c->hidden_size, c->rms_norm_eps);
-            if (launch_check() != 0) return -1;
-            if (linear(ctx, &l->gate_up_proj, ctx->x_norm,
-                       ctx->ffn_gate_up, total, c->hidden_size,
+            rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x_norm, ctx->x, l->post_attn_norm,
+                                                            total, c->hidden_size, c->rms_norm_eps);
+            if (launch_check() != 0)
+                return -1;
+            if (linear(ctx, &l->gate_up_proj, ctx->x_norm, ctx->ffn_gate_up, total, c->hidden_size,
                        2 * c->intermediate_size) != 0)
                 return -1;
-            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads,
-                                     threads, 0, ctx->stream>>>(
-                ctx->ffn_gate_up, 2 * c->intermediate_size, ctx->ffn_gate_up,
-                total, c->intermediate_size);
-            if (launch_check() != 0) return -1;
-            if (linear_ex(ctx, &l->down_proj, ctx->ffn_gate_up, 0, ctx->x,
-                          total, c->intermediate_size, c->hidden_size,
-                          2 * c->intermediate_size, 1.0f) != 0)
+            silu_mul_packed_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                     ctx->stream>>>(ctx->ffn_gate_up, 2 * c->intermediate_size,
+                                                    ctx->ffn_gate_up, total, c->intermediate_size);
+            if (launch_check() != 0)
+                return -1;
+            if (linear_ex(ctx, &l->down_proj, ctx->ffn_gate_up, 0, ctx->x, total,
+                          c->intermediate_size, c->hidden_size, 2 * c->intermediate_size,
+                          1.0f) != 0)
                 return -1;
         }
     }
 
-    rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(
-        ctx->x, ctx->x, ctx->norm, total, c->hidden_size, c->rms_norm_eps);
-    if (launch_check() != 0) return -1;
+    rms_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, ctx->norm, total,
+                                                    c->hidden_size, c->rms_norm_eps);
+    if (launch_check() != 0)
+        return -1;
 
     return 0;
 }
 
-int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
-                          int batch, float *out_embeddings)
-{
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx,
+                            const embed_input_t *inputs,
+                            int batch,
+                            float *out_embeddings) {
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings)
+        return -1;
     const embed_config_t *c = &ctx->config;
     if (cuda_forward_batch(ctx, inputs, batch) != 0)
         return -1;
     if (ensure_pooled_rows(ctx, batch) != 0)
         return -1;
     if (c->pooling_mode == EMBED_POOL_LAST_TOKEN)
-        last_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
-            ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
+        last_pool_kernel<<<batch, 256, 0, ctx->stream>>>(ctx->pooled_out, ctx->x, ctx->offsets,
+                                                         batch, c->hidden_size);
     else
-        mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(
-            ctx->pooled_out, ctx->x, ctx->offsets, batch, c->hidden_size);
-    if (launch_check() != 0) return -1;
+        mean_pool_kernel<<<batch, 256, 0, ctx->stream>>>(ctx->pooled_out, ctx->x, ctx->offsets,
+                                                         batch, c->hidden_size);
+    if (launch_check() != 0)
+        return -1;
     cudaError_t ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
                                      (size_t)batch * c->hidden_size * sizeof(float),
                                      cudaMemcpyDeviceToHost, ctx->stream);
@@ -1395,9 +1387,8 @@ int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
     }
     if (c->normalize_embeddings) {
         for (int b = 0; b < batch; b++) {
-            if (embed_l2_normalize(
-                    out_embeddings + (size_t)b * c->hidden_size,
-                    c->hidden_size) != 0)
+            if (embed_l2_normalize(out_embeddings + (size_t)b * c->hidden_size, c->hidden_size) !=
+                0)
                 return -1;
         }
     }
@@ -1405,25 +1396,24 @@ int embed_cuda_encode_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs,
 }
 
 int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
-                                const embed_context_input_t *inputs,
-                                int batch, float *out_embeddings)
-{
-    if (!ctx || !inputs || batch <= 0 || !out_embeddings) return -1;
+                                  const embed_context_input_t *inputs,
+                                  int batch,
+                                  float *out_embeddings) {
+    if (!ctx || !inputs || batch <= 0 || !out_embeddings)
+        return -1;
     const embed_config_t *c = &ctx->config;
     int total_spans = 0;
     int total_tokens = 0;
     for (int b = 0; b < batch; b++) {
         const embed_context_input_t *input = &inputs[b];
         int n_tokens = input->input.n_tokens;
-        if (!input->input.ids || n_tokens <= 0 || !input->spans ||
-            input->n_spans <= 0 || total_spans > INT_MAX - input->n_spans ||
-            total_tokens > INT_MAX - n_tokens)
+        if (!input->input.ids || n_tokens <= 0 || !input->spans || input->n_spans <= 0 ||
+            total_spans > INT_MAX - input->n_spans || total_tokens > INT_MAX - n_tokens)
             return -1;
         for (int s = 0; s < input->n_spans; s++) {
             int start = input->spans[s].start;
             int len = input->spans[s].n_tokens;
-            if (start < 0 || len <= 0 || start > n_tokens ||
-                len > n_tokens - start)
+            if (start < 0 || len <= 0 || start > n_tokens || len > n_tokens - start)
                 return -1;
         }
         total_spans += input->n_spans;
@@ -1457,23 +1447,19 @@ int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
     cudaError_t ce;
     if (cuda_forward_batch(ctx, packed, batch) != 0)
         goto cleanup;
-    if (ensure_pooled_rows(ctx, total_spans) != 0 ||
-        ensure_span_buffers(ctx, total_spans) != 0)
+    if (ensure_pooled_rows(ctx, total_spans) != 0 || ensure_span_buffers(ctx, total_spans) != 0)
         goto cleanup;
-    ce = cudaMemcpyAsync(ctx->span_starts, h_starts,
-                         (size_t)total_spans * sizeof(int),
+    ce = cudaMemcpyAsync(ctx->span_starts, h_starts, (size_t)total_spans * sizeof(int),
                          cudaMemcpyHostToDevice, ctx->stream);
     if (ce == cudaSuccess)
-        ce = cudaMemcpyAsync(ctx->span_lens, h_lens,
-                             (size_t)total_spans * sizeof(int),
+        ce = cudaMemcpyAsync(ctx->span_lens, h_lens, (size_t)total_spans * sizeof(int),
                              cudaMemcpyHostToDevice, ctx->stream);
     if (ce != cudaSuccess) {
         fprintf(stderr, "cuda span copy failed: %s\n", cudaGetErrorString(ce));
         goto cleanup;
     }
     span_pool_kernel<<<total_spans, 256, 0, ctx->stream>>>(
-        ctx->pooled_out, ctx->x, ctx->span_starts, ctx->span_lens,
-        total_spans, c->hidden_size);
+        ctx->pooled_out, ctx->x, ctx->span_starts, ctx->span_lens, total_spans, c->hidden_size);
     if (launch_check() != 0)
         goto cleanup;
     ce = cudaMemcpyAsync(out_embeddings, ctx->pooled_out,
@@ -1482,8 +1468,7 @@ int embed_cuda_encode_spans_batch(embed_cuda_ctx_t *ctx,
     if (ce == cudaSuccess)
         ce = cudaStreamSynchronize(ctx->stream);
     if (ce != cudaSuccess) {
-        fprintf(stderr, "cuda span output copy failed: %s\n",
-                cudaGetErrorString(ce));
+        fprintf(stderr, "cuda span output copy failed: %s\n", cudaGetErrorString(ce));
         goto cleanup;
     }
     rc = 0;
@@ -1495,20 +1480,21 @@ cleanup:
     return rc;
 }
 
-int embed_cuda_encode_into(embed_cuda_ctx_t *ctx, const int *token_ids,
-                         int n_tokens, float *out_embedding)
-{
-    embed_input_t input = { token_ids, n_tokens };
+int embed_cuda_encode_into(embed_cuda_ctx_t *ctx,
+                           const int *token_ids,
+                           int n_tokens,
+                           float *out_embedding) {
+    embed_input_t input = {token_ids, n_tokens};
     return embed_cuda_encode_batch(ctx, &input, 1, out_embedding);
 }
 
-float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids,
-                       int n_tokens)
-{
-    if (!ctx) return NULL;
+float *embed_cuda_encode(embed_cuda_ctx_t *ctx, const int *token_ids, int n_tokens) {
+    if (!ctx)
+        return NULL;
     int hidden = ctx->config.hidden_size;
     float *out = (float *)malloc((size_t)hidden * sizeof(float));
-    if (!out) return NULL;
+    if (!out)
+        return NULL;
     if (embed_cuda_encode_into(ctx, token_ids, n_tokens, out) != 0) {
         free(out);
         return NULL;

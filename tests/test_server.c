@@ -16,30 +16,35 @@
 
 static int test_failures = 0;
 
-#define TEST_ASSERT(cond) do {                                        \
-    if (!(cond)) {                                                    \
-        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        test_failures++;                                              \
-    }                                                                 \
-} while (0)
+#define TEST_ASSERT(cond)                                                   \
+    do {                                                                    \
+        if (!(cond)) {                                                      \
+            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            test_failures++;                                                \
+        }                                                                   \
+    } while (0)
 
-static void test_base64_rfc4648(void)
-{
+static void test_base64_rfc4648(void) {
     /* RFC 4648 test vectors. */
-    static const struct { const char *in, *out; } cases[] = {
-        {"", ""}, {"f", "Zg=="}, {"fo", "Zm8="}, {"foo", "Zm9v"},
-        {"foob", "Zm9vYg=="}, {"fooba", "Zm9vYmE="}, {"foobar", "Zm9vYmFy"},
+    static const struct {
+        const char *in, *out;
+    } cases[] = {
+        {"", ""},
+        {"f", "Zg=="},
+        {"fo", "Zm8="},
+        {"foo", "Zm9v"},
+        {"foob", "Zm9vYg=="},
+        {"fooba", "Zm9vYmE="},
+        {"foobar", "Zm9vYmFy"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        char *got = base64_encode((const unsigned char *)cases[i].in,
-                                  strlen(cases[i].in));
+        char *got = base64_encode((const unsigned char *)cases[i].in, strlen(cases[i].in));
         TEST_ASSERT(strcmp(got, cases[i].out) == 0);
         free(got);
     }
 }
 
-static void test_quantize_int8_tanh(void)
-{
+static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.0f) == 0);
     /* tanh saturates to +-1, scaled by 127. */
     TEST_ASSERT(quantize_int8_tanh(100.0f) == 127);
@@ -50,8 +55,7 @@ static void test_quantize_int8_tanh(void)
     TEST_ASSERT(quantize_int8_tanh(0.5f) == 59);
 }
 
-static void test_encode_embedding_int8(void)
-{
+static void test_encode_embedding_int8(void) {
     float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
     signed char expect[4] = {0, 59, -59, 127};
     char *got = encode_embedding(emb, 4, "base64_int8");
@@ -61,8 +65,7 @@ static void test_encode_embedding_int8(void)
     free(want);
 }
 
-static void test_encode_embedding_binary(void)
-{
+static void test_encode_embedding_binary(void) {
     /* Sign bits pack LSB-first: bit i of byte i/8 is 1 when emb[i] >= 0. */
     float emb[8] = {1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f};
     unsigned char expect = 0x85; /* bits 0, 2, 7 set */
@@ -82,8 +85,7 @@ static void test_encode_embedding_binary(void)
     free(want);
 }
 
-static void test_encode_embedding_base64_float32(void)
-{
+static void test_encode_embedding_base64_float32(void) {
     /* OpenAI/DashScope "base64" is base64 of the raw little-endian float32
      * vector - lossless, unlike the int8 formats. */
     float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
@@ -98,8 +100,7 @@ static void test_encode_embedding_base64_float32(void)
     free(want);
 }
 
-static void test_append_embedding_value_float(void)
-{
+static void test_append_embedding_value_float(void) {
     float emb[1] = {0.5f};
 
     /* OpenAI/DashScope (Qwen3): the true float32 value. */
@@ -115,16 +116,14 @@ static void test_append_embedding_value_float(void)
     sbuf_free(&b2);
 }
 
-static void test_encoding_from_root_family(void)
-{
+static void test_encoding_from_root_family(void) {
     cJSON *detail = cJSON_CreateArray();
 
     /* Default encoding differs by family when the field is absent. */
     cJSON *empty = cJSON_CreateObject();
-    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_OPENAI),
-                       "float") == 0);
-    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_PERPLEXITY),
-                       "base64_int8") == 0);
+    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_OPENAI), "float") == 0);
+    TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_PERPLEXITY), "base64_int8") ==
+                0);
     cJSON_Delete(empty);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
 
@@ -144,8 +143,7 @@ static void test_encoding_from_root_family(void)
     cJSON_Delete(detail);
 }
 
-static void test_collect_job_batch_deadline(void)
-{
+static void test_collect_job_batch_deadline(void) {
     http_server s;
     memset(&s, 0, sizeof(s));
     s.batch_size = 32;
@@ -158,10 +156,8 @@ static void test_collect_job_batch_deadline(void)
     job before_deadline = {.srv = &s, .created_ns = first_ns + 500000u};
     job after_deadline = {.srv = &s, .created_ns = first_ns + 2000000u};
     snprintf(first.path, sizeof(first.path), "%s", "/v1/embeddings");
-    snprintf(before_deadline.path, sizeof(before_deadline.path), "%s",
-             "/v1/embeddings");
-    snprintf(after_deadline.path, sizeof(after_deadline.path), "%s",
-             "/v1/embeddings");
+    snprintf(before_deadline.path, sizeof(before_deadline.path), "%s", "/v1/embeddings");
+    snprintf(after_deadline.path, sizeof(after_deadline.path), "%s", "/v1/embeddings");
     enqueue_job(&first);
     enqueue_job(&before_deadline);
     enqueue_job(&after_deadline);
@@ -179,8 +175,7 @@ static void test_collect_job_batch_deadline(void)
     pthread_mutex_destroy(&s.mu);
 }
 
-static void test_collect_job_batch_zero_wait(void)
-{
+static void test_collect_job_batch_zero_wait(void) {
     http_server s;
     memset(&s, 0, sizeof(s));
     s.batch_size = 32;
@@ -211,10 +206,10 @@ static void test_collect_job_batch_zero_wait(void)
 
 #define TEST_API_KEY "tt-test-key"
 
-static int find_free_port(void)
-{
+static int find_free_port(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
@@ -230,10 +225,10 @@ static int find_free_port(void)
     return port;
 }
 
-static int tcp_connect(int port)
-{
+static int tcp_connect(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
@@ -246,13 +241,13 @@ static int tcp_connect(int port)
     return fd;
 }
 
-static int send_all(int fd, const char *buf, size_t n)
-{
+static int send_all(int fd, const char *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         ssize_t w = write(fd, buf + off, n - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return -1;
         }
         off += (size_t)w;
@@ -262,10 +257,14 @@ static int send_all(int fd, const char *buf, size_t n)
 
 /* Send one request; raw == NULL builds a normal request, otherwise `raw`
  * bytes go on the wire verbatim (for malformed-HTTP checks). */
-static int http_send(int fd, const char *method, const char *path,
-                     const char *auth, const char *body, const char *raw)
-{
-    if (raw) return send_all(fd, raw, strlen(raw));
+static int http_send(int fd,
+                     const char *method,
+                     const char *path,
+                     const char *auth,
+                     const char *body,
+                     const char *raw) {
+    if (raw)
+        return send_all(fd, raw, strlen(raw));
     char head[512];
     size_t blen = body ? strlen(body) : 0;
     int n = snprintf(head, sizeof(head),
@@ -275,55 +274,71 @@ static int http_send(int fd, const char *method, const char *path,
                      "Content-Type: application/json\r\n"
                      "Content-Length: %zu\r\n"
                      "\r\n",
-                     method, path,
-                     auth ? "Authorization: Bearer " : "",
-                     auth ? auth : "", auth ? "\r\n" : "",
-                     blen);
-    if (n < 0 || (size_t)n >= sizeof(head)) return -1;
-    if (send_all(fd, head, (size_t)n) != 0) return -1;
+                     method, path, auth ? "Authorization: Bearer " : "", auth ? auth : "",
+                     auth ? "\r\n" : "", blen);
+    if (n < 0 || (size_t)n >= sizeof(head))
+        return -1;
+    if (send_all(fd, head, (size_t)n) != 0)
+        return -1;
     return blen ? send_all(fd, body, blen) : 0;
 }
 
 /* Read one response: returns the status code (or -1) and the body, which
  * the caller frees. Reads exactly Content-Length body bytes so it works
  * with keep-alive connections. */
-static int http_recv(int fd, char **out_body)
-{
+static int http_recv(int fd, char **out_body) {
     *out_body = NULL;
     size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
-    if (!buf) return -1;
+    if (!buf)
+        return -1;
     char *hdr_end = NULL;
     while (!hdr_end) {
         if (len + 1 >= cap) {
             cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); return -1; }
+            if (!nb) {
+                free(buf);
+                return -1;
+            }
             buf = nb;
         }
         ssize_t r = read(fd, buf + len, cap - len - 1);
-        if (r <= 0) { free(buf); return -1; }
+        if (r <= 0) {
+            free(buf);
+            return -1;
+        }
         len += (size_t)r;
         buf[len] = '\0';
         hdr_end = strstr(buf, "\r\n\r\n");
     }
 
     int status = -1;
-    if (sscanf(buf, "HTTP/1.1 %d", &status) != 1) { free(buf); return -1; }
+    if (sscanf(buf, "HTTP/1.1 %d", &status) != 1) {
+        free(buf);
+        return -1;
+    }
     size_t content_length = 0;
     const char *cl = strstr(buf, "Content-Length:");
-    if (cl && cl < hdr_end) content_length = strtoul(cl + 15, NULL, 10);
+    if (cl && cl < hdr_end)
+        content_length = strtoul(cl + 15, NULL, 10);
 
     size_t body_off = (size_t)(hdr_end - buf) + 4;
     size_t need = body_off + content_length;
     if (need + 1 > cap) {
         char *nb = realloc(buf, need + 1);
-        if (!nb) { free(buf); return -1; }
+        if (!nb) {
+            free(buf);
+            return -1;
+        }
         buf = nb;
     }
     while (len < need) {
         ssize_t r = read(fd, buf + len, need - len);
-        if (r <= 0) { free(buf); return -1; }
+        if (r <= 0) {
+            free(buf);
+            return -1;
+        }
         len += (size_t)r;
     }
     buf[need] = '\0';
@@ -334,19 +349,25 @@ static int http_recv(int fd, char **out_body)
 
 /* One-shot request helper; returns status, body via out_body (caller frees,
  * may be NULL when only the status matters). */
-static int http_req(int port, const char *method, const char *path,
-                    const char *auth, const char *body, const char *raw,
-                    char **out_body)
-{
+static int http_req(int port,
+                    const char *method,
+                    const char *path,
+                    const char *auth,
+                    const char *body,
+                    const char *raw,
+                    char **out_body) {
     int fd = tcp_connect(port);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     char *resp = NULL;
     int status = -1;
     if (http_send(fd, method, path, auth, body, raw) == 0)
         status = http_recv(fd, &resp);
     close(fd);
-    if (out_body) *out_body = resp;
-    else free(resp);
+    if (out_body)
+        *out_body = resp;
+    else
+        free(resp);
     return status;
 }
 
@@ -356,18 +377,17 @@ typedef struct {
     int rc;
 } srv_ctx;
 
-static void *srv_thread_main(void *arg)
-{
+static void *srv_thread_main(void *arg) {
     srv_ctx *s = (srv_ctx *)arg;
     s->rc = embed_run_server(&s->cfg);
     return NULL;
 }
 
-static cJSON *parse_embeddings_body(const char *body, int want_items)
-{
+static cJSON *parse_embeddings_body(const char *body, int want_items) {
     cJSON *root = cJSON_Parse(body);
     TEST_ASSERT(root != NULL);
-    if (!root) return NULL;
+    if (!root)
+        return NULL;
     cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
     TEST_ASSERT(cJSON_IsArray(data));
     TEST_ASSERT(cJSON_GetArraySize(data) == want_items);
@@ -378,71 +398,63 @@ static cJSON *parse_embeddings_body(const char *body, int want_items)
     return root;
 }
 
-static void test_http_embeddings(int port)
-{
+static void test_http_embeddings(int port) {
     char *body = NULL;
 
     /* Routing. */
-    TEST_ASSERT(http_req(port, "OPTIONS", "/v1/embeddings", NULL, NULL, NULL,
-                         NULL) == 204);
-    TEST_ASSERT(http_req(port, "GET", "/v1/embeddings", TEST_API_KEY, NULL,
-                         NULL, NULL) == 404);
-    TEST_ASSERT(http_req(port, "POST", "/nope", TEST_API_KEY, "{}", NULL,
-                         NULL) == 404);
+    TEST_ASSERT(http_req(port, "OPTIONS", "/v1/embeddings", NULL, NULL, NULL, NULL) == 204);
+    TEST_ASSERT(http_req(port, "GET", "/v1/embeddings", TEST_API_KEY, NULL, NULL, NULL) == 404);
+    TEST_ASSERT(http_req(port, "POST", "/nope", TEST_API_KEY, "{}", NULL, NULL) == 404);
 
     /* Auth: required, and the exact key. */
-    const char *ok_req =
-        "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello world\","
-        "\"encoding_format\":\"float\"}";
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", NULL, ok_req, NULL,
-                         NULL) == 401);
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", "wrong-key", ok_req,
-                         NULL, NULL) == 401);
+    const char *ok_req = "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello world\","
+                         "\"encoding_format\":\"float\"}";
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", NULL, ok_req, NULL, NULL) == 401);
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", "wrong-key", ok_req, NULL, NULL) == 401);
 
     /* Malformed HTTP (400) and malformed JSON (422 detail). */
-    TEST_ASSERT(http_req(port, NULL, NULL, NULL, NULL,
-                         "GARBAGE\r\n\r\n", NULL) == 400);
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{nope", NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, NULL, NULL, NULL, NULL, "GARBAGE\r\n\r\n", NULL) == 400);
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, "{nope", NULL, NULL) == 422);
 
     /* Validation: missing/unknown model, wrong endpoint family, valid but
      * unloaded id, bad encoding enum, dimensions out of range; the
      * API answers validation errors with 422 detail arrays. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"input\":\"hi\"}", NULL, NULL) == 422);
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"foo\",\"input\":\"hi\"}", NULL,
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, "{\"input\":\"hi\"}", NULL,
                          NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"foo\",\"input\":\"hi\"}", NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-0.6b\","
-                         "\"input\":\"hi\"}", NULL, NULL) == 422);
+                         "\"input\":\"hi\"}",
+                         NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-4b\",\"input\":\"hi\"}",
-                         NULL, NULL) == 503);
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hi\","
-                         "\"encoding_format\":\"yaml\"}", NULL, NULL) == 422);
+                         "{\"model\":\"pplx-embed-v1-4b\",\"input\":\"hi\"}", NULL, NULL) == 503);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hi\","
-                         "\"dimensions\":64}", NULL, NULL) == 422);
+                         "\"encoding_format\":\"yaml\"}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hi\","
+                         "\"dimensions\":64}",
+                         NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\","
-                         "\"input\":[]}", NULL, NULL) == 422);
+                         "\"input\":[]}",
+                         NULL, NULL) == 422);
 
     /* Contextual endpoint: standard id is the wrong enum, the 4B contextual
      * id is valid but not loaded. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\","
-                         "\"input\":[[\"a\"]]}", NULL, NULL) == 422);
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+                         "\"input\":[[\"a\"]]}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-4b\","
-                         "\"input\":[[\"a\"]]}", NULL, NULL) == 503);
+                         "\"input\":[[\"a\"]]}",
+                         NULL, NULL) == 503);
 
     /* Happy path, float encoding, single string input. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, ok_req,
-                         NULL, &body) == 200);
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, ok_req, NULL, &body) == 200);
     cJSON *root = body ? parse_embeddings_body(body, 1) : NULL;
     if (root) {
         cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
@@ -456,12 +468,12 @@ static void test_http_embeddings(int port)
         cJSON *v;
         cJSON_ArrayForEach(v, emb) {
             TEST_ASSERT(cJSON_IsNumber(v));
-            if (v->valuedouble != 0.0) nonzero = 1;
+            if (v->valuedouble != 0.0)
+                nonzero = 1;
         }
         TEST_ASSERT(nonzero);
         cJSON *usage = cJSON_GetObjectItemCaseSensitive(root, "usage");
-        cJSON *total = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        cJSON *total = usage ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
         TEST_ASSERT(total && cJSON_IsNumber(total) && total->valueint >= 1);
         cJSON_Delete(root);
     }
@@ -478,19 +490,15 @@ static void test_http_embeddings(int port)
     root = body ? parse_embeddings_body(body, 3) : NULL;
     if (root) {
         cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
-        cJSON *e0 = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(data, 0), "embedding");
-        cJSON *e1 = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(data, 1), "embedding");
+        cJSON *e0 = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(data, 0), "embedding");
+        cJSON *e1 = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(data, 1), "embedding");
         for (int i = 0; i < 3; i++) {
-            cJSON *idx = cJSON_GetObjectItemCaseSensitive(
-                cJSON_GetArrayItem(data, i), "index");
+            cJSON *idx = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(data, i), "index");
             TEST_ASSERT(cJSON_IsNumber(idx) && idx->valueint == i);
         }
         int differ = 0;
         for (int i = 0; i < 1024 && !differ; i++) {
-            if (cJSON_GetArrayItem(e0, i)->valuedouble !=
-                cJSON_GetArrayItem(e1, i)->valuedouble)
+            if (cJSON_GetArrayItem(e0, i)->valuedouble != cJSON_GetArrayItem(e1, i)->valuedouble)
                 differ = 1;
         }
         TEST_ASSERT(differ);
@@ -502,12 +510,12 @@ static void test_http_embeddings(int port)
     /* Default encoding is base64_int8: a string of 1024 quantized bytes. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-v1-0.6b\","
-                         "\"input\":\"hello\"}", NULL, &body) == 200);
+                         "\"input\":\"hello\"}",
+                         NULL, &body) == 200);
     root = body ? parse_embeddings_body(body, 1) : NULL;
     if (root) {
         cJSON *emb = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "data"),
-                               0), "embedding");
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "data"), 0), "embedding");
         TEST_ASSERT(cJSON_IsString(emb));
         TEST_ASSERT(strlen(emb->valuestring) == ((1024 + 2) / 3) * 4);
         cJSON_Delete(root);
@@ -524,8 +532,7 @@ static void test_http_embeddings(int port)
     root = body ? parse_embeddings_body(body, 1) : NULL;
     if (root) {
         cJSON *emb = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "data"),
-                               0), "embedding");
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "data"), 0), "embedding");
         TEST_ASSERT(cJSON_IsArray(emb) && cJSON_GetArraySize(emb) == 128);
         cJSON_Delete(root);
     }
@@ -548,28 +555,24 @@ static void test_http_embeddings(int port)
                          NULL, &body) == 200);
     cJSON *qwen_mrl = body ? parse_embeddings_body(body, 1) : NULL;
     if (qwen_full && qwen_mrl) {
-        cJSON *full_data =
-            cJSON_GetObjectItemCaseSensitive(qwen_full, "data");
-        cJSON *mrl_data =
-            cJSON_GetObjectItemCaseSensitive(qwen_mrl, "data");
-        cJSON *full_emb = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(full_data, 0), "embedding");
-        cJSON *mrl_emb = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(mrl_data, 0), "embedding");
-        TEST_ASSERT(cJSON_IsArray(full_emb) &&
-                    cJSON_GetArraySize(full_emb) == 1024);
-        TEST_ASSERT(cJSON_IsArray(mrl_emb) &&
-                    cJSON_GetArraySize(mrl_emb) == 32);
+        cJSON *full_data = cJSON_GetObjectItemCaseSensitive(qwen_full, "data");
+        cJSON *mrl_data = cJSON_GetObjectItemCaseSensitive(qwen_mrl, "data");
+        cJSON *full_emb =
+            cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(full_data, 0), "embedding");
+        cJSON *mrl_emb =
+            cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(mrl_data, 0), "embedding");
+        TEST_ASSERT(cJSON_IsArray(full_emb) && cJSON_GetArraySize(full_emb) == 1024);
+        TEST_ASSERT(cJSON_IsArray(mrl_emb) && cJSON_GetArraySize(mrl_emb) == 32);
         double prefix_diff = 0.0;
         for (int i = 0; i < 32; i++) {
             double d = fabs(cJSON_GetArrayItem(full_emb, i)->valuedouble -
                             cJSON_GetArrayItem(mrl_emb, i)->valuedouble);
-            if (d > prefix_diff) prefix_diff = d;
+            if (d > prefix_diff)
+                prefix_diff = d;
         }
         TEST_ASSERT(prefix_diff > 0.0);
         cJSON *usage = cJSON_GetObjectItemCaseSensitive(qwen_mrl, "usage");
-        cJSON *total = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        cJSON *total = usage ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
         TEST_ASSERT(total && total->valueint == 2);
     }
     cJSON_Delete(qwen_full);
@@ -585,11 +588,12 @@ static void test_http_embeddings(int port)
         fds[i] = tcp_connect(port);
         TEST_ASSERT(fds[i] >= 0);
         if (fds[i] >= 0)
-            TEST_ASSERT(http_send(fds[i], "POST", "/v1/embeddings",
-                                  TEST_API_KEY, ok_req, NULL) == 0);
+            TEST_ASSERT(http_send(fds[i], "POST", "/v1/embeddings", TEST_API_KEY, ok_req, NULL) ==
+                        0);
     }
     for (int i = 0; i < N_CONC; i++) {
-        if (fds[i] < 0) continue;
+        if (fds[i] < 0)
+            continue;
         char *resp = NULL;
         TEST_ASSERT(http_recv(fds[i], &resp) == 200);
         free(resp);
@@ -598,8 +602,7 @@ static void test_http_embeddings(int port)
 }
 
 /* data[di].data[ci].embedding from a contextual response. */
-static cJSON *ctx_chunk_emb(cJSON *root, int di, int ci)
-{
+static cJSON *ctx_chunk_emb(cJSON *root, int di, int ci) {
     cJSON *docs = cJSON_GetObjectItemCaseSensitive(root, "data");
     cJSON *doc = cJSON_GetArrayItem(docs, di);
     cJSON *chunks = cJSON_GetObjectItemCaseSensitive(doc, "data");
@@ -607,40 +610,40 @@ static cJSON *ctx_chunk_emb(cJSON *root, int di, int ci)
     return cJSON_GetObjectItemCaseSensitive(item, "embedding");
 }
 
-static double emb_max_absdiff(cJSON *a, cJSON *b)
-{
-    if (!cJSON_IsArray(a) || !cJSON_IsArray(b)) return 1e9;
+static double emb_max_absdiff(cJSON *a, cJSON *b) {
+    if (!cJSON_IsArray(a) || !cJSON_IsArray(b))
+        return 1e9;
     int n = cJSON_GetArraySize(a);
-    if (n != cJSON_GetArraySize(b)) return 1e9;
+    if (n != cJSON_GetArraySize(b))
+        return 1e9;
     double m = 0.0;
     for (int i = 0; i < n; i++) {
-        double d = fabs(cJSON_GetArrayItem(a, i)->valuedouble -
-                        cJSON_GetArrayItem(b, i)->valuedouble);
-        if (d > m) m = d;
+        double d =
+            fabs(cJSON_GetArrayItem(a, i)->valuedouble - cJSON_GetArrayItem(b, i)->valuedouble);
+        if (d > m)
+            m = d;
     }
     return m;
 }
 
-static void test_http_contextual(int port)
-{
+static void test_http_contextual(int port) {
     char *body = NULL;
 
     /* Input must be an array of chunk arrays; chunks must be non-empty. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-0.6b\","
-                         "\"input\":\"hi\"}", NULL, NULL) == 422);
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+                         "\"input\":\"hi\"}",
+                         NULL, NULL) == 422);
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-0.6b\","
-                         "\"input\":[[\"\"]]}", NULL, NULL) == 422);
+                         "\"input\":[[\"\"]]}",
+                         NULL, NULL) == 422);
 
     /* Happy path: chunks concatenate per document with one separator token
      * between them, one embedding per chunk in document order. Fixture
      * token counts: hello=1, world=3, held=2, one separator in doc 0, so
      * usage must report 7. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-0.6b\","
                          "\"input\":[[\"hello\",\"world\"],[\"held\"]],"
                          "\"encoding_format\":\"float\"}",
@@ -664,21 +667,18 @@ static void test_http_contextual(int port)
                 cJSON *cidx = cJSON_GetObjectItemCaseSensitive(item, "index");
                 cJSON *emb = ctx_chunk_emb(multi, di, ci);
                 TEST_ASSERT(cidx && cidx->valueint == ci);
-                TEST_ASSERT(cJSON_IsArray(emb) &&
-                            cJSON_GetArraySize(emb) == 1024);
+                TEST_ASSERT(cJSON_IsArray(emb) && cJSON_GetArraySize(emb) == 1024);
             }
         }
         cJSON *usage = cJSON_GetObjectItemCaseSensitive(multi, "usage");
-        cJSON *total = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        cJSON *total = usage ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
         TEST_ASSERT(total && total->valueint == 7);
     }
 
     /* A single-chunk document has no separators and its pooling span covers
      * the whole sequence, so it must match the standard embedding of the
      * same text from the same weights. */
-    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings",
-                         TEST_API_KEY,
+    TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
                          "{\"model\":\"pplx-embed-context-v1-0.6b\","
                          "\"input\":[[\"hello\"]],"
                          "\"encoding_format\":\"float\"}",
@@ -699,8 +699,7 @@ static void test_http_contextual(int port)
 
     if (multi && single && std) {
         cJSON *std_emb = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(std, "data"),
-                               0), "embedding");
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(std, "data"), 0), "embedding");
         cJSON *alone = ctx_chunk_emb(single, 0, 0);
         cJSON *in_doc = ctx_chunk_emb(multi, 0, 0);
         TEST_ASSERT(emb_max_absdiff(std_emb, alone) < 1e-4);
@@ -713,8 +712,7 @@ static void test_http_contextual(int port)
     cJSON_Delete(std);
 }
 
-static void test_http_rerank(int port)
-{
+static void test_http_rerank(int port) {
     char *body = NULL;
 
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
@@ -735,55 +733,45 @@ static void test_http_rerank(int port)
                          "\"top_n\":1,\"top_k\":1}",
                          NULL, NULL) == 422);
 
-    const char *request =
-        "{\"model\":\"pplx-embed-v1-late-0.6b\","
-        "\"query\":\"hello\",\"documents\":["
-        "\"hello!\",\"world\",\"quoted \\\"document\\\"\"],"
-        "\"top_n\":2,\"return_documents\":true}";
-    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY, request,
-                         NULL, &body) == 200);
+    const char *request = "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                          "\"query\":\"hello\",\"documents\":["
+                          "\"hello!\",\"world\",\"quoted \\\"document\\\"\"],"
+                          "\"top_n\":2,\"return_documents\":true}";
+    TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY, request, NULL, &body) == 200);
     cJSON *root = body ? cJSON_Parse(body) : NULL;
     TEST_ASSERT(root != NULL);
     if (root) {
         cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "object");
         cJSON *model = cJSON_GetObjectItemCaseSensitive(root, "model");
         cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
-        TEST_ASSERT(cJSON_IsString(object) &&
-                    strcmp(object->valuestring, "list") == 0);
+        TEST_ASSERT(cJSON_IsString(object) && strcmp(object->valuestring, "list") == 0);
         TEST_ASSERT(cJSON_IsString(model) &&
-                    strcmp(model->valuestring,
-                           "pplx-embed-v1-late-0.6b") == 0);
-        TEST_ASSERT(cJSON_IsArray(results) &&
-                    cJSON_GetArraySize(results) == 2);
+                    strcmp(model->valuestring, "pplx-embed-v1-late-0.6b") == 0);
+        TEST_ASSERT(cJSON_IsArray(results) && cJSON_GetArraySize(results) == 2);
         double previous = INFINITY;
         int seen[3] = {0};
         cJSON *result;
         cJSON_ArrayForEach(result, results) {
-            cJSON *index =
-                cJSON_GetObjectItemCaseSensitive(result, "index");
-            cJSON *score =
-                cJSON_GetObjectItemCaseSensitive(result, "relevance_score");
-            cJSON *document =
-                cJSON_GetObjectItemCaseSensitive(result, "document");
-            TEST_ASSERT(cJSON_IsNumber(index) &&
-                        index->valueint >= 0 && index->valueint < 3);
-            TEST_ASSERT(cJSON_IsNumber(score) &&
-                        score->valuedouble <= previous);
+            cJSON *index = cJSON_GetObjectItemCaseSensitive(result, "index");
+            cJSON *score = cJSON_GetObjectItemCaseSensitive(result, "relevance_score");
+            cJSON *document = cJSON_GetObjectItemCaseSensitive(result, "document");
+            TEST_ASSERT(cJSON_IsNumber(index) && index->valueint >= 0 && index->valueint < 3);
+            TEST_ASSERT(cJSON_IsNumber(score) && score->valuedouble <= previous);
             TEST_ASSERT(cJSON_IsString(document));
-            if (cJSON_IsNumber(index) && index->valueint >= 0 &&
-                index->valueint < 3)
+            if (cJSON_IsNumber(index) && index->valueint >= 0 && index->valueint < 3)
                 seen[index->valueint]++;
-            if (cJSON_IsNumber(score)) previous = score->valuedouble;
+            if (cJSON_IsNumber(score))
+                previous = score->valuedouble;
         }
         TEST_ASSERT(seen[0] + seen[1] + seen[2] == 2);
 
         cJSON *usage = cJSON_GetObjectItemCaseSensitive(root, "usage");
-        cJSON *query_tokens = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "query_tokens") : NULL;
-        cJSON *document_tokens = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "document_tokens") : NULL;
-        cJSON *total_tokens = usage
-            ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
+        cJSON *query_tokens =
+            usage ? cJSON_GetObjectItemCaseSensitive(usage, "query_tokens") : NULL;
+        cJSON *document_tokens =
+            usage ? cJSON_GetObjectItemCaseSensitive(usage, "document_tokens") : NULL;
+        cJSON *total_tokens =
+            usage ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
         TEST_ASSERT(query_tokens && document_tokens && total_tokens);
         if (query_tokens && document_tokens && total_tokens) {
             TEST_ASSERT(cJSON_IsNumber(query_tokens));
@@ -808,18 +796,16 @@ static void test_http_rerank(int port)
     TEST_ASSERT(root != NULL);
     if (root) {
         cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
-        TEST_ASSERT(cJSON_IsArray(results) &&
-                    cJSON_GetArraySize(results) == 1);
-        cJSON *document = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetArrayItem(results, 0), "document");
+        TEST_ASSERT(cJSON_IsArray(results) && cJSON_GetArraySize(results) == 1);
+        cJSON *document =
+            cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(results, 0), "document");
         TEST_ASSERT(document == NULL);
         cJSON_Delete(root);
     }
     free(body);
 }
 
-static void test_http_server(void)
-{
+static void test_http_server(void) {
     char dir[1024], late_dir[1024], qwen_dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
@@ -845,14 +831,11 @@ static void test_http_server(void)
     /* The 0.6b server slot requires hidden_size 1024; everything else stays
      * tiny. The model vocab covers every tokenizer fixture id. */
     tm_dims_t dims = {1024, 2, 1, 64, 8, TF_VOCAB_SIZE};
-    if (tf_write_vocab(dir) != 0 ||
-        tm_write_model_dims(dir, "F32", &dims) != 0 ||
-        tf_write_vocab(late_dir) != 0 ||
-        tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
+    if (tf_write_vocab(dir) != 0 || tm_write_model_dims(dir, "F32", &dims) != 0 ||
+        tf_write_vocab(late_dir) != 0 || tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
         tm_write_late_projection(late_dir, "F32", 128, 1024) != 0 ||
         tf_write_vocab(qwen_dir) != 0 ||
-        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims,
-                                  TF_EOT_ID) != 0) {
+        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims, TF_EOT_ID) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
         test_failures++;
         return;
@@ -888,9 +871,13 @@ static void test_http_server(void)
     }
 
     int up = 0;
-    for (int i = 0; i < 200; i++) {        /* up to ~10 s */
+    for (int i = 0; i < 200; i++) { /* up to ~10 s */
         int fd = tcp_connect(port);
-        if (fd >= 0) { close(fd); up = 1; break; }
+        if (fd >= 0) {
+            close(fd);
+            up = 1;
+            break;
+        }
         usleep(50 * 1000);
     }
     TEST_ASSERT(up);
@@ -905,8 +892,7 @@ static void test_http_server(void)
     TEST_ASSERT(ctx.rc == 0);
 }
 
-int main(void)
-{
+int main(void) {
     test_base64_rfc4648();
     test_quantize_int8_tanh();
     test_encode_embedding_int8();
