@@ -97,6 +97,16 @@ EMBED_API embed_mlx_late_vectors_t *embed_mlx_late_encode_docs_device(embed_mlx_
                                                                       int n_docs,
                                                                       int normalize,
                                                                       int *out_offsets);
+/* Device-resident select/concat primitives, retained for the late-interaction
+ * verification harness (scripts/check_late_interaction.py); the server rerank
+ * path uses embed_mlx_late_encode_docs_device. */
+EMBED_API embed_mlx_late_vectors_t *embed_mlx_late_vectors_concat(
+    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *const *items, int count);
+EMBED_API embed_mlx_late_vectors_t *
+embed_mlx_late_vectors_select(embed_mlx_late_ctx_t *ctx,
+                              const embed_mlx_late_vectors_t *vecs,
+                              const int *token_indices,
+                              int count);
 EMBED_API int embed_mlx_late_maxsim_batch_device(embed_mlx_late_ctx_t *ctx,
                                                  const embed_mlx_late_vectors_t *query,
                                                  const embed_mlx_late_vectors_t *docs,

@@ -1344,6 +1344,107 @@ cleanup:
     return result;
 }
 
+/* Device-resident select/concat primitives. The server rerank path batches
+ * candidates through embed_mlx_late_encode_docs_device, but the late-interaction
+ * verification harness (scripts/check_late_interaction.py) drives these directly
+ * to validate per-document gather and concat against the CPU MaxSim reference. */
+embed_mlx_late_vectors_t *embed_mlx_late_vectors_concat(
+    embed_mlx_late_ctx_t *ctx, const embed_mlx_late_vectors_t *const *items, int count) {
+    if (!ctx || !ctx->base || !items || count <= 0)
+        return NULL;
+    int dim = 0;
+    int total = 0;
+    for (int i = 0; i < count; i++) {
+        const embed_mlx_late_vectors_t *v = items[i];
+        if (!v || v->owner != ctx || !arr_ok(v->vectors) || v->tokens <= 0 || v->dim <= 0)
+            return NULL;
+        if (i == 0)
+            dim = v->dim;
+        if (v->dim != dim || total > INT_MAX - v->tokens)
+            return NULL;
+        total += v->tokens;
+    }
+
+    mlx_array *parts = (mlx_array *)malloc((size_t)count * sizeof(*parts));
+    if (!parts)
+        return NULL;
+    for (int i = 0; i < count; i++)
+        parts[i] = items[i]->vectors;
+
+    mlx_stream S = ctx->base->stream;
+    mlx_vector_array vec = mlx_vector_array_new_data(parts, (size_t)count);
+    free(parts);
+    if (!vec.ctx)
+        return NULL;
+
+    mlx_array joined = mlx_array_new();
+    mlx_concatenate_axis(&joined, vec, 0, S);
+    mlx_vector_array_free(vec);
+    if (!arr_ok(joined)) {
+        mlx_array_free(joined);
+        return NULL;
+    }
+
+    embed_mlx_late_vectors_t *out = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    if (!out) {
+        mlx_array_free(joined);
+        return NULL;
+    }
+    out->owner = ctx;
+    out->vectors = joined;
+    out->tokens = total;
+    out->dim = dim;
+    return out;
+}
+
+embed_mlx_late_vectors_t *embed_mlx_late_vectors_select(embed_mlx_late_ctx_t *ctx,
+                                                        const embed_mlx_late_vectors_t *vecs,
+                                                        const int *token_indices,
+                                                        int count) {
+    if (!ctx || !ctx->base || !vecs || vecs->owner != ctx || !arr_ok(vecs->vectors) ||
+        !token_indices || count <= 0 || vecs->tokens <= 0 || vecs->dim <= 0)
+        return NULL;
+
+    for (int i = 0; i < count; i++) {
+        if (token_indices[i] < 0 || token_indices[i] >= vecs->tokens)
+            return NULL;
+    }
+
+    size_t idx_bytes;
+    if (mlx_mul_size((size_t)count, sizeof(int), &idx_bytes) != 0)
+        return NULL;
+    int *idx_data = (int *)malloc(idx_bytes);
+    if (!idx_data)
+        return NULL;
+    memcpy(idx_data, token_indices, idx_bytes);
+
+    int idx_shape[] = {count};
+    mlx_array idx = mlx_array_new_data(idx_data, idx_shape, 1, MLX_INT32);
+    free(idx_data);
+    if (!arr_ok(idx))
+        return NULL;
+
+    mlx_stream S = ctx->base->stream;
+    mlx_array selected = mlx_array_new();
+    mlx_take_axis(&selected, vecs->vectors, idx, 0, S);
+    mlx_array_free(idx);
+    if (!arr_ok(selected)) {
+        mlx_array_free(selected);
+        return NULL;
+    }
+
+    embed_mlx_late_vectors_t *out = (embed_mlx_late_vectors_t *)calloc(1, sizeof(*out));
+    if (!out) {
+        mlx_array_free(selected);
+        return NULL;
+    }
+    out->owner = ctx;
+    out->vectors = selected;
+    out->tokens = count;
+    out->dim = vecs->dim;
+    return out;
+}
+
 int embed_mlx_late_maxsim_batch_device(embed_mlx_late_ctx_t *ctx,
                                        const embed_mlx_late_vectors_t *query,
                                        const embed_mlx_late_vectors_t *docs,
