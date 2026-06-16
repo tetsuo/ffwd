@@ -49,27 +49,27 @@ void embed_linear_nobias_bf16(
 
 /* Small-sequence BF16 path: compute two projections with one threaded dispatch. */
 void embed_linear_nobias_bf16_pair(float *a,
-                                  float *b,
-                                  const float *x,
-                                  const uint16_t *Wa_bf16,
-                                  const uint16_t *Wb_bf16,
-                                  int seq_len,
-                                  int in_dim,
-                                  int a_dim,
-                                  int b_dim);
+                                   float *b,
+                                   const float *x,
+                                   const uint16_t *Wa_bf16,
+                                   const uint16_t *Wb_bf16,
+                                   int seq_len,
+                                   int in_dim,
+                                   int a_dim,
+                                   int b_dim);
 
 /* Small-sequence BF16 path: compute Q/K/V matvecs with one threaded dispatch. */
 void embed_linear_nobias_bf16_qkv(float *q,
-                                 float *k,
-                                 float *v,
-                                 const float *x,
-                                 const uint16_t *Wq_bf16,
-                                 const uint16_t *Wk_bf16,
-                                 const uint16_t *Wv_bf16,
-                                 int seq_len,
-                                 int in_dim,
-                                 int q_dim,
-                                 int kv_dim);
+                                  float *k,
+                                  float *v,
+                                  const float *x,
+                                  const uint16_t *Wq_bf16,
+                                  const uint16_t *Wk_bf16,
+                                  const uint16_t *Wv_bf16,
+                                  int seq_len,
+                                  int in_dim,
+                                  int q_dim,
+                                  int kv_dim);
 
 /* Dot product using the best available local SIMD implementation. */
 float embed_dot_f32(const float *a, const float *b, int n);
@@ -92,12 +92,12 @@ void embed_rms_norm_per_head(
  * + beta, with mean and biased (population) variance over the hidden axis per
  * row. Unlike RMSNorm this subtracts the mean and adds a bias. */
 void embed_layer_norm(float *out,
-                     const float *x,
-                     const float *gamma,
-                     const float *beta,
-                     int seq_len,
-                     int hidden,
-                     float eps);
+                      const float *x,
+                      const float *gamma,
+                      const float *beta,
+                      int seq_len,
+                      int hidden,
+                      float eps);
 
 /* ========================================================================
  * Activation Functions
@@ -130,57 +130,57 @@ void embed_gelu_tanh_inplace(float *x, int n);
  * offsets[b]..offsets[b+1] span.
  */
 void embed_bidirectional_gqa_attention_packed(float *out,
-                                             const float *Q,
-                                             const float *K,
-                                             const float *V,
-                                             const int *offsets,
-                                             int batch,
-                                             int n_heads,
-                                             int n_kv_heads,
-                                             int head_dim,
-                                             float scale);
+                                              const float *Q,
+                                              const float *K,
+                                              const float *V,
+                                              const int *offsets,
+                                              int batch,
+                                              int n_heads,
+                                              int n_kv_heads,
+                                              int head_dim,
+                                              float scale);
 
 /* Optional reusable scratch for the BLAS-tiled packed attention path. */
 size_t embed_bidirectional_gqa_attention_packed_scratch_bytes(const int *offsets, int batch);
 void embed_bidirectional_gqa_attention_packed_with_scratch(float *out,
-                                                          const float *Q,
-                                                          const float *K,
-                                                          const float *V,
-                                                          const int *offsets,
-                                                          int batch,
-                                                          int n_heads,
-                                                          int n_kv_heads,
-                                                          int head_dim,
-                                                          float scale,
-                                                          float *scratch,
-                                                          size_t scratch_bytes);
+                                                           const float *Q,
+                                                           const float *K,
+                                                           const float *V,
+                                                           const int *offsets,
+                                                           int batch,
+                                                           int n_heads,
+                                                           int n_kv_heads,
+                                                           int head_dim,
+                                                           float scale,
+                                                           float *scratch,
+                                                           size_t scratch_bytes);
 
 /*
  * Causal GQA attention over a packed/ragged batch. Query position i attends
  * only to positions at or before i within its sequence.
  */
 void embed_causal_gqa_attention_packed(float *out,
-                                      const float *Q,
-                                      const float *K,
-                                      const float *V,
-                                      const int *offsets,
-                                      int batch,
-                                      int n_heads,
-                                      int n_kv_heads,
-                                      int head_dim,
-                                      float scale);
+                                       const float *Q,
+                                       const float *K,
+                                       const float *V,
+                                       const int *offsets,
+                                       int batch,
+                                       int n_heads,
+                                       int n_kv_heads,
+                                       int head_dim,
+                                       float scale);
 void embed_causal_gqa_attention_packed_with_scratch(float *out,
-                                                   const float *Q,
-                                                   const float *K,
-                                                   const float *V,
-                                                   const int *offsets,
-                                                   int batch,
-                                                   int n_heads,
-                                                   int n_kv_heads,
-                                                   int head_dim,
-                                                   float scale,
-                                                   float *scratch,
-                                                   size_t scratch_bytes);
+                                                    const float *Q,
+                                                    const float *K,
+                                                    const float *V,
+                                                    const int *offsets,
+                                                    int batch,
+                                                    int n_heads,
+                                                    int n_kv_heads,
+                                                    int head_dim,
+                                                    float scale,
+                                                    float *scratch,
+                                                    size_t scratch_bytes);
 
 /* ========================================================================
  * Position Embeddings
@@ -206,12 +206,9 @@ void embed_apply_rope_neox(
  * Threading
  * ======================================================================== */
 
-/* Set number of threads for parallel operations (default: 1).
- * Creates a persistent thread pool. Call before inference. */
-EMBED_API void embed_set_threads(int n);
-
-/* Get number of available CPU cores */
-EMBED_API int embed_get_num_cpus(void);
+/* The persistent worker pool lives in threadpool.{c,h}; included here so kernel
+ * callers keep getting embed_set_threads / embed_get_num_cpus from one header. */
+#include "threadpool.h"
 
 /* Global verbose flag */
 EMBED_API extern int embed_verbose;

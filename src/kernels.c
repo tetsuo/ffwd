@@ -35,204 +35,6 @@ void openblas_set_num_threads(int num_threads);
 #endif
 
 /* ========================================================================
- * Thread Pool
- * ======================================================================== */
-
-#define EMBED_MAX_THREADS 16
-
-typedef void (*parallel_fn_t)(int tid, int n_threads, void *arg);
-
-static struct {
-    pthread_t threads[EMBED_MAX_THREADS - 1];
-    int tids[EMBED_MAX_THREADS - 1];
-    int n_threads;
-    int shutdown;
-
-    parallel_fn_t fn;
-    void *arg;
-    int generation;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_work;
-    pthread_cond_t cond_done;
-    int n_done;
-} tp = {
-    .n_threads = 1,
-    .shutdown = 0,
-    .generation = 0,
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .cond_work = PTHREAD_COND_INITIALIZER,
-    .cond_done = PTHREAD_COND_INITIALIZER,
-};
-
-static void *worker_loop(void *arg) {
-    int tid = *(int *)arg;
-    int my_gen = 0;
-
-    for (;;) {
-        pthread_mutex_lock(&tp.mutex);
-        while (tp.generation == my_gen && !tp.shutdown)
-            pthread_cond_wait(&tp.cond_work, &tp.mutex);
-        if (tp.shutdown) {
-            pthread_mutex_unlock(&tp.mutex);
-            return NULL;
-        }
-        my_gen = tp.generation;
-        parallel_fn_t fn = tp.fn;
-        void *a = tp.arg;
-        int nt = tp.n_threads;
-        pthread_mutex_unlock(&tp.mutex);
-
-        fn(tid, nt, a);
-
-        pthread_mutex_lock(&tp.mutex);
-        if (++tp.n_done >= tp.n_threads - 1)
-            pthread_cond_signal(&tp.cond_done);
-        pthread_mutex_unlock(&tp.mutex);
-    }
-}
-
-void embed_set_threads(int n) {
-    if (n < 1)
-        n = 1;
-    if (n > EMBED_MAX_THREADS)
-        n = EMBED_MAX_THREADS;
-
-#if defined(USE_OPENBLAS)
-    /* OpenBLAS owns the heavy F32 GEMM parallelism on Linux. Keep the
-     * auxiliary pool serial to avoid nested thread contention. */
-    int blas_threads = n;
-    openblas_set_num_threads(blas_threads);
-    n = 1;
-#endif
-
-    /* Shutdown existing workers */
-    if (tp.n_threads > 1) {
-        pthread_mutex_lock(&tp.mutex);
-        tp.shutdown = 1;
-        pthread_cond_broadcast(&tp.cond_work);
-        pthread_mutex_unlock(&tp.mutex);
-        for (int i = 0; i < tp.n_threads - 1; i++)
-            pthread_join(tp.threads[i], NULL);
-        tp.shutdown = 0;
-        tp.generation = 0;
-    }
-
-    tp.n_threads = n;
-    if (n <= 1) {
-        if (embed_verbose >= 2) {
-#if defined(USE_OPENBLAS)
-            fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n", n, blas_threads);
-#else
-            fprintf(stderr, "Thread pool: %d threads\n", n);
-#endif
-        }
-        return;
-    }
-
-    for (int i = 0; i < n - 1; i++) {
-        tp.tids[i] = i + 1;
-        pthread_create(&tp.threads[i], NULL, worker_loop, &tp.tids[i]);
-    }
-
-    if (embed_verbose >= 2) {
-#if defined(USE_OPENBLAS)
-        fprintf(stderr, "Thread pool: %d threads, OpenBLAS: %d threads\n", n, blas_threads);
-#else
-        fprintf(stderr, "Thread pool: %d threads\n", n);
-#endif
-    }
-}
-
-#ifndef __APPLE__
-/* CPU bandwidth this process may actually use, in whole cores, or 0 if there
- * is no cgroup limit. Containers (Docker --cpus, Kubernetes, RunPod) expose
- * every host CPU through sysconf()/cpuset, but the CFS quota caps the CPU time
- * the process really gets. Sizing the BLAS/thread pool to the host count then
- * oversubscribes that quota: the threads spend the period's budget early and
- * the scheduler throttles them for the rest of each period, which adds large,
- * bursty stalls (e.g. a 16-thread default against a 5.1-core quota ran the
- * 0.6B model ~2x slower than a 5-thread pool). Floor, not ceil, so a fully
- * busy pool stays under the quota and never trips throttling. */
-static int cgroup_cpu_quota(void) {
-    /* cgroup v2: "/sys/fs/cgroup/cpu.max" is "<quota> <period>", or
-     * "max <period>" when unlimited. */
-    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
-    if (f) {
-        char quota[32];
-        long period = 0;
-        int got = fscanf(f, "%31s %ld", quota, &period);
-        fclose(f);
-        if (got == 2 && period > 0 && strcmp(quota, "max") != 0) {
-            long q = atol(quota);
-            if (q > 0)
-                return q / period < 1 ? 1 : (int)(q / period);
-        }
-    }
-    /* cgroup v1: separate files; quota -1 means unlimited. */
-    long q = -1, period = 0;
-    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
-    if (f) {
-        if (fscanf(f, "%ld", &q) != 1)
-            q = -1;
-        fclose(f);
-    }
-    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
-    if (f) {
-        if (fscanf(f, "%ld", &period) != 1)
-            period = 0;
-        fclose(f);
-    }
-    if (q > 0 && period > 0)
-        return q / period < 1 ? 1 : (int)(q / period);
-    return 0;
-}
-#endif
-
-int embed_get_num_cpus(void) {
-#ifdef __APPLE__
-    int n = 0;
-    size_t len = sizeof(n);
-    sysctlbyname("hw.ncpu", &n, &len, NULL, 0);
-    return n > 0 ? n : 1;
-#else
-    int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (online < 1)
-        online = 1;
-    /* Honor a cgroup CPU quota when it is tighter than the visible core count,
-     * so the default thread pool does not oversubscribe a CPU-limited
-     * container and get throttled. */
-    int quota = cgroup_cpu_quota();
-    if (quota >= 1 && quota < online)
-        return quota;
-    return online;
-#endif
-}
-
-/* Dispatch work to all threads; main thread is tid=0 */
-static void parallel_for(parallel_fn_t fn, void *arg) {
-    if (tp.n_threads <= 1) {
-        fn(0, 1, arg);
-        return;
-    }
-
-    pthread_mutex_lock(&tp.mutex);
-    tp.fn = fn;
-    tp.arg = arg;
-    tp.n_done = 0;
-    tp.generation++;
-    pthread_cond_broadcast(&tp.cond_work);
-    pthread_mutex_unlock(&tp.mutex);
-
-    fn(0, tp.n_threads, arg);
-
-    pthread_mutex_lock(&tp.mutex);
-    while (tp.n_done < tp.n_threads - 1)
-        pthread_cond_wait(&tp.cond_done, &tp.mutex);
-    pthread_mutex_unlock(&tp.mutex);
-}
-
-/* ========================================================================
  * Basic Element-wise Operations
  * ======================================================================== */
 
@@ -360,7 +162,7 @@ static void matvec_worker(int tid, int n_threads, void *arg) {
 
 static void bf16_matvec_threaded(
     float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
-    if (tp.n_threads <= 1) {
+    if (embed_num_threads() <= 1) {
         bf16_matvec_fused(y, x, W_bf16, bias, in_dim, out_dim);
         return;
     }
@@ -411,7 +213,7 @@ static void bf16_linear_rows(float *y,
         .out_dim = out_dim,
     };
 
-    if (tp.n_threads > 1 && seq_len >= 2)
+    if (embed_num_threads() > 1 && seq_len >= 2)
         parallel_for(bf16_linear_rows_worker, &task);
     else
         bf16_linear_rows_worker(0, 1, &task);
@@ -488,7 +290,7 @@ void embed_linear_nobias_bf16_pair(float *a,
     if (seq_len <= 0)
         return;
 
-    if (tp.n_threads <= 1) {
+    if (embed_num_threads() <= 1) {
         for (int s = 0; s < seq_len; s++) {
             const float *x_row = x + (size_t)s * in_dim;
             bf16_matvec_fused(a + (size_t)s * a_dim, x_row, Wa_bf16, NULL, in_dim, a_dim);
@@ -598,7 +400,7 @@ void embed_linear_nobias_bf16_qkv(float *q,
     if (seq_len <= 0)
         return;
 
-    if (tp.n_threads <= 1) {
+    if (embed_num_threads() <= 1) {
         for (int s = 0; s < seq_len; s++) {
             const float *x_row = x + (size_t)s * in_dim;
             bf16_matvec_fused(q + (size_t)s * q_dim, x_row, Wq_bf16, NULL, in_dim, q_dim);
@@ -737,7 +539,7 @@ void embed_rms_norm(
         return;
 
     long long elems = (long long)seq_len * hidden;
-    if (tp.n_threads > 1 && elems >= EMBED_RMS_NORM_PARALLEL_ELEMS) {
+    if (embed_num_threads() > 1 && elems >= EMBED_RMS_NORM_PARALLEL_ELEMS) {
         rms_norm_task_t task = {
             .out = out,
             .x = x,
@@ -1096,9 +898,9 @@ size_t embed_bidirectional_gqa_attention_packed_scratch_bytes(const int *offsets
     if (max_seq < EMBED_PACKED_ATTN_BLAS_MIN_SEQ)
         return 0;
     if ((size_t)max_seq >
-        SIZE_MAX / (sizeof(float) * EMBED_PACKED_ATTN_QUERY_TILE * (size_t)tp.n_threads))
+        SIZE_MAX / (sizeof(float) * EMBED_PACKED_ATTN_QUERY_TILE * (size_t)embed_num_threads()))
         return 0;
-    return (size_t)tp.n_threads * EMBED_PACKED_ATTN_QUERY_TILE * (size_t)max_seq * sizeof(float);
+    return (size_t)embed_num_threads() * EMBED_PACKED_ATTN_QUERY_TILE * (size_t)max_seq * sizeof(float);
 #else
     (void)offsets;
     (void)batch;
@@ -1148,7 +950,7 @@ void embed_bidirectional_gqa_attention_packed_with_scratch(float *out,
                                    .scale = scale,
                                    .scores = scores,
                                    .max_seq = max_seq};
-    if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096) {
+    if (embed_num_threads() > 1 && n_heads >= 2 && qk_work >= 4096) {
         parallel_for(packed_gqa_attn_worker, &task);
     } else {
         packed_gqa_attn_worker(0, 1, &task);
@@ -1336,7 +1138,7 @@ void embed_causal_gqa_attention_packed_with_scratch(float *out,
                                    .scale = scale,
                                    .scores = scores,
                                    .max_seq = max_seq};
-    if (tp.n_threads > 1 && n_heads >= 2 && qk_work >= 4096)
+    if (embed_num_threads() > 1 && n_heads >= 2 && qk_work >= 4096)
         parallel_for(packed_causal_gqa_attn_worker, &task);
     else
         packed_causal_gqa_attn_worker(0, 1, &task);
