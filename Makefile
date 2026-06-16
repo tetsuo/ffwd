@@ -184,7 +184,7 @@ TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_config.c \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 # The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
 TEST_CLI_BIN_SRCS     = embed_cli.c embed.c embed_config.c \
-                        qwen_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
+                        qwen_tokenizer.c wordpiece_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
 
 test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_kernels_generic \
@@ -381,7 +381,7 @@ embed_server.o: embed_server.c embed_server.h embed_build.h embed.h embed_mlx.h 
 embed_mlx.o: embed_mlx.c embed_mlx.h embed_config.h embed.h qwen_safetensors.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-embed_cli.o: embed_cli.c embed_build.h embed.h qwen_kernels.h qwen_tokenizer.h
+embed_cli.o: embed_cli.c embed_build.h embed.h qwen_kernels.h qwen_tokenizer.h wordpiece_tokenizer.h
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -Ideps/ae -c -o $@ $<
 
 
