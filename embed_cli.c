@@ -56,7 +56,7 @@ static void print_usage(const char *prog) {
             "  -b, --batch-size N\n"
             "               Max texts per engine batch (default: all; --stream: 1)\n"
             "  -t, --threads N\n"
-            "               CPU threads (default: all cores)\n"
+            "               CPU threads (default: available cores, cgroup-aware)\n"
             "  -e, --embeddings\n"
             "               Print raw embeddings (with multiple texts)\n"
             "  -v, --verbose\n"

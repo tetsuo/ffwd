@@ -144,6 +144,51 @@ void qwen_set_threads(int n) {
     }
 }
 
+#ifndef __APPLE__
+/* CPU bandwidth this process may actually use, in whole cores, or 0 if there
+ * is no cgroup limit. Containers (Docker --cpus, Kubernetes, RunPod) expose
+ * every host CPU through sysconf()/cpuset, but the CFS quota caps the CPU time
+ * the process really gets. Sizing the BLAS/thread pool to the host count then
+ * oversubscribes that quota: the threads spend the period's budget early and
+ * the scheduler throttles them for the rest of each period, which adds large,
+ * bursty stalls (e.g. a 16-thread default against a 5.1-core quota ran the
+ * 0.6B model ~2x slower than a 5-thread pool). Floor, not ceil, so a fully
+ * busy pool stays under the quota and never trips throttling. */
+static int cgroup_cpu_quota(void) {
+    /* cgroup v2: "/sys/fs/cgroup/cpu.max" is "<quota> <period>", or
+     * "max <period>" when unlimited. */
+    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char quota[32];
+        long period = 0;
+        int got = fscanf(f, "%31s %ld", quota, &period);
+        fclose(f);
+        if (got == 2 && period > 0 && strcmp(quota, "max") != 0) {
+            long q = atol(quota);
+            if (q > 0)
+                return q / period < 1 ? 1 : (int)(q / period);
+        }
+    }
+    /* cgroup v1: separate files; quota -1 means unlimited. */
+    long q = -1, period = 0;
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (f) {
+        if (fscanf(f, "%ld", &q) != 1)
+            q = -1;
+        fclose(f);
+    }
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+    if (f) {
+        if (fscanf(f, "%ld", &period) != 1)
+            period = 0;
+        fclose(f);
+    }
+    if (q > 0 && period > 0)
+        return q / period < 1 ? 1 : (int)(q / period);
+    return 0;
+}
+#endif
+
 int qwen_get_num_cpus(void) {
 #ifdef __APPLE__
     int n = 0;
@@ -151,8 +196,16 @@ int qwen_get_num_cpus(void) {
     sysctlbyname("hw.ncpu", &n, &len, NULL, 0);
     return n > 0 ? n : 1;
 #else
-    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? n : 1;
+    int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (online < 1)
+        online = 1;
+    /* Honor a cgroup CPU quota when it is tighter than the visible core count,
+     * so the default thread pool does not oversubscribe a CPU-limited
+     * container and get throttled. */
+    int quota = cgroup_cpu_quota();
+    if (quota >= 1 && quota < online)
+        return quota;
+    return online;
 #endif
 }
 

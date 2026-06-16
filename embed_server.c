@@ -3446,7 +3446,7 @@ static void print_usage(const char *prog) {
             "  --cuda-weight-dtype DTYPE CUDA weight storage: f32 or bf16 (default:\n"
             "                            f32); bf16 halves weight memory\n"
 #endif
-            "  -t, --threads N           CPU threads (default: all cores)\n"
+            "  -t, --threads N           CPU threads (default: available cores, cgroup-aware)\n"
             "  -v, --verbose             Verbose (-vv for debug)\n"
             "  -V, --version             Print version and exit\n"
             "  --build-info              Print build details and exit\n"
