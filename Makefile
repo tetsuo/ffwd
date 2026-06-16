@@ -78,7 +78,7 @@ LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 # in one variable stops the per-test source lists from drifting apart.
 KERNEL_SRCS = src/kernels.c src/kernels_generic.c src/kernels_neon.c src/kernels_avx.c
 TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c
-CORE_SRCS = src/embed.c src/config.c src/safetensors.c $(KERNEL_SRCS)
+CORE_SRCS = src/embed.c src/alloc.c src/vec.c src/config.c src/safetensors.c $(KERNEL_SRCS)
 
 SRCS = $(CORE_SRCS) $(TOKENIZER_SRCS) \
        deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c

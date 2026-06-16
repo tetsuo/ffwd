@@ -1,4 +1,5 @@
 #include "embed.h"
+#include "alloc.h"
 #include "config.h"
 #include "internal.h"
 #include "dtype.h"
@@ -32,70 +33,12 @@ struct embed_late_workspace {
 
 int embed_verbose = 0;
 
-#define EMBED_BF16_QKV_FUSE_MAX_SEQ     16
-#define EMBED_BF16_PAIR_FUSE_MAX_SEQ    4
-#define EMBED_MIN_WORKSPACE_SEQ_CAP     16
-#define EMBED_WORKSPACE_SEQ_GRANULARITY 16
+#define EMBED_BF16_QKV_FUSE_MAX_SEQ  16
+#define EMBED_BF16_PAIR_FUSE_MAX_SEQ 4
 
 /* ========================================================================
- * Size helpers
+ * Model-directory probes
  * ======================================================================== */
-
-static int mul_size(size_t a, size_t b, size_t *out) {
-    if (a != 0 && b > SIZE_MAX / a)
-        return -1;
-    *out = a * b;
-    return 0;
-}
-
-static int add_size(size_t a, size_t b, size_t *out) {
-    if (b > SIZE_MAX - a)
-        return -1;
-    *out = a + b;
-    return 0;
-}
-
-static int grow_cap(int current, int needed, int *out) {
-    if (needed <= 0)
-        return -1;
-
-    int cap = needed;
-    if (cap < EMBED_MIN_WORKSPACE_SEQ_CAP)
-        cap = EMBED_MIN_WORKSPACE_SEQ_CAP;
-
-    int rem = cap % EMBED_WORKSPACE_SEQ_GRANULARITY;
-    if (rem != 0) {
-        int add = EMBED_WORKSPACE_SEQ_GRANULARITY - rem;
-        if (cap > INT_MAX - add)
-            return -1;
-        cap += add;
-    }
-
-    if (cap < current)
-        cap = current;
-
-    *out = cap;
-    return 0;
-}
-
-static int realloc_floats(float **ptr, size_t count) {
-    size_t bytes;
-    if (mul_size(count, sizeof(float), &bytes) != 0)
-        return -1;
-
-    void *p = realloc(*ptr, bytes);
-    if (!p && bytes != 0)
-        return -1;
-    *ptr = (float *)p;
-    return 0;
-}
-
-static float *malloc_floats(size_t count) {
-    size_t bytes;
-    if (mul_size(count, sizeof(float), &bytes) != 0)
-        return NULL;
-    return (float *)malloc(bytes);
-}
 
 static int model_dir_has_file(const char *model_dir, const char *rel) {
     char path[1024];
@@ -114,16 +57,6 @@ static int model_dir_has_late_projection(const char *model_dir) {
            model_dir_has_file(model_dir, "1_Dense/model.safetensors");
 }
 
-static int realloc_floats_2d(float **ptr, int rows, int cols) {
-    if (rows < 0 || cols < 0)
-        return -1;
-
-    size_t count;
-    if (mul_size((size_t)rows, (size_t)cols, &count) != 0)
-        return -1;
-    return realloc_floats(ptr, count);
-}
-
 static int ensure_late_state_buffer(embed_late_workspace_t *ws, int n_tokens) {
     if (!ws || !ws->model || n_tokens <= 0)
         return -1;
@@ -133,18 +66,6 @@ static int ensure_late_state_buffer(embed_late_workspace_t *ws, int n_tokens) {
     if (realloc_floats_2d(&ws->states, n_tokens, hidden) != 0)
         return -1;
     ws->states_seq_cap = n_tokens;
-    return 0;
-}
-
-static int realloc_ints(int **ptr, size_t count) {
-    size_t bytes;
-    if (mul_size(count, sizeof(int), &bytes) != 0)
-        return -1;
-
-    void *p = realloc(*ptr, bytes);
-    if (!p && bytes != 0)
-        return -1;
-    *ptr = (int *)p;
     return 0;
 }
 
@@ -1771,43 +1692,4 @@ float *embed_model_encode(const embed_model_t *model,
         return NULL;
     }
     return emb;
-}
-
-/* ========================================================================
- * Vector helpers
- * ======================================================================== */
-
-int embed_l2_normalize(float *vec, int dim) {
-    if (!vec || dim <= 0)
-        return -1;
-
-    float norm_sq = 0.0f;
-    for (int i = 0; i < dim; i++)
-        norm_sq += vec[i] * vec[i];
-
-    if (!(norm_sq > 0.0f) || !isfinite(norm_sq))
-        return -1;
-
-    float inv_norm = 1.0f / sqrtf(norm_sq);
-    for (int i = 0; i < dim; i++)
-        vec[i] *= inv_norm;
-    return 0;
-}
-
-float embed_cosine_similarity(const float *a, const float *b, int dim) {
-    if (!a || !b || dim <= 0)
-        return 0.0f;
-
-    float dot = 0.0f;
-    float norm_a_sq = 0.0f;
-    float norm_b_sq = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        dot += a[i] * b[i];
-        norm_a_sq += a[i] * a[i];
-        norm_b_sq += b[i] * b[i];
-    }
-
-    if (!(norm_a_sq > 0.0f) || !(norm_b_sq > 0.0f) || !isfinite(norm_a_sq) || !isfinite(norm_b_sq))
-        return 0.0f;
-    return dot / sqrtf(norm_a_sq * norm_b_sq);
 }
