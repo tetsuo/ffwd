@@ -4,9 +4,10 @@
 #include <stdint.h>
 #include <limits.h>
 
-/* Sequence-capacity growth policy for the forward-pass workspaces: never
- * allocate fewer than the minimum, and round up to the granularity so small
- * length changes do not trigger a realloc on every call. */
+/* Sequence-capacity growth policy for the forward-pass workspaces: for new
+ * growth, never allocate fewer than the minimum, and round up to the
+ * granularity so small length changes do not trigger a realloc on every call.
+ * Existing larger capacity is preserved. */
 #define EMBED_MIN_WORKSPACE_SEQ_CAP     16
 #define EMBED_WORKSPACE_SEQ_GRANULARITY 16
 
@@ -25,7 +26,7 @@ int add_size(size_t a, size_t b, size_t *out) {
 }
 
 int grow_cap(int current, int needed, int *out) {
-    if (needed <= 0)
+    if (current < 0 || needed <= 0)
         return -1;
 
     int cap = needed;
@@ -34,10 +35,10 @@ int grow_cap(int current, int needed, int *out) {
 
     int rem = cap % EMBED_WORKSPACE_SEQ_GRANULARITY;
     if (rem != 0) {
-        int add = EMBED_WORKSPACE_SEQ_GRANULARITY - rem;
-        if (cap > INT_MAX - add)
+        int pad = EMBED_WORKSPACE_SEQ_GRANULARITY - rem;
+        if (cap > INT_MAX - pad)
             return -1;
-        cap += add;
+        cap += pad;
     }
 
     if (cap < current)

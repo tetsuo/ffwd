@@ -8,6 +8,8 @@
 #include "tiny_model.h"
 #include "tok_fixture.h"
 
+#include "../src/alloc.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +24,23 @@ static float max_abs_diff(const float *a, const float *b, int n) {
             m = d;
     }
     return m;
+}
+
+static int check_alloc_helpers(void) {
+    int cap = 0;
+    if (grow_cap(-1, 1, &cap) == 0) {
+        fprintf(stderr, "grow_cap accepted a negative current capacity\n");
+        return -1;
+    }
+    if (grow_cap(33, 17, &cap) != 0 || cap != 33) {
+        fprintf(stderr, "grow_cap failed to preserve a larger current capacity\n");
+        return -1;
+    }
+    if (grow_cap(0, 17, &cap) != 0 || cap != 32) {
+        fprintf(stderr, "grow_cap failed to round new capacity to granularity\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* The allocating and pooling API variants must agree with the *_into
@@ -161,6 +180,9 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (check_alloc_helpers() != 0)
+        return 1;
+
     char fixture_dir[1024];
     const char *model_dir;
     if (argc == 2) {
