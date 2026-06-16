@@ -32,7 +32,12 @@ void sbuf_append(sbuf *b, const void *p, size_t n) {
     b->ptr[b->len] = '\0';
 }
 
-void sbuf_putc(sbuf *b, char c) { sbuf_append(b, &c, 1); }
+void sbuf_putc(sbuf *b, char c) {
+    sbuf_reserve(b, 1);
+    b->ptr[b->len++] = c;
+    b->ptr[b->len] = '\0';
+}
+
 void sbuf_puts(sbuf *b, const char *s) { sbuf_append(b, s, strlen(s)); }
 
 void sbuf_clear(sbuf *b) {
@@ -42,19 +47,25 @@ void sbuf_clear(sbuf *b) {
 }
 
 void sbuf_printf(sbuf *b, const char *fmt, ...) {
-    va_list ap, ap2;
+    va_list ap;
     va_start(ap, fmt);
-    va_copy(ap2, ap);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        die_oom();
-    sbuf_reserve(b, (size_t)n);
-    int n2 = vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
-    va_end(ap2);
-    if (n2 < 0 || n2 != n)
-        die_oom();
-    b->len += (size_t)n;
+    for (;;) {
+        size_t avail = b->cap > b->len ? b->cap - b->len : 0;
+        va_list aq;
+        va_copy(aq, ap);
+        int n = vsnprintf(avail ? b->ptr + b->len : NULL, avail, fmt, aq);
+        va_end(aq);
+        if (n < 0) {
+            va_end(ap);
+            die_oom();
+        }
+        if ((size_t)n < avail) {
+            b->len += (size_t)n;
+            va_end(ap);
+            return;
+        }
+        sbuf_reserve(b, (size_t)n);
+    }
 }
 
 void sbuf_free(sbuf *b) {

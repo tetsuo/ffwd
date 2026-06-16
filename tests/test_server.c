@@ -45,6 +45,30 @@ static void test_base64_rfc4648(void) {
     }
 }
 
+static void test_sbuf_growth_and_formatting(void) {
+    sbuf b = {0};
+    sbuf_puts(&b, "ab");
+    sbuf_putc(&b, 'c');
+    TEST_ASSERT(b.len == 3);
+    TEST_ASSERT(strcmp(b.ptr, "abc") == 0);
+
+    size_t old_cap = b.cap;
+    sbuf_printf(&b, "-%04d-%s", 7, "tail");
+    TEST_ASSERT(strcmp(b.ptr, "abc-0007-tail") == 0);
+    TEST_ASSERT(b.cap == old_cap);
+
+    char big[600];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    sbuf_puts(&b, big);
+    TEST_ASSERT(b.len == strlen("abc-0007-tail") + sizeof(big) - 1);
+    TEST_ASSERT(b.ptr[b.len] == '\0');
+    sbuf_clear(&b);
+    TEST_ASSERT(b.len == 0);
+    TEST_ASSERT(b.ptr && b.ptr[0] == '\0');
+    sbuf_free(&b);
+}
+
 static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.0f) == 0);
     /* tanh saturates to +-1, scaled by 127. */
@@ -1050,6 +1074,7 @@ static void test_http_server(void) {
 
 int main(void) {
     test_base64_rfc4648();
+    test_sbuf_growth_and_formatting();
     test_quantize_int8_tanh();
     test_encode_embedding_int8();
     test_encode_embedding_binary();
