@@ -1,6 +1,11 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "threadpool.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +13,9 @@
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -30,7 +38,7 @@ static struct {
 
     parallel_fn_t fn;
     void *arg;
-    int generation;
+    uint64_t generation;
 
     pthread_mutex_t mutex;
     pthread_cond_t cond_work;
@@ -47,7 +55,7 @@ static struct {
 
 static void *worker_loop(void *arg) {
     int tid = *(int *)arg;
-    int my_gen = 0;
+    uint64_t my_gen = 0;
 
     for (;;) {
         pthread_mutex_lock(&tp.mutex);
@@ -179,6 +187,14 @@ int embed_get_num_cpus(void) {
     int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (online < 1)
         online = 1;
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int affinity = CPU_COUNT(&set);
+        if (affinity >= 1 && affinity < online)
+            online = affinity;
+    }
+#endif
     /* Honor a cgroup CPU quota when it is tighter than the visible core count,
      * so the default thread pool does not oversubscribe a CPU-limited
      * container and get throttled. */
