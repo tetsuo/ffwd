@@ -64,7 +64,9 @@ struct embed_cuda_ctx {
     float *qkv;
     float *attn_out;
     float *ffn_gate_up;
-    void *act_bf16; // BF16 cast of a GEMM activation operand (bf16 weights)
+    void *act_bf16;    // BF16 cast of a GEMM activation operand (bf16 weights)
+    float *weight_f32; // F32 widen scratch for one BF16 weight (memory-only bf16)
+    size_t weight_f32_elems;
     float *pooled_out;
     float *rope_cos;
     float *rope_sin;
@@ -362,6 +364,14 @@ __global__ static void cast_f32_to_bf16_kernel(__nv_bfloat16 *out, const float *
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
         out[i] = __float2bfloat16(in[i]);
+}
+
+// Widen n BF16 values to F32 (used to run an exact F32 GEMM on BF16-stored
+// weights - memory-only BF16, no precision loss from the operands).
+__global__ static void cast_bf16_to_f32_kernel(float *out, const __nv_bfloat16 *in, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        out[i] = __bfloat162float(in[i]);
 }
 
 __device__ static float block_sum(float v) {
@@ -748,11 +758,25 @@ static cublasComputeType_t gemm_compute(void) {
     return g_gemm_compute;
 }
 
-// y = w @ x (+ beta*y). With BF16 weights both GEMM inputs are BF16 and
-// accumulation/output stay F32: when x_is_bf16 the activation operand was
-// already produced in BF16 by the upstream kernel, otherwise the F32 operand
-// is cast into ctx->act_bf16 first. With F32 weights this is the exact path,
-// honoring gemm_compute().
+// Grow the F32 weight-widen scratch to hold `elems` floats. The memory-only
+// BF16 path materializes one F32 weight at a time into this buffer.
+static int ensure_weight_f32(embed_cuda_ctx_t *ctx, size_t elems) {
+    if (ctx->weight_f32_elems >= elems)
+        return 0;
+    cudaFree(ctx->weight_f32);
+    ctx->weight_f32 = NULL;
+    ctx->weight_f32_elems = 0;
+    CUDA_CHECK(cudaMalloc((void **)&ctx->weight_f32, elems * sizeof(float)));
+    ctx->weight_f32_elems = elems;
+    return 0;
+}
+
+// y = w @ x (+ beta*y). With BF16 weights and an already-BF16 activation
+// (x_is_bf16 - the Qwen fused path) both inputs are BF16 with F32 accumulation.
+// For the BERT family the activation stays F32 and the BF16 weight is widened
+// back to F32 here, so the GEMM is exact (honoring gemm_compute): BF16 is then a
+// storage choice that costs no quality, which the post-norm LayerNorm needs.
+// With F32 weights this is the exact path.
 static int linear_ex(embed_cuda_ctx_t *ctx,
                      const cuda_matrix_t *w,
                      const void *x,
@@ -765,6 +789,21 @@ static int linear_ex(embed_cuda_ctx_t *ctx,
                      float beta) {
     const float alpha = 1.0f;
     if (w->bf16) {
+        if (!x_is_bf16 && ctx->config.family == EMBED_FAMILY_BERT) {
+            size_t welems = (size_t)out_dim * (size_t)in_dim;
+            if (ensure_weight_f32(ctx, welems) != 0)
+                return -1;
+            int wt = 256;
+            cast_bf16_to_f32_kernel<<<(welems + wt - 1) / wt, wt, 0, ctx->stream>>>(
+                ctx->weight_f32, (const __nv_bfloat16 *)w->d, welems);
+            if (launch_check() != 0)
+                return -1;
+            CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim,
+                                      &alpha, ctx->weight_f32, CUDA_R_32F, in_dim, x, CUDA_R_32F,
+                                      x_stride, &beta, y, CUDA_R_32F, out_dim, gemm_compute(),
+                                      CUBLAS_GEMM_DEFAULT));
+            return 0;
+        }
         const void *xb = x;
         if (!x_is_bf16) {
             size_t n = (size_t)rows * (size_t)x_stride;
@@ -1356,6 +1395,7 @@ void embed_cuda_free(embed_cuda_ctx_t *ctx) {
     cudaFree(ctx->kexp);
     cudaFree(ctx->vexp);
     cudaFree(ctx->act_bf16);
+    cudaFree(ctx->weight_f32);
     cudaFree(ctx->attn_scores);
     cudaFree(ctx->attn_probs);
     cudaFree((void *)ctx->attn_ptrs);
