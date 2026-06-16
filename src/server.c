@@ -5,6 +5,9 @@
 #include "build.h"
 #include "server.h"
 #include "server_internal.h"
+#include "server_util.h"
+#include "sbuf.h"
+#include "base64.h"
 #include "embed.h"
 #include "safetensors.h"
 #include "kernels.h"
@@ -49,134 +52,6 @@
 
 #include <cjson/cJSON.h>
 
-static void die_oom(void) {
-    fprintf(stderr, "embed-server: out of memory\n");
-    exit(1);
-}
-
-static void *xmalloc(size_t n) {
-    void *p = malloc(n ? n : 1);
-    if (!p)
-        die_oom();
-    return p;
-}
-
-static void *xcalloc(size_t n, size_t sz) {
-    void *p = calloc(n ? n : 1, sz ? sz : 1);
-    if (!p)
-        die_oom();
-    return p;
-}
-
-static void *xrealloc(void *p, size_t n) {
-    p = realloc(p, n ? n : 1);
-    if (!p)
-        die_oom();
-    return p;
-}
-
-static char *xstrdup(const char *s) {
-    size_t n = strlen(s);
-    char *p = xmalloc(n + 1);
-    memcpy(p, s, n + 1);
-    return p;
-}
-
-static char *xstrndup(const char *s, size_t n) {
-    char *p = xmalloc(n + 1);
-    memcpy(p, s, n);
-    p[n] = '\0';
-    return p;
-}
-
-static uint64_t mstime(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
-}
-
-static uint64_t nstime(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000000u + (uint64_t)tv.tv_usec * 1000u;
-}
-
-static double ns_to_ms(uint64_t ns) { return (double)ns / 1000000.0; }
-
-static void server_log(const char *fmt, ...) {
-    char ts[32];
-    time_t now = time(NULL);
-    struct tm tmv;
-    localtime_r(&now, &tmv);
-    strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tmv);
-    fprintf(stderr, "%s ", ts);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
-}
-
-static void sbuf_reserve(sbuf *b, size_t add) {
-    if (add > SIZE_MAX - b->len - 1)
-        die_oom();
-    size_t need = b->len + add + 1;
-    if (need <= b->cap)
-        return;
-    size_t cap = b->cap ? b->cap * 2 : 256;
-    while (cap < need) {
-        if (cap > SIZE_MAX / 2)
-            die_oom();
-        cap *= 2;
-    }
-    b->ptr = xrealloc(b->ptr, cap);
-    b->cap = cap;
-}
-
-static void sbuf_append(sbuf *b, const void *p, size_t n) {
-    sbuf_reserve(b, n);
-    memcpy(b->ptr + b->len, p, n);
-    b->len += n;
-    b->ptr[b->len] = '\0';
-}
-
-static void sbuf_putc(sbuf *b, char c) { sbuf_append(b, &c, 1); }
-static void sbuf_puts(sbuf *b, const char *s) { sbuf_append(b, s, strlen(s)); }
-
-static void sbuf_clear(sbuf *b) {
-    b->len = 0;
-    if (b->ptr)
-        b->ptr[0] = '\0';
-}
-
-static void sbuf_printf(sbuf *b, const char *fmt, ...) {
-    va_list ap, ap2;
-    va_start(ap, fmt);
-    va_copy(ap2, ap);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        die_oom();
-    sbuf_reserve(b, (size_t)n);
-    int n2 = vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
-    va_end(ap2);
-    if (n2 < 0 || n2 != n)
-        die_oom();
-    b->len += (size_t)n;
-}
-
-static void sbuf_free(sbuf *b) {
-    free(b->ptr);
-    memset(b, 0, sizeof(*b));
-}
-
-
 static const model_info k_models[] = {
     {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
      EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
@@ -218,7 +93,6 @@ static model_slot model_slot_for_id(const char *id) {
     }
     return MODEL_UNKNOWN;
 }
-
 
 static int queue_write(client *c);
 static void dispatch_request(client *c);
@@ -1113,27 +987,6 @@ dimensions_from_root(cJSON *root, cJSON *detail, int min_dim, int max_dim, const
         ve_add(detail, "[\"body\",\"dimensions\"]",
                "dimensions must be divisible by 8 for base64_binary", "value_error.divisible");
     return dims;
-}
-
-static char *base64_encode(const unsigned char *src, size_t n) {
-    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t out_len = ((n + 2) / 3) * 4;
-    char *out = xmalloc(out_len + 1);
-    size_t o = 0;
-    for (size_t i = 0; i < n; i += 3) {
-        unsigned v = (unsigned)src[i] << 16;
-        int remain = (int)(n - i);
-        if (remain > 1)
-            v |= (unsigned)src[i + 1] << 8;
-        if (remain > 2)
-            v |= (unsigned)src[i + 2];
-        out[o++] = tbl[(v >> 18) & 63];
-        out[o++] = tbl[(v >> 12) & 63];
-        out[o++] = remain > 1 ? tbl[(v >> 6) & 63] : '=';
-        out[o++] = remain > 2 ? tbl[v & 63] : '=';
-    }
-    out[o] = '\0';
-    return out;
 }
 
 static signed char quantize_int8_tanh(float x) {

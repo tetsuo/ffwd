@@ -81,6 +81,11 @@ TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c
 CORE_SRCS = src/model.c src/forward.c src/late.c src/vec.c src/alloc.c \
             src/config.c src/safetensors.c $(KERNEL_SRCS)
 
+# Server-only objects: the embed-server binary and the server test link these
+# alongside server.o. Not in libembed.a - the CLI and library do not use them.
+SERVER_SRCS = src/server_util.c src/sbuf.c src/base64.c
+SERVER_OBJS = $(SERVER_SRCS:.c=.o)
+
 SRCS = $(CORE_SRCS) $(TOKENIZER_SRCS) \
        deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 
@@ -171,8 +176,8 @@ $(LIB): $(OBJS) $(EXTRA_OBJS)
 $(TARGET): $(LIB) src/cli.o
 	$(CC) $(CFLAGS) -o $@ src/cli.o $(LIB) $(LDFLAGS)
 
-$(SERVER_TARGET): $(LIB) src/server.o
-	$(CC) $(CFLAGS) -o $@ src/server.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
+$(SERVER_TARGET): $(LIB) src/server.o $(SERVER_OBJS)
+	$(CC) $(CFLAGS) -o $@ src/server.o $(SERVER_OBJS) $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
 
 # =============================================================================
 # Tests (no model files required)
@@ -199,7 +204,10 @@ TEST_WORKSPACE_SRCS   = tests/test_workspace.c $(CORE_SRCS) src/tokenizer_bpe.c
 TEST_LATE_SRCS        = tests/test_late.c $(CORE_SRCS) src/tokenizer_bpe.c
 # test_server.c #includes ../src/server.c, so server is not a separate object
 # here; it needs -I. for server.c's "deps/ae/ae.h" plus the ae sources.
+# test_server.c #includes ../src/server.c, so server.c itself is not listed;
+# the carved-out server objects (util/sbuf/base64) are separate TUs and must be.
 TEST_SERVER_SRCS      = tests/test_server.c $(CORE_SRCS) $(TOKENIZER_SRCS) \
+                        $(SERVER_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 # The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
 TEST_CLI_BIN_SRCS     = src/cli.c $(CORE_SRCS) $(TOKENIZER_SRCS)

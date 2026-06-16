@@ -8,6 +8,7 @@
  * the CLI and library do not include it. */
 
 #include "embed.h"
+#include "sbuf.h"
 #include "tokenizer_bpe.h"
 #include "tokenizer_wordpiece.h"
 
@@ -66,12 +67,6 @@
 #define EMBED_SERVER_MICROBATCH_MAX_JOBS 128
 #define EMBED_MLX_MEMORY_BUDGET_PERCENT  90
 #define EMBED_MLX_RESIDENT_MULTIPLIER    2
-
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-} sbuf;
 
 typedef enum {
     MODEL_STD_06,
