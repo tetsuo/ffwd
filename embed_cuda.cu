@@ -29,6 +29,14 @@ typedef struct {
     float *input_norm;
     float *post_attn_norm;
     cuda_matrix_t gate_up_proj, down_proj;
+    /* BERT family (NULL for Qwen3). The two block LayerNorm weights reuse
+     * input_norm (post-attention) and post_attn_norm (post-FFN); gate_up_proj
+     * holds the single BERT up_proj. These add the biases those slots lack. */
+    float *o_bias;
+    float *attn_ln_bias;
+    float *ffn_inter_bias;
+    float *ffn_out_bias;
+    float *ffn_ln_bias;
 } cuda_layer_t;
 
 struct embed_cuda_ctx {
@@ -40,6 +48,13 @@ struct embed_cuda_ctx {
     cuda_matrix_t embed_tokens;
     cuda_layer_t *layers;
     float *norm;
+    /* BERT family (NULL for Qwen3): learned absolute position embeddings, the
+     * token-type[0] embedding (row 0 only, [hidden]), and the embedding
+     * LayerNorm weight/bias. */
+    float *position_embeddings;
+    float *token_type_embedding;
+    float *embed_ln_w;
+    float *embed_ln_b;
 
     int seq_cap;
     int batch_cap;
@@ -642,6 +657,63 @@ __global__ static void span_pool_kernel(
     }
 }
 
+// BERT LayerNorm: mean-subtract, biased variance (/dim), scale by gamma, shift
+// by beta. One block per row, two block reductions before any write, so it is
+// safe in place (out == x). Matches the CPU qwen_layer_norm.
+__global__ static void layer_norm_kernel(float *out,
+                                         const float *x,
+                                         const float *gamma,
+                                         const float *beta,
+                                         int rows,
+                                         int dim,
+                                         float eps) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    const float *xr = x + (size_t)row * dim;
+    float s = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x)
+        s += xr[d];
+    float mean = block_sum(s) / (float)dim;
+    float vs = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float c = xr[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
+    float *o = out + (size_t)row * dim;
+    for (int d = tid; d < dim; d += blockDim.x)
+        o[d] = (xr[d] - mean) * inv * gamma[d] + beta[d];
+}
+
+// Exact-erf GeLU in place: 0.5 x (1 + erf(x / sqrt(2))). Not the tanh
+// approximation - BERT-family checkpoints use the exact form.
+__global__ static void gelu_kernel(float *x, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+    }
+}
+
+// Add the learned absolute position embedding (indexed by the within-sequence
+// position) and the token-type[0] embedding to the token embeddings already in
+// x. token_type holds row 0 only; every input token has segment id 0.
+__global__ static void bert_pos_type_add_kernel(float *x,
+                                                const int *positions,
+                                                const float *pos_emb,
+                                                const float *token_type,
+                                                int total,
+                                                int hidden) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)total * hidden;
+    if (idx >= count)
+        return;
+    int tok = (int)(idx / hidden);
+    int d = (int)(idx - (size_t)tok * hidden);
+    int pos = positions[tok];
+    x[idx] += pos_emb[(size_t)pos * hidden + d] + token_type[d];
+}
+
 static int launch_check(void) {
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -1127,6 +1199,25 @@ static int load_layer(cuda_layer_t *dst, const embed_layer_t *src, const embed_c
            load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size);
 }
 
+/* BERT layer: attention reuses the fused qkv matrix and qkv_bias (q_dim ==
+ * kv_dim == hidden); the two block LayerNorm weights load into input_norm
+ * (post-attention) and post_attn_norm (post-FFN); gate_up_proj holds the single
+ * up_proj. The added fields carry the biases the Qwen slots lack. */
+static int load_bert_layer(cuda_layer_t *dst, const embed_layer_t *src, const embed_config_t *c) {
+    return load_qkv_matrix(&dst->qkv, src, c) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
+           load_qkv_bias(&dst->qkv_bias, src, c) ||
+           load_vector(&dst->o_bias, src->o_bias, c->hidden_size) ||
+           load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
+           load_vector(&dst->attn_ln_bias, src->attn_ln_bias, c->hidden_size) ||
+           load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
+           load_vector(&dst->ffn_ln_bias, src->ffn_ln_bias, c->hidden_size) ||
+           load_matrix(&dst->gate_up_proj, &src->up_proj, c->intermediate_size, c->hidden_size) ||
+           load_vector(&dst->ffn_inter_bias, src->ffn_inter_bias, c->intermediate_size) ||
+           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size) ||
+           load_vector(&dst->ffn_out_bias, src->ffn_out_bias, c->hidden_size);
+}
+
 static void free_layer(cuda_layer_t *l) {
     cuda_matrix_free(&l->qkv);
     cuda_matrix_free(&l->wo);
@@ -1137,6 +1228,11 @@ static void free_layer(cuda_layer_t *l) {
     cudaFree(l->post_attn_norm);
     cuda_matrix_free(&l->gate_up_proj);
     cuda_matrix_free(&l->down_proj);
+    cudaFree(l->o_bias);
+    cudaFree(l->attn_ln_bias);
+    cudaFree(l->ffn_inter_bias);
+    cudaFree(l->ffn_out_bias);
+    cudaFree(l->ffn_ln_bias);
 }
 
 /* Build a device context from an already-loaded CPU model. own_cpu records
@@ -1181,13 +1277,33 @@ static embed_cuda_ctx_t *cuda_ctx_from_model(embed_model_t *cpu, int own_cpu) {
         return NULL;
     }
     if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size,
-                    c->hidden_size) != 0 ||
-        load_vector(&ctx->norm, cpu->weights.norm, c->hidden_size) != 0) {
+                    c->hidden_size) != 0) {
+        embed_cuda_free(ctx);
+        return NULL;
+    }
+    if (c->family == EMBED_FAMILY_BERT) {
+        /* BERT has no final norm; it adds learned position + token-type[0]
+         * embeddings and an embedding LayerNorm (only row 0 of token-type is
+         * ever used, so load just that row). */
+        const embed_weights_t *w = &cpu->weights;
+        if (load_vector(&ctx->position_embeddings, w->position_embeddings,
+                        c->max_position_embeddings * c->hidden_size) != 0 ||
+            load_vector(&ctx->token_type_embedding, w->token_type_embeddings, c->hidden_size) !=
+                0 ||
+            load_vector(&ctx->embed_ln_w, w->embed_ln_w, c->hidden_size) != 0 ||
+            load_vector(&ctx->embed_ln_b, w->embed_ln_b, c->hidden_size) != 0) {
+            embed_cuda_free(ctx);
+            return NULL;
+        }
+    } else if (load_vector(&ctx->norm, cpu->weights.norm, c->hidden_size) != 0) {
         embed_cuda_free(ctx);
         return NULL;
     }
     for (int i = 0; i < c->n_layers; i++) {
-        if (load_layer(&ctx->layers[i], &cpu->weights.layers[i], c) != 0) {
+        int rc = c->family == EMBED_FAMILY_BERT
+                     ? load_bert_layer(&ctx->layers[i], &cpu->weights.layers[i], c)
+                     : load_layer(&ctx->layers[i], &cpu->weights.layers[i], c);
+        if (rc != 0) {
             fprintf(stderr, "cuda: failed to load layer %d\n", i);
             embed_cuda_free(ctx);
             return NULL;
@@ -1211,6 +1327,10 @@ void embed_cuda_free(embed_cuda_ctx_t *ctx) {
         free(ctx->layers);
     }
     cudaFree(ctx->norm);
+    cudaFree(ctx->position_embeddings);
+    cudaFree(ctx->token_type_embedding);
+    cudaFree(ctx->embed_ln_w);
+    cudaFree(ctx->embed_ln_b);
     cudaFree(ctx->x);
     cudaFree(ctx->x_norm);
     cudaFree(ctx->qkv);
@@ -1245,10 +1365,13 @@ const embed_config_t *embed_cuda_config(const embed_cuda_ctx_t *ctx) {
     return ctx ? &ctx->config : NULL;
 }
 
-static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs, int batch) {
-    if (!ctx || !inputs || batch <= 0)
-        return -1;
-    const embed_config_t *c = &ctx->config;
+// Pack inputs into the device scratch every forward shares: token ids, the
+// per-sequence positions 0..L-1, and the batch offsets. Grows scratch via
+// ensure_buffers. Returns the packed token count in *out_total, or -1 on error.
+static int cuda_upload_packed_inputs(embed_cuda_ctx_t *ctx,
+                                     const embed_input_t *inputs,
+                                     int batch,
+                                     int *out_total) {
     int *h_offsets = (int *)malloc((size_t)(batch + 1) * sizeof(int));
     if (!h_offsets)
         return -1;
@@ -1266,13 +1389,12 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
     h_offsets[batch] = total;
     int *h_ids = (int *)malloc((size_t)total * sizeof(int));
     int *h_pos = (int *)malloc((size_t)total * sizeof(int));
-    if (!h_offsets || !h_ids || !h_pos) {
+    if (!h_ids || !h_pos) {
         free(h_offsets);
         free(h_ids);
         free(h_pos);
         return -1;
     }
-
     for (int b = 0; b < batch; b++) {
         int off = h_offsets[b];
         memcpy(h_ids + off, inputs[b].ids, (size_t)inputs[b].n_tokens * sizeof(int));
@@ -1301,6 +1423,113 @@ static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs
         fprintf(stderr, "cuda input copy failed: %s\n", cudaGetErrorString(ce));
         return -1;
     }
+    *out_total = total;
+    return 0;
+}
+
+// BERT-family forward (post-norm encoder), mirroring the CPU forward_packed_bert.
+// Embeddings: token + learned position + token-type[0], then the embedding
+// LayerNorm. Each layer: QKV(+bias) from x directly -> bidirectional attention
+// -> output dense(+bias) -> residual -> LayerNorm -> dense(+bias) -> GeLU ->
+// dense(+bias) -> residual -> LayerNorm. No RoPE, no qk-norm, no final norm.
+// F32 activations: BERT checkpoints are F32, so the linear/linear_accum F32
+// entry points are used throughout (they still handle bf16 weights via an
+// internal cast, which keeps a future bf16 BERT correct if not yet optimized).
+static int cuda_forward_batch_bert(embed_cuda_ctx_t *ctx, const embed_input_t *inputs, int batch) {
+    const embed_config_t *c = &ctx->config;
+    int total = 0;
+    if (cuda_upload_packed_inputs(ctx, inputs, batch, &total) != 0)
+        return -1;
+
+    int hidden = c->hidden_size;
+    int inter = c->intermediate_size;
+    int qkv_dim = c->q_dim + 2 * c->kv_dim;
+    int q_offset = 0, k_offset = c->q_dim, v_offset = c->q_dim + c->kv_dim;
+    float scale = 1.0f / sqrtf((float)c->head_dim);
+    float eps = c->layer_norm_eps;
+    int threads = 256;
+    int blocks_hidden = (total * hidden + threads - 1) / threads;
+
+    embed_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, hidden,
+        c->vocab_size);
+    if (launch_check() != 0)
+        return -1;
+    bert_pos_type_add_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
+        ctx->x, ctx->positions, ctx->position_embeddings, ctx->token_type_embedding, total, hidden);
+    if (launch_check() != 0)
+        return -1;
+    layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, ctx->embed_ln_w,
+                                                      ctx->embed_ln_b, total, hidden, eps);
+    if (launch_check() != 0)
+        return -1;
+
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim) != 0)
+        return -1;
+
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        cuda_layer_t *l = &ctx->layers[layer];
+
+        // Self-attention (post-norm): QKV read x directly, then +bias.
+        if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
+            return -1;
+        int qkv_count = total * qkv_dim;
+        add_row_bias_kernel<<<(qkv_count + 255) / 256, 256, 0, ctx->stream>>>(ctx->qkv, l->qkv_bias,
+                                                                              total, qkv_dim);
+        if (launch_check() != 0)
+            return -1;
+        if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset,
+                                qkv_dim, scale, NULL) != 0)
+            return -1;
+
+        // Output dense(+bias), residual into x, then post-attention LayerNorm.
+        if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0)
+            return -1;
+        add_row_bias_kernel<<<(total * hidden + 255) / 256, 256, 0, ctx->stream>>>(
+            ctx->x, l->o_bias, total, hidden);
+        if (launch_check() != 0)
+            return -1;
+        layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, l->input_norm,
+                                                          l->attn_ln_bias, total, hidden, eps);
+        if (launch_check() != 0)
+            return -1;
+
+        // Feed-forward (post-norm): dense(+bias) -> GeLU -> dense(+bias).
+        if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
+            return -1;
+        int inter_count = total * inter;
+        add_row_bias_kernel<<<(inter_count + 255) / 256, 256, 0, ctx->stream>>>(
+            ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
+        if (launch_check() != 0)
+            return -1;
+        gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            ctx->ffn_gate_up, (size_t)inter_count);
+        if (launch_check() != 0)
+            return -1;
+        if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
+            return -1;
+        add_row_bias_kernel<<<(total * hidden + 255) / 256, 256, 0, ctx->stream>>>(
+            ctx->x, l->ffn_out_bias, total, hidden);
+        if (launch_check() != 0)
+            return -1;
+        layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, l->post_attn_norm,
+                                                          l->ffn_ln_bias, total, hidden, eps);
+        if (launch_check() != 0)
+            return -1;
+    }
+    // No final norm; embed_cuda_encode_batch pools ctx->x directly.
+    return 0;
+}
+
+static int cuda_forward_batch(embed_cuda_ctx_t *ctx, const embed_input_t *inputs, int batch) {
+    if (!ctx || !inputs || batch <= 0)
+        return -1;
+    const embed_config_t *c = &ctx->config;
+    if (c->family == EMBED_FAMILY_BERT)
+        return cuda_forward_batch_bert(ctx, inputs, batch);
+    int total = 0;
+    if (cuda_upload_packed_inputs(ctx, inputs, batch, &total) != 0)
+        return -1;
 
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
