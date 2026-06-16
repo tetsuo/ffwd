@@ -8,6 +8,7 @@
 #define EMBED_SERVER_TEST
 #include "../src/server.c"
 
+#include "../src/base64.h" /* base64_encode: exercised directly by the encoding tests */
 #include "tiny_model.h"
 #include "tok_fixture.h"
 

@@ -361,4 +361,24 @@ int configure_loaded_model(loaded_model *m, const embed_config_t *config, int to
 int load_one_model(http_server *s, model_slot slot, const char *path);
 void free_models(http_server *s);
 
+/* ---- server_handlers.c: per-endpoint prepare / batch-group / execute ---- */
+void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_request *out);
+int embedding_request_compatible(const embedding_request *a, const embedding_request *b);
+int embedding_request_fits_group(const embedding_request *r,
+                                 int group_inputs,
+                                 int group_tokens,
+                                 int max_batch,
+                                 int max_batch_tokens);
+void execute_embedding_request_list(embedding_request **reqs, int n_reqs);
+void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_request *out);
+int contextual_request_compatible(const contextual_request *a, const contextual_request *b);
+int contextual_request_fits_group(const contextual_request *r,
+                                  int group_docs,
+                                  int group_tokens,
+                                  int max_batch,
+                                  int max_batch_tokens);
+void execute_contextual_request_list(contextual_request **reqs, int n_reqs);
+void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out);
+void execute_rerank_request(rerank_request *r);
+
 #endif /* EMBED_SERVER_INTERNAL_H */
