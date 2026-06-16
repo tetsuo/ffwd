@@ -76,8 +76,9 @@ LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 
 # Source groups. CORE_SRCS is the engine the tests and benches reuse; keeping it
 # in one variable stops the per-test source lists from drifting apart.
-KERNEL_SRCS = src/kernels.c src/threadpool.c src/kernels_generic.c src/kernels_neon.c \
-              src/kernels_avx.c
+KERNEL_SRCS = src/kernels_gemm.c src/kernels_norm.c src/kernels_act.c src/kernels_attn.c \
+              src/kernels_rope.c src/threadpool.c \
+              src/kernels_generic.c src/kernels_neon.c src/kernels_avx.c
 TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c
 CORE_SRCS = src/model.c src/forward.c src/late.c src/vec.c src/alloc.c \
             src/config.c src/safetensors.c $(KERNEL_SRCS)
