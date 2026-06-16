@@ -621,8 +621,21 @@ loaded:
             upcast_f32_inplace(&l->k_norm, ctx->stream);
             upcast_f32_inplace(&l->input_norm, ctx->stream);
             upcast_f32_inplace(&l->post_attn_norm, ctx->stream);
+            /* BERT block biases (no-ops for Qwen, whose arrays are unset); the
+             * two BERT LayerNorm weights reuse input_norm/post_attn_norm above. */
+            upcast_f32_inplace(&l->o_bias, ctx->stream);
+            upcast_f32_inplace(&l->attn_ln_bias, ctx->stream);
+            upcast_f32_inplace(&l->ffn_inter_bias, ctx->stream);
+            upcast_f32_inplace(&l->ffn_out_bias, ctx->stream);
+            upcast_f32_inplace(&l->ffn_ln_bias, ctx->stream);
         }
         upcast_f32_inplace(&ctx->norm, ctx->stream);
+        /* BERT embedding stage (no-ops for Qwen): learned position and token-type
+         * embeddings and the embedding LayerNorm all feed the F32 residual. */
+        upcast_f32_inplace(&ctx->position_embeddings, ctx->stream);
+        upcast_f32_inplace(&ctx->token_type_embeddings, ctx->stream);
+        upcast_f32_inplace(&ctx->embed_ln_w, ctx->stream);
+        upcast_f32_inplace(&ctx->embed_ln_b, ctx->stream);
     }
     if (ctx->quantize_bits) {
         for (int i = layer_start; i < layer_end; i++) {
