@@ -7,13 +7,15 @@
  *   WordPiece: greedy longest-match-first against vocab.txt, continuation
  *     pieces marked "##", whole token -> [UNK] when any piece fails to match.
  *
- * Punctuation, whitespace and control classification is full-Unicode and exact
- * against transformers: punctuation and control use generated category tables
- * (wordpiece_unicode.h), whitespace is the complete Zs set, and the CJK split
- * uses the BERT ideograph ranges. This makes cased multilingual encoders (e.g.
- * bert-base-multilingual-cased) match Hugging Face. Casing and accent stripping
- * still cover only ASCII + Latin-1 (wp_lower_deaccent), so do_lower_case
- * multilingual checkpoints need full Unicode lowercase + NFD - a follow-up.
+ * Unicode handling is full and exact against transformers, driven by generated
+ * tables (wordpiece_unicode.h): punctuation and control by Unicode category,
+ * whitespace by the complete Zs set, the CJK split by the BERT ideograph ranges,
+ * and the do_lower_case fold by a lowercase+NFD+strip-marks table (with Hangul
+ * decomposed by formula). Cased and uncased multilingual encoders (e.g.
+ * bert-base-multilingual-cased / -uncased) match Hugging Face exactly, including
+ * Greek, Cyrillic, Vietnamese and Korean. The fold is per-codepoint, matching
+ * transformers, which lowercases character by character (no context-sensitive
+ * Greek final sigma).
  */
 
 #include "wordpiece_tokenizer.h"
@@ -182,90 +184,55 @@ static int wp_is_cjk(uint32_t cp) {
            (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x2F800 && cp <= 0x2FA1F);
 }
 
-/* Lowercase + strip accents, BERT do_lower_case style. Returns the mapped
- * codepoint, or 0 to drop it (combining diacritical marks, like NFD + drop Mn).
- * ASCII and Latin-1 Supplement letters fold to a base ASCII letter where one
- * exists; letters with no ASCII base (æ ð ø þ) only lowercase. */
-static uint32_t wp_lower_deaccent(uint32_t cp) {
-    if (cp >= 'A' && cp <= 'Z')
-        return cp + 32;
-    if (cp >= 0x0300 && cp <= 0x036F)
-        return 0;
-    if (cp < 0x00C0)
-        return cp;
-    switch (cp) {
-    case 0xC0:
-    case 0xC1:
-    case 0xC2:
-    case 0xC3:
-    case 0xC4:
-    case 0xC5:
-    case 0xE0:
-    case 0xE1:
-    case 0xE2:
-    case 0xE3:
-    case 0xE4:
-    case 0xE5:
-        return 'a';
-    case 0xC7:
-    case 0xE7:
-        return 'c';
-    case 0xC8:
-    case 0xC9:
-    case 0xCA:
-    case 0xCB:
-    case 0xE8:
-    case 0xE9:
-    case 0xEA:
-    case 0xEB:
-        return 'e';
-    case 0xCC:
-    case 0xCD:
-    case 0xCE:
-    case 0xCF:
-    case 0xEC:
-    case 0xED:
-    case 0xEE:
-    case 0xEF:
-        return 'i';
-    case 0xD1:
-    case 0xF1:
-        return 'n';
-    case 0xD2:
-    case 0xD3:
-    case 0xD4:
-    case 0xD5:
-    case 0xD6:
-    case 0xF2:
-    case 0xF3:
-    case 0xF4:
-    case 0xF5:
-    case 0xF6:
-        return 'o';
-    case 0xD9:
-    case 0xDA:
-    case 0xDB:
-    case 0xDC:
-    case 0xF9:
-    case 0xFA:
-    case 0xFB:
-    case 0xFC:
-        return 'u';
-    case 0xDD:
-    case 0xFD:
-    case 0xFF:
-        return 'y';
-    case 0xC6:
-        return 0xE6; /* AE -> ae (no ASCII base) */
-    case 0xD0:
-        return 0xF0; /* ETH -> eth */
-    case 0xD8:
-        return 0xF8; /* O/ -> o/ */
-    case 0xDE:
-        return 0xFE; /* THORN -> thorn */
-    default:
-        return cp; /* incl. 0xD7 x, 0xF7 /, 0xDF ss, already-lowercase letters */
+/* Hangul syllable decomposition constants (the standard algorithm). Hangul
+ * syllables are not cased, so their do_lower_case fold is the canonical NFD into
+ * leading (L), vowel (V), and optional trailing (T) jamo - none combining marks
+ * - which keeps them out of the generated WP_FOLD table. */
+enum {
+    WP_HANGUL_S = 0xAC00,
+    WP_HANGUL_L = 0x1100,
+    WP_HANGUL_V = 0x1161,
+    WP_HANGUL_T = 0x11A7,
+    WP_HANGUL_TCOUNT = 28,
+    WP_HANGUL_NCOUNT = 588,
+    WP_HANGUL_SCOUNT = 11172
+};
+
+/* Apply the do_lower_case fold (Python str.lower then NFD then drop combining
+ * marks) to one codepoint, writing 0..3 output codepoints to out and the count
+ * to *n_out. 0 outputs means the codepoint is a dropped mark. Hangul decomposes
+ * by formula; everything else is the generated WP_FOLD table or an identity. */
+static void wp_fold(uint32_t cp, uint32_t out[3], int *n_out) {
+    if (cp >= WP_HANGUL_S && cp < WP_HANGUL_S + WP_HANGUL_SCOUNT) {
+        int s = (int)(cp - WP_HANGUL_S);
+        out[0] = (uint32_t)(WP_HANGUL_L + s / WP_HANGUL_NCOUNT);
+        out[1] = (uint32_t)(WP_HANGUL_V + (s % WP_HANGUL_NCOUNT) / WP_HANGUL_TCOUNT);
+        int t = s % WP_HANGUL_TCOUNT;
+        if (t == 0) {
+            *n_out = 2;
+        } else {
+            out[2] = (uint32_t)(WP_HANGUL_T + t);
+            *n_out = 3;
+        }
+        return;
     }
+    int lo = 0, hi = WP_FOLD_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (cp < WP_FOLD[mid].cp) {
+            hi = mid - 1;
+        } else if (cp > WP_FOLD[mid].cp) {
+            lo = mid + 1;
+        } else {
+            int n = WP_FOLD[mid].n;
+            for (int i = 0; i < n; i++)
+                out[i] = WP_FOLD[mid].out[i];
+            *n_out = n;
+            return;
+        }
+    }
+    out[0] = cp;
+    *n_out = 1;
 }
 
 /* =============================== workspace ================================== */
@@ -460,18 +427,22 @@ wordpiece_run(const wordpiece_tokenizer_t *tok, wordpiece_workspace_t *ws, const
             i++;
         int wlen = i - wstart;
 
-        /* lowercase + strip accents (may drop codepoints). */
+        /* lowercase + strip accents; the fold can drop a codepoint (combining
+         * mark) or expand it to up to 3 (Hangul, a few ligatures). */
         int m = 0;
-        if (grow_u32(&ws->norm, &ws->norm_cap, wlen) != 0)
+        if (grow_u32(&ws->norm, &ws->norm_cap, tok->do_lower_case ? wlen * 3 : wlen) != 0)
             return -1;
         for (int k = 0; k < wlen; k++) {
             uint32_t cp = ws->cps[wstart + k];
             if (tok->do_lower_case) {
-                cp = wp_lower_deaccent(cp);
-                if (cp == 0)
-                    continue;
+                uint32_t out[3];
+                int no = 0;
+                wp_fold(cp, out, &no);
+                for (int j = 0; j < no; j++)
+                    ws->norm[m++] = out[j];
+            } else {
+                ws->norm[m++] = cp;
             }
-            ws->norm[m++] = cp;
         }
 
         /* split_on_punc, then WordPiece each piece. */
