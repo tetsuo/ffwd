@@ -22,12 +22,19 @@ write_st(const char *path, const char *header, const void *payload, size_t paylo
         perror(path);
         exit(2);
     }
+    /* Pad the header to an 8-byte boundary with trailing spaces so the data
+     * section is 8-aligned, matching the real safetensors serializer; otherwise
+     * tensor data lands unaligned and typed reads of it are UBSan-flagged UB. */
     uint64_t n = strlen(header);
+    uint64_t pad = (8 - (n % 8)) % 8;
+    uint64_t total = n + pad;
     unsigned char len8[8];
     for (int i = 0; i < 8; i++)
-        len8[i] = (unsigned char)(n >> (8 * i));
+        len8[i] = (unsigned char)(total >> (8 * i));
     fwrite(len8, 1, 8, f);
     fwrite(header, 1, n, f);
+    for (uint64_t i = 0; i < pad; i++)
+        fputc(' ', f);
     if (payload_len)
         fwrite(payload, 1, payload_len, f);
     fclose(f);

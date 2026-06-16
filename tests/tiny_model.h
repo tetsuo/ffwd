@@ -142,6 +142,18 @@ static int tm_write_safetensors_with_prefix_options(const char *path,
     if (hoff >= sizeof(header) - 1)
         return -1;
 
+    /* Pad the header with trailing spaces (valid JSON whitespace the parser
+     * skips) so the data section starts at a multiple of 8, exactly as the real
+     * safetensors serializer does. Without this the tensor data lands at an
+     * unaligned address and the loader's typed reads of it are UB - harmless on
+     * x86/arm64 but flagged by UBSan. Real model files are always aligned, so
+     * the fixtures must be too. */
+    while ((8 + hoff) % 8 != 0) {
+        if (hoff >= sizeof(header))
+            return -1;
+        header[hoff++] = ' ';
+    }
+
     FILE *f = fopen(path, "wb");
     if (!f)
         return -1;
