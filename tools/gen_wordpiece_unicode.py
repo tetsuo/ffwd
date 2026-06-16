@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate wordpiece_unicode.h: Unicode range tables for the WordPiece
+"""Generate src/tokenizer_unicode.h: Unicode range tables for the WordPiece
 BasicTokenizer's punctuation and control classification, matching transformers'
 BertTokenizer._is_punctuation and _is_control exactly.
 
@@ -10,7 +10,7 @@ as sorted, merged [lo, hi] ranges for binary search in the C tokenizer.
 
 Run when bumping the target Unicode version (the C side is data-only otherwise):
 
-  uv run python tools/gen_wordpiece_unicode.py > wordpiece_unicode.h
+  uv run python tools/gen_wordpiece_unicode.py > src/tokenizer_unicode.h
 """
 
 import unicodedata
