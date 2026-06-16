@@ -234,6 +234,68 @@ struct job {
     job *next;
 };
 
+/* Parsed request state, shared by the prepare (handlers), execute (schedule),
+ * and render (encode) stages. Each carries its source cJSON root (freed when
+ * the request is freed), the resolved model, and the tokenized inputs. */
+typedef struct {
+    int *ids;
+    int n_tokens;
+} token_buf;
+
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    int dims;
+    const char *encoding;
+    int n_inputs;
+    token_buf *tokens;
+    embed_input_t *inputs;
+    int total_tokens;
+    int ready;
+} embedding_request;
+
+typedef struct {
+    int *ids;
+    int n_tokens;
+    embed_span_t *spans;
+    int n_spans;
+} contextual_doc;
+
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    int dims;
+    const char *encoding;
+    contextual_doc *docs;
+    int n_docs;
+    int total_chunks;
+    int total_tokens;
+    int ready;
+} contextual_request;
+
+typedef struct {
+    int *ids;
+    int n_tokens;
+    int *keep;
+    int n_keep;
+} late_tokens;
+
+typedef struct {
+    job *j;
+    cJSON *root;
+    loaded_model *model;
+    late_tokens query;
+    late_tokens *documents;
+    int n_documents;
+    int top_n;
+    int return_documents;
+    int query_tokens;
+    int document_tokens;
+    int ready;
+} rerank_request;
+
 /* ---- server_json.c: request validation and error bodies ---- */
 void append_json_string(sbuf *b, const char *s);
 char *json_error_body(const char *message, const char *type, size_t *len);
@@ -246,5 +308,14 @@ const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api);
 int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct);
 int dimensions_from_root(
     cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding);
+
+/* ---- server_encode.c: embedding output encoding ---- */
+signed char quantize_int8_tanh(float x);
+char *encode_embedding(const float *emb, int dims, const char *encoding);
+void append_embedding_value(
+    sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api);
+void set_response_from_buf(job *j, sbuf *b);
+int render_embedding_response(embedding_request *r, const float *embs);
+void render_contextual_response(contextual_request *r, const float *embs);
 
 #endif /* EMBED_SERVER_INTERNAL_H */
