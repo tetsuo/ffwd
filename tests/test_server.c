@@ -45,6 +45,24 @@ static void test_base64_rfc4648(void) {
     }
 }
 
+static void test_base64_binary_vectors(void) {
+    static const struct {
+        unsigned char bytes[5];
+        size_t n;
+        const char *out;
+    } cases[] = {
+        {{0xff}, 1, "/w=="},
+        {{0xff, 0xee}, 2, "/+4="},
+        {{0xff, 0xee, 0xdd}, 3, "/+7d"},
+        {{0x00, 0x01, 0x02, 0x03, 0x04}, 5, "AAECAwQ="},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *got = base64_encode(cases[i].bytes, cases[i].n);
+        TEST_ASSERT(strcmp(got, cases[i].out) == 0);
+        free(got);
+    }
+}
+
 static void test_sbuf_growth_and_formatting(void) {
     sbuf b = {0};
     sbuf_puts(&b, "ab");
@@ -1125,6 +1143,7 @@ static void test_http_server(void) {
 
 int main(void) {
     test_base64_rfc4648();
+    test_base64_binary_vectors();
     test_sbuf_growth_and_formatting();
     test_json_error_body_escaping();
     test_job_set_422_replaces_response();
