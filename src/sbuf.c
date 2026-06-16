@@ -13,10 +13,12 @@ void sbuf_reserve(sbuf *b, size_t add) {
     size_t need = b->len + add + 1;
     if (need <= b->cap)
         return;
-    size_t cap = b->cap ? b->cap * 2 : 256;
+    size_t cap = b->cap ? b->cap : 256;
     while (cap < need) {
-        if (cap > SIZE_MAX / 2)
-            die_oom();
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
         cap *= 2;
     }
     b->ptr = xrealloc(b->ptr, cap);
