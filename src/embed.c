@@ -1,6 +1,7 @@
 #include "embed.h"
 #include "config.h"
 #include "internal.h"
+#include "dtype.h"
 #include "kernels.h"
 #include "safetensors.h"
 
@@ -270,10 +271,8 @@ load_norm_f32(multi_safetensors_t *ms, const char *name, const int64_t *shape, i
 }
 
 static void bf16_row_to_f32(float *dst, const uint16_t *src, int n) {
-    for (int i = 0; i < n; i++) {
-        uint32_t u = ((uint32_t)src[i]) << 16;
-        memcpy(dst + i, &u, sizeof(float));
-    }
+    for (int i = 0; i < n; i++)
+        dst[i] = embed_bf16_to_f32(src[i]);
 }
 
 static void copy_weight_row(float *dst, const embed_weight_ref_t *w, size_t row, int row_width) {
@@ -336,8 +335,8 @@ static void linear_qkv_weight(embed_workspace_t *ws,
     if (wq->dtype == DTYPE_BF16 && wk->dtype == DTYPE_BF16 && wv->dtype == DTYPE_BF16 &&
         seq_len <= EMBED_BF16_QKV_FUSE_MAX_SEQ) {
         embed_linear_nobias_bf16_qkv(q, k, v, x, (const uint16_t *)wq->data,
-                                    (const uint16_t *)wk->data, (const uint16_t *)wv->data, seq_len,
-                                    in_dim, q_dim, kv_dim);
+                                     (const uint16_t *)wk->data, (const uint16_t *)wv->data,
+                                     seq_len, in_dim, q_dim, kv_dim);
         return;
     }
 
@@ -369,7 +368,7 @@ static void linear_pair_weight(embed_workspace_t *ws,
     if (wa->dtype == DTYPE_BF16 && wb->dtype == DTYPE_BF16 &&
         seq_len <= EMBED_BF16_PAIR_FUSE_MAX_SEQ) {
         embed_linear_nobias_bf16_pair(a, b, x, (const uint16_t *)wa->data,
-                                     (const uint16_t *)wb->data, seq_len, in_dim, a_dim, b_dim);
+                                      (const uint16_t *)wb->data, seq_len, in_dim, a_dim, b_dim);
         return;
     }
 
@@ -1009,7 +1008,7 @@ int embed_late_maxsim_batch(const float *query_vectors,
             int group_tokens = doc_offsets[doc] - start;
 
             embed_matmul_t(sim, query_vectors, doc_vectors + (size_t)start * dim, query_tokens, dim,
-                          group_tokens);
+                           group_tokens);
 
             for (int i = first; i < doc; i++) {
                 int s0 = doc_offsets[i] - start;
@@ -1231,9 +1230,9 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
             int start = offsets[b];
             int len = offsets[b + 1] - start;
             embed_apply_rope_neox(q_buf + (size_t)start * q_dim, rope_cos, rope_sin, len, n_heads,
-                                 head_dim);
+                                  head_dim);
             embed_apply_rope_neox(k_buf + (size_t)start * kv_dim, rope_cos, rope_sin, len,
-                                 n_kv_heads, head_dim);
+                                  n_kv_heads, head_dim);
         }
 
         model->attention(attn_out, q_buf, k_buf, v_buf, offsets, batch, n_heads, n_kv_heads,

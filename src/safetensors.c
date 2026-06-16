@@ -1,4 +1,5 @@
 #include "safetensors.h"
+#include "dtype.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -342,13 +343,6 @@ int64_t safetensor_numel(const safetensor_t *t) {
     return n;
 }
 
-static float bf16_to_f32(uint16_t bf16) {
-    uint32_t f32 = ((uint32_t)bf16) << 16;
-    float result;
-    memcpy(&result, &f32, sizeof(float));
-    return result;
-}
-
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
     int64_t n = safetensor_numel(t);
     if (n <= 0)
@@ -367,7 +361,7 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     case DTYPE_BF16: {
         const uint16_t *src = (const uint16_t *)data;
         for (int64_t i = 0; i < n; i++)
-            out[i] = bf16_to_f32(src[i]);
+            out[i] = embed_bf16_to_f32(src[i]);
         break;
     }
     default:
