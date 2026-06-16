@@ -99,6 +99,27 @@ static void test_json_error_body_escaping(void) {
     free(body);
 }
 
+static void test_job_set_422_replaces_response(void) {
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.response = xstrdup("old response");
+    j.response_len = strlen(j.response);
+    j.status = 500;
+
+    cJSON *detail = cJSON_CreateArray();
+    ve_add(detail, "[\"body\",\"field\"]", "bad value", "value_error");
+    job_set_422(&j, detail);
+    TEST_ASSERT(j.status == 422);
+    TEST_ASSERT(j.response != NULL);
+    if (j.response) {
+        TEST_ASSERT(j.response_len == strlen(j.response));
+        TEST_ASSERT(strstr(j.response, "bad value") != NULL);
+    }
+
+    cJSON_Delete(detail);
+    free(j.response);
+}
+
 static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.0f) == 0);
     /* tanh saturates to +-1, scaled by 127. */
@@ -1106,6 +1127,7 @@ int main(void) {
     test_base64_rfc4648();
     test_sbuf_growth_and_formatting();
     test_json_error_body_escaping();
+    test_job_set_422_replaces_response();
     test_quantize_int8_tanh();
     test_encode_embedding_int8();
     test_encode_embedding_binary();

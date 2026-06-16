@@ -99,6 +99,7 @@ void job_set_422(job *j, cJSON *detail) {
         job_set_error(j, 500, "failed to render validation error", "server_error");
         return;
     }
+    free(j->response);
     j->status = 422;
     j->content_type = "application/json";
     j->response = xstrdup(s);
