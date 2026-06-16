@@ -1,10 +1,54 @@
 # embed.c
 
-`embed.c` implements inference for the
-[pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed) and
-[Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding) text
-embedding models. It also serves these models via an
-OpenAI/Perplexity-compatible HTTP API.
+`embed.c` implements inference for several text embedding model families —
+[pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed),
+[Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding),
+GTE-Qwen2, and BERT/BGE encoders. It serves them through an
+OpenAI/Perplexity-compatible HTTP API and runs on CPU, Apple MLX, and NVIDIA
+CUDA. See [Supported models](#supported-models).
+
+## Supported models
+
+The server registers these model IDs out of the box; pass any of them as
+`--model ID=DIR`, loading a Hugging Face safetensors checkpoint from `DIR`.
+Every model runs on all three backends, and `dimensions` truncates
+Matryoshka-trained vectors (pplx-embed down to 128, Qwen3-Embedding down to 32).
+
+**Pooled embeddings** — one vector per text, via `POST /v1/embeddings`:
+
+| Model ID                | Family          | Dim  | Pooling    | Output                 |
+| ----------------------- | --------------- | ---- | ---------- | ---------------------- |
+| pplx-embed-v1-0.6b      | pplx-embed      | 1024 | mean       | int8, unnormalized     |
+| pplx-embed-v1-4b        | pplx-embed      | 2560 | mean       | int8, unnormalized     |
+| Qwen3-Embedding-0.6B    | Qwen3-Embedding | 1024 | last token | float32, L2-normalized |
+| Qwen3-Embedding-4B      | Qwen3-Embedding | 2560 | last token | float32, L2-normalized |
+| Qwen3-Embedding-8B      | Qwen3-Embedding | 4096 | last token | float32, L2-normalized |
+| gte-Qwen2-1.5B-instruct | GTE-Qwen2       | 1536 | last token | float32, L2-normalized |
+| all-MiniLM-L6-v2        | BERT (MiniLM)   | 384  | mean       | float32, L2-normalized |
+| bge-small-en-v1.5       | BERT (BGE)      | 384  | CLS        | float32, L2-normalized |
+| bge-base-en-v1.5        | BERT (BGE)      | 768  | CLS        | float32, L2-normalized |
+| bge-large-en-v1.5       | BERT (BGE)      | 1024 | CLS        | float32, L2-normalized |
+
+**Contextual embeddings** — one vector per document chunk, each embedded with
+its document as context, via `POST /v1/contextualizedembeddings`:
+
+| Model ID                   | Dim  | Output             |
+| -------------------------- | ---- | ------------------ |
+| pplx-embed-context-v1-0.6b | 1024 | int8, unnormalized |
+| pplx-embed-context-v1-4b   | 2560 | int8, unnormalized |
+
+**Late interaction** — token-level vectors scored with MaxSim for reranking, via
+`POST /v1/rerank`:
+
+| Model ID                | Token dim | Output              |
+| ----------------------- | --------- | ------------------- |
+| pplx-embed-v1-late-0.6b | 128       | MaxSim rerank score |
+
+The engine handles three transformer blocks — the Qwen3 block (pplx-embed and
+Qwen3-Embedding), the Qwen2 block (GTE-Qwen2), and the BERT block (MiniLM, BGE)
+— and selects the tokenizer from the model files (byte-level BPE for the Qwen
+families, WordPiece for BERT). pplx-embed vectors are unnormalized int8 (rank
+them by cosine similarity); the other families emit L2-normalized float32.
 
 ## Building
 
@@ -61,7 +105,7 @@ Pipe in lines and use `--stream` to get one JSON embedding per line:
 
 ```bash
 cat texts.txt | ./embed -d ./model --stream -b 8
-# {"embedding":[...],"dim":2048,"tokens":7,"ms":12.3,"workspace_bytes":1048576}
+# {"embedding":[...],"dim":2560,"tokens":7,"ms":12.3,"workspace_bytes":1048576}
 ```
 
 Without `--stream`, reading from stdin accumulates all lines then prints the
@@ -141,8 +185,9 @@ Returns a list of embeddings, one per input text:
 
 `encoding_format` follows the model family:
 
-- Qwen3-Embedding (OpenAI-compatible) defaults to `float` (the true float32
-  vector) and also accepts `base64` (base64 of float32).
+- The OpenAI-API models (Qwen3-Embedding, GTE-Qwen2, MiniLM, BGE) default to
+  `float` (the true float32 vector) and also accept `base64` (base64 of
+  float32).
 - pplx-embed (Perplexity-compatible) defaults to `base64_int8` and also accepts
   `base64_binary` and `float` (the decoded int8 view).
 
