@@ -110,7 +110,7 @@ SHARED_FLAGS = -shared
 endif
 
 .PHONY: all cpu mlx cuda gpu test test-bf16 test-safetensors coverage bench \
-        bench-model bench-tokenizer debug clean help
+        bench-model bench-tokenizer bench-server-utils debug clean help
 
 all: help
 
@@ -125,6 +125,8 @@ help:
 	@echo "  make bench    Kernel microbenchmarks; records bench/results/*.json"
 	@echo "  make bench-model MODEL_DIR=/path/to/model"
 	@echo "                End-to-end embedding benchmark"
+	@echo "  make bench-server-utils"
+	@echo "                Base64 and server string-buffer microbenchmarks"
 	@echo "  make debug    Debug build"
 	@echo "  make clean    Remove build artifacts"
 
@@ -377,6 +379,8 @@ bench-tokenizer:
 # every record as -dirty.
 BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet -- ':!.gitignore' 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
 BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -Isrc
+BENCH_SERVER_UTILS_BIN ?= /private/tmp/embed-bench-server-utils
+BENCH_ARGS ?=
 
 bench:
 	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_kernels \
@@ -392,6 +396,12 @@ bench-model:
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	@mkdir -p bench/results
 	./bench/bench_model "$(MODEL_DIR)" --json bench/results/model-$(BENCH_STAMP).json
+
+bench-server-utils:
+	$(CC) $(BENCH_CC_FLAGS) -Ibench -o $(BENCH_SERVER_UTILS_BIN) \
+	    bench/bench_server_utils.c src/base64.c src/sbuf.c src/server_util.c \
+	    -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	$(BENCH_SERVER_UTILS_BIN) $(BENCH_ARGS)
 
 # =============================================================================
 # Debug build
