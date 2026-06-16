@@ -381,4 +381,10 @@ void execute_contextual_request_list(contextual_request **reqs, int n_reqs);
 void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out);
 void execute_rerank_request(rerank_request *r);
 
+/* ---- server_schedule.c: job queue, micro-batching, completion ---- */
+void enqueue_job(job *j);
+int collect_job_batch(http_server *s, job **jobs, int max_jobs);
+void process_job_group(http_server *s, job **jobs, int n_jobs);
+void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask);
+
 #endif /* EMBED_SERVER_INTERNAL_H */
