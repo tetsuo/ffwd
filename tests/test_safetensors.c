@@ -2,7 +2,7 @@
  * Hermetic: synthesizes every fixture in a temp directory. Runs via
  * `make test`. */
 
-#include "qwen_safetensors.h"
+#include "safetensors.h"
 
 #include <stdint.h>
 #include <stdio.h>

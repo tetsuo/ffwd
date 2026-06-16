@@ -7,7 +7,7 @@
  * text only; the frontend wraps the result with [CLS]/[SEP], exactly as the
  * byte-level BPE backend leaves terminal/separator tokens to the frontend.
  *
- * The public surface mirrors qwen_tokenizer.h (load / encode with a reusable
+ * The public surface mirrors embed_tokenizer.h (load / encode with a reusable
  * workspace / decode / resolve a named special token / free) so both can sit
  * behind one tokenizer interface later.
  */

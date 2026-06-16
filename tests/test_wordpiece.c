@@ -3,7 +3,7 @@
  * punctuation splitting, CJK char-splitting, special-token resolution, and the
  * workspace encode paths. No model files or network needed. */
 
-#include "wordpiece_tokenizer.h"
+#include "tokenizer_wordpiece.h"
 
 #include <stdio.h>
 #include <stdlib.h>

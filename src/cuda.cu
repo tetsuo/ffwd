@@ -1,6 +1,6 @@
 extern "C" {
-#include "embed_cuda.h"
-#include "embed_internal.h"
+#include "cuda.h"
+#include "internal.h"
 }
 
 #include <cuda_runtime.h>
@@ -669,7 +669,7 @@ __global__ static void span_pool_kernel(
 
 // BERT LayerNorm: mean-subtract, biased variance (/dim), scale by gamma, shift
 // by beta. One block per row, two block reductions before any write, so it is
-// safe in place (out == x). Matches the CPU qwen_layer_norm.
+// safe in place (out == x). Matches the CPU embed_layer_norm.
 __global__ static void layer_norm_kernel(float *out,
                                          const float *x,
                                          const float *gamma,

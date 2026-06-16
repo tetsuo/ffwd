@@ -1,5 +1,5 @@
 /*
- * qwen_kernels_avx.c - x86 SIMD hot kernels (AVX2+FMA, with AVX-512 when available)
+ * embed_kernels_avx.c - x86 SIMD hot kernels (AVX2+FMA, with AVX-512 when available)
  *
  * bf16 to f32 conversion: load 16 uint16, zero-extend to 32-bit, shift left 16.
  * Uses AVX-512F+BW for 16-wide bf16 matvec (dominant for seq_len==1), and
@@ -9,7 +9,7 @@
  * overhead and improve out-of-order execution on memory-bound workloads.
  */
 
-#include "qwen_kernels_impl.h"
+#include "kernels_impl.h"
 
 #if defined(__AVX2__) && defined(__FMA__)
 
@@ -22,7 +22,7 @@
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
-void qwen_bf16_matvec_fused_avx(
+void embed_bf16_matvec_fused_avx(
     float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
     int o = 0;
 
@@ -201,7 +201,7 @@ static inline void bf16x16_to_f32(const uint16_t *src, __m256 *lo, __m256 *hi) {
     *hi = bf16x8_to_f32(_mm256_extracti128_si256(raw, 1));
 }
 
-void qwen_bf16_matvec_fused_avx(
+void embed_bf16_matvec_fused_avx(
     float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
     int o = 0;
 
@@ -273,7 +273,7 @@ void qwen_bf16_matvec_fused_avx(
  * (operates on L1-resident head vectors)
  * ===================================================================== */
 
-float qwen_dot_f32_avx(const float *a, const float *b, int n) {
+float embed_dot_f32_avx(const float *a, const float *b, int n) {
 #if defined(__AVX512F__)
     int i = 0;
     __m512 acc0 = _mm512_setzero_ps();
@@ -320,7 +320,7 @@ float qwen_dot_f32_avx(const float *a, const float *b, int n) {
 #endif
 }
 
-void qwen_vec_scale_inplace_avx(float *dst, float scale, int n) {
+void embed_vec_scale_inplace_avx(float *dst, float scale, int n) {
 #if defined(__AVX512F__)
     int i = 0;
     __m512 s = _mm512_set1_ps(scale);
@@ -352,7 +352,7 @@ void qwen_vec_scale_inplace_avx(float *dst, float scale, int n) {
 #endif
 }
 
-void qwen_vec_axpy_inplace_avx(float *dst, const float *src, float alpha, int n) {
+void embed_vec_axpy_inplace_avx(float *dst, const float *src, float alpha, int n) {
 #if defined(__AVX512F__)
     int i = 0;
     __m512 a = _mm512_set1_ps(alpha);
@@ -394,7 +394,7 @@ void qwen_vec_axpy_inplace_avx(float *dst, const float *src, float alpha, int n)
 #endif
 }
 
-void qwen_vec_scale_add_avx(float *dst, const float *src, float correction, int n) {
+void embed_vec_scale_add_avx(float *dst, const float *src, float correction, int n) {
 #if defined(__AVX512F__)
     int i = 0;
     __m512 c = _mm512_set1_ps(correction);

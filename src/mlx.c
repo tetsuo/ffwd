@@ -1,7 +1,7 @@
-#include "embed_mlx.h"
-#include "embed_config.h"
+#include "mlx.h"
+#include "config.h"
 #include "embed.h"
-#include "qwen_safetensors.h"
+#include "safetensors.h"
 
 #include <mlx/c/mlx.h>
 

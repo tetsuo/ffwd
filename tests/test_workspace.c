@@ -4,7 +4,7 @@
  * what scripts/check_workspace_api.py does. Runs via `make test`. */
 
 #include "embed.h"
-#include "qwen_tokenizer.h"
+#include "tokenizer_bpe.h"
 #include "tiny_model.h"
 #include "tok_fixture.h"
 
@@ -199,10 +199,10 @@ int main(int argc, char **argv) {
 
     embed_workspace_t *batch_ws = embed_workspace_new(model);
     embed_workspace_t *single_ws = embed_workspace_new(model);
-    qwen_tokenizer_t *tok = qwen_tokenizer_load(vocab_path);
+    embed_tokenizer_t *tok = embed_tokenizer_load(vocab_path);
     if (!batch_ws || !single_ws || !tok) {
         fprintf(stderr, "failed to allocate workspace or tokenizer\n");
-        qwen_tokenizer_free(tok);
+        embed_tokenizer_free(tok);
         embed_workspace_free(single_ws);
         embed_workspace_free(batch_ws);
         embed_model_free(model);
@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
     }
 
     for (int i = 0; i < batch; i++) {
-        ids[i] = qwen_tokenizer_encode(tok, texts[i], &ntok[i]);
+        ids[i] = embed_tokenizer_encode(tok, texts[i], &ntok[i]);
         if (!ids[i] || ntok[i] <= 0) {
             fprintf(stderr, "failed to tokenize input %d\n", i);
             goto fail;
@@ -331,7 +331,7 @@ int main(int argc, char **argv) {
 
     /* Same separator resolution as the server: the fixture vocab defines
      * <|endoftext|>, real snapshots use the reserved id. */
-    int sep_id = qwen_tokenizer_token_id(tok, "<|endoftext|>");
+    int sep_id = embed_tokenizer_token_id(tok, "<|endoftext|>");
     if (sep_id < 0)
         sep_id = EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
     if (check_spans_batch_parity(model, batch_ws, ids, ntok, sep_id, cfg) != 0) {
@@ -349,7 +349,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < batch; i++)
         free(ids[i]);
-    qwen_tokenizer_free(tok);
+    embed_tokenizer_free(tok);
     embed_workspace_free(single_ws);
     embed_workspace_free(batch_ws);
     embed_model_free(model);
@@ -367,7 +367,7 @@ int main(int argc, char **argv) {
 fail:
     for (int i = 0; i < batch; i++)
         free(ids[i]);
-    qwen_tokenizer_free(tok);
+    embed_tokenizer_free(tok);
     embed_workspace_free(single_ws);
     embed_workspace_free(batch_ws);
     embed_model_free(model);

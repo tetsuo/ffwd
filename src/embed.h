@@ -351,6 +351,5 @@ EMBED_API int embed_late_maxsim_batch(const float *query_vectors,
 
 /* Verbose level: 0=quiet, 1=info, 2=debug */
 EMBED_API extern int embed_verbose;
-EMBED_API extern int qwen_verbose;
 
 #endif /* EMBED_H */

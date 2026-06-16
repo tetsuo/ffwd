@@ -1,5 +1,5 @@
-#include "qwen_tokenizer.h"
-#include "qwen_kernels.h"
+#include "tokenizer_bpe.h"
+#include "kernels.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -437,7 +437,7 @@ pair_map_insert(pair_merge_entry_t *map, int cap, uint64_t key, int rank, int me
 
 /* Returns the rank and sets *merged_id, or INT_MAX when the pair never
  * merges. */
-static int pair_merge_lookup(const qwen_tokenizer_t *tok, int left, int right, int *merged_id) {
+static int pair_merge_lookup(const embed_tokenizer_t *tok, int left, int right, int *merged_id) {
     const pair_merge_entry_t *map = (const pair_merge_entry_t *)tok->int_merges;
     uint64_t key = ((uint64_t)(uint32_t)left << 32) | (uint32_t)right;
     int mask = tok->int_merges_cap - 1;
@@ -453,7 +453,7 @@ static int pair_merge_lookup(const qwen_tokenizer_t *tok, int left, int right, i
     return INT_MAX;
 }
 
-static int merge_rank(const qwen_tokenizer_t *tok, const char *a, const char *b) {
+static int merge_rank(const embed_tokenizer_t *tok, const char *a, const char *b) {
     if (!tok->merge_map || tok->merge_map_cap <= 0)
         return INT_MAX;
 
@@ -496,7 +496,7 @@ static char *text_to_bpe_unicode(const char *text) {
 }
 
 static int
-encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int **out_ids, int *out_n);
+encode_bpe_word(const embed_tokenizer_t *tok, const char *mapped, int **out_ids, int *out_n);
 
 static int
 utf8_decode_cp_len(const unsigned char *p, const unsigned char *end, int *cp_out, int *len_out) {
@@ -828,7 +828,7 @@ static int match_contraction(const unsigned char *p, const unsigned char *end) {
     return 0;
 }
 
-static int append_encoded_piece(const qwen_tokenizer_t *tok,
+static int append_encoded_piece(const embed_tokenizer_t *tok,
                                 const char *piece,
                                 size_t piece_len,
                                 int **ids,
@@ -868,7 +868,7 @@ static int append_encoded_piece(const qwen_tokenizer_t *tok,
 }
 
 static int
-encode_pretokenized(const qwen_tokenizer_t *tok, const char *text, int **out_ids, int *out_n) {
+encode_pretokenized(const embed_tokenizer_t *tok, const char *text, int **out_ids, int *out_n) {
     const unsigned char *start = (const unsigned char *)text;
     const unsigned char *p = start;
     const unsigned char *end = start + strlen(text);
@@ -1001,7 +1001,7 @@ encode_pretokenized(const qwen_tokenizer_t *tok, const char *text, int **out_ids
 
 /* Encode one mapped BPE unicode string to token IDs. */
 static int
-encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int **out_ids, int *out_n) {
+encode_bpe_word(const embed_tokenizer_t *tok, const char *mapped, int **out_ids, int *out_n) {
     *out_ids = NULL;
     *out_n = 0;
     if (!mapped || !*mapped)
@@ -1078,7 +1078,7 @@ typedef struct {
     size_t off;
 } bpe_sym_ref_t;
 
-struct qwen_tokenizer_workspace {
+struct embed_tokenizer_workspace {
     char *normalized;
     size_t normalized_cap;
     char *mapped;
@@ -1101,7 +1101,7 @@ struct qwen_tokenizer_workspace {
     int bpe_cap;
 };
 
-static int reserve_bpe(qwen_tokenizer_workspace_t *ws, int need) {
+static int reserve_bpe(embed_tokenizer_workspace_t *ws, int need) {
     if (ws->bpe_cap >= need)
         return 0;
     int new_cap = ws->bpe_cap ? ws->bpe_cap : 64;
@@ -1160,7 +1160,7 @@ static int reserve_ints(int **buf, int *cap, int need) {
     return 0;
 }
 
-static int reserve_syms(qwen_tokenizer_workspace_t *ws, int need) {
+static int reserve_syms(embed_tokenizer_workspace_t *ws, int need) {
     if (ws->syms_cap >= need)
         return 0;
     int new_cap = ws->syms_cap ? ws->syms_cap : 64;
@@ -1177,7 +1177,7 @@ static int reserve_syms(qwen_tokenizer_workspace_t *ws, int need) {
     return 0;
 }
 
-static int arena_append(qwen_tokenizer_workspace_t *ws, const char *s, size_t len, size_t *off) {
+static int arena_append(embed_tokenizer_workspace_t *ws, const char *s, size_t len, size_t *off) {
     if (ws->arena_len > SIZE_MAX - len - 1)
         return -1;
     size_t need = ws->arena_len + len + 1;
@@ -1190,12 +1190,12 @@ static int arena_append(qwen_tokenizer_workspace_t *ws, const char *s, size_t le
     return 0;
 }
 
-static const char *arena_str(const qwen_tokenizer_workspace_t *ws, bpe_sym_ref_t sym) {
+static const char *arena_str(const embed_tokenizer_workspace_t *ws, bpe_sym_ref_t sym) {
     return ws->arena + sym.off;
 }
 
 static int
-normalize_nfc_latin_into(qwen_tokenizer_workspace_t *ws, const char *text, const char **out) {
+normalize_nfc_latin_into(embed_tokenizer_workspace_t *ws, const char *text, const char **out) {
     const unsigned char *p = (const unsigned char *)text;
     const unsigned char *end = p + strlen(text);
     size_t in_len = (size_t)(end - p);
@@ -1235,7 +1235,7 @@ normalize_nfc_latin_into(qwen_tokenizer_workspace_t *ws, const char *text, const
     return 0;
 }
 
-static int text_to_bpe_unicode_into(qwen_tokenizer_workspace_t *ws,
+static int text_to_bpe_unicode_into(embed_tokenizer_workspace_t *ws,
                                     const char *text,
                                     size_t len,
                                     const char **out) {
@@ -1267,8 +1267,8 @@ static int output_append_id(int *out_ids, int out_cap, int *n_ids, int *overflow
     return 0;
 }
 
-static int encode_bpe_word_into_slow(const qwen_tokenizer_t *tok,
-                                     qwen_tokenizer_workspace_t *ws,
+static int encode_bpe_word_into_slow(const embed_tokenizer_t *tok,
+                                     embed_tokenizer_workspace_t *ws,
                                      const char *mapped,
                                      int *out_ids,
                                      int out_cap,
@@ -1349,8 +1349,8 @@ static int encode_bpe_word_into_slow(const qwen_tokenizer_t *tok,
  * the string-based loop when the int tables are unavailable. Identical
  * output: initial ids are the byte-level single-char token ids and every
  * merge result is the vocab id of the concatenated pair. */
-static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
-                                qwen_tokenizer_workspace_t *ws,
+static int encode_bpe_word_into(const embed_tokenizer_t *tok,
+                                embed_tokenizer_workspace_t *ws,
                                 const char *mapped,
                                 int *out_ids,
                                 int out_cap,
@@ -1427,8 +1427,8 @@ static int encode_bpe_word_into(const qwen_tokenizer_t *tok,
     return 0;
 }
 
-static int append_encoded_piece_into(const qwen_tokenizer_t *tok,
-                                     qwen_tokenizer_workspace_t *ws,
+static int append_encoded_piece_into(const embed_tokenizer_t *tok,
+                                     embed_tokenizer_workspace_t *ws,
                                      const char *piece,
                                      size_t piece_len,
                                      int *out_ids,
@@ -1444,8 +1444,8 @@ static int append_encoded_piece_into(const qwen_tokenizer_t *tok,
     return encode_bpe_word_into(tok, ws, mapped, out_ids, out_cap, n_ids, overflow);
 }
 
-static int encode_pretokenized_into(const qwen_tokenizer_t *tok,
-                                    qwen_tokenizer_workspace_t *ws,
+static int encode_pretokenized_into(const embed_tokenizer_t *tok,
+                                    embed_tokenizer_workspace_t *ws,
                                     const char *text,
                                     int *out_ids,
                                     int out_cap,
@@ -1622,7 +1622,7 @@ static int parse_merge_pair(char *line, char **a, char **b) {
     return 0;
 }
 
-static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
+static int load_merges_map(embed_tokenizer_t *tok, const char *merges_path) {
     FILE *f = fopen(merges_path, "rb");
     if (!f)
         return -1;
@@ -1745,10 +1745,10 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
  * Public API
  * ======================================================================== */
 
-qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
+embed_tokenizer_t *embed_tokenizer_load(const char *vocab_json_path) {
     FILE *f = fopen(vocab_json_path, "rb");
     if (!f) {
-        fprintf(stderr, "qwen_tokenizer_load: cannot open %s\n", vocab_json_path);
+        fprintf(stderr, "embed_tokenizer_load: cannot open %s\n", vocab_json_path);
         return NULL;
     }
 
@@ -1803,7 +1803,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
     }
 
     int vocab_size = max_id + 1;
-    qwen_tokenizer_t *tok = (qwen_tokenizer_t *)calloc(1, sizeof(qwen_tokenizer_t));
+    embed_tokenizer_t *tok = (embed_tokenizer_t *)calloc(1, sizeof(embed_tokenizer_t));
     if (!tok) {
         free(json);
         return NULL;
@@ -1812,7 +1812,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
     tok->id_to_text = (char **)calloc((size_t)vocab_size, sizeof(char *));
     tok->id_to_bpe = (char **)calloc((size_t)vocab_size, sizeof(char *));
     if (!tok->id_to_text || !tok->id_to_bpe) {
-        qwen_tokenizer_free(tok);
+        embed_tokenizer_free(tok);
         free(json);
         return NULL;
     }
@@ -1852,7 +1852,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
     tok->vocab_map_cap = next_pow2(n_vocab_entries * 2 + 1);
     tok->vocab_map = calloc((size_t)tok->vocab_map_cap, sizeof(str_int_entry_t));
     if (!tok->vocab_map) {
-        qwen_tokenizer_free(tok);
+        embed_tokenizer_free(tok);
         return NULL;
     }
     for (int i = 0; i < vocab_size; i++) {
@@ -1863,7 +1863,7 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
 
     char merges_path[1024];
     if (derive_merges_path(vocab_json_path, merges_path, sizeof(merges_path)) == 0) {
-        if (load_merges_map(tok, merges_path) != 0 && qwen_verbose >= 2) {
+        if (load_merges_map(tok, merges_path) != 0 && embed_verbose >= 2) {
             fprintf(stderr,
                     "Tokenizer: merges not loaded from %s (encoding falls back to byte-level)\n",
                     merges_path);
@@ -1873,19 +1873,19 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
     return tok;
 }
 
-const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id) {
+const char *embed_tokenizer_decode(const embed_tokenizer_t *tok, int token_id) {
     if (!tok || token_id < 0 || token_id >= tok->vocab_size)
         return "";
     return tok->id_to_text[token_id] ? tok->id_to_text[token_id] : "";
 }
 
-int qwen_tokenizer_token_id(const qwen_tokenizer_t *tok, const char *token) {
+int embed_tokenizer_token_id(const embed_tokenizer_t *tok, const char *token) {
     if (!tok || !token || !tok->vocab_map)
         return -1;
     return map_get((const str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap, token);
 }
 
-int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *out_n_tokens) {
+int *embed_tokenizer_encode(const embed_tokenizer_t *tok, const char *text, int *out_n_tokens) {
     if (out_n_tokens)
         *out_n_tokens = 0;
     if (!tok || !text || text[0] == '\0')
@@ -1909,11 +1909,11 @@ int *qwen_tokenizer_encode(const qwen_tokenizer_t *tok, const char *text, int *o
     return ids;
 }
 
-qwen_tokenizer_workspace_t *qwen_tokenizer_workspace_new(void) {
-    return (qwen_tokenizer_workspace_t *)calloc(1, sizeof(qwen_tokenizer_workspace_t));
+embed_tokenizer_workspace_t *embed_tokenizer_workspace_new(void) {
+    return (embed_tokenizer_workspace_t *)calloc(1, sizeof(embed_tokenizer_workspace_t));
 }
 
-void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws) {
+void embed_tokenizer_workspace_free(embed_tokenizer_workspace_t *ws) {
     if (!ws)
         return;
     free(ws->normalized);
@@ -1929,8 +1929,8 @@ void qwen_tokenizer_workspace_free(qwen_tokenizer_workspace_t *ws) {
     free(ws);
 }
 
-int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
-                               qwen_tokenizer_workspace_t *ws,
+int embed_tokenizer_encode_into(const embed_tokenizer_t *tok,
+                               embed_tokenizer_workspace_t *ws,
                                const char *text,
                                int *out_ids,
                                int out_cap,
@@ -1953,8 +1953,8 @@ int qwen_tokenizer_encode_into(const qwen_tokenizer_t *tok,
     return rc;
 }
 
-int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
-                                          qwen_tokenizer_workspace_t *ws,
+int *embed_tokenizer_encode_with_workspace(const embed_tokenizer_t *tok,
+                                          embed_tokenizer_workspace_t *ws,
                                           const char *text,
                                           int *out_n_tokens) {
     if (out_n_tokens)
@@ -1972,11 +1972,11 @@ int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
         return NULL;
 
     int n_ids = 0;
-    int rc = qwen_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap, &n_ids);
+    int rc = embed_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap, &n_ids);
     if (rc == -2) {
         if (reserve_ints(&ws->ids, &ws->ids_cap, n_ids) != 0)
             return NULL;
-        rc = qwen_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap, &n_ids);
+        rc = embed_tokenizer_encode_into(tok, ws, text, ws->ids, ws->ids_cap, &n_ids);
     }
     if (rc != 0 || n_ids <= 0)
         return NULL;
@@ -1990,7 +1990,7 @@ int *qwen_tokenizer_encode_with_workspace(const qwen_tokenizer_t *tok,
     return ids;
 }
 
-void qwen_tokenizer_free(qwen_tokenizer_t *tok) {
+void embed_tokenizer_free(embed_tokenizer_t *tok) {
     if (!tok)
         return;
 

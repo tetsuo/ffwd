@@ -1,16 +1,16 @@
 /* embed_cli.c - embed command-line tool */
 
 #include "embed.h"
-#include "embed_build.h"
-#include "qwen_kernels.h"
-#include "qwen_tokenizer.h"
-#include "wordpiece_tokenizer.h"
+#include "build.h"
+#include "kernels.h"
+#include "tokenizer_bpe.h"
+#include "tokenizer_wordpiece.h"
 
 #ifdef USE_MLX
-#include "embed_mlx.h"
+#include "mlx.h"
 #endif
 #ifdef USE_CUDA
-#include "embed_cuda.h"
+#include "cuda.h"
 #endif
 
 #include <stdio.h>
@@ -96,8 +96,8 @@ typedef struct {
 #ifdef USE_CUDA
     embed_cuda_ctx_t *cuda_ctx;
 #endif
-    qwen_tokenizer_t *tok;
-    qwen_tokenizer_workspace_t *tok_ws;
+    embed_tokenizer_t *tok;
+    embed_tokenizer_workspace_t *tok_ws;
     /* BERT-family WordPiece tokenizer, selected by a vocab.txt probe at load.
      * When wp_tok is set, tokenize_text wraps the ids with [CLS]/[SEP] and the
      * Qwen byte-level BPE fields above stay NULL. */
@@ -111,8 +111,8 @@ typedef struct {
 } engine_t;
 
 static void engine_free_tokenizers(engine_t *e) {
-    qwen_tokenizer_workspace_free(e->tok_ws);
-    qwen_tokenizer_free(e->tok);
+    embed_tokenizer_workspace_free(e->tok_ws);
+    embed_tokenizer_free(e->tok);
     wordpiece_workspace_free(e->wp_tok_ws);
     wordpiece_tokenizer_free(e->wp_tok);
 }
@@ -158,7 +158,7 @@ static int tokenize_text(engine_t *e, const char *text, token_buf_t *out) {
         out->ids = ids;
         out->n_tokens = n + 2;
     } else {
-        out->ids = qwen_tokenizer_encode_with_workspace(e->tok, e->tok_ws, text, &out->n_tokens);
+        out->ids = embed_tokenizer_encode_with_workspace(e->tok, e->tok_ws, text, &out->n_tokens);
         if (!out->ids || out->n_tokens == 0) {
             fprintf(stderr, "tokenization failed: %s\n", text);
             free(out->ids);
@@ -628,7 +628,6 @@ int main(int argc, char *argv[]) {
     }
 
     embed_verbose = verbose;
-    qwen_verbose = verbose;
 
 #ifdef USE_CUDA
     if (cuda_fast_gemm) {
@@ -683,8 +682,8 @@ int main(int argc, char *argv[]) {
 #endif
     {
         if (n_threads <= 0)
-            n_threads = qwen_get_num_cpus();
-        qwen_set_threads(n_threads);
+            n_threads = embed_get_num_cpus();
+        embed_set_threads(n_threads);
         if (verbose >= 1)
             fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
     }
@@ -711,7 +710,7 @@ int main(int argc, char *argv[]) {
     } else {
         char vocab_path[1024];
         snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
-        e.tok = qwen_tokenizer_load(vocab_path);
+        e.tok = embed_tokenizer_load(vocab_path);
         if (!e.tok) {
             fprintf(stderr, "failed to load tokenizer: %s\n", vocab_path);
             return 1;
@@ -774,7 +773,7 @@ int main(int argc, char *argv[]) {
      * like the contextual separator: a vocab that defines it (test models)
      * wins; otherwise the released-model family constant applies. */
     if (e.append_terminal_token) {
-        int eot = qwen_tokenizer_token_id(e.tok, "<|endoftext|>");
+        int eot = embed_tokenizer_token_id(e.tok, "<|endoftext|>");
         e.terminal_token_id = eot >= 0 ? eot : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
     }
     if (verbose >= 1)
@@ -791,7 +790,7 @@ int main(int argc, char *argv[]) {
     if (e.wp_tok)
         e.wp_tok_ws = wordpiece_workspace_new();
     else
-        e.tok_ws = qwen_tokenizer_workspace_new();
+        e.tok_ws = embed_tokenizer_workspace_new();
     if (!e.tok_ws && !e.wp_tok_ws) {
         fprintf(stderr, "failed to allocate tokenizer workspace\n");
         if (e.workspace)

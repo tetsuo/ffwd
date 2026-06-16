@@ -18,9 +18,9 @@
  * Greek final sigma).
  */
 
-#include "wordpiece_tokenizer.h"
+#include "tokenizer_wordpiece.h"
 
-#include "wordpiece_unicode.h"
+#include "tokenizer_unicode.h"
 
 #include <stdint.h>
 #include <stdio.h>

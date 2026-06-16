@@ -11,7 +11,7 @@
 
 #include "bench.h"
 #include "embed.h"
-#include "qwen_kernels.h"
+#include "kernels.h"
 
 static embed_model_t *g_model;
 static embed_workspace_t *g_ws;
@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
     }
     if (threads < 1)
         threads = 1;
-    qwen_set_threads(threads);
+    embed_set_threads(threads);
 
     g_model = embed_model_load(argv[1]);
     if (!g_model) {

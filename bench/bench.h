@@ -8,7 +8,7 @@
  *         float *x = make_input();          // setup, not measured
  *         bench_begin(b);
  *         for (long i = 0; i < b->n; i++)
- *             bench_sink += qwen_dot_f32(x, x, 1024);
+ *             bench_sink += embed_dot_f32(x, x, 1024);
  *         free(x);
  *     }
  *

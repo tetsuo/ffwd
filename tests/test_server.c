@@ -6,7 +6,7 @@
  * path over loopback sockets. Runs via `make test`. */
 
 #define EMBED_SERVER_TEST
-#include "../embed_server.c"
+#include "../src/server.c"
 
 #include "tiny_model.h"
 #include "tok_fixture.h"
@@ -596,7 +596,7 @@ static void test_http_embeddings(int port) {
                          "{\"model\":\"Qwen3-Embedding-0.6B\","
                          "\"input\":\"hello\",\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
-    cJSON *qwen_full = body ? parse_embeddings_body(body, 1) : NULL;
+    cJSON *embed_full = body ? parse_embeddings_body(body, 1) : NULL;
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
@@ -604,10 +604,10 @@ static void test_http_embeddings(int port) {
                          "\"input\":\"hello\",\"dimensions\":32,"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
-    cJSON *qwen_mrl = body ? parse_embeddings_body(body, 1) : NULL;
-    if (qwen_full && qwen_mrl) {
-        cJSON *full_data = cJSON_GetObjectItemCaseSensitive(qwen_full, "data");
-        cJSON *mrl_data = cJSON_GetObjectItemCaseSensitive(qwen_mrl, "data");
+    cJSON *embed_mrl = body ? parse_embeddings_body(body, 1) : NULL;
+    if (embed_full && embed_mrl) {
+        cJSON *full_data = cJSON_GetObjectItemCaseSensitive(embed_full, "data");
+        cJSON *mrl_data = cJSON_GetObjectItemCaseSensitive(embed_mrl, "data");
         cJSON *full_emb =
             cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(full_data, 0), "embedding");
         cJSON *mrl_emb =
@@ -622,12 +622,12 @@ static void test_http_embeddings(int port) {
                 prefix_diff = d;
         }
         TEST_ASSERT(prefix_diff > 0.0);
-        cJSON *usage = cJSON_GetObjectItemCaseSensitive(qwen_mrl, "usage");
+        cJSON *usage = cJSON_GetObjectItemCaseSensitive(embed_mrl, "usage");
         cJSON *total = usage ? cJSON_GetObjectItemCaseSensitive(usage, "total_tokens") : NULL;
         TEST_ASSERT(total && total->valueint == 2);
     }
-    cJSON_Delete(qwen_full);
-    cJSON_Delete(qwen_mrl);
+    cJSON_Delete(embed_full);
+    cJSON_Delete(embed_mrl);
     free(body);
     body = NULL;
 
@@ -949,7 +949,7 @@ static void test_http_rerank(int port) {
 }
 
 static void test_http_server(void) {
-    char dir[1024], late_dir[1024], qwen_dir[1024], gte_dir[1024];
+    char dir[1024], late_dir[1024], embed_dir[1024], gte_dir[1024];
     snprintf(dir, sizeof(dir), "%s/embed-srv-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir)) {
@@ -964,9 +964,9 @@ static void test_http_server(void) {
         test_failures++;
         return;
     }
-    snprintf(qwen_dir, sizeof(qwen_dir), "%s/embed-srv-qwen-test-XXXXXX",
+    snprintf(embed_dir, sizeof(embed_dir), "%s/embed-srv-qwen-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(qwen_dir)) {
+    if (!mkdtemp(embed_dir)) {
         fprintf(stderr, "FAIL: Qwen mkdtemp\n");
         test_failures++;
         return;
@@ -985,8 +985,8 @@ static void test_http_server(void) {
     if (tf_write_vocab(dir) != 0 || tm_write_model_dims(dir, "F32", &dims) != 0 ||
         tf_write_vocab(late_dir) != 0 || tm_write_model_dims(late_dir, "F32", &dims) != 0 ||
         tm_write_late_projection(late_dir, "F32", 128, 1024) != 0 ||
-        tf_write_vocab(qwen_dir) != 0 ||
-        tm_write_qwen3_model_dims(qwen_dir, "F32", &dims, TF_EOT_ID) != 0 ||
+        tf_write_vocab(embed_dir) != 0 ||
+        tm_write_qwen3_model_dims(embed_dir, "F32", &dims, TF_EOT_ID) != 0 ||
         tf_write_vocab(gte_dir) != 0 ||
         tm_write_qwen2_model_dims(gte_dir, "F32", &gte_dims, TF_EOT_ID, 0) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
@@ -1008,7 +1008,7 @@ static void test_http_server(void) {
     ctx.spec[2].id = "pplx-embed-v1-late-0.6b";
     ctx.spec[2].path = late_dir;
     ctx.spec[3].id = "Qwen3-Embedding-0.6B";
-    ctx.spec[3].path = qwen_dir;
+    ctx.spec[3].path = embed_dir;
     ctx.spec[4].id = "gte-Qwen2-1.5B-instruct";
     ctx.spec[4].path = gte_dir;
     ctx.cfg.models = ctx.spec;

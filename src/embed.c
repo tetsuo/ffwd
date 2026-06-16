@@ -1,8 +1,8 @@
 #include "embed.h"
-#include "embed_config.h"
-#include "embed_internal.h"
-#include "qwen_kernels.h"
-#include "qwen_safetensors.h"
+#include "config.h"
+#include "internal.h"
+#include "kernels.h"
+#include "safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +30,6 @@ struct embed_late_workspace {
  * ======================================================================== */
 
 int embed_verbose = 0;
-int qwen_verbose = 0;
 
 #define EMBED_BF16_QKV_FUSE_MAX_SEQ     16
 #define EMBED_BF16_PAIR_FUSE_MAX_SEQ    4
@@ -306,7 +305,7 @@ static void linear_nobias_weight(embed_workspace_t *ws,
                                  int in_dim,
                                  int out_dim) {
     if (w->dtype == DTYPE_F32) {
-        qwen_linear_nobias(y, x, (const float *)w->data, seq_len, in_dim, out_dim);
+        embed_linear_nobias(y, x, (const float *)w->data, seq_len, in_dim, out_dim);
         return;
     }
     if (seq_len > 16) {
@@ -314,12 +313,12 @@ static void linear_nobias_weight(embed_workspace_t *ws,
          * BLAS-backed F32 path; below that the fused BF16 row kernels win. */
         size_t count = (size_t)out_dim * (size_t)in_dim;
         if (ensure_bf16_widen(ws, count) == 0) {
-            qwen_bf16_to_f32_buf(ws->bf16_widen, (const uint16_t *)w->data, count);
-            qwen_linear_nobias(y, x, ws->bf16_widen, seq_len, in_dim, out_dim);
+            embed_bf16_to_f32_buf(ws->bf16_widen, (const uint16_t *)w->data, count);
+            embed_linear_nobias(y, x, ws->bf16_widen, seq_len, in_dim, out_dim);
             return;
         }
     }
-    qwen_linear_nobias_bf16(y, x, (const uint16_t *)w->data, seq_len, in_dim, out_dim);
+    embed_linear_nobias_bf16(y, x, (const uint16_t *)w->data, seq_len, in_dim, out_dim);
 }
 
 static void linear_qkv_weight(embed_workspace_t *ws,
@@ -336,7 +335,7 @@ static void linear_qkv_weight(embed_workspace_t *ws,
                               int kv_dim) {
     if (wq->dtype == DTYPE_BF16 && wk->dtype == DTYPE_BF16 && wv->dtype == DTYPE_BF16 &&
         seq_len <= EMBED_BF16_QKV_FUSE_MAX_SEQ) {
-        qwen_linear_nobias_bf16_qkv(q, k, v, x, (const uint16_t *)wq->data,
+        embed_linear_nobias_bf16_qkv(q, k, v, x, (const uint16_t *)wq->data,
                                     (const uint16_t *)wk->data, (const uint16_t *)wv->data, seq_len,
                                     in_dim, q_dim, kv_dim);
         return;
@@ -369,7 +368,7 @@ static void linear_pair_weight(embed_workspace_t *ws,
                                int b_dim) {
     if (wa->dtype == DTYPE_BF16 && wb->dtype == DTYPE_BF16 &&
         seq_len <= EMBED_BF16_PAIR_FUSE_MAX_SEQ) {
-        qwen_linear_nobias_bf16_pair(a, b, x, (const uint16_t *)wa->data,
+        embed_linear_nobias_bf16_pair(a, b, x, (const uint16_t *)wa->data,
                                      (const uint16_t *)wb->data, seq_len, in_dim, a_dim, b_dim);
         return;
     }
@@ -413,7 +412,7 @@ static int ensure_buffers(embed_workspace_t *ws, const embed_config_t *c, int se
 }
 
 static void ensure_attention_scores(embed_workspace_t *ws, const int *offsets, int batch) {
-    size_t bytes = qwen_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
+    size_t bytes = embed_bidirectional_gqa_attention_packed_scratch_bytes(offsets, batch);
     if (bytes <= ws->attn_scores_bytes)
         return;
 
@@ -614,8 +613,8 @@ model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int a
     model->layer_start = layer_start;
     model->layer_end = layer_end;
     model->attention = cfg->attention_mode == EMBED_ATTENTION_CAUSAL
-                           ? qwen_causal_gqa_attention_packed_with_scratch
-                           : qwen_bidirectional_gqa_attention_packed_with_scratch;
+                           ? embed_causal_gqa_attention_packed_with_scratch
+                           : embed_bidirectional_gqa_attention_packed_with_scratch;
 
     /* Open safetensors (handles single file or multi-shard) */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
@@ -955,7 +954,7 @@ float embed_late_maxsim(const float *query_vectors,
         float best = -FLT_MAX;
         for (int di = 0; di < doc_tokens; di++) {
             const float *d = doc_vectors + (size_t)di * dim;
-            float dot = qwen_dot_f32(q, d, dim);
+            float dot = embed_dot_f32(q, d, dim);
             if (dot > best)
                 best = dot;
         }
@@ -1009,7 +1008,7 @@ int embed_late_maxsim_batch(const float *query_vectors,
                 doc++;
             int group_tokens = doc_offsets[doc] - start;
 
-            qwen_matmul_t(sim, query_vectors, doc_vectors + (size_t)start * dim, query_tokens, dim,
+            embed_matmul_t(sim, query_vectors, doc_vectors + (size_t)start * dim, query_tokens, dim,
                           group_tokens);
 
             for (int i = first; i < doc; i++) {
@@ -1215,7 +1214,7 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
     for (int layer = layer_start; layer < layer_end; layer++) {
         const embed_layer_t *l = &w->layers[layer];
 
-        qwen_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
+        embed_rms_norm(x_norm, x, l->input_norm, total_seq, hidden, eps);
 
         linear_qkv_weight(ws, q_buf, k_buf, v_buf, x_norm, &l->wq, &l->wk, &l->wv, total_seq,
                           hidden, q_dim, kv_dim);
@@ -1224,16 +1223,16 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
         add_bias_rows(k_buf, l->k_bias, total_seq, kv_dim);
         add_bias_rows(v_buf, l->v_bias, total_seq, kv_dim);
         if (cfg->qk_norm) {
-            qwen_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads, head_dim, eps);
-            qwen_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
+            embed_rms_norm_per_head(q_buf, l->q_norm, total_seq, n_heads, head_dim, eps);
+            embed_rms_norm_per_head(k_buf, l->k_norm, total_seq, n_kv_heads, head_dim, eps);
         }
 
         for (int b = 0; b < batch; b++) {
             int start = offsets[b];
             int len = offsets[b + 1] - start;
-            qwen_apply_rope_neox(q_buf + (size_t)start * q_dim, rope_cos, rope_sin, len, n_heads,
+            embed_apply_rope_neox(q_buf + (size_t)start * q_dim, rope_cos, rope_sin, len, n_heads,
                                  head_dim);
-            qwen_apply_rope_neox(k_buf + (size_t)start * kv_dim, rope_cos, rope_sin, len,
+            embed_apply_rope_neox(k_buf + (size_t)start * kv_dim, rope_cos, rope_sin, len,
                                  n_kv_heads, head_dim);
         }
 
@@ -1241,19 +1240,19 @@ static int forward_packed_slice_inplace(const embed_model_t *model,
                          head_dim, scale, ws->attn_scores, ws->attn_scores_bytes);
 
         linear_nobias_weight(ws, proj_out, attn_out, &l->wo, total_seq, q_dim, hidden);
-        qwen_add_inplace(x, proj_out, total_seq * hidden);
+        embed_add_inplace(x, proj_out, total_seq * hidden);
 
-        qwen_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
+        embed_rms_norm(x_norm, x, l->post_attn_norm, total_seq, hidden, eps);
 
         linear_pair_weight(ws, ffn_gate, ffn_up, x_norm, &l->gate_proj, &l->up_proj, total_seq,
                            hidden, inter, inter);
-        qwen_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
+        embed_silu_mul_inplace(ffn_gate, ffn_up, total_seq * inter);
         linear_nobias_weight(ws, proj_out, ffn_gate, &l->down_proj, total_seq, inter, hidden);
-        qwen_add_inplace(x, proj_out, total_seq * hidden);
+        embed_add_inplace(x, proj_out, total_seq * hidden);
     }
 
     if (apply_final_norm)
-        qwen_rms_norm(x, x, w->norm, total_seq, hidden, eps);
+        embed_rms_norm(x, x, w->norm, total_seq, hidden, eps);
     return 0;
 }
 
@@ -1322,11 +1321,11 @@ static int forward_packed_bert(const embed_model_t *model,
             }
             float *row = x + (size_t)(start + i) * hidden;
             copy_weight_row(row, &w->embed_tokens, (size_t)id, hidden);
-            qwen_add_inplace(row, w->position_embeddings + (size_t)i * hidden, hidden);
-            qwen_add_inplace(row, w->token_type_embeddings, hidden);
+            embed_add_inplace(row, w->position_embeddings + (size_t)i * hidden, hidden);
+            embed_add_inplace(row, w->token_type_embeddings, hidden);
         }
     }
-    qwen_layer_norm(x, x, w->embed_ln_w, w->embed_ln_b, total_seq, hidden, eps);
+    embed_layer_norm(x, x, w->embed_ln_w, w->embed_ln_b, total_seq, hidden, eps);
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
@@ -1345,20 +1344,20 @@ static int forward_packed_bert(const embed_model_t *model,
 
         linear_nobias_weight(ws, proj_out, attn_out, &l->wo, total_seq, hidden, hidden);
         add_bias_rows(proj_out, l->o_bias, total_seq, hidden);
-        qwen_add_inplace(x, proj_out, total_seq * hidden);
-        qwen_layer_norm(x, x, l->input_norm, l->attn_ln_bias, total_seq, hidden, eps);
+        embed_add_inplace(x, proj_out, total_seq * hidden);
+        embed_layer_norm(x, x, l->input_norm, l->attn_ln_bias, total_seq, hidden, eps);
 
         /* Feed-forward (post-norm): dense -> GeLU -> dense. */
         linear_nobias_weight(ws, ffn_up, x, &l->up_proj, total_seq, hidden, inter);
         add_bias_rows(ffn_up, l->ffn_inter_bias, total_seq, inter);
         if (cfg->ffn_act == EMBED_ACT_GELU_TANH)
-            qwen_gelu_tanh_inplace(ffn_up, total_seq * inter);
+            embed_gelu_tanh_inplace(ffn_up, total_seq * inter);
         else
-            qwen_gelu_inplace(ffn_up, total_seq * inter);
+            embed_gelu_inplace(ffn_up, total_seq * inter);
         linear_nobias_weight(ws, proj_out, ffn_up, &l->down_proj, total_seq, inter, hidden);
         add_bias_rows(proj_out, l->ffn_out_bias, total_seq, hidden);
-        qwen_add_inplace(x, proj_out, total_seq * hidden);
-        qwen_layer_norm(x, x, l->post_attn_norm, l->ffn_ln_bias, total_seq, hidden, eps);
+        embed_add_inplace(x, proj_out, total_seq * hidden);
+        embed_layer_norm(x, x, l->post_attn_norm, l->ffn_ln_bias, total_seq, hidden, eps);
     }
     return 0;
 }

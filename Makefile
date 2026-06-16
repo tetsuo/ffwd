@@ -8,8 +8,8 @@ BUILD_OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
 BUILD_ARCH ?= $(shell uname -m)
 
 # Version and build identity compiled into the embed and embed-server binaries.
-# Applied on the embed_cli.o and embed_server.o recipes. VERSION is set for
-# release builds; otherwise the C fallbacks apply.
+# Applied on the cli.o and server.o recipes. VERSION is set for release builds;
+# otherwise the C fallbacks apply.
 VERSION_CFLAGS = \
 	-DEMBED_BUILD_DATE=\"$(BUILD_DATE)\" \
 	-DEMBED_BUILD_COMMIT=\"$(BUILD_COMMIT)\" \
@@ -56,11 +56,11 @@ BACKEND_LDFLAGS = -framework Accelerate -framework Metal -framework Foundation \
                   -L$(MLXC_PREFIX)/lib -lmlxc \
                   -L$(MLX_PREFIX)/lib -lmlx \
                   -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
-EXTRA_OBJS = embed_mlx.o
+EXTRA_OBJS = src/mlx.o
 else ifeq ($(BACKEND),cuda)
 BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
 BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
-EXTRA_OBJS = embed_cuda.o
+EXTRA_OBJS = src/cuda.o
 else ifeq ($(UNAME_S),Darwin)
 BACKEND_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 BACKEND_LDFLAGS = -framework Accelerate
@@ -69,34 +69,29 @@ BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 BACKEND_LDFLAGS = -lopenblas
 endif
 
-CFLAGS  = $(CFLAGS_BASE) $(BACKEND_CFLAGS)
+# -Isrc so frontends, tests, and benches resolve the public/internal headers
+# now that every source lives under src/.
+CFLAGS  = $(CFLAGS_BASE) $(BACKEND_CFLAGS) -Isrc
 LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 
-# Source files
-SRCS = embed.c \
-       embed_config.c \
-       qwen_kernels.c \
-       qwen_kernels_generic.c \
-       qwen_kernels_neon.c \
-       qwen_kernels_avx.c \
-       qwen_tokenizer.c \
-       wordpiece_tokenizer.c \
-       qwen_safetensors.c \
-       deps/ae/ae.c \
-       deps/ae/anet.c \
-       deps/ae/monotonic.c
+# Source groups. CORE_SRCS is the engine the tests and benches reuse; keeping it
+# in one variable stops the per-test source lists from drifting apart.
+KERNEL_SRCS = src/kernels.c src/kernels_generic.c src/kernels_neon.c src/kernels_avx.c
+TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c
+CORE_SRCS = src/embed.c src/config.c src/safetensors.c $(KERNEL_SRCS)
 
-MLX_SRCS = embed_mlx.c
-CUDA_SRCS = embed_cuda.cu
+SRCS = $(CORE_SRCS) $(TOKENIZER_SRCS) \
+       deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
+
+MLX_SRCS = src/mlx.c
+CUDA_SRCS = src/cuda.cu
 
 OBJS     = $(SRCS:.c=.o)
 MLX_OBJS = $(MLX_SRCS:.c=.o)
+HEADERS  = $(wildcard src/*.h)
 TARGET        = embed
 SERVER_TARGET = embed-server
 LIB           = libembed.a
-
-KERNEL_SRCS = qwen_kernels.c qwen_kernels_generic.c \
-              qwen_kernels_neon.c qwen_kernels_avx.c
 
 ifeq ($(shell uname -s),Darwin)
 SHARED_LIB   = libembed.dylib
@@ -137,11 +132,28 @@ else
 gpu: cuda
 endif
 
+# =============================================================================
+# Compile rules
+# =============================================================================
+# Generic rule for the plain core/kernel/tokenizer/safetensors/mlx objects.
+# Sibling headers in src/ resolve via the quote-include search; -Isrc (in
+# CFLAGS) makes it explicit. -arch=native for CUDA targets the GPU at build.
+src/%.o: src/%.c $(HEADERS)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # -fPIC so the same object links into both binaries and the shared library.
-# -arch=native targets the GPU present at build time (we always build CUDA
-# on the machine that runs it), avoiding first-load PTX JIT.
-embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
-	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC,-fvisibility=hidden -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+src/cuda.o: src/cuda.cu src/cuda.h src/internal.h src/embed.h
+	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC,-fvisibility=hidden -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -Isrc -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+
+# server.c reaches deps/ae via "deps/ae/ae.h", so it needs -I. (repo root).
+src/server.o: src/server.c $(HEADERS) deps/ae/ae.h deps/ae/anet.h
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae -c -o $@ $<
+
+src/cli.o: src/cli.c $(HEADERS)
+	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -c -o $@ $<
+
+deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
+	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
 
 # =============================================================================
 # Shared library (built by every backend target from the same objects)
@@ -149,6 +161,17 @@ embed_cuda.o: embed_cuda.cu embed_cuda.h embed_internal.h embed.h
 $(SHARED_LIB): $(OBJS) $(EXTRA_OBJS)
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS)
 
+# =============================================================================
+# Static library and binary link
+# =============================================================================
+$(LIB): $(OBJS) $(EXTRA_OBJS)
+	$(AR) rcs $@ $^
+
+$(TARGET): $(LIB) src/cli.o
+	$(CC) $(CFLAGS) -o $@ src/cli.o $(LIB) $(LDFLAGS)
+
+$(SERVER_TARGET): $(LIB) src/server.o
+	$(CC) $(CFLAGS) -o $@ src/server.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
 
 # =============================================================================
 # Tests (no model files required)
@@ -162,29 +185,23 @@ TEST_BLAS_LDFLAGS = -lopenblas
 endif
 
 # Source lists shared by test and coverage targets so the two cannot drift.
-TEST_CC_FLAGS         = -Wall -Wextra -O2 -I.
+TEST_CC_FLAGS         = -Wall -Wextra -O2 -Isrc
 TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
-TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS)
-TEST_WORDPIECE_SRCS   = tests/test_wordpiece.c wordpiece_tokenizer.c
-TEST_SAFETENSORS_SRCS = tests/test_safetensors.c qwen_safetensors.c
-TEST_BF16_SRCS        = tests/test_bf16_model.c embed.c embed_config.c qwen_safetensors.c \
-                        $(KERNEL_SRCS)
-TEST_QWEN3_SRCS       = tests/test_qwen3.c embed.c embed_config.c qwen_safetensors.c \
-                        $(KERNEL_SRCS)
-TEST_QWEN2_SRCS       = tests/test_qwen2.c embed.c embed_config.c qwen_safetensors.c \
-                        $(KERNEL_SRCS)
-TEST_CLS_SRCS         = tests/test_cls.c embed.c embed_config.c qwen_safetensors.c \
-                        $(KERNEL_SRCS)
-TEST_WORKSPACE_SRCS   = tests/test_workspace.c embed.c embed_config.c qwen_tokenizer.c \
-                        qwen_safetensors.c $(KERNEL_SRCS)
-TEST_LATE_SRCS        = tests/test_late.c embed.c embed_config.c qwen_tokenizer.c \
-                        qwen_safetensors.c $(KERNEL_SRCS)
-TEST_SERVER_SRCS      = tests/test_server.c embed.c embed_config.c \
-                        qwen_tokenizer.c wordpiece_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS) \
+TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c src/tokenizer_bpe.c $(KERNEL_SRCS)
+TEST_WORDPIECE_SRCS   = tests/test_wordpiece.c src/tokenizer_wordpiece.c
+TEST_SAFETENSORS_SRCS = tests/test_safetensors.c src/safetensors.c
+TEST_BF16_SRCS        = tests/test_bf16_model.c $(CORE_SRCS)
+TEST_QWEN3_SRCS       = tests/test_qwen3.c $(CORE_SRCS)
+TEST_QWEN2_SRCS       = tests/test_qwen2.c $(CORE_SRCS)
+TEST_CLS_SRCS         = tests/test_cls.c $(CORE_SRCS)
+TEST_WORKSPACE_SRCS   = tests/test_workspace.c $(CORE_SRCS) src/tokenizer_bpe.c
+TEST_LATE_SRCS        = tests/test_late.c $(CORE_SRCS) src/tokenizer_bpe.c
+# test_server.c #includes ../src/server.c, so server is not a separate object
+# here; it needs -I. for server.c's "deps/ae/ae.h" plus the ae sources.
+TEST_SERVER_SRCS      = tests/test_server.c $(CORE_SRCS) $(TOKENIZER_SRCS) \
                         deps/ae/ae.c deps/ae/anet.c deps/ae/monotonic.c
 # The CLI check builds the real CLI (CPU backend) plus a driver that runs it.
-TEST_CLI_BIN_SRCS     = embed_cli.c embed.c embed_config.c \
-                        qwen_tokenizer.c wordpiece_tokenizer.c qwen_safetensors.c $(KERNEL_SRCS)
+TEST_CLI_BIN_SRCS     = src/cli.c $(CORE_SRCS) $(TOKENIZER_SRCS)
 
 test:
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_kernels_generic \
@@ -222,7 +239,7 @@ test:
 	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c -lm
 	./tests/test_cli ./tests/cli_under_test
-	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
 	./tests/test_server
@@ -237,15 +254,12 @@ test-safetensors:
 	    $(TEST_SAFETENSORS_SRCS) -lm -lpthread
 	./tests/test_safetensors
 
-
 # =============================================================================
 # Test-suite line coverage (requires clang + llvm-cov/llvm-profdata. Writes a
 # per-file text summary to stdout and an HTML report to coverage/html/index.html.)
 # =============================================================================
 COV_DIR   = coverage
 # Source-based coverage; -O0 so no line is folded away by the optimizer.
-# The "." compilation dir keeps report paths relative to the repo root;
-# run llvm-cov from the repo root so sources resolve.
 COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
             -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
@@ -297,7 +311,7 @@ coverage:
 	    $(TEST_CLI_BIN_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_cli tests/test_cli.c -lm
 	LLVM_PROFILE_FILE=$(COV_DIR)/cli_%p.profraw ./tests/test_cli ./tests/cli_under_test
-	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae \
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae \
 	    -o tests/test_server $(TEST_SERVER_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS) $(CJSON_LDFLAGS)
 	LLVM_PROFILE_FILE=$(COV_DIR)/server.profraw ./tests/test_server
@@ -317,8 +331,8 @@ coverage:
 	@echo "HTML report: $(COV_DIR)/html/index.html"
 
 bench-tokenizer:
-	$(CC) -Wall -Wextra -O3 -march=native -I. -o bench/bench_tokenizer \
-	    bench/bench_tokenizer.c qwen_tokenizer.c $(KERNEL_SRCS) -lm -lpthread
+	$(CC) -Wall -Wextra -O3 -march=native -Isrc -o bench/bench_tokenizer \
+	    bench/bench_tokenizer.c src/tokenizer_bpe.c $(KERNEL_SRCS) -lm -lpthread
 	@echo "run: bench/bench_tokenizer <model_dir> [runs]"
 
 # =============================================================================
@@ -329,7 +343,7 @@ bench-tokenizer:
 # Dirtiness ignores .gitignore so local-only ignore entries do not mark
 # every record as -dirty.
 BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet -- ':!.gitignore' 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
-BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -I.
+BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -Isrc
 
 bench:
 	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_kernels \
@@ -341,7 +355,7 @@ bench:
 bench-model:
 	@test -n "$(MODEL_DIR)" || { echo "usage: make bench-model MODEL_DIR=/path/to/model-dir"; exit 1; }
 	$(CC) $(BENCH_CC_FLAGS) -o bench/bench_model \
-	    bench/bench_model.c embed.c embed_config.c qwen_safetensors.c $(KERNEL_SRCS) \
+	    bench/bench_model.c $(CORE_SRCS) \
 	    -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	@mkdir -p bench/results
 	./bench/bench_model "$(MODEL_DIR)" --json bench/results/model-$(BENCH_STAMP).json
@@ -351,74 +365,19 @@ bench-model:
 # =============================================================================
 SANITIZE ?= address,undefined
 
-debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=$(SANITIZE)
+debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -Isrc -fsanitize=$(SANITIZE)
 debug: LDFLAGS  = -lm -lpthread -fsanitize=$(SANITIZE)
 debug:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
-# Static library and binary link
-# =============================================================================
-$(LIB): $(OBJS) $(EXTRA_OBJS)
-	$(AR) rcs $@ $^
-
-$(TARGET): $(LIB) embed_cli.o
-	$(CC) $(CFLAGS) -o $@ embed_cli.o $(LIB) $(LDFLAGS)
-
-$(SERVER_TARGET): $(LIB) embed_server.o
-	$(CC) $(CFLAGS) -o $@ embed_server.o $(LIB) $(LDFLAGS) $(CJSON_LDFLAGS)
-
-# =============================================================================
-# Compile rules
-# =============================================================================
-embed.o: embed.c embed.h embed_config.h qwen_kernels.h qwen_safetensors.h
-	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
-
-embed_server.o: embed_server.c embed_server.h embed_build.h embed.h embed_mlx.h qwen_tokenizer.h wordpiece_tokenizer.h deps/ae/ae.h deps/ae/anet.h
-	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -Ideps/ae -c -o $@ $<
-
-embed_mlx.o: embed_mlx.c embed_mlx.h embed_config.h embed.h qwen_safetensors.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-embed_cli.o: embed_cli.c embed_build.h embed.h qwen_kernels.h qwen_tokenizer.h wordpiece_tokenizer.h
-	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -Ideps/ae -c -o $@ $<
-
-
-qwen_kernels.o: qwen_kernels.c qwen_kernels.h qwen_kernels_impl.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-qwen_kernels_generic.o: qwen_kernels_generic.c qwen_kernels_impl.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-qwen_kernels_neon.o: qwen_kernels_neon.c qwen_kernels_impl.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-qwen_kernels_avx.o: qwen_kernels_avx.c qwen_kernels_impl.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-qwen_tokenizer.o: qwen_tokenizer.c qwen_tokenizer.h qwen_kernels.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-wordpiece_tokenizer.o: wordpiece_tokenizer.c wordpiece_tokenizer.h wordpiece_unicode.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-qwen_safetensors.o: qwen_safetensors.c qwen_safetensors.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-embed_config.o: embed_config.c embed_config.h embed.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
-	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
-
-# =============================================================================
 clean:
-	rm -f $(OBJS) embed_mlx.o embed_cuda.o embed_cli.o embed_server.o \
+	rm -f src/*.o deps/ae/*.o \
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libembed.dylib libembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
 	      tests/test_qwen3 tests/test_qwen2 \
-	      tests/test_tokenizer tests/test_workspace tests/test_cli tests/test_late \
+	      tests/test_tokenizer tests/test_wordpiece tests/test_workspace tests/test_cli tests/test_late \
 	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels bench/bench_model
 	rm -rf $(COV_DIR)

@@ -3,7 +3,7 @@
  * byte-complete tokenizer fixture. Runs via `make test`. */
 
 #include "embed.h"
-#include "qwen_tokenizer.h"
+#include "tokenizer_bpe.h"
 #include "tiny_model.h"
 #include "tok_fixture.h"
 
@@ -63,7 +63,7 @@ int main(void) {
     tm_dims_t dims = {4, 2, 1, 2, 8, TF_VOCAB_SIZE};
     int hidden = dims.hidden;
 
-    qwen_tokenizer_t *tok = NULL;
+    embed_tokenizer_t *tok = NULL;
     embed_model_t *base = NULL;
     embed_workspace_t *base_ws = NULL;
     embed_late_model_t *late = NULL;
@@ -145,14 +145,14 @@ int main(void) {
 
     char vocab_path[1280];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", dir);
-    tok = qwen_tokenizer_load(vocab_path);
+    tok = embed_tokenizer_load(vocab_path);
     if (!tok) {
         fprintf(stderr, "tokenizer load failed\n");
         goto fail;
     }
 
     int n_tokens = 0;
-    ids = qwen_tokenizer_encode(tok, "hello world", &n_tokens);
+    ids = embed_tokenizer_encode(tok, "hello world", &n_tokens);
     if (!ids || n_tokens <= 1) {
         fprintf(stderr, "tokenization failed\n");
         goto fail;
@@ -244,7 +244,7 @@ int main(void) {
         int lens[3] = {0};
         int offsets[4] = {0};
         for (int i = 0; i < 3; i++) {
-            doc_ids[i] = qwen_tokenizer_encode(tok, doc_texts[i], &lens[i]);
+            doc_ids[i] = embed_tokenizer_encode(tok, doc_texts[i], &lens[i]);
             if (!doc_ids[i] || lens[i] <= 0) {
                 fprintf(stderr, "doc tokenization failed\n");
                 goto fail;
@@ -401,7 +401,7 @@ fail:
     free(raw);
     free(states);
     free(ids);
-    qwen_tokenizer_free(tok);
+    embed_tokenizer_free(tok);
     embed_late_workspace_free(ws);
     embed_late_model_free(late);
     embed_workspace_free(base_ws);

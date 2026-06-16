@@ -2,19 +2,19 @@
 #define _GNU_SOURCE
 #endif
 
-#include "embed_build.h"
-#include "embed_server.h"
+#include "build.h"
+#include "server.h"
 #include "embed.h"
-#include "qwen_safetensors.h"
-#include "qwen_kernels.h"
-#include "qwen_tokenizer.h"
-#include "wordpiece_tokenizer.h"
+#include "safetensors.h"
+#include "kernels.h"
+#include "tokenizer_bpe.h"
+#include "tokenizer_wordpiece.h"
 
 #ifdef USE_MLX
-#include "embed_mlx.h"
+#include "mlx.h"
 #endif
 #ifdef USE_CUDA
-#include "embed_cuda.h"
+#include "cuda.h"
 #endif
 
 #include "deps/ae/ae.h"
@@ -313,8 +313,8 @@ static model_slot model_slot_for_id(const char *id) {
 typedef struct {
     const model_info *info;
     char *path;
-    qwen_tokenizer_t *tok;
-    qwen_tokenizer_workspace_t *tok_ws;
+    embed_tokenizer_t *tok;
+    embed_tokenizer_workspace_t *tok_ws;
     /* BERT-family WordPiece tokenizer, selected by file probe in load_one_model.
      * When wp_tok is set, tokenize_one wraps the ids with [CLS]/[SEP] and the
      * Qwen byte-level BPE fields above stay NULL. */
@@ -1529,7 +1529,7 @@ static int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *ou
         out->n_tokens = n + 2;
         return 0;
     }
-    out->ids = qwen_tokenizer_encode_with_workspace(m->tok, m->tok_ws, text, &out->n_tokens);
+    out->ids = embed_tokenizer_encode_with_workspace(m->tok, m->tok_ws, text, &out->n_tokens);
     if (j)
         j->tokenize_ns += nstime() - t0;
     if (!out->ids || out->n_tokens <= 0) {
@@ -3041,12 +3041,12 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
     } else {
         char vocab_path[1024];
         snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
-        m->tok = qwen_tokenizer_load(vocab_path);
+        m->tok = embed_tokenizer_load(vocab_path);
         if (!m->tok) {
             server_log("embed-server: failed to load tokenizer: %s", vocab_path);
             return -1;
         }
-        m->tok_ws = qwen_tokenizer_workspace_new();
+        m->tok_ws = embed_tokenizer_workspace_new();
         if (!m->tok_ws) {
             server_log("embed-server: failed to allocate tokenizer workspace: %s", path);
             return -1;
@@ -3056,18 +3056,18 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
          * family constant is the normal case; a vocab that does define the
          * token (e.g. small test models) takes precedence so the id stays
          * inside that model's embedding table. */
-        int sep_id = qwen_tokenizer_token_id(m->tok, "<|endoftext|>");
+        int sep_id = embed_tokenizer_token_id(m->tok, "<|endoftext|>");
         m->context_separator_id = sep_id >= 0 ? sep_id : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
         /* Qwen3-Embedding pools the last token, the tokenizer's <|endoftext|>
          * suffix - the same token as the separator, not the model's chat
          * eos_token_id (<|im_end|>). Resolve it here from the tokenizer. */
         m->terminal_token_id = m->context_separator_id;
         if (m->info->kind == MODEL_KIND_LATE) {
-            int id = qwen_tokenizer_token_id(m->tok, "[MASK]");
+            int id = embed_tokenizer_token_id(m->tok, "[MASK]");
             m->late_mask_id = id >= 0 ? id : EMBED_LATE_MASK_TOKEN_ID;
-            id = qwen_tokenizer_token_id(m->tok, "[Q]");
+            id = embed_tokenizer_token_id(m->tok, "[Q]");
             m->late_query_prefix_id = id >= 0 ? id : EMBED_LATE_QUERY_PREFIX_ID;
-            id = qwen_tokenizer_token_id(m->tok, "[D]");
+            id = embed_tokenizer_token_id(m->tok, "[D]");
             m->late_document_prefix_id = id >= 0 ? id : EMBED_LATE_DOCUMENT_PREFIX_ID;
 
             const char *punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
@@ -3077,7 +3077,7 @@ static int load_one_model(http_server *s, model_slot slot, const char *path) {
                  p++) {
                 char text[2] = {*p, '\0'};
                 int n_ids = 0;
-                int *ids = qwen_tokenizer_encode(m->tok, text, &n_ids);
+                int *ids = embed_tokenizer_encode(m->tok, text, &n_ids);
                 if (ids && n_ids == 1)
                     m->late_skip_ids[m->n_late_skip_ids++] = ids[0];
                 free(ids);
@@ -3142,9 +3142,9 @@ static void free_models(http_server *s) {
         loaded_model *m = &s->models[i];
         free(m->path);
         if (m->tok_ws)
-            qwen_tokenizer_workspace_free(m->tok_ws);
+            embed_tokenizer_workspace_free(m->tok_ws);
         if (m->tok)
-            qwen_tokenizer_free(m->tok);
+            embed_tokenizer_free(m->tok);
         if (m->wp_tok_ws)
             wordpiece_workspace_free(m->wp_tok_ws);
         if (m->wp_tok)
@@ -3626,7 +3626,6 @@ int main(int argc, char *argv[]) {
     }
 
     embed_verbose = verbose;
-    qwen_verbose = verbose;
 
     if (arg < argc) {
         fprintf(stderr, "unexpected argument: %s\n", argv[arg]);
@@ -3692,8 +3691,8 @@ int main(int argc, char *argv[]) {
 #endif
     {
         if (n_threads <= 0)
-            n_threads = qwen_get_num_cpus();
-        qwen_set_threads(n_threads);
+            n_threads = embed_get_num_cpus();
+        embed_set_threads(n_threads);
         if (verbose >= 1)
             fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
     }

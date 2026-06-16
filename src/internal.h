@@ -2,7 +2,7 @@
 #define EMBED_INTERNAL_H
 
 #include "embed.h"
-#include "qwen_safetensors.h"
+#include "safetensors.h"
 
 typedef struct {
     safetensor_dtype_t dtype;

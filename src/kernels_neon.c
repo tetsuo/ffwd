@@ -1,15 +1,15 @@
 /*
- * qwen_kernels_neon.c - ARM NEON hot kernels
+ * embed_kernels_neon.c - ARM NEON hot kernels
  */
 
-#include "qwen_kernels_impl.h"
+#include "kernels_impl.h"
 
 #ifdef __ARM_NEON
 
 #include <arm_neon.h>
 #include <string.h>
 
-void qwen_bf16_matvec_fused_neon(
+void embed_bf16_matvec_fused_neon(
     float *y, const float *x, const uint16_t *W_bf16, const float *bias, int in_dim, int out_dim) {
     int o = 0;
 
@@ -115,7 +115,7 @@ void qwen_bf16_matvec_fused_neon(
     }
 }
 
-float qwen_dot_f32_neon(const float *a, const float *b, int n) {
+float embed_dot_f32_neon(const float *a, const float *b, int n) {
     int i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -133,7 +133,7 @@ float qwen_dot_f32_neon(const float *a, const float *b, int n) {
     return sum;
 }
 
-void qwen_vec_scale_inplace_neon(float *dst, float scale, int n) {
+void embed_vec_scale_inplace_neon(float *dst, float scale, int n) {
     int i = 0;
     float32x4_t s = vdupq_n_f32(scale);
     for (; i + 8 <= n; i += 8) {
@@ -146,7 +146,7 @@ void qwen_vec_scale_inplace_neon(float *dst, float scale, int n) {
         dst[i] *= scale;
 }
 
-void qwen_vec_axpy_inplace_neon(float *dst, const float *src, float alpha, int n) {
+void embed_vec_axpy_inplace_neon(float *dst, const float *src, float alpha, int n) {
     int i = 0;
     float32x4_t a = vdupq_n_f32(alpha);
     for (; i + 8 <= n; i += 8) {
@@ -161,7 +161,7 @@ void qwen_vec_axpy_inplace_neon(float *dst, const float *src, float alpha, int n
         dst[i] += alpha * src[i];
 }
 
-void qwen_vec_scale_add_neon(float *dst, const float *src, float correction, int n) {
+void embed_vec_scale_add_neon(float *dst, const float *src, float correction, int n) {
     int i = 0;
     float32x4_t c = vdupq_n_f32(correction);
     for (; i + 8 <= n; i += 8) {

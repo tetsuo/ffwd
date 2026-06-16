@@ -1,14 +1,14 @@
 /* bench/bench_tokenizer.c - tokenizer encode-path benchmark.
  * Build via `make bench-tokenizer`; needs a model dir (vocab.json). */
 
-#include "qwen_tokenizer.h"
+#include "tokenizer_bpe.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-int qwen_verbose = 0;
+int embed_verbose = 0;
 
 static double now_ms(void) {
     struct timespec ts;
@@ -45,8 +45,8 @@ int main(int argc, char **argv) {
     int n_texts = argc - 3;
     char **texts = argv + 3;
 
-    qwen_tokenizer_t *tok = qwen_tokenizer_load(vocab);
-    qwen_tokenizer_workspace_t *ws = qwen_tokenizer_workspace_new();
+    embed_tokenizer_t *tok = embed_tokenizer_load(vocab);
+    embed_tokenizer_workspace_t *ws = embed_tokenizer_workspace_new();
     if (!tok || !ws) {
         fprintf(stderr, "failed to initialize tokenizer\n");
         goto cleanup;
@@ -61,13 +61,13 @@ int main(int argc, char **argv) {
 
     int tokens_per_pass = 0;
     for (int i = 0; i < n_texts; i++) {
-        gold[i] = qwen_tokenizer_encode(tok, texts[i], &gold_n[i]);
+        gold[i] = embed_tokenizer_encode(tok, texts[i], &gold_n[i]);
         if (!gold[i] || gold_n[i] <= 0)
             goto cleanup;
         tokens_per_pass += gold_n[i];
 
         int n_ws = 0;
-        int *ids_ws = qwen_tokenizer_encode_with_workspace(tok, ws, texts[i], &n_ws);
+        int *ids_ws = embed_tokenizer_encode_with_workspace(tok, ws, texts[i], &n_ws);
         if (!ids_ws || !same_ids(gold[i], gold_n[i], ids_ws, n_ws)) {
             free(ids_ws);
             goto cleanup;
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
         if (!bufs[i])
             goto cleanup;
         int n_into = 0;
-        if (qwen_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n_into) != 0 ||
+        if (embed_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n_into) != 0 ||
             !same_ids(gold[i], gold_n[i], bufs[i], n_into))
             goto cleanup;
     }
@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int *ids = qwen_tokenizer_encode(tok, texts[i], &n);
+            int *ids = embed_tokenizer_encode(tok, texts[i], &n);
             if (!ids || n != gold_n[i]) {
                 free(ids);
                 goto cleanup;
@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int *ids = qwen_tokenizer_encode_with_workspace(tok, ws, texts[i], &n);
+            int *ids = embed_tokenizer_encode_with_workspace(tok, ws, texts[i], &n);
             if (!ids || n != gold_n[i]) {
                 free(ids);
                 goto cleanup;
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int rc = qwen_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n);
+            int rc = embed_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n);
             if (rc != 0 || n != gold_n[i])
                 goto cleanup;
             into_tokens += n;
@@ -152,7 +152,7 @@ cleanup:
     free(gold_n);
     free(bufs);
     free(caps);
-    qwen_tokenizer_workspace_free(ws);
-    qwen_tokenizer_free(tok);
+    embed_tokenizer_workspace_free(ws);
+    embed_tokenizer_free(tok);
     return status;
 }
