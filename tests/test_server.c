@@ -69,6 +69,36 @@ static void test_sbuf_growth_and_formatting(void) {
     sbuf_free(&b);
 }
 
+static void test_json_error_body_escaping(void) {
+    size_t len = 0;
+    char *body = json_error_body("line\nquote\" tab\t ctrl\001 slash\\", "bad\ntype", &len);
+    TEST_ASSERT(body != NULL);
+    if (!body)
+        return;
+    TEST_ASSERT(len == strlen(body));
+    TEST_ASSERT(strchr(body, '\n') == NULL);
+    TEST_ASSERT(strchr(body, '\t') == NULL);
+    cJSON *root = cJSON_Parse(body);
+    TEST_ASSERT(root != NULL);
+    if (!root) {
+        free(body);
+        return;
+    }
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+    cJSON *msg = err ? cJSON_GetObjectItemCaseSensitive(err, "message") : NULL;
+    cJSON *type = err ? cJSON_GetObjectItemCaseSensitive(err, "type") : NULL;
+    if (!msg || !type || !cJSON_IsString(msg) || !cJSON_IsString(type)) {
+        TEST_ASSERT(0 && "error body fields must be strings");
+        cJSON_Delete(root);
+        free(body);
+        return;
+    }
+    TEST_ASSERT(strcmp(msg->valuestring, "line\nquote\" tab\t ctrl\001 slash\\") == 0);
+    TEST_ASSERT(strcmp(type->valuestring, "bad\ntype") == 0);
+    cJSON_Delete(root);
+    free(body);
+}
+
 static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.0f) == 0);
     /* tanh saturates to +-1, scaled by 127. */
@@ -1075,6 +1105,7 @@ static void test_http_server(void) {
 int main(void) {
     test_base64_rfc4648();
     test_sbuf_growth_and_formatting();
+    test_json_error_body_escaping();
     test_quantize_int8_tanh();
     test_encode_embedding_int8();
     test_encode_embedding_binary();

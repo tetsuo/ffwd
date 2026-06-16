@@ -19,18 +19,11 @@
  * inclusion in a response. */
 
 static void append_json_error(sbuf *b, const char *message, const char *type) {
-    sbuf_puts(b, "{\"error\":{\"message\":\"");
-    for (const char *p = message ? message : ""; *p; p++) {
-        if (*p == '"' || *p == '\\') {
-            sbuf_putc(b, '\\');
-            sbuf_putc(b, *p);
-        } else {
-            sbuf_putc(b, *p);
-        }
-    }
-    sbuf_puts(b, "\",\"type\":\"");
-    sbuf_puts(b, type ? type : "server_error");
-    sbuf_puts(b, "\"}}");
+    sbuf_puts(b, "{\"error\":{\"message\":");
+    append_json_string(b, message ? message : "");
+    sbuf_puts(b, ",\"type\":");
+    append_json_string(b, type ? type : "server_error");
+    sbuf_puts(b, "}}");
 }
 
 void append_json_string(sbuf *b, const char *s) {
