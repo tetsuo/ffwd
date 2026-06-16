@@ -685,13 +685,23 @@ __global__ static void layer_norm_kernel(float *out,
         o[d] = (xr[d] - mean) * inv * gamma[d] + beta[d];
 }
 
-// Exact-erf GeLU in place: 0.5 x (1 + erf(x / sqrt(2))). Not the tanh
-// approximation - BERT-family checkpoints use the exact form.
+// Exact-erf GeLU in place: 0.5 x (1 + erf(x / sqrt(2))). The released encoders
+// use this; the tanh approximation below is for gelu_new / gelu_pytorch_tanh.
 __global__ static void gelu_kernel(float *x, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = x[i];
         x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+    }
+}
+
+// Tanh-approximation GeLU in place: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))).
+__global__ static void gelu_tanh_kernel(float *x, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        x[i] = 0.5f * v * (1.0f + tanhf(inner));
     }
 }
 
@@ -1502,8 +1512,12 @@ static int cuda_forward_batch_bert(embed_cuda_ctx_t *ctx, const embed_input_t *i
             ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
         if (launch_check() != 0)
             return -1;
-        gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            ctx->ffn_gate_up, (size_t)inter_count);
+        if (c->ffn_act == EMBED_ACT_GELU_TANH)
+            gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->ffn_gate_up, (size_t)inter_count);
+        else
+            gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->ffn_gate_up, (size_t)inter_count);
         if (launch_check() != 0)
             return -1;
         if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)

@@ -48,8 +48,17 @@ typedef enum {
     EMBED_FAMILY_BERT = 1,  /* LayerNorm + learned positions + GeLU encoder block */
 } embed_family_t;
 
+/* BERT feed-forward activation. The released MiniLM/BGE encoders use exact erf
+ * GeLU; some encoders publish the tanh approximation (hidden_act gelu_new or
+ * gelu_pytorch_tanh), which is a different curve and must be matched exactly. */
+typedef enum {
+    EMBED_ACT_GELU_ERF = 0,  /* 0.5 x (1 + erf(x / sqrt(2))) */
+    EMBED_ACT_GELU_TANH = 1, /* 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) */
+} embed_act_t;
+
 typedef struct {
     embed_family_t family;
+    embed_act_t ffn_act; /* BERT feed-forward GeLU variant; ERF for Qwen/SwiGLU */
     int hidden_size;
     int n_layers;
     int n_heads;

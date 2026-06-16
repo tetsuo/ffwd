@@ -108,6 +108,24 @@ static void test_gelu(void) {
     expect_close("gelu_neg1", out[2], -0.158655254f, 1e-5f);
 }
 
+static void test_gelu_tanh(void) {
+    float x[5] = {0.0f, 1.0f, -1.0f, 2.5f, -3.0f};
+    float out[5];
+    memcpy(out, x, sizeof(out));
+    qwen_gelu_tanh_inplace(out, 5);
+    for (int i = 0; i < 5; i++) {
+        float v = x[i];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        float want = 0.5f * v * (1.0f + tanhf(inner));
+        expect_close("gelu_tanh", out[i], want, 1e-6f);
+    }
+    /* Reference values for the tanh approximation; distinct from the erf GeLU
+     * (erf gelu(1) = 0.841344746) by ~1.5e-4, well outside this tolerance. */
+    expect_close("gelu_tanh0", out[0], 0.0f, 1e-7f);
+    expect_close("gelu_tanh1", out[1], 0.841191991f, 1e-5f);
+    expect_close("gelu_tanh_neg1", out[2], -0.158808009f, 1e-5f);
+}
+
 static void test_rope_neox(void) {
     const int seq = 2, heads = 1, head_dim = 4;
     const int positions[2] = {0, 3};
@@ -579,6 +597,7 @@ int main(void) {
     test_rms_norm();
     test_layer_norm();
     test_gelu();
+    test_gelu_tanh();
     test_rope_neox();
     test_packed_gqa_attention();
     test_packed_gqa_attention_long();

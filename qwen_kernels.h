@@ -111,6 +111,10 @@ void qwen_silu_mul_inplace(float *gate, const float *up, int n);
  * "gelu" activation HF BERT/BGE/MiniLM use, not the tanh approximation. */
 void qwen_gelu_inplace(float *x, int n);
 
+/* Tanh-approximation GeLU in place (HF gelu_new / gelu_pytorch_tanh):
+ * x = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). */
+void qwen_gelu_tanh_inplace(float *x, int n);
+
 /* ========================================================================
  * Attention Operations
  * ======================================================================== */

@@ -233,11 +233,12 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
         cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
         cfg->n_kv_heads = cfg->n_heads; /* full multi-head attention, no GQA */
         cfg->head_dim = cfg->n_heads > 0 ? cfg->hidden_size / cfg->n_heads : 0;
+        /* hidden_act selects the feed-forward GeLU curve. gelu_new and
+         * gelu_pytorch_tanh are the same tanh approximation; everything else
+         * (gelu, absent) is the exact erf GeLU the released encoders use. */
         if (json_string_equals(buf, "hidden_act", "gelu_new") ||
             json_string_equals(buf, "hidden_act", "gelu_pytorch_tanh")) {
-            fprintf(stderr, "embed_config: BERT tanh-GeLU is not supported yet; need exact gelu\n");
-            free(buf);
-            return -1;
+            cfg->ffn_act = EMBED_ACT_GELU_TANH;
         }
         if (cfg->max_position_embeddings <= 0 || !isfinite(cfg->layer_norm_eps) ||
             cfg->layer_norm_eps <= 0.0f) {

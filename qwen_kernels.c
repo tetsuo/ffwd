@@ -837,6 +837,15 @@ void qwen_gelu_inplace(float *x, int n) {
         x[i] = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
 }
 
+void qwen_gelu_tanh_inplace(float *x, int n) {
+    /* Tanh-approximation GeLU; 0.79788456... = sqrt(2/pi). */
+    for (int i = 0; i < n; i++) {
+        float v = x[i];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        x[i] = 0.5f * v * (1.0f + tanhf(inner));
+    }
+}
+
 void qwen_softmax(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;

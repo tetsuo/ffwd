@@ -1351,7 +1351,10 @@ static int forward_packed_bert(const embed_model_t *model,
         /* Feed-forward (post-norm): dense -> GeLU -> dense. */
         linear_nobias_weight(ws, ffn_up, x, &l->up_proj, total_seq, hidden, inter);
         add_bias_rows(ffn_up, l->ffn_inter_bias, total_seq, inter);
-        qwen_gelu_inplace(ffn_up, total_seq * inter);
+        if (cfg->ffn_act == EMBED_ACT_GELU_TANH)
+            qwen_gelu_tanh_inplace(ffn_up, total_seq * inter);
+        else
+            qwen_gelu_inplace(ffn_up, total_seq * inter);
         linear_nobias_weight(ws, proj_out, ffn_up, &l->down_proj, total_seq, inter, hidden);
         add_bias_rows(proj_out, l->ffn_out_bias, total_seq, hidden);
         qwen_add_inplace(x, proj_out, total_seq * hidden);

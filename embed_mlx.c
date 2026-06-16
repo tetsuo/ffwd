@@ -840,6 +840,46 @@ static mlx_array mlx_gelu_erf(mlx_array x, mlx_stream S) {
     return g;
 }
 
+/* Tanh-approximation GeLU (gelu_new / gelu_pytorch_tanh):
+ * 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). Frees nothing given. */
+static mlx_array mlx_gelu_tanh(mlx_array x, mlx_stream S) {
+    mlx_array x2 = mlx_array_new();
+    mlx_multiply(&x2, x, x, S);
+    mlx_array x3 = mlx_array_new();
+    mlx_multiply(&x3, x2, x, S);
+    mlx_array_free(x2);
+    mlx_array c = mlx_array_new_float32(0.044715f);
+    mlx_array cx3 = mlx_array_new();
+    mlx_multiply(&cx3, x3, c, S);
+    mlx_array_free(x3);
+    mlx_array_free(c);
+    mlx_array sum = mlx_array_new();
+    mlx_add(&sum, x, cx3, S);
+    mlx_array_free(cx3);
+    mlx_array s2pi = mlx_array_new_float32(0.79788456080286536f);
+    mlx_array inner = mlx_array_new();
+    mlx_multiply(&inner, sum, s2pi, S);
+    mlx_array_free(sum);
+    mlx_array_free(s2pi);
+    mlx_array t = mlx_array_new();
+    mlx_tanh(&t, inner, S);
+    mlx_array_free(inner);
+    mlx_array one = mlx_array_new_float32(1.0f);
+    mlx_array t1 = mlx_array_new();
+    mlx_add(&t1, t, one, S);
+    mlx_array_free(t);
+    mlx_array_free(one);
+    mlx_array half = mlx_array_new_float32(0.5f);
+    mlx_array xh = mlx_array_new();
+    mlx_multiply(&xh, x, half, S);
+    mlx_array_free(half);
+    mlx_array g = mlx_array_new();
+    mlx_multiply(&g, xh, t1, S);
+    mlx_array_free(xh);
+    mlx_array_free(t1);
+    return g;
+}
+
 /* BERT-family forward: post-norm encoder layers (bias on every projection, GeLU
  * feed-forward, no RoPE, no per-head norm) over an already-embedded x. Frees the
  * x it is given and returns the new hidden states. */
@@ -929,7 +969,8 @@ static mlx_array mlx_forward_bert(embed_mlx_ctx_t *ctx,
         mlx_array mid_b = mlx_array_new();
         mlx_add(&mid_b, mid, l->ffn_inter_bias, S);
         mlx_array_free(mid);
-        mlx_array g = mlx_gelu_erf(mid_b, S);
+        mlx_array g = ctx->config.ffn_act == EMBED_ACT_GELU_TANH ? mlx_gelu_tanh(mid_b, S)
+                                                                 : mlx_gelu_erf(mid_b, S);
         mlx_array_free(mid_b);
         mlx_array out = linear(g, &l->down_proj, S);
         mlx_array_free(g);
