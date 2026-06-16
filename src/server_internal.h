@@ -309,6 +309,26 @@ int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct);
 int dimensions_from_root(
     cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding);
 
+/* ---- server_http.c: connection lifecycle, header parse, response framing ---- */
+int set_nonblock(int fd);
+void client_incref(client *c);
+void client_decref_n(client *c, int n);
+int close_client_unlink(client *c);
+void close_client(client *c);
+void append_http_response_ex(client *c,
+                             int status,
+                             const char *ctype,
+                             const char *extra_headers,
+                             const char *body,
+                             size_t body_len);
+void append_http_response(
+    client *c, int status, const char *ctype, const char *body, size_t body_len);
+int queue_write(client *c);
+bool route_is_inference(const char *method, const char *path);
+void read_cb(aeEventLoop *loop, int fd, void *clientData, int mask);
+/* Defined in server.c (request routing): framed requests are handed here. */
+void dispatch_request(client *c);
+
 /* ---- server_encode.c: embedding output encoding ---- */
 signed char quantize_int8_tanh(float x);
 char *encode_embedding(const float *emb, int dims, const char *encoding);
