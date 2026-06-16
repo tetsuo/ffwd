@@ -296,8 +296,9 @@ int forward_packed_inplace(const embed_model_t *model,
  * embedding LayerNorm, then post-norm encoder layers (bias on every projection,
  * GeLU feed-forward, no RoPE, no per-head norm). Bidirectional attention is
  * block-diagonal over the packed batch, so each sequence's positions restart at
- * 0. Leaves the final hidden states in ws->x; pooling reads them as-is because
- * the last layer's LayerNorm is already the model's final normalization. */
+ * cfg->position_id_offset (0 for BERT, pad_id + 1 for RoBERTa/XLM-R). Leaves the
+ * final hidden states in ws->x; pooling reads them as-is because the last
+ * layer's LayerNorm is already the model's final normalization. */
 static int forward_packed_bert(const embed_model_t *model,
                                embed_workspace_t *ws,
                                const embed_input_t *inputs,
@@ -320,9 +321,10 @@ static int forward_packed_bert(const embed_model_t *model,
     if (!w->embed_tokens.data || !w->position_embeddings || !w->token_type_embeddings ||
         !w->embed_ln_w || !w->embed_ln_b)
         return -1;
-    if (max_seq > cfg->max_position_embeddings) {
-        fprintf(stderr, "embed: sequence length %d exceeds max_position_embeddings %d\n", max_seq,
-                cfg->max_position_embeddings);
+    if (max_seq > cfg->max_position_embeddings - cfg->position_id_offset) {
+        fprintf(stderr,
+                "embed: sequence length %d plus position offset %d exceeds max_position_embeddings %d\n",
+                max_seq, cfg->position_id_offset, cfg->max_position_embeddings);
         return -1;
     }
     if (ensure_buffers(ws, cfg, total_seq) != 0)
@@ -345,7 +347,8 @@ static int forward_packed_bert(const embed_model_t *model,
             }
             float *row = x + (size_t)(start + i) * hidden;
             copy_weight_row(row, &w->embed_tokens, (size_t)id, hidden);
-            embed_add_inplace(row, w->position_embeddings + (size_t)i * hidden, hidden);
+            int pos = cfg->position_id_offset + i;
+            embed_add_inplace(row, w->position_embeddings + (size_t)pos * hidden, hidden);
             embed_add_inplace(row, w->token_type_embeddings, hidden);
         }
     }

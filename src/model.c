@@ -173,15 +173,17 @@ load_bert_weights(embed_model_t *model, multi_safetensors_t *ms, int layer_start
     embed_weights_t *w = &model->weights;
     char name[256];
 
-    /* sentence-transformers checkpoints store the BERT submodule unprefixed;
-     * raw HF checkpoints prefix every tensor with "bert.". */
+    /* sentence-transformers checkpoints store encoder tensors unprefixed; raw
+     * HF BERT and RoBERTa/XLM-R checkpoints use "bert." or "roberta.". */
     const char *p;
     if (multi_safetensors_find(ms, "embeddings.word_embeddings.weight", NULL))
         p = "";
     else if (multi_safetensors_find(ms, "bert.embeddings.word_embeddings.weight", NULL))
         p = "bert.";
+    else if (multi_safetensors_find(ms, "roberta.embeddings.word_embeddings.weight", NULL))
+        p = "roberta.";
     else {
-        fprintf(stderr, "embed_model_load: BERT word embeddings not found\n");
+        fprintf(stderr, "embed_model_load: BERT-family word embeddings not found\n");
         return -1;
     }
 
@@ -194,7 +196,7 @@ load_bert_weights(embed_model_t *model, multi_safetensors_t *ms, int layer_start
         const int64_t pos_shape[2] = {cfg->max_position_embeddings, hidden};
         snprintf(name, sizeof(name), "%sembeddings.position_embeddings.weight", p);
         w->position_embeddings = load_norm_f32(ms, name, pos_shape, 2);
-        const int64_t type_shape[2] = {2, hidden};
+        const int64_t type_shape[2] = {cfg->type_vocab_size, hidden};
         snprintf(name, sizeof(name), "%sembeddings.token_type_embeddings.weight", p);
         w->token_type_embeddings = load_norm_f32(ms, name, type_shape, 2);
         const int64_t ln_shape[1] = {hidden};

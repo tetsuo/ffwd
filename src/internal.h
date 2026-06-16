@@ -43,7 +43,7 @@ typedef struct {
     /* BERT family (NULL for Qwen3): learned absolute position embeddings,
      * token-type (segment) embeddings, and the embedding LayerNorm. */
     const float *position_embeddings;   /* [max_position_embeddings, hidden] */
-    const float *token_type_embeddings; /* [2, hidden] */
+    const float *token_type_embeddings; /* [type_vocab_size, hidden] */
     const float *embed_ln_w;            /* embedding LayerNorm weight [hidden] */
     const float *embed_ln_b;            /* embedding LayerNorm bias [hidden] */
 } embed_weights_t;

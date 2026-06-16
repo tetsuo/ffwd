@@ -209,6 +209,8 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
     cfg->layer_norm_eps = (float)json_get_double(buf, "layer_norm_eps", 1e-12);
     cfg->rope_theta = (float)json_get_double(buf, "rope_theta", 1000000.0);
     cfg->max_position_embeddings = json_get_int(buf, "max_position_embeddings", 0);
+    cfg->position_id_offset = 0;
+    cfg->type_vocab_size = json_get_int(buf, "type_vocab_size", 2);
     cfg->family = EMBED_FAMILY_QWEN3;
     cfg->qk_norm = 1;
     cfg->qkv_bias = 0;
@@ -226,13 +228,25 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
         cfg->qk_norm = 0;
         cfg->qkv_bias = 1;
         cfg->attention_mode = EMBED_ATTENTION_CAUSAL;
-    } else if (json_string_equals(buf, "model_type", "bert")) {
+    } else if (json_string_equals(buf, "model_type", "bert") ||
+               json_string_equals(buf, "model_type", "roberta") ||
+               json_string_equals(buf, "model_type", "xlm-roberta")) {
         cfg->family = EMBED_FAMILY_BERT;
         cfg->qk_norm = 0;
         cfg->qkv_bias = 1; /* q/k/v/o and both dense layers carry bias */
         cfg->attention_mode = EMBED_ATTENTION_BIDIRECTIONAL;
         cfg->n_kv_heads = cfg->n_heads; /* full multi-head attention, no GQA */
         cfg->head_dim = cfg->n_heads > 0 ? cfg->hidden_size / cfg->n_heads : 0;
+        if (json_string_equals(buf, "model_type", "roberta") ||
+            json_string_equals(buf, "model_type", "xlm-roberta")) {
+            int pad_id = json_get_int(buf, "pad_token_id", 1);
+            if (pad_id < 0 || pad_id == INT_MAX) {
+                fprintf(stderr, "embed_config: invalid RoBERTa pad_token_id\n");
+                free(buf);
+                return -1;
+            }
+            cfg->position_id_offset = pad_id + 1;
+        }
         /* hidden_act selects the feed-forward GeLU curve. gelu_new and
          * gelu_pytorch_tanh are the same tanh approximation; everything else
          * (gelu, absent) is the exact erf GeLU the released encoders use. */
@@ -240,7 +254,9 @@ int embed_config_parse(embed_config_t *cfg, const char *model_dir) {
             json_string_equals(buf, "hidden_act", "gelu_pytorch_tanh")) {
             cfg->ffn_act = EMBED_ACT_GELU_TANH;
         }
-        if (cfg->max_position_embeddings <= 0 || !isfinite(cfg->layer_norm_eps) ||
+        if (cfg->max_position_embeddings <= 0 ||
+            cfg->position_id_offset >= cfg->max_position_embeddings ||
+            cfg->type_vocab_size <= 0 || !isfinite(cfg->layer_norm_eps) ||
             cfg->layer_norm_eps <= 0.0f) {
             fprintf(stderr, "embed_config: invalid BERT layer_norm_eps/max_position_embeddings\n");
             free(buf);

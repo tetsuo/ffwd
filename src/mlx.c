@@ -392,8 +392,10 @@ static int load_mlx_bert_weights(embed_mlx_ctx_t *ctx, int layer_start, int laye
         p = "";
     else if (multi_safetensors_find(ctx->ms, "bert.embeddings.word_embeddings.weight", NULL))
         p = "bert.";
+    else if (multi_safetensors_find(ctx->ms, "roberta.embeddings.word_embeddings.weight", NULL))
+        p = "roberta.";
     else {
-        fprintf(stderr, "mlx: BERT word embeddings not found\n");
+        fprintf(stderr, "mlx: BERT-family word embeddings not found\n");
         return -1;
     }
 
@@ -404,7 +406,7 @@ static int load_mlx_bert_weights(embed_mlx_ctx_t *ctx, int layer_start, int laye
         int pos_shape[] = {c->max_position_embeddings, h};
         snprintf(name, sizeof(name), "%sembeddings.position_embeddings.weight", p);
         ctx->position_embeddings = load_tensor(ctx->ms, name, pos_shape, 2);
-        int type_shape[] = {2, h};
+        int type_shape[] = {c->type_vocab_size, h};
         snprintf(name, sizeof(name), "%sembeddings.token_type_embeddings.weight", p);
         ctx->token_type_embeddings = load_tensor(ctx->ms, name, type_shape, 2);
         int ln_shape[] = {h};
@@ -2046,9 +2048,19 @@ static int embed_mlx_encode_batch_dense(embed_mlx_ctx_t *ctx,
     mlx_array x_normed;
     if (c->family == EMBED_FAMILY_BERT) {
         int start2[] = {0, 0}, stride2[] = {1, 1};
-        int pos_stop[] = {max_seq, hidden}, type_stop[] = {1, hidden};
+        int pos_start[] = {c->position_id_offset, 0};
+        int pos_stop[] = {c->position_id_offset + max_seq, hidden}, type_stop[] = {1, hidden};
+        if (pos_stop[0] > c->max_position_embeddings) {
+            mlx_array_free(x);
+            mlx_array_free(pool_mask);
+            mlx_array_free(lengths);
+            mlx_array_free(last_indices);
+            if (needs_attn_mask)
+                mlx_array_free(attn_mask);
+            return -1;
+        }
         mlx_array pos = mlx_array_new();
-        mlx_slice(&pos, ctx->position_embeddings, start2, 2, pos_stop, 2, stride2, 2, S);
+        mlx_slice(&pos, ctx->position_embeddings, pos_start, 2, pos_stop, 2, stride2, 2, S);
         mlx_array xp = mlx_array_new();
         mlx_add(&xp, x, pos, S);
         mlx_array_free(x);

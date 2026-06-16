@@ -13,7 +13,7 @@
  * k_models is the static table of every model the server can serve (name,
  * dimensions, attention/pooling mode, API family). load_one_model resolves a
  * served id to a slot, picks the tokenizer by the files present (WordPiece
- * vocab.txt -> BERT, else byte-level BPE vocab.json), and loads the CPU model
+ * vocab.txt, SentencePiece .model, else byte-level BPE vocab.json), and loads the CPU model
  * (GPU backends load on the worker thread). The tokenize_* and model_embed_*
  * helpers are the single dispatch point the request handlers call, hiding the
  * CPU/MLX/CUDA backend choice behind one signature.
@@ -43,6 +43,12 @@ const model_info k_models[] = {
      EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
     {"bge-large-en-v1.5", MODEL_KIND_STANDARD, 1024, 1024, 0, EMBED_ATTENTION_BIDIRECTIONAL,
      EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
+    {"multilingual-e5-large-instruct", MODEL_KIND_STANDARD, 1024, 1024, 0,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 1, EMBED_API_OPENAI,
+     EMBED_E5_QUERY_INSTRUCT},
+    {"snowflake-arctic-embed-l-v2.0", MODEL_KIND_STANDARD, 1024, 256, 0,
+     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_CLS, 1, EMBED_API_OPENAI,
+     EMBED_SNOWFLAKE_QUERY_INSTRUCT},
     {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0,
      EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
     {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
@@ -125,6 +131,30 @@ int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *out) {
          * cleans to zero core tokens (core == NULL, n == 0); the bare
          * [CLS][SEP] pair is what Hugging Face produces for it too. Grow the
          * returned buffer in place so only one allocation is touched. */
+        if (n < 0 || n > INT_MAX - 2) {
+            free(core);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        int *ids = realloc(core, (size_t)(n + 2) * sizeof(*ids));
+        if (!ids) {
+            free(core);
+            memset(out, 0, sizeof(*out));
+            return -1;
+        }
+        memmove(ids + 1, ids, (size_t)n * sizeof(*ids));
+        ids[0] = m->cls_id;
+        ids[n + 1] = m->sep_id;
+        out->ids = ids;
+        out->n_tokens = n + 2;
+        return 0;
+    }
+    if (m->sp_tok) {
+        int n = 0;
+        int *core =
+            sentencepiece_tokenizer_encode_with_workspace(m->sp_tok, m->sp_tok_ws, text, &n);
+        if (j)
+            j->tokenize_ns += nstime() - t0;
         if (n < 0 || n > INT_MAX - 2) {
             free(core);
             memset(out, 0, sizeof(*out));
@@ -299,9 +329,8 @@ int load_one_model(http_server *s, model_slot slot, const char *path) {
     m->terminal_token_id = -1;
     m->cls_id = -1;
     m->sep_id = -1;
-    /* Pick the tokenizer by the files present: a WordPiece vocab.txt marks a
-     * BERT encoder; otherwise the Qwen byte-level BPE vocab.json. The two never
-     * coexist in a model directory, so the probe is unambiguous. */
+    /* Pick the tokenizer by the files present: WordPiece vocab.txt, then a
+     * SentencePiece .model, otherwise the Qwen byte-level BPE vocab.json. */
     char wp_path[1024];
     snprintf(wp_path, sizeof(wp_path), "%s/vocab.txt", path);
     if (access(wp_path, R_OK) == 0) {
@@ -323,6 +352,33 @@ int load_one_model(http_server *s, model_slot slot, const char *path) {
             return -1;
         }
     } else {
+        char sp_path[1024];
+        snprintf(sp_path, sizeof(sp_path), "%s/sentencepiece.bpe.model", path);
+        if (access(sp_path, R_OK) != 0) {
+            snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", path);
+            if (access(sp_path, R_OK) != 0)
+                snprintf(sp_path, sizeof(sp_path), "%s/spiece.model", path);
+        }
+        if (access(sp_path, R_OK) == 0) {
+            m->sp_tok = sentencepiece_tokenizer_load(path);
+            if (!m->sp_tok) {
+                server_log("embed-server: failed to load SentencePiece tokenizer: %s", sp_path);
+                return -1;
+            }
+            m->sp_tok_ws = sentencepiece_workspace_new();
+            if (!m->sp_tok_ws) {
+                server_log("embed-server: failed to allocate SentencePiece workspace: %s", path);
+                return -1;
+            }
+            m->cls_id = sentencepiece_tokenizer_token_id(m->sp_tok, "<s>");
+            m->sep_id = sentencepiece_tokenizer_token_id(m->sp_tok, "</s>");
+            if (m->cls_id < 0 || m->sep_id < 0) {
+                server_log("embed-server: SentencePiece vocab missing <s>/</s>: %s", path);
+                return -1;
+            }
+        }
+    }
+    if (!m->wp_tok && !m->sp_tok) {
         char vocab_path[1024];
         snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", path);
         m->tok = embed_tokenizer_load(vocab_path);
@@ -433,6 +489,10 @@ void free_models(http_server *s) {
             wordpiece_workspace_free(m->wp_tok_ws);
         if (m->wp_tok)
             wordpiece_tokenizer_free(m->wp_tok);
+        if (m->sp_tok_ws)
+            sentencepiece_workspace_free(m->sp_tok_ws);
+        if (m->sp_tok)
+            sentencepiece_tokenizer_free(m->sp_tok);
         if (m->cpu_ws)
             embed_workspace_free(m->cpu_ws);
         if (m->cpu_model)

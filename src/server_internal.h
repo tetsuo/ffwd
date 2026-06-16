@@ -10,6 +10,7 @@
 #include "embed.h"
 #include "sbuf.h"
 #include "tokenizer_bpe.h"
+#include "tokenizer_sentencepiece.h"
 #include "tokenizer_wordpiece.h"
 
 #ifdef USE_MLX
@@ -54,6 +55,10 @@
 #define EMBED_GTE_QWEN2_QUERY_INSTRUCT                                                \
     "Instruct: Given a web search query, retrieve relevant passages that answer the " \
     "query\nQuery: "
+#define EMBED_E5_QUERY_INSTRUCT                                                       \
+    "Instruct: Given a web search query, retrieve relevant passages that answer the " \
+    "query\nQuery: "
+#define EMBED_SNOWFLAKE_QUERY_INSTRUCT "query: "
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
@@ -80,6 +85,8 @@ typedef enum {
     MODEL_BGE_SMALL,
     MODEL_BGE_BASE,
     MODEL_BGE_LARGE,
+    MODEL_E5_MULTI_LARGE_INSTRUCT,
+    MODEL_SNOWFLAKE_ARCTIC_L_V2,
     MODEL_CTX_06,
     MODEL_CTX_4,
     MODEL_LATE_06,
@@ -124,6 +131,8 @@ typedef struct {
      * Qwen byte-level BPE fields above stay NULL. */
     wordpiece_tokenizer_t *wp_tok;
     wordpiece_workspace_t *wp_tok_ws;
+    sentencepiece_tokenizer_t *sp_tok;
+    sentencepiece_workspace_t *sp_tok_ws;
     int cls_id;
     int sep_id;
     int context_separator_id;

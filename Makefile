@@ -79,7 +79,7 @@ LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
 KERNEL_SRCS = src/kernels_gemm.c src/kernels_norm.c src/kernels_act.c src/kernels_attn.c \
               src/kernels_rope.c src/threadpool.c \
               src/kernels_generic.c src/kernels_neon.c src/kernels_avx.c
-TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c
+TOKENIZER_SRCS = src/tokenizer_bpe.c src/tokenizer_wordpiece.c src/tokenizer_sentencepiece.c
 CORE_SRCS = src/model.c src/forward.c src/late.c src/vec.c src/alloc.c \
             src/config.c src/safetensors.c $(KERNEL_SRCS)
 
@@ -203,11 +203,13 @@ TEST_CC_FLAGS         = -Wall -Wextra -O2 -Isrc
 TEST_KERNELS_SRCS     = tests/test_kernels.c $(KERNEL_SRCS)
 TEST_TOKENIZER_SRCS   = tests/test_tokenizer.c src/tokenizer_bpe.c $(KERNEL_SRCS)
 TEST_WORDPIECE_SRCS   = tests/test_wordpiece.c src/tokenizer_wordpiece.c
+TEST_SENTENCEPIECE_SRCS = tests/test_sentencepiece.c src/tokenizer_sentencepiece.c
 TEST_SAFETENSORS_SRCS = tests/test_safetensors.c src/safetensors.c
 TEST_BF16_SRCS        = tests/test_bf16_model.c $(CORE_SRCS)
 TEST_QWEN3_SRCS       = tests/test_qwen3.c $(CORE_SRCS)
 TEST_QWEN2_SRCS       = tests/test_qwen2.c $(CORE_SRCS)
 TEST_CLS_SRCS         = tests/test_cls.c $(CORE_SRCS)
+TEST_XLM_ROBERTA_SRCS = tests/test_xlm_roberta.c $(CORE_SRCS)
 TEST_WORKSPACE_SRCS   = tests/test_workspace.c $(CORE_SRCS) src/tokenizer_bpe.c
 TEST_LATE_SRCS        = tests/test_late.c $(CORE_SRCS) src/tokenizer_bpe.c
 # test_server.c #includes ../src/server.c, so server is not a separate object
@@ -232,6 +234,8 @@ test:
 	./tests/test_tokenizer
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_wordpiece $(TEST_WORDPIECE_SRCS)
 	./tests/test_wordpiece
+	$(CC) $(TEST_CC_FLAGS) -o tests/test_sentencepiece $(TEST_SENTENCEPIECE_SRCS)
+	./tests/test_sentencepiece
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_safetensors $(TEST_SAFETENSORS_SRCS)
 	./tests/test_safetensors
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_bf16_model \
@@ -246,6 +250,9 @@ test:
 	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_cls \
 	    $(TEST_CLS_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	./tests/test_cls
+	$(CC) $(TEST_CC_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_xlm_roberta \
+	    $(TEST_XLM_ROBERTA_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	./tests/test_xlm_roberta
 	$(CC) $(TEST_CC_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	./tests/test_workspace
@@ -280,9 +287,9 @@ COV_DIR   = coverage
 COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
             -fcoverage-compilation-dir=.
 COV_BINS  = tests/test_kernels_generic tests/test_kernels_blas \
-            tests/test_tokenizer tests/test_safetensors \
+            tests/test_tokenizer tests/test_sentencepiece tests/test_safetensors \
             tests/test_bf16_model tests/test_qwen3 tests/test_qwen2 tests/test_workspace \
-            tests/test_late \
+            tests/test_cls tests/test_xlm_roberta tests/test_late \
             tests/cli_under_test tests/test_server
 # Report on project sources only - not the harnesses, vendored deps, or
 # system headers (cJSON lands under /opt or /usr otherwise).
@@ -307,6 +314,9 @@ coverage:
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_tokenizer \
 	    $(TEST_TOKENIZER_SRCS) -lm -lpthread
 	LLVM_PROFILE_FILE=$(COV_DIR)/tokenizer.profraw ./tests/test_tokenizer
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_sentencepiece \
+	    $(TEST_SENTENCEPIECE_SRCS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/sentencepiece.profraw ./tests/test_sentencepiece
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_safetensors $(TEST_SAFETENSORS_SRCS)
 	LLVM_PROFILE_FILE=$(COV_DIR)/safetensors.profraw ./tests/test_safetensors
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_bf16_model \
@@ -318,6 +328,12 @@ coverage:
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_qwen2 \
 	    $(TEST_QWEN2_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
 	LLVM_PROFILE_FILE=$(COV_DIR)/qwen2.profraw ./tests/test_qwen2
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_cls \
+	    $(TEST_CLS_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/cls.profraw ./tests/test_cls
+	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) $(TEST_BLAS_CFLAGS) -o tests/test_xlm_roberta \
+	    $(TEST_XLM_ROBERTA_SRCS) -lm -lpthread $(TEST_BLAS_LDFLAGS)
+	LLVM_PROFILE_FILE=$(COV_DIR)/xlm_roberta.profraw ./tests/test_xlm_roberta
 	$(CC) $(TEST_CC_FLAGS) $(COV_FLAGS) -o tests/test_workspace \
 	    $(TEST_WORKSPACE_SRCS) -lm -lpthread
 	LLVM_PROFILE_FILE=$(COV_DIR)/workspace.profraw ./tests/test_workspace
@@ -349,8 +365,8 @@ coverage:
 
 bench-tokenizer:
 	$(CC) -Wall -Wextra -O3 -march=native -Isrc -o bench/bench_tokenizer \
-	    bench/bench_tokenizer.c src/tokenizer_bpe.c $(KERNEL_SRCS) -lm -lpthread
-	@echo "run: bench/bench_tokenizer <model_dir> [runs]"
+	    bench/bench_tokenizer.c $(TOKENIZER_SRCS) $(KERNEL_SRCS) -lm -lpthread
+	@echo "run: bench/bench_tokenizer <model_dir-or-vocab.json> [runs] TEXT..."
 
 # =============================================================================
 # Regression microbenchmarks (see bench/bench.h). Each run records a JSON
@@ -394,7 +410,8 @@ clean:
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libembed.dylib libembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
-	      tests/test_qwen3 tests/test_qwen2 \
-	      tests/test_tokenizer tests/test_wordpiece tests/test_workspace tests/test_cli tests/test_late \
+	      tests/test_qwen3 tests/test_qwen2 tests/test_cls tests/test_xlm_roberta \
+	      tests/test_tokenizer tests/test_wordpiece tests/test_sentencepiece \
+	      tests/test_workspace tests/test_cli tests/test_late \
 	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels bench/bench_model
 	rm -rf $(COV_DIR)

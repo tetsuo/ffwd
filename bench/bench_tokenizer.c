@@ -1,11 +1,14 @@
 /* bench/bench_tokenizer.c - tokenizer encode-path benchmark.
- * Build via `make bench-tokenizer`; needs a model dir (vocab.json). */
+ * Build via `make bench-tokenizer`; accepts a model dir or vocab.json. */
 
 #include "tokenizer_bpe.h"
+#include "tokenizer_sentencepiece.h"
+#include "tokenizer_wordpiece.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <time.h>
 
 int embed_verbose = 0;
@@ -26,6 +29,110 @@ static int same_ids(const int *a, int na, const int *b, int nb) {
     return 1;
 }
 
+typedef enum {
+    TOK_BPE,
+    TOK_WORDPIECE,
+    TOK_SENTENCEPIECE,
+} tok_kind_t;
+
+typedef struct {
+    tok_kind_t kind;
+    void *tok;
+    void *ws;
+} bench_tok_t;
+
+static int path_exists(const char *path) {
+    return access(path, R_OK) == 0;
+}
+
+static int load_tokenizer(bench_tok_t *bt, const char *path) {
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/vocab.txt", path);
+    if (path_exists(p)) {
+        bt->kind = TOK_WORDPIECE;
+        bt->tok = wordpiece_tokenizer_load(path);
+        bt->ws = wordpiece_workspace_new();
+        return bt->tok && bt->ws ? 0 : -1;
+    }
+    snprintf(p, sizeof(p), "%s/sentencepiece.bpe.model", path);
+    if (!path_exists(p)) {
+        snprintf(p, sizeof(p), "%s/tokenizer.model", path);
+        if (!path_exists(p))
+            snprintf(p, sizeof(p), "%s/spiece.model", path);
+    }
+    if (path_exists(p)) {
+        bt->kind = TOK_SENTENCEPIECE;
+        bt->tok = sentencepiece_tokenizer_load(path);
+        bt->ws = sentencepiece_workspace_new();
+        return bt->tok && bt->ws ? 0 : -1;
+    }
+    bt->kind = TOK_BPE;
+    const char *vocab = path;
+    snprintf(p, sizeof(p), "%s/vocab.json", path);
+    if (path_exists(p))
+        vocab = p;
+    bt->tok = embed_tokenizer_load(vocab);
+    bt->ws = embed_tokenizer_workspace_new();
+    return bt->tok && bt->ws ? 0 : -1;
+}
+
+static int *tok_encode(bench_tok_t *bt, const char *text, int *n) {
+    switch (bt->kind) {
+    case TOK_WORDPIECE:
+        return wordpiece_tokenizer_encode((wordpiece_tokenizer_t *)bt->tok, text, n);
+    case TOK_SENTENCEPIECE:
+        return sentencepiece_tokenizer_encode((sentencepiece_tokenizer_t *)bt->tok, text, n);
+    default:
+        return embed_tokenizer_encode((embed_tokenizer_t *)bt->tok, text, n);
+    }
+}
+
+static int *tok_encode_ws(bench_tok_t *bt, const char *text, int *n) {
+    switch (bt->kind) {
+    case TOK_WORDPIECE:
+        return wordpiece_tokenizer_encode_with_workspace((wordpiece_tokenizer_t *)bt->tok,
+                                                         (wordpiece_workspace_t *)bt->ws, text, n);
+    case TOK_SENTENCEPIECE:
+        return sentencepiece_tokenizer_encode_with_workspace(
+            (sentencepiece_tokenizer_t *)bt->tok, (sentencepiece_workspace_t *)bt->ws, text, n);
+    default:
+        return embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)bt->tok,
+                                                     (embed_tokenizer_workspace_t *)bt->ws, text, n);
+    }
+}
+
+static int tok_encode_into(bench_tok_t *bt, const char *text, int *out, int cap, int *n) {
+    switch (bt->kind) {
+    case TOK_WORDPIECE:
+        return wordpiece_tokenizer_encode_into((wordpiece_tokenizer_t *)bt->tok,
+                                               (wordpiece_workspace_t *)bt->ws, text, out, cap, n);
+    case TOK_SENTENCEPIECE:
+        return sentencepiece_tokenizer_encode_into((sentencepiece_tokenizer_t *)bt->tok,
+                                                   (sentencepiece_workspace_t *)bt->ws, text, out,
+                                                   cap, n);
+    default:
+        return embed_tokenizer_encode_into((embed_tokenizer_t *)bt->tok,
+                                           (embed_tokenizer_workspace_t *)bt->ws, text, out, cap, n);
+    }
+}
+
+static void free_tokenizer(bench_tok_t *bt) {
+    switch (bt->kind) {
+    case TOK_WORDPIECE:
+        wordpiece_workspace_free((wordpiece_workspace_t *)bt->ws);
+        wordpiece_tokenizer_free((wordpiece_tokenizer_t *)bt->tok);
+        break;
+    case TOK_SENTENCEPIECE:
+        sentencepiece_workspace_free((sentencepiece_workspace_t *)bt->ws);
+        sentencepiece_tokenizer_free((sentencepiece_tokenizer_t *)bt->tok);
+        break;
+    default:
+        embed_tokenizer_workspace_free((embed_tokenizer_workspace_t *)bt->ws);
+        embed_tokenizer_free((embed_tokenizer_t *)bt->tok);
+        break;
+    }
+}
+
 int main(int argc, char **argv) {
     int status = 1;
     int **gold = NULL;
@@ -33,8 +140,10 @@ int main(int argc, char **argv) {
     int **bufs = NULL;
     int *caps = NULL;
 
+    bench_tok_t bt = {0};
+
     if (argc < 4) {
-        fprintf(stderr, "usage: %s VOCAB_JSON RUNS TEXT...\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL_DIR_OR_VOCAB_JSON RUNS TEXT...\n", argv[0]);
         return 2;
     }
 
@@ -45,9 +154,7 @@ int main(int argc, char **argv) {
     int n_texts = argc - 3;
     char **texts = argv + 3;
 
-    embed_tokenizer_t *tok = embed_tokenizer_load(vocab);
-    embed_tokenizer_workspace_t *ws = embed_tokenizer_workspace_new();
-    if (!tok || !ws) {
+    if (load_tokenizer(&bt, vocab) != 0) {
         fprintf(stderr, "failed to initialize tokenizer\n");
         goto cleanup;
     }
@@ -61,14 +168,14 @@ int main(int argc, char **argv) {
 
     int tokens_per_pass = 0;
     for (int i = 0; i < n_texts; i++) {
-        gold[i] = embed_tokenizer_encode(tok, texts[i], &gold_n[i]);
-        if (!gold[i] || gold_n[i] <= 0)
+        gold[i] = tok_encode(&bt, texts[i], &gold_n[i]);
+        if (gold_n[i] < 0 || (!gold[i] && gold_n[i] != 0))
             goto cleanup;
         tokens_per_pass += gold_n[i];
 
         int n_ws = 0;
-        int *ids_ws = embed_tokenizer_encode_with_workspace(tok, ws, texts[i], &n_ws);
-        if (!ids_ws || !same_ids(gold[i], gold_n[i], ids_ws, n_ws)) {
+        int *ids_ws = tok_encode_ws(&bt, texts[i], &n_ws);
+        if ((!ids_ws && n_ws != 0) || !same_ids(gold[i], gold_n[i], ids_ws, n_ws)) {
             free(ids_ws);
             goto cleanup;
         }
@@ -81,7 +188,7 @@ int main(int argc, char **argv) {
         if (!bufs[i])
             goto cleanup;
         int n_into = 0;
-        if (embed_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n_into) != 0 ||
+        if (tok_encode_into(&bt, texts[i], bufs[i], caps[i], &n_into) != 0 ||
             !same_ids(gold[i], gold_n[i], bufs[i], n_into))
             goto cleanup;
     }
@@ -91,8 +198,8 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int *ids = embed_tokenizer_encode(tok, texts[i], &n);
-            if (!ids || n != gold_n[i]) {
+            int *ids = tok_encode(&bt, texts[i], &n);
+            if ((!ids && n != 0) || n != gold_n[i]) {
                 free(ids);
                 goto cleanup;
             }
@@ -107,8 +214,8 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int *ids = embed_tokenizer_encode_with_workspace(tok, ws, texts[i], &n);
-            if (!ids || n != gold_n[i]) {
+            int *ids = tok_encode_ws(&bt, texts[i], &n);
+            if ((!ids && n != 0) || n != gold_n[i]) {
                 free(ids);
                 goto cleanup;
             }
@@ -123,7 +230,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         for (int i = 0; i < n_texts; i++) {
             int n = 0;
-            int rc = embed_tokenizer_encode_into(tok, ws, texts[i], bufs[i], caps[i], &n);
+            int rc = tok_encode_into(&bt, texts[i], bufs[i], caps[i], &n);
             if (rc != 0 || n != gold_n[i])
                 goto cleanup;
             into_tokens += n;
@@ -152,7 +259,6 @@ cleanup:
     free(gold_n);
     free(bufs);
     free(caps);
-    embed_tokenizer_workspace_free(ws);
-    embed_tokenizer_free(tok);
+    free_tokenizer(&bt);
     return status;
 }

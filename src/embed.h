@@ -69,6 +69,8 @@ typedef struct {
     int intermediate_size;
     int vocab_size;
     int max_position_embeddings; /* BERT learned position table size */
+    int position_id_offset;      /* RoBERTa/XLM-R positions start at pad_id + 1 */
+    int type_vocab_size;         /* BERT token-type embedding rows; XLM-R uses 1 */
     float rms_norm_eps;
     float layer_norm_eps; /* BERT LayerNorm epsilon */
     float rope_theta;

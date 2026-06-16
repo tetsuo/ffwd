@@ -1337,8 +1337,7 @@ static embed_cuda_ctx_t *cuda_ctx_from_model(embed_model_t *cpu, int own_cpu) {
         const embed_weights_t *w = &cpu->weights;
         if (load_vector(&ctx->position_embeddings, w->position_embeddings,
                         c->max_position_embeddings * c->hidden_size) != 0 ||
-            load_vector(&ctx->token_type_embedding, w->token_type_embeddings, c->hidden_size) !=
-                0 ||
+            load_vector(&ctx->token_type_embedding, w->token_type_embeddings, c->hidden_size) != 0 ||
             load_vector(&ctx->embed_ln_w, w->embed_ln_w, c->hidden_size) != 0 ||
             load_vector(&ctx->embed_ln_b, w->embed_ln_b, c->hidden_size) != 0) {
             embed_cuda_free(ctx);
@@ -1436,6 +1435,11 @@ static int cuda_upload_packed_inputs(embed_cuda_ctx_t *ctx,
         if (inputs[b].n_tokens > max_seq)
             max_seq = inputs[b].n_tokens;
     }
+    if (ctx->config.family == EMBED_FAMILY_BERT &&
+        max_seq > ctx->config.max_position_embeddings - ctx->config.position_id_offset) {
+        free(h_offsets);
+        return -1;
+    }
     h_offsets[batch] = total;
     int *h_ids = (int *)malloc((size_t)total * sizeof(int));
     int *h_pos = (int *)malloc((size_t)total * sizeof(int));
@@ -1449,7 +1453,7 @@ static int cuda_upload_packed_inputs(embed_cuda_ctx_t *ctx,
         int off = h_offsets[b];
         memcpy(h_ids + off, inputs[b].ids, (size_t)inputs[b].n_tokens * sizeof(int));
         for (int i = 0; i < inputs[b].n_tokens; i++)
-            h_pos[off + i] = i;
+            h_pos[off + i] = ctx->config.position_id_offset + i;
     }
     if (ensure_buffers(ctx, total, batch, max_seq) != 0) {
         free(h_offsets);

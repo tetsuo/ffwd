@@ -4,6 +4,7 @@
 #include "build.h"
 #include "kernels.h"
 #include "tokenizer_bpe.h"
+#include "tokenizer_sentencepiece.h"
 #include "tokenizer_wordpiece.h"
 
 #ifdef USE_MLX
@@ -103,6 +104,10 @@ typedef struct {
      * Qwen byte-level BPE fields above stay NULL. */
     wordpiece_tokenizer_t *wp_tok;
     wordpiece_workspace_t *wp_tok_ws;
+    /* SentencePiece/XLM-R tokenizer. When sp_tok is set, tokenize_text wraps
+     * core ids with <s> ... </s>. */
+    sentencepiece_tokenizer_t *sp_tok;
+    sentencepiece_workspace_t *sp_tok_ws;
     int cls_id;
     int sep_id;
     int dim;
@@ -115,6 +120,8 @@ static void engine_free_tokenizers(engine_t *e) {
     embed_tokenizer_free(e->tok);
     wordpiece_workspace_free(e->wp_tok_ws);
     wordpiece_tokenizer_free(e->wp_tok);
+    sentencepiece_workspace_free(e->sp_tok_ws);
+    sentencepiece_tokenizer_free(e->sp_tok);
 }
 
 typedef struct {
@@ -143,6 +150,24 @@ static int tokenize_text(engine_t *e, const char *text, token_buf_t *out) {
          * bare pair, matching Hugging Face. Grow the buffer in place. */
         int n = 0;
         int *core = wordpiece_tokenizer_encode_with_workspace(e->wp_tok, e->wp_tok_ws, text, &n);
+        if (n < 0 || n > INT_MAX - 2) {
+            free(core);
+            return -1;
+        }
+        int *ids = (int *)realloc(core, (size_t)(n + 2) * sizeof(*ids));
+        if (!ids) {
+            free(core);
+            return -1;
+        }
+        memmove(ids + 1, ids, (size_t)n * sizeof(*ids));
+        ids[0] = e->cls_id;
+        ids[n + 1] = e->sep_id;
+        out->ids = ids;
+        out->n_tokens = n + 2;
+    } else if (e->sp_tok) {
+        int n = 0;
+        int *core =
+            sentencepiece_tokenizer_encode_with_workspace(e->sp_tok, e->sp_tok_ws, text, &n);
         if (n < 0 || n > INT_MAX - 2) {
             free(core);
             return -1;
@@ -688,8 +713,8 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
     }
 
-    /* Tokenizer: a WordPiece vocab.txt selects the BERT tokenizer (the frontend
-     * wraps [CLS]/[SEP]); otherwise the Qwen byte-level BPE vocab.json. */
+    /* Tokenizer selection by files present: WordPiece vocab.txt for BERT,
+     * SentencePiece .model for XLM-R/RoBERTa, otherwise Qwen byte-level BPE. */
     engine_t e = {0};
     e.cls_id = -1;
     e.sep_id = -1;
@@ -708,6 +733,27 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else {
+        char sp_path[1024];
+        snprintf(sp_path, sizeof(sp_path), "%s/sentencepiece.bpe.model", model_dir);
+        if (access(sp_path, R_OK) != 0) {
+            snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
+            if (access(sp_path, R_OK) != 0)
+                snprintf(sp_path, sizeof(sp_path), "%s/spiece.model", model_dir);
+        }
+        if (access(sp_path, R_OK) == 0) {
+            e.sp_tok = sentencepiece_tokenizer_load(model_dir);
+            if (e.sp_tok) {
+                e.cls_id = sentencepiece_tokenizer_token_id(e.sp_tok, "<s>");
+                e.sep_id = sentencepiece_tokenizer_token_id(e.sp_tok, "</s>");
+            }
+            if (!e.sp_tok || e.cls_id < 0 || e.sep_id < 0) {
+                fprintf(stderr, "failed to load SentencePiece tokenizer: %s\n", sp_path);
+                sentencepiece_tokenizer_free(e.sp_tok);
+                return 1;
+            }
+        }
+    }
+    if (!e.wp_tok && !e.sp_tok) {
         char vocab_path[1024];
         snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
         e.tok = embed_tokenizer_load(vocab_path);
@@ -773,6 +819,23 @@ int main(int argc, char *argv[]) {
      * like the contextual separator: a vocab that defines it (test models)
      * wins; otherwise the released-model family constant applies. */
     if (e.append_terminal_token) {
+        if (!e.tok) {
+            fprintf(stderr, "terminal-token appending requires the BPE tokenizer\n");
+            if (e.workspace)
+                embed_workspace_free(e.workspace);
+            if (e.model)
+                embed_model_free(e.model);
+#ifdef USE_MLX
+            if (e.mlx_ctx)
+                embed_mlx_free(e.mlx_ctx);
+#endif
+#ifdef USE_CUDA
+            if (e.cuda_ctx)
+                embed_cuda_free(e.cuda_ctx);
+#endif
+            engine_free_tokenizers(&e);
+            return 1;
+        }
         int eot = embed_tokenizer_token_id(e.tok, "<|endoftext|>");
         e.terminal_token_id = eot >= 0 ? eot : EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
     }
@@ -789,9 +852,11 @@ int main(int argc, char *argv[]) {
 
     if (e.wp_tok)
         e.wp_tok_ws = wordpiece_workspace_new();
+    else if (e.sp_tok)
+        e.sp_tok_ws = sentencepiece_workspace_new();
     else
         e.tok_ws = embed_tokenizer_workspace_new();
-    if (!e.tok_ws && !e.wp_tok_ws) {
+    if (!e.tok_ws && !e.wp_tok_ws && !e.sp_tok_ws) {
         fprintf(stderr, "failed to allocate tokenizer workspace\n");
         if (e.workspace)
             embed_workspace_free(e.workspace);
