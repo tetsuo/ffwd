@@ -83,7 +83,7 @@ CORE_SRCS = src/model.c src/forward.c src/late.c src/vec.c src/alloc.c \
 
 # Server-only objects: the embed-server binary and the server test link these
 # alongside server.o. Not in libembed.a - the CLI and library do not use them.
-SERVER_SRCS = src/server_util.c src/sbuf.c src/base64.c
+SERVER_SRCS = src/server_util.c src/sbuf.c src/base64.c src/server_json.c
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
 SRCS = $(CORE_SRCS) $(TOKENIZER_SRCS) \
@@ -154,6 +154,12 @@ src/cuda.o: src/cuda.cu src/cuda.h src/internal.h src/embed.h
 # server.c reaches deps/ae via "deps/ae/ae.h", so it needs -I. (repo root).
 src/server.o: src/server.c $(HEADERS) deps/ae/ae.h deps/ae/anet.h
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae -c -o $@ $<
+
+# Server concern objects: server_internal.h pulls deps/ae/ae.h and cJSON, so
+# they need the same -I. and cJSON flags as server.o (the leaf util/sbuf/base64
+# objects do not include it but are unharmed by the extra search paths).
+$(SERVER_OBJS): src/%.o: src/%.c $(HEADERS) deps/ae/ae.h
+	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae -c -o $@ $<
 
 src/cli.o: src/cli.c $(HEADERS)
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -c -o $@ $<

@@ -21,6 +21,7 @@
 
 #include "deps/ae/ae.h"
 
+#include <cjson/cJSON.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -232,5 +233,18 @@ struct job {
     uint64_t encode_ns;
     job *next;
 };
+
+/* ---- server_json.c: request validation and error bodies ---- */
+void append_json_string(sbuf *b, const char *s);
+char *json_error_body(const char *message, const char *type, size_t *len);
+void job_set_error(job *j, int status, const char *message, const char *type);
+bool ve_add(cJSON *detail, const char *loc_json, const char *msg, const char *type);
+void job_set_422(job *j, cJSON *detail);
+cJSON *parse_json_body(job *j, cJSON *detail);
+bool cjson_is_integer(cJSON *item);
+const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api);
+int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct);
+int dimensions_from_root(
+    cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding);
 
 #endif /* EMBED_SERVER_INTERNAL_H */
