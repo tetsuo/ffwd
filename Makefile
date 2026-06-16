@@ -400,7 +400,7 @@ qwen_kernels_avx.o: qwen_kernels_avx.c qwen_kernels_impl.h
 qwen_tokenizer.o: qwen_tokenizer.c qwen_tokenizer.h qwen_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-wordpiece_tokenizer.o: wordpiece_tokenizer.c wordpiece_tokenizer.h
+wordpiece_tokenizer.o: wordpiece_tokenizer.c wordpiece_tokenizer.h wordpiece_unicode.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 qwen_safetensors.o: qwen_safetensors.c qwen_safetensors.h

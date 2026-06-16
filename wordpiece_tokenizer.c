@@ -7,15 +7,18 @@
  *   WordPiece: greedy longest-match-first against vocab.txt, continuation
  *     pieces marked "##", whole token -> [UNK] when any piece fails to match.
  *
- * Unicode coverage is scoped to the English/Western-European + CJK-split path
- * that the first target encoders (bge-large-en, all-MiniLM-L6-v2) need: ASCII
- * and Latin-1 Supplement casing/accents, the BERT CJK ranges, and the common
- * punctuation/whitespace/control classes. Latin Extended beyond Latin-1, full
- * Unicode category tables, and full NFD normalization are deliberate follow-ups
- * (they matter for multilingual models, which mostly use SentencePiece anyway).
+ * Punctuation, whitespace and control classification is full-Unicode and exact
+ * against transformers: punctuation and control use generated category tables
+ * (wordpiece_unicode.h), whitespace is the complete Zs set, and the CJK split
+ * uses the BERT ideograph ranges. This makes cased multilingual encoders (e.g.
+ * bert-base-multilingual-cased) match Hugging Face. Casing and accent stripping
+ * still cover only ASCII + Latin-1 (wp_lower_deaccent), so do_lower_case
+ * multilingual checkpoints need full Unicode lowercase + NFD - a follow-up.
  */
 
 #include "wordpiece_tokenizer.h"
+
+#include "wordpiece_unicode.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -144,51 +147,33 @@ static int wp_is_whitespace(uint32_t cp) {
            cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
 }
 
+/* Binary search a sorted, non-overlapping [lo, hi] range table. */
+static int wp_in_ranges(uint32_t cp, const wp_range_t *r, int n) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (cp < r[mid].lo)
+            hi = mid - 1;
+        else if (cp > r[mid].hi)
+            lo = mid + 1;
+        else
+            return 1;
+    }
+    return 0;
+}
+
+/* transformers' _is_control: tab/newline/carriage-return are whitespace, not
+ * control (they fall through to wp_is_whitespace); everything else is Unicode
+ * category Cc, Cf, or Co. */
 static int wp_is_control(uint32_t cp) {
     if (cp == '\t' || cp == '\n' || cp == '\r')
         return 0;
-    if (cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F))
-        return 1; /* category Cc */
-    return cp == 0x00AD || (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x202A && cp <= 0x202E) ||
-           (cp >= 0x2060 && cp <= 0x2064) || cp == 0xFEFF; /* common Cf */
+    return wp_in_ranges(cp, WP_CONTROL_RANGES, WP_CONTROL_RANGES_N);
 }
 
-static int wp_is_punct(uint32_t cp) {
-    if ((cp >= 33 && cp <= 47) || (cp >= 58 && cp <= 64) || (cp >= 91 && cp <= 96) ||
-        (cp >= 123 && cp <= 126))
-        return 1; /* all ASCII non-alnum, matching BERT */
-    switch (cp) {
-    case 0x00A1:
-    case 0x00BF:
-    case 0x2010:
-    case 0x2011:
-    case 0x2012:
-    case 0x2013:
-    case 0x2014:
-    case 0x2015:
-    case 0x2018:
-    case 0x2019:
-    case 0x201A:
-    case 0x201B:
-    case 0x201C:
-    case 0x201D:
-    case 0x201E:
-    case 0x201F:
-    case 0x2026:
-    case 0x2032:
-    case 0x2033:
-    case 0x3001:
-    case 0x3002:
-    case 0xFF01:
-    case 0xFF0C:
-    case 0xFF1A:
-    case 0xFF1B:
-    case 0xFF1F:
-        return 1;
-    default:
-        return 0;
-    }
-}
+/* transformers' _is_punctuation: the ASCII non-alphanumeric set plus every
+ * Unicode category P* codepoint, both folded into the generated table. */
+static int wp_is_punct(uint32_t cp) { return wp_in_ranges(cp, WP_PUNCT_RANGES, WP_PUNCT_RANGES_N); }
 
 static int wp_is_cjk(uint32_t cp) {
     return (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
