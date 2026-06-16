@@ -43,6 +43,23 @@ static int check_alloc_helpers(void) {
     return 0;
 }
 
+static int check_vector_helpers(void) {
+    float a[1] = {1.0e19f};
+    float b[1] = {1.0e19f};
+    float cos = embed_cosine_similarity(a, b, 1);
+    if (fabsf(cos - 1.0f) > 1e-5f) {
+        fprintf(stderr, "large finite cosine failed: got %.9g\n", cos);
+        return -1;
+    }
+
+    float z[2] = {0.0f, 0.0f};
+    if (embed_l2_normalize(z, 2) == 0 || embed_cosine_similarity(z, a, 1) != 0.0f) {
+        fprintf(stderr, "zero-vector helpers accepted invalid input\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* The allocating and pooling API variants must agree with the *_into
  * results validated in main. reference is the batched row for ids0. */
 static int check_alloc_and_pooling_variants(const embed_model_t *model,
@@ -180,7 +197,7 @@ done:
 }
 
 int main(int argc, char **argv) {
-    if (check_alloc_helpers() != 0)
+    if (check_alloc_helpers() != 0 || check_vector_helpers() != 0)
         return 1;
 
     char fixture_dir[1024];
