@@ -27,6 +27,38 @@ static float tm_bf16_to_f32(uint16_t b) {
     return f;
 }
 
+/* Round f32 to IEEE-754 binary16 (round-to-nearest-even) for F16 fixtures.
+ * Covers normals, subnormals, zero, and overflow-to-inf - enough for the small
+ * in-range weight values tm_value produces. */
+static uint16_t tm_f32_to_f16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    uint32_t sign = (u >> 16) & 0x8000u;
+    int exp = (int)((u >> 23) & 0xffu) - 127;
+    uint32_t mant = u & 0x7fffffu;
+    if (((u >> 23) & 0xffu) == 0xffu)
+        return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0u)); /* inf/NaN */
+    if (exp > 15)
+        return (uint16_t)(sign | 0x7c00u); /* overflow -> inf */
+    if (exp >= -14) {
+        uint32_t h = ((uint32_t)(exp + 15) << 10) | (mant >> 13);
+        uint32_t rem = mant & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u)))
+            h++; /* round to nearest even; a carry into the exponent is correct */
+        return (uint16_t)(sign | h);
+    }
+    if (exp < -25)
+        return (uint16_t)sign; /* underflow -> signed zero */
+    mant |= 0x800000u;         /* implicit leading 1 */
+    int shift = -1 - exp;
+    uint32_t h = mant >> shift;
+    uint32_t rem = mant & ((1u << shift) - 1u);
+    uint32_t halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (h & 1u)))
+        h++;
+    return (uint16_t)(sign | h);
+}
+
 /* Deterministic, BF16-exact value for element i of tensor `name`. */
 static float tm_value(const char *name, size_t i) {
     float v;
@@ -75,7 +107,7 @@ tm_write_config(const char *dir, const tm_dims_t *d, const char *model_type, int
 }
 
 /* Write a safetensors file holding `specs` with tm_value() contents.
- * dtype: "F32" or "BF16". Returns 0 on success. */
+ * dtype: "F32", "BF16", or "F16". Returns 0 on success. */
 static int tm_write_safetensors_with_prefix_options(const char *path,
                                                     const char *dtype,
                                                     const tm_spec_t *specs,
@@ -83,7 +115,8 @@ static int tm_write_safetensors_with_prefix_options(const char *path,
                                                     const char *prefix,
                                                     int zero_bias) {
     int bf16 = strcmp(dtype, "BF16") == 0;
-    size_t esize = bf16 ? 2 : 4;
+    int f16 = strcmp(dtype, "F16") == 0;
+    size_t esize = (bf16 || f16) ? 2 : 4;
 
     char header[4096];
     size_t hoff = 0, doff = 0;
@@ -122,8 +155,8 @@ static int tm_write_safetensors_with_prefix_options(const char *path,
         size_t n = (size_t)s->rows * (s->cols ? (size_t)s->cols : 1);
         for (size_t i = 0; i < n; i++) {
             float v = zero_bias && strstr(s->name, ".bias") ? 0.0f : tm_value(s->name, i);
-            if (bf16) {
-                uint16_t h = tm_f32_to_bf16(v);
+            if (bf16 || f16) {
+                uint16_t h = bf16 ? tm_f32_to_bf16(v) : tm_f32_to_f16(v);
                 fwrite(&h, sizeof(h), 1, f);
             } else {
                 fwrite(&v, sizeof(v), 1, f);

@@ -45,6 +45,7 @@ static size_t dtype_size(safetensor_dtype_t dtype) {
     case DTYPE_F32:
         return sizeof(float);
     case DTYPE_BF16:
+    case DTYPE_F16:
         return sizeof(uint16_t);
     default:
         return 0;
@@ -76,9 +77,12 @@ int tensor_has_supported_shape(const safetensors_file_t *sf,
                                const int64_t *shape,
                                int ndim,
                                int bf16_ok) {
-    if (t->dtype != DTYPE_F32 && !(bf16_ok && t->dtype == DTYPE_BF16)) {
+    /* bf16_ok admits either 16-bit float format (BF16 or F16); both are widened
+     * to F32 by the caller (BF16 lazily per matmul, F16 once at load). */
+    int sixteen_ok = bf16_ok && (t->dtype == DTYPE_BF16 || t->dtype == DTYPE_F16);
+    if (t->dtype != DTYPE_F32 && !sixteen_ok) {
         fprintf(stderr, "embed: unsupported dtype for %s: got %s, expected %s\n", name,
-                dtype_name(t->dtype), bf16_ok ? "F32 or BF16" : "F32");
+                dtype_name(t->dtype), bf16_ok ? "F32, BF16, or F16" : "F32");
         return 0;
     }
     if (t->ndim != ndim) {
@@ -128,9 +132,29 @@ int tensor_has_supported_shape(const safetensors_file_t *sf,
     return 1;
 }
 
+embed_weight_ref_t weight_ref_from_tensor(const safetensors_file_t *sf, const safetensor_t *t) {
+    embed_weight_ref_t ref = {DTYPE_UNKNOWN, NULL, 0};
+    /* F32/BF16 are consumed directly by the forward pass, so the ref borrows the
+     * mmap (zero copy; BF16 is widened lazily per matmul). F16 has neither a
+     * fused kernel nor a zero-copy F32 view, so widen it once here into an owned
+     * buffer the model frees on unload. DTYPE_F16 never reaches the forward. */
+    if (t->dtype == DTYPE_F16) {
+        float *buf = safetensors_get_f32(sf, t);
+        if (!buf)
+            return ref;
+        ref.dtype = DTYPE_F32;
+        ref.data = buf;
+        ref.owned = 1;
+    } else {
+        ref.dtype = t->dtype;
+        ref.data = safetensors_data(sf, t);
+    }
+    return ref;
+}
+
 static embed_weight_ref_t
 load_weight_direct(multi_safetensors_t *ms, const char *name, const int64_t *shape, int ndim) {
-    embed_weight_ref_t ref = {DTYPE_UNKNOWN, NULL};
+    embed_weight_ref_t ref = {DTYPE_UNKNOWN, NULL, 0};
     safetensors_file_t *sf = NULL;
     const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
     if (!t) {
@@ -140,9 +164,7 @@ load_weight_direct(multi_safetensors_t *ms, const char *name, const int64_t *sha
     if (!tensor_has_supported_shape(sf, t, name, shape, ndim, 1))
         return ref;
 
-    ref.dtype = t->dtype;
-    ref.data = safetensors_data(sf, t);
-    return ref;
+    return weight_ref_from_tensor(sf, t);
 }
 
 static float *
@@ -414,12 +436,28 @@ embed_model_t *embed_model_load(const char *model_dir) {
     return model_load_range_ex(model_dir, 0, -1, 0);
 }
 
+/* Release a weight ref's backing store. Only F16-widened refs own their buffer;
+ * borrowed F32/BF16 views into the mmap are a no-op (see weight_ref_from_tensor). */
+static void free_weight_ref(embed_weight_ref_t *w) {
+    if (w->owned)
+        free((void *)w->data);
+    w->data = NULL;
+    w->owned = 0;
+}
+
 void embed_model_free(embed_model_t *model) {
     if (!model)
         return;
     if (model->weights.layers) {
         for (int i = 0; i < model->config.n_layers; i++) {
             embed_layer_t *l = &model->weights.layers[i];
+            free_weight_ref(&l->wq);
+            free_weight_ref(&l->wk);
+            free_weight_ref(&l->wv);
+            free_weight_ref(&l->wo);
+            free_weight_ref(&l->gate_proj);
+            free_weight_ref(&l->up_proj);
+            free_weight_ref(&l->down_proj);
             free((void *)l->q_bias);
             free((void *)l->k_bias);
             free((void *)l->v_bias);
@@ -434,6 +472,7 @@ void embed_model_free(embed_model_t *model) {
             free((void *)l->ffn_ln_bias);
         }
     }
+    free_weight_ref(&model->weights.embed_tokens);
     free((void *)model->weights.norm);
     free((void *)model->weights.position_embeddings);
     free((void *)model->weights.token_type_embeddings);

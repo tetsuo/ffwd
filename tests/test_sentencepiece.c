@@ -167,14 +167,22 @@ static int run_hermetic(void) {
         return 2;
     }
 
+    /* A directory with no SentencePiece model must fail cleanly, not crash. */
+    char empty[1024];
+    snprintf(empty, sizeof(empty), "%s/embed-sp-empty-XXXXXX", tmp);
+    if (mkdtemp(empty) && sentencepiece_tokenizer_load(empty) != NULL) {
+        fprintf(stderr, "load of model-less dir should fail\n");
+        return 1;
+    }
+
     sentencepiece_tokenizer_t *tok = sentencepiece_tokenizer_load(dir);
     sentencepiece_workspace_t *ws = sentencepiece_workspace_new();
     if (!tok || !ws) {
         fprintf(stderr, "load failed\n");
         return 1;
     }
-    if (tok->piece_count != 12 || tok->vocab_size != 14 || tok->unk_id != 3 ||
-        tok->bos_id != 0 || tok->eos_id != 2 || tok->pad_id != 1 || tok->mask_id != 13) {
+    if (tok->piece_count != 12 || tok->vocab_size != 14 || tok->unk_id != 3 || tok->bos_id != 0 ||
+        tok->eos_id != 2 || tok->pad_id != 1 || tok->mask_id != 13) {
         fprintf(stderr, "metadata wrong\n");
         return 1;
     }
@@ -201,6 +209,17 @@ static int run_hermetic(void) {
         fprintf(stderr, "small-buffer handling wrong\n");
         return 1;
     }
+
+    /* The no-workspace encode entry point must agree with the workspace path. */
+    int plain_n = -1;
+    int *plain = sentencepiece_tokenizer_encode(tok, "Hello world!", &plain_n);
+    if (plain_n != 3 || !plain || plain[0] != 8 || plain[1] != 9 || plain[2] != 7) {
+        fprintf(stderr, "plain encode mismatch: n=%d\n", plain_n);
+        free(plain);
+        return 1;
+    }
+    free(plain);
+
     sentencepiece_workspace_free(ws);
     sentencepiece_tokenizer_free(tok);
 
@@ -232,17 +251,19 @@ static int run_live(const char *model_dir) {
     int rc = 0;
     rc |= check_ids(tok, ws, "Hello world! \xe5\x8d\x97\xe7\x93\x9c",
                     (int[]){35378, 8999, 38, 6, 4617, 39613}, 6, "live-mixed");
-    rc |= check_ids(tok, ws, "caf\xc3\xa9 d\xc3\xa9j\xc3\xa0 vu",
-                    (int[]){26216, 15154, 13946}, 3, "live-accents");
-    rc |= check_ids(tok, ws, "\xef\xbc\xa1\xef\xbc\xa2\xef\xbc\xa3 \xef\xbc\x91\xef\xbc\x92\xef\xbc\x93",
+    rc |= check_ids(tok, ws, "caf\xc3\xa9 d\xc3\xa9j\xc3\xa0 vu", (int[]){26216, 15154, 13946}, 3,
+                    "live-accents");
+    rc |= check_ids(tok, ws,
+                    "\xef\xbc\xa1\xef\xbc\xa2\xef\xbc\xa3 \xef\xbc\x91\xef\xbc\x92\xef\xbc\x93",
                     (int[]){47457, 37638}, 2, "live-nfkc");
     rc |= check_ids(tok, ws, "query: what is snowflake?",
-                    (int[]){41, 1294, 12, 2367, 83, 108203, 13034, 350, 32}, 9,
-                    "live-query");
-    rc |= check_ids(tok, ws, "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xd0\xbc\xd0\xb8\xd1\x80",
+                    (int[]){41, 1294, 12, 2367, 83, 108203, 13034, 350, 32}, 9, "live-query");
+    rc |= check_ids(tok, ws,
+                    "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xd0\xbc\xd0\xb8\xd1\x80",
                     (int[]){1813, 18454, 11373}, 3, "live-cyrillic");
     rc |= check_ids(tok, ws,
-                    "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7 \xd8\xa8\xd8\xa7\xd9\x84\xd8\xb9\xd8\xa7\xd9\x84\xd9\x85",
+                    "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7 "
+                    "\xd8\xa8\xd8\xa7\xd9\x84\xd8\xb9\xd8\xa7\xd9\x84\xd9\x85",
                     (int[]){665, 193478, 258, 1705, 77796}, 5, "live-arabic");
     rc |= check_ids(tok, ws, "", NULL, 0, "live-empty");
     rc |= check_ids(tok, ws, "   ", NULL, 0, "live-spaces");

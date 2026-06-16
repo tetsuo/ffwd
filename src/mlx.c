@@ -1,5 +1,6 @@
 #include "mlx.h"
 #include "config.h"
+#include "dtype.h"
 #include "embed.h"
 #include "safetensors.h"
 
@@ -88,6 +89,7 @@ static size_t safetensor_dtype_size(safetensor_dtype_t dtype) {
     case DTYPE_F32:
         return sizeof(float);
     case DTYPE_BF16:
+    case DTYPE_F16:
         return sizeof(uint16_t);
     default:
         return 0;
@@ -101,7 +103,7 @@ static int mlx_tensor_has_supported_shape(const safetensors_file_t *sf,
                                           int ndim) {
     size_t elem_size = safetensor_dtype_size(t->dtype);
     if (elem_size == 0) {
-        fprintf(stderr, "mlx: expected F32 or BF16 for %s\n", name);
+        fprintf(stderr, "mlx: expected F32, BF16, or F16 for %s\n", name);
         return 0;
     }
     if (t->ndim != ndim) {
@@ -156,13 +158,29 @@ load_tensor(multi_safetensors_t *ms, const char *name, const int *shape, int ndi
     }
     if (!mlx_tensor_has_supported_shape(sf, t, name, shape, ndim))
         return (mlx_array){0};
+    if (t->dtype == DTYPE_F16) {
+        /* No F16 forward path on MLX (the matmul fast path keys on BF16). Widen
+         * to F32 on the host at load so the whole forward runs in F32, mirroring
+         * the CPU loader. mlx_array_new_data copies its buffer, so the temporary
+         * is freed immediately. Public F16 snapshots load through here. */
+        int64_t n = safetensor_numel(t);
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (!tmp)
+            return (mlx_array){0};
+        const uint16_t *src = (const uint16_t *)safetensors_data(sf, t);
+        for (int64_t i = 0; i < n; i++)
+            tmp[i] = embed_f16_to_f32(src[i]);
+        mlx_array a = mlx_array_new_data(tmp, shape, ndim, MLX_FLOAT32);
+        free(tmp);
+        return a;
+    }
     mlx_dtype dtype;
     if (t->dtype == DTYPE_F32) {
         dtype = MLX_FLOAT32;
     } else if (t->dtype == DTYPE_BF16) {
         dtype = MLX_BFLOAT16;
     } else {
-        fprintf(stderr, "mlx: expected F32 or BF16 for %s\n", name);
+        fprintf(stderr, "mlx: expected F32, BF16, or F16 for %s\n", name);
         return (mlx_array){0};
     }
     return mlx_array_new_data(safetensors_data(sf, t), shape, ndim, dtype);

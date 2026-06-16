@@ -7,6 +7,10 @@
 typedef struct {
     safetensor_dtype_t dtype;
     const void *data;
+    /* 0: data is a borrowed view into the safetensors mmap (F32/BF16, the common
+     * case). 1: data is a heap buffer owned by the model and freed on unload.
+     * Set when an F16 tensor is widened to F32 at load (no fused F16 kernel). */
+    int owned;
 } embed_weight_ref_t;
 
 typedef struct {

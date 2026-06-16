@@ -12,13 +12,20 @@
  * file. The frontends and the GPU backends do not include this header. */
 
 /* Validate that a safetensor matches an expected dtype/rank/shape and that its
- * bytes lie within the mapped file. bf16_ok permits BF16 in addition to F32. */
+ * bytes lie within the mapped file. bf16_ok permits either 16-bit float format
+ * (BF16 or F16) in addition to F32. */
 int tensor_has_supported_shape(const safetensors_file_t *sf,
                                const safetensor_t *t,
                                const char *name,
                                const int64_t *shape,
                                int ndim,
                                int bf16_ok);
+
+/* Build a weight ref from a located tensor: F32/BF16 borrow the mmap, F16 is
+ * widened to an owned F32 buffer (no fused F16 kernel). Shared by the model
+ * loader and the late-interaction projection loader; the owner frees ref.data
+ * when ref.owned is set. Returns ref.data == NULL on allocation failure. */
+embed_weight_ref_t weight_ref_from_tensor(const safetensors_file_t *sf, const safetensor_t *t);
 
 /* True if model_dir carries a 1_Dense projection (a late-interaction model). */
 int model_dir_has_late_projection(const char *model_dir);

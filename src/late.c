@@ -96,8 +96,10 @@ embed_late_model_t *embed_late_model_load(const char *model_dir) {
     if (!tensor_has_supported_shape(late->dense_sf, t, "linear.weight", shape, 2, 1))
         goto fail;
 
-    late->projection.dtype = t->dtype;
-    late->projection.data = safetensors_data(late->dense_sf, t);
+    /* Same F32/BF16-borrow, F16-widen contract as the backbone weights. */
+    late->projection = weight_ref_from_tensor(late->dense_sf, t);
+    if (!late->projection.data)
+        goto fail;
     late->token_dim = (int)t->shape[0];
     return late;
 
@@ -110,6 +112,10 @@ void embed_late_model_free(embed_late_model_t *model) {
     if (!model)
         return;
     embed_model_free(model->base);
+    /* Free the projection before the mmap: only an F16-widened ref owns its
+     * buffer; a borrowed F32/BF16 ref points into dense_sf and must not be freed. */
+    if (model->projection.owned)
+        free((void *)model->projection.data);
     safetensors_close(model->dense_sf);
     free(model);
 }

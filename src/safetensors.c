@@ -364,6 +364,12 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
             out[i] = embed_bf16_to_f32(src[i]);
         break;
     }
+    case DTYPE_F16: {
+        const uint16_t *src = (const uint16_t *)data;
+        for (int64_t i = 0; i < n; i++)
+            out[i] = embed_f16_to_f32(src[i]);
+        break;
+    }
     default:
         free(out);
         return NULL;
