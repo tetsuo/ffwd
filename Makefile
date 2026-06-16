@@ -83,7 +83,7 @@ CORE_SRCS = src/model.c src/forward.c src/late.c src/vec.c src/alloc.c \
 
 # Server-only objects: the embed-server binary and the server test link these
 # alongside server.o. Not in libembed.a - the CLI and library do not use them.
-SERVER_SRCS = src/server_util.c src/sbuf.c src/base64.c src/server_json.c src/server_encode.c src/server_http.c
+SERVER_SRCS = src/server_util.c src/sbuf.c src/base64.c src/server_json.c src/server_encode.c src/server_http.c src/server_models.c
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
 SRCS = $(CORE_SRCS) $(TOKENIZER_SRCS) \

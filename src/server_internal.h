@@ -338,4 +338,27 @@ void set_response_from_buf(job *j, sbuf *b);
 int render_embedding_response(embedding_request *r, const float *embs);
 void render_contextual_response(contextual_request *r, const float *embs);
 
+/* ---- server_models.c: registry, load/lifecycle, tokenize/inference dispatch ---- */
+extern const model_info k_models[];
+model_slot model_slot_for_id(const char *id);
+void free_token_bufs(token_buf *t, int n);
+void embedding_request_free(embedding_request *r);
+void contextual_request_free(contextual_request *r);
+void late_tokens_free(late_tokens *t);
+void rerank_request_free(rerank_request *r);
+int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *out);
+int tokenize_input(
+    loaded_model *m, job *j, const char *text, const char *query_instruct, token_buf *out);
+int tokenize_late_text(loaded_model *m, job *j, const char *text, int is_query, late_tokens *out);
+int model_embed_batch(loaded_model *m, const embed_input_t *inputs, int batch, float *out);
+int model_embed_spans_batch(loaded_model *m,
+                            const embed_context_input_t *inputs,
+                            int batch,
+                            float *out);
+int inference_batch_accepts_input(
+    const loaded_model *m, int batch, int packed_tokens, int next_tokens, int max_batch_tokens);
+int configure_loaded_model(loaded_model *m, const embed_config_t *config, int token_dim);
+int load_one_model(http_server *s, model_slot slot, const char *path);
+void free_models(http_server *s);
+
 #endif /* EMBED_SERVER_INTERNAL_H */
