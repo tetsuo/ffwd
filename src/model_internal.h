@@ -1,14 +1,15 @@
-#ifndef EMBED_ENGINE_H
-#define EMBED_ENGINE_H
+#ifndef EMBED_MODEL_INTERNAL_H
+#define EMBED_MODEL_INTERNAL_H
 
 #include "internal.h"
 #include "alloc.h"
 
-/* Cross-file declarations internal to the CPU engine. These functions are not
- * part of the public API (embed.h) and carry no EMBED_API visibility; they are
- * shared between the engine translation units (model loading, the forward pass,
- * and late interaction) that used to live in one file. The frontends and the
- * GPU backends do not include this header. */
+/* Cross-file function declarations private to the CPU model code. The companion
+ * to internal.h: that header holds the shared struct definitions, this one the
+ * shared functions. None are part of the public API (embed.h) and none carry
+ * EMBED_API visibility; they are shared between the translation units (model
+ * loading, the forward pass, and late interaction) that used to live in one
+ * file. The frontends and the GPU backends do not include this header. */
 
 /* Validate that a safetensor matches an expected dtype/rank/shape and that its
  * bytes lie within the mapped file. bf16_ok permits BF16 in addition to F32. */
@@ -26,6 +27,14 @@ int model_dir_has_late_projection(const char *model_dir);
  * 1_Dense snapshot that the pooled loader rejects. layer_end == -1 means all. */
 embed_model_t *
 model_load_range_ex(const char *model_dir, int layer_start, int layer_end, int allow_late);
+
+/* Workspace scratch growth, lazy per forward call. Defined in model.c beside the
+ * workspace lifecycle (embed_workspace_nbytes mirrors their sizing); called from
+ * the forward pass in forward.c. */
+int ensure_buffers(embed_workspace_t *ws, const embed_config_t *c, int seq);
+void ensure_attention_scores(embed_workspace_t *ws, const int *offsets, int batch);
+int ensure_rope_cache(embed_workspace_t *ws, const embed_config_t *cfg, int n_pos);
+int ensure_offsets(embed_workspace_t *ws, int batch);
 
 /* y[seq,out] = x[seq,in] @ w^T, no bias; dispatches F32/BF16 paths. Shared by
  * the forward pass and the late projection. */
@@ -57,4 +66,4 @@ int forward_packed_inplace(const embed_model_t *model,
                            int max_seq,
                            int apply_final_norm);
 
-#endif /* EMBED_ENGINE_H */
+#endif /* EMBED_MODEL_INTERNAL_H */

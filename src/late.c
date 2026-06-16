@@ -1,5 +1,5 @@
 #include "embed.h"
-#include "engine.h"
+#include "model_internal.h"
 #include "kernels.h"
 
 #include <stdio.h>
