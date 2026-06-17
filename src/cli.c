@@ -647,6 +647,18 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
             print_usage(prog);
             return 0;
+        } else if (!strcmp(f, "--")) {
+            /* End of options: everything after is positional text, even if it
+             * starts with a dash. */
+            arg_start++;
+            break;
+        } else if (f[0] == '-' && f[1] == '-') {
+            /* An unrecognized --option is a hard error, not silently-embedded
+             * text. Catches typos and stale flags (e.g. the removed --backend)
+             * loudly instead of running the default path or embedding the flag. */
+            fprintf(stderr, "unknown option: %s\n", f);
+            print_usage(prog);
+            return 1;
         } else
             break;
         arg_start++;

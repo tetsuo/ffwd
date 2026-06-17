@@ -178,6 +178,16 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
         expect(run_cli(bad[i].args, NULL) == 1, bad[i].what);
 
+    /* Unknown --options fail loudly instead of being silently embedded as text
+     * (guards against typos and removed flags like --backend). A bare -- ends
+     * option parsing so dash-prefixed text can still be embedded. */
+    snprintf(args, sizeof(args), "-d '%s' --backend cuda hi", g_dir);
+    expect(run_cli(args, NULL) == 1, "unknown --option exits 1");
+    expect(file_contains(g_err, "unknown option"), "unknown --option names the flag");
+    snprintf(args, sizeof(args), "-d '%s' -- '-dashy text'", g_dir);
+    expect(run_cli(args, NULL) == 0, "-- terminator allows dash-prefixed text");
+    expect(stdout_is_embedding(dims.hidden), "dash text after -- embeds as one input");
+
     if (g_failures) {
         fprintf(stderr, "%d CLI check(s) failed\n", g_failures);
         return 1;
