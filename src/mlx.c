@@ -520,6 +520,7 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
     }
     ctx->layer_start = layer_start;
     ctx->layer_end = layer_end;
+    int h = c->hidden_size;
 
     ctx->ms = multi_safetensors_open(model_dir);
     if (!ctx->ms) {
@@ -541,7 +542,7 @@ static embed_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
         goto fail;
     }
 
-    int h = c->hidden_size, qd = c->q_dim, kvd = c->kv_dim;
+    int qd = c->q_dim, kvd = c->kv_dim;
     int inter = c->intermediate_size, hd = c->head_dim;
     char name[256];
 

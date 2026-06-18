@@ -11,11 +11,10 @@
 /* ========================================================================
  * Embedding output encoding
  *
- * Turns a pooled float vector into the wire form the model's API family wants:
- * base64 of int8 (tanh-quantized, Perplexity default), base64 of a binary sign
- * bitmap, base64 of little-endian float32, or a plain JSON float array. The
- * render_* functions assemble the full OpenAI-style response object from a
- * prepared request and its computed embeddings.
+ * Turns a pooled float vector into the requested wire form. OpenAI-compatible
+ * models emit true float32 arrays by default. Perplexity-compatible models
+ * emit tanh-quantized int8 by default, and their "float" view is the decoded
+ * int8 value for SDK compatibility.
  * ======================================================================== */
 
 signed char quantize_int8_tanh(float x) {
@@ -66,10 +65,6 @@ static void append_embedding_object(sbuf *b, int index, const char *embedding) {
     sbuf_puts(b, "\"}");
 }
 
-/* Emit one embedding into the response, following the model's API family.
- * "float" renders a JSON array: the true float32 vector for OpenAI/DashScope
- * (Qwen3), or the int8-decoded view (int8/128) for Perplexity (pplx). Every
- * other encoding renders a base64 string via encode_embedding(). */
 void append_embedding_value(
     sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api) {
     if (!strcmp(encoding, "float")) {
@@ -77,7 +72,8 @@ void append_embedding_value(
         for (int i = 0; i < dims; i++) {
             if (i)
                 sbuf_putc(b, ',');
-            float v = api == EMBED_API_OPENAI ? emb[i] : (float)quantize_int8_tanh(emb[i]) / 128.0f;
+            float v =
+                api == EMBED_API_PERPLEXITY ? (float)quantize_int8_tanh(emb[i]) / 128.0f : emb[i];
             sbuf_printf(b, "%.9g", (double)v);
         }
         sbuf_puts(b, "]}");

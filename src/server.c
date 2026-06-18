@@ -79,7 +79,6 @@ static bool auth_ok(http_server *s, const char *auth) {
            !strcmp(auth + sizeof(prefix) - 1, s->api_key);
 }
 
-
 void dispatch_request(client *c) {
     aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
 
@@ -190,10 +189,8 @@ static void *worker_main(void *arg) {
 #ifdef USE_MLX
     if (s->use_mlx) {
         int rc = 0;
-        for (int i = 0; i < MODEL_COUNT; i++) {
+        for (int i = 0; i < s->n_models; i++) {
             loaded_model *m = &s->models[i];
-            if (!m->info)
-                continue;
             embed_mlx_options_t mlx_opts = {
                 .quantize_bits = s->mlx_quantize_bits,
                 .quantize_group_size = s->mlx_quantize_group_size,
@@ -230,7 +227,7 @@ static void *worker_main(void *arg) {
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         if (rc) {
-            for (int i = 0; i < MODEL_COUNT; i++) {
+            for (int i = 0; i < s->n_models; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->mlx_ctx) {
                     embed_mlx_free(m->mlx_ctx);
@@ -248,10 +245,8 @@ static void *worker_main(void *arg) {
 #ifdef USE_CUDA
         if (s->use_cuda) {
         int rc = 0;
-        for (int i = 0; i < MODEL_COUNT; i++) {
+        for (int i = 0; i < s->n_models; i++) {
             loaded_model *m = &s->models[i];
-            if (!m->info)
-                continue;
             if (m->info->kind == MODEL_KIND_LATE)
                 m->cuda_late_ctx = embed_cuda_late_load(m->path);
             else
@@ -284,7 +279,7 @@ static void *worker_main(void *arg) {
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         if (rc) {
-            for (int i = 0; i < MODEL_COUNT; i++) {
+            for (int i = 0; i < s->n_models; i++) {
                 loaded_model *m = &s->models[i];
                 if (m->cuda_ctx) {
                     embed_cuda_free(m->cuda_ctx);
@@ -315,7 +310,7 @@ static void *worker_main(void *arg) {
     }
 #ifdef USE_MLX
     if (s->use_mlx) {
-        for (int i = 0; i < MODEL_COUNT; i++) {
+        for (int i = 0; i < s->n_models; i++) {
             loaded_model *m = &s->models[i];
             if (m->mlx_ctx) {
                 embed_mlx_free(m->mlx_ctx);
@@ -330,7 +325,7 @@ static void *worker_main(void *arg) {
 #endif
 #ifdef USE_CUDA
     if (s->use_cuda) {
-        for (int i = 0; i < MODEL_COUNT; i++) {
+        for (int i = 0; i < s->n_models; i++) {
             loaded_model *m = &s->models[i];
             if (m->cuda_ctx) {
                 embed_cuda_free(m->cuda_ctx);
@@ -375,23 +370,34 @@ static uint64_t physical_memory_nbytes(void) {
 }
 
 static int validate_model_specs(const embed_server_config_t *cfg) {
-    int seen[MODEL_COUNT] = {0};
     for (int i = 0; i < cfg->n_models; i++) {
         const embed_server_model_spec_t *spec = &cfg->models[i];
-        model_slot slot = model_slot_for_id(spec->id);
-        if (slot == MODEL_UNKNOWN) {
-            fprintf(stderr, "embed-server: unknown model id: %s\n", spec->id ? spec->id : "<null>");
+        if (!spec->id || !spec->id[0]) {
+            fprintf(stderr, "embed-server: model label must not be empty\n");
             return -1;
         }
         if (!spec->path || !spec->path[0]) {
             fprintf(stderr, "embed-server: model %s has an empty path\n", spec->id);
             return -1;
         }
-        if (seen[slot]) {
-            fprintf(stderr, "embed-server: duplicate model id: %s\n", spec->id);
+        if (spec->kind < EMBED_SERVER_MODEL_STANDARD || spec->kind > EMBED_SERVER_MODEL_LATE) {
+            fprintf(stderr, "embed-server: model %s has an invalid kind\n", spec->id);
             return -1;
         }
-        seen[slot] = 1;
+        if (spec->api < EMBED_SERVER_API_DEFAULT || spec->api > EMBED_SERVER_API_PERPLEXITY) {
+            fprintf(stderr, "embed-server: model %s has an invalid api\n", spec->id);
+            return -1;
+        }
+        if (spec->min_dim < 0) {
+            fprintf(stderr, "embed-server: model %s has an invalid min_dim\n", spec->id);
+            return -1;
+        }
+        for (int j = 0; j < i; j++) {
+            if (spec->id && cfg->models[j].id && !strcmp(cfg->models[j].id, spec->id)) {
+                fprintf(stderr, "embed-server: duplicate model label: %s\n", spec->id);
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -452,7 +458,7 @@ static int mlx_memory_preflight(const embed_server_config_t *cfg) {
 
 int embed_run_server(const embed_server_config_t *cfg) {
     if (!cfg || !cfg->models || cfg->n_models <= 0) {
-        fprintf(stderr, "embed-server: at least one --model MODEL_ID=PATH is required\n");
+        fprintf(stderr, "embed-server: at least one model label and path is required\n");
         return 1;
     }
     if (validate_model_specs(cfg) != 0 || mlx_memory_preflight(cfg) != 0)
@@ -485,13 +491,7 @@ int embed_run_server(const embed_server_config_t *cfg) {
     pthread_cond_init(&s.cv, NULL);
 
     for (int i = 0; i < cfg->n_models; i++) {
-        model_slot slot = model_slot_for_id(cfg->models[i].id);
-        if (slot == MODEL_UNKNOWN) {
-            fprintf(stderr, "embed-server: unknown model id: %s\n", cfg->models[i].id);
-            free_models(&s);
-            return 1;
-        }
-        if (load_one_model(&s, slot, cfg->models[i].path) != 0) {
+        if (load_one_model(&s, &cfg->models[i]) != 0) {
             free_models(&s);
             return 1;
         }
@@ -599,10 +599,17 @@ int embed_run_server(const embed_server_config_t *cfg) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s --model ID=DIR [options]\n"
+            "Usage: %s --model LABEL=DIR [options]\n"
             "\n"
             "Options:\n"
-            "  --model ID=DIR            Model to serve (repeatable)\n"
+            "  --model LABEL=DIR[:key=val]\n"
+            "                            Standard embedding model (repeatable)\n"
+            "  --contextual-model LABEL=DIR[:key=val]\n"
+            "                            Contextual embedding model (repeatable)\n"
+            "  --late-model LABEL=DIR[:key=val]\n"
+            "                            Late-interaction rerank model (repeatable)\n"
+            "                            keys: api=openai|perplexity, min_dim=N,\n"
+            "                            query=TEXT (last key; \\n escapes newline)\n"
 #ifdef USE_MLX
             "  --mlx                     Use Apple MLX GPU backend\n"
 #endif
@@ -641,14 +648,15 @@ static void print_usage(const char *prog) {
             "  -h, --help                Show this help\n"
             "\n"
             "Examples:\n"
-            "  %s --model pplx-embed-v1-0.6b=./model --port 8000\n"
+            "  %s --model docs=./model --port 8000\n"
+            "  %s --model pplx=./model:api=perplexity:min_dim=128 --port 8000\n"
 #ifdef USE_MLX
             "  %s --mlx --mlx-quant-bits 8 \\\n"
-            "      --model pplx-embed-v1-4b=./model-4b-bf16\n",
-            prog, prog, prog);
+            "      --model pplx=./model-4b-bf16:api=perplexity:min_dim=128\n",
+            prog, prog, prog, prog);
 #else
             ,
-            prog, prog);
+            prog, prog, prog);
 #endif
 }
 
@@ -658,10 +666,82 @@ typedef struct {
     int cap;
 } model_specs_t;
 
-static int append_model_spec(model_specs_t *specs, const char *arg) {
+static char *dup_range(const char *p, size_t n) {
+    char *s = (char *)malloc(n + 1);
+    if (!s)
+        return NULL;
+    memcpy(s, p, n);
+    s[n] = '\0';
+    return s;
+}
+
+static char *unescape_model_option(const char *s) {
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1);
+    if (!out)
+        return NULL;
+    size_t w = 0;
+    for (size_t r = 0; r < n; r++) {
+        if (s[r] == '\\' && r + 1 < n) {
+            r++;
+            if (s[r] == 'n')
+                out[w++] = '\n';
+            else if (s[r] == 't')
+                out[w++] = '\t';
+            else if (s[r] == 'r')
+                out[w++] = '\r';
+            else
+                out[w++] = s[r];
+        } else {
+            out[w++] = s[r];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static int parse_model_option(embed_server_model_spec_t *spec, const char *opt, const char *flag) {
+    const char *eq = strchr(opt, '=');
+    if (!eq || eq == opt || !eq[1]) {
+        fprintf(stderr, "%s option expects key=value: %s\n", flag, opt);
+        return -1;
+    }
+    size_t key_len = (size_t)(eq - opt);
+    const char *val = eq + 1;
+    if (key_len == 3 && strncmp(opt, "api", key_len) == 0) {
+        if (!strcmp(val, "openai")) {
+            spec->api = EMBED_SERVER_API_OPENAI;
+        } else if (!strcmp(val, "perplexity") || !strcmp(val, "pplx")) {
+            spec->api = EMBED_SERVER_API_PERPLEXITY;
+        } else if (!strcmp(val, "default")) {
+            spec->api = EMBED_SERVER_API_DEFAULT;
+        } else {
+            fprintf(stderr, "%s api must be openai or perplexity\n", flag);
+            return -1;
+        }
+        return 0;
+    }
+    if (key_len == 7 && strncmp(opt, "min_dim", key_len) == 0) {
+        char *end = NULL;
+        long v = strtol(val, &end, 10);
+        if (!end || *end || v <= 0 || v > INT_MAX) {
+            fprintf(stderr, "%s min_dim must be a positive integer\n", flag);
+            return -1;
+        }
+        spec->min_dim = (int)v;
+        return 0;
+    }
+    fprintf(stderr, "%s unknown model option: %.*s\n", flag, (int)key_len, opt);
+    return -1;
+}
+
+static int append_model_spec(model_specs_t *specs,
+                             const char *arg,
+                             embed_server_model_kind_t kind,
+                             const char *flag) {
     const char *eq = strchr(arg, '=');
     if (!eq || eq == arg || !eq[1]) {
-        fprintf(stderr, "--model expects MODEL_ID=DIR\n");
+        fprintf(stderr, "%s expects LABEL=DIR\n", flag);
         return -1;
     }
     if (specs->n == specs->cap) {
@@ -673,18 +753,52 @@ static int append_model_spec(model_specs_t *specs, const char *arg) {
         specs->cap = new_cap;
     }
     size_t id_len = (size_t)(eq - arg);
-    char *id = (char *)malloc(id_len + 1);
-    char *path = strdup(eq + 1);
-    if (id) {
-        memcpy(id, arg, id_len);
-        id[id_len] = '\0';
-    }
-    specs->v[specs->n].id = id;
-    specs->v[specs->n].path = path;
-    if (!specs->v[specs->n].id || !specs->v[specs->n].path)
+    const char *path_start = eq + 1;
+    const char *opts = strchr(path_start, ':');
+    size_t path_len = opts ? (size_t)(opts - path_start) : strlen(path_start);
+    if (path_len == 0) {
+        fprintf(stderr, "%s expects a non-empty DIR\n", flag);
         return -1;
+    }
+    embed_server_model_spec_t spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.id = dup_range(arg, id_len);
+    spec.path = dup_range(path_start, path_len);
+    spec.kind = kind;
+    if (!spec.id || !spec.path) {
+        free((char *)spec.id);
+        free((char *)spec.path);
+        return -1;
+    }
+    const char *p = opts ? opts + 1 : NULL;
+    while (p && *p) {
+        if (!strncmp(p, "query=", 6) || !strncmp(p, "query_instruct=", 15)) {
+            const char *val = p + (!strncmp(p, "query=", 6) ? 6 : 15);
+            spec.query_instruct = unescape_model_option(val);
+            if (!spec.query_instruct)
+                goto fail;
+            break;
+        }
+        const char *next = strchr(p, ':');
+        size_t opt_len = next ? (size_t)(next - p) : strlen(p);
+        char *opt = dup_range(p, opt_len);
+        if (!opt)
+            goto fail;
+        int rc = parse_model_option(&spec, opt, flag);
+        free(opt);
+        if (rc != 0)
+            goto fail;
+        p = next ? next + 1 : NULL;
+    }
+    specs->v[specs->n] = spec;
     specs->n++;
     return 0;
+
+fail:
+    free((char *)spec.id);
+    free((char *)spec.path);
+    free((char *)spec.query_instruct);
+    return -1;
 }
 
 static void free_model_specs(model_specs_t *specs) {
@@ -693,6 +807,7 @@ static void free_model_specs(model_specs_t *specs) {
     for (int i = 0; i < specs->n; i++) {
         free((char *)specs->v[i].id);
         free((char *)specs->v[i].path);
+        free((char *)specs->v[i].query_instruct);
     }
     free(specs->v);
 }
@@ -732,7 +847,22 @@ int main(int argc, char *argv[]) {
             free_model_specs(&model_specs);
             return 0;
         } else if (!strcmp(f, "--model")) {
-            if (append_model_spec(&model_specs, argv[++arg]) != 0) {
+            if (arg + 1 >= argc ||
+                append_model_spec(&model_specs, argv[++arg], EMBED_SERVER_MODEL_STANDARD, f) !=
+                    0) {
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        } else if (!strcmp(f, "--contextual-model")) {
+            if (arg + 1 >= argc ||
+                append_model_spec(&model_specs, argv[++arg], EMBED_SERVER_MODEL_CONTEXTUAL, f) !=
+                    0) {
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        } else if (!strcmp(f, "--late-model")) {
+            if (arg + 1 >= argc ||
+                append_model_spec(&model_specs, argv[++arg], EMBED_SERVER_MODEL_LATE, f) != 0) {
                 free_model_specs(&model_specs);
                 return 1;
             }
@@ -822,7 +952,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (model_specs.n == 0) {
-        fprintf(stderr, "at least one --model MODEL_ID=DIR is required\n");
+        fprintf(stderr, "at least one --model LABEL=DIR is required\n");
         print_usage(prog);
         free_model_specs(&model_specs);
         return 1;

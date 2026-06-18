@@ -8,6 +8,7 @@
  * the CLI and library do not include it. */
 
 #include "embed.h"
+#include "server.h"
 #include "sbuf.h"
 #include "tokenizer_bpe.h"
 #include "tokenizer_sentencepiece.h"
@@ -47,18 +48,6 @@
 #define EMBED_LATE_MASK_TOKEN_ID       151642
 #define EMBED_LATE_QUERY_PREFIX_ID     151669
 #define EMBED_LATE_DOCUMENT_PREFIX_ID  151670
-/* `text_type: query` prepends the model's published retrieval instruction.
- * Documents and the default pass through unchanged. Callers needing a custom
- * instruction prepend it themselves and leave text_type at "document". */
-#define EMBED_QWEN3_QUERY_INSTRUCT \
-    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
-#define EMBED_GTE_QWEN2_QUERY_INSTRUCT                                                \
-    "Instruct: Given a web search query, retrieve relevant passages that answer the " \
-    "query\nQuery: "
-#define EMBED_E5_QUERY_INSTRUCT                                                       \
-    "Instruct: Given a web search query, retrieve relevant passages that answer the " \
-    "query\nQuery: "
-#define EMBED_SNOWFLAKE_QUERY_INSTRUCT "query: "
 /* Chosen from the L4 scheduler sweep: -b 32 gained ~24% concurrent
  * short-request throughput over 8 with no long-document penalty, while 128
  * was no faster and inflated long-document tail latency. */
@@ -74,42 +63,15 @@
 #define EMBED_MLX_MEMORY_BUDGET_PERCENT  90
 #define EMBED_MLX_RESIDENT_MULTIPLIER    2
 
-typedef enum {
-    MODEL_STD_06,
-    MODEL_STD_4,
-    MODEL_QWEN3_06,
-    MODEL_QWEN3_4,
-    MODEL_QWEN3_8,
-    MODEL_GTE_QWEN2_15,
-    MODEL_MINILM_L6,
-    MODEL_BGE_SMALL,
-    MODEL_BGE_BASE,
-    MODEL_BGE_LARGE,
-    MODEL_E5_MULTI_LARGE_INSTRUCT,
-    MODEL_SNOWFLAKE_ARCTIC_L_V2,
-    MODEL_CTX_06,
-    MODEL_CTX_4,
-    MODEL_LATE_06,
-    MODEL_COUNT,
-    MODEL_UNKNOWN
-} model_slot;
-
 typedef enum { MODEL_KIND_STANDARD, MODEL_KIND_CONTEXTUAL, MODEL_KIND_LATE } model_kind;
 
-/* Which embedding API a model speaks. pplx-embed models follow the Perplexity
- * API: the canonical output is the tanh int8 quantization, so the default
- * encoding is base64_int8 and "float" is the int8-decoded view (int8/128).
- * Instruction embedding models follow the OpenAI-compatible API: "float" is
- * the true float32 vector and "base64" is base64 of little-endian float32.
- * int8 quantization underuses the range of L2-normalized vectors, so it is not
- * used for these models. */
 typedef enum {
-    EMBED_API_PERPLEXITY = 0,
-    EMBED_API_OPENAI = 1,
+    EMBED_API_OPENAI = 0,
+    EMBED_API_PERPLEXITY = 1,
 } embedding_api_t;
 
 typedef struct {
-    const char *id;
+    char *id;
     model_kind kind;
     int dim;
     int min_dim;
@@ -118,11 +80,11 @@ typedef struct {
     embed_pooling_mode_t pooling_mode;
     int normalize_embeddings;
     embedding_api_t api;
-    const char *query_instruct;
+    char *query_instruct;
 } model_info;
 
 typedef struct {
-    const model_info *info;
+    model_info *info;
     char *path;
     embed_tokenizer_t *tok;
     embed_tokenizer_workspace_t *tok_ws;
@@ -172,7 +134,8 @@ typedef struct {
     int max_batch_tokens;
     int batch_wait_us;
     char *api_key;
-    loaded_model models[MODEL_COUNT];
+    loaded_model *models;
+    int n_models;
     int use_mlx;
     int use_cuda;
     int mlx_quantize_bits;
@@ -347,9 +310,8 @@ void set_response_from_buf(job *j, sbuf *b);
 int render_embedding_response(embedding_request *r, const float *embs);
 void render_contextual_response(contextual_request *r, const float *embs);
 
-/* ---- server_models.c: registry, load/lifecycle, tokenize/inference dispatch ---- */
-extern const model_info k_models[];
-model_slot model_slot_for_id(const char *id);
+/* ---- server_models.c: model load/lifecycle, tokenize/inference dispatch ---- */
+loaded_model *loaded_model_for_label(http_server *s, const char *label);
 void free_token_bufs(token_buf *t, int n);
 void embedding_request_free(embedding_request *r);
 void contextual_request_free(contextual_request *r);
@@ -367,7 +329,7 @@ int model_embed_spans_batch(loaded_model *m,
 int inference_batch_accepts_input(
     const loaded_model *m, int batch, int packed_tokens, int next_tokens, int max_batch_tokens);
 int configure_loaded_model(loaded_model *m, const embed_config_t *config, int token_dim);
-int load_one_model(http_server *s, model_slot slot, const char *path);
+int load_one_model(http_server *s, const embed_server_model_spec_t *spec);
 void free_models(http_server *s);
 
 /* ---- server_handlers.c: per-endpoint prepare / batch-group / execute ---- */

@@ -14,9 +14,25 @@
 
 #include <stdbool.h>
 
+typedef enum {
+    EMBED_SERVER_MODEL_STANDARD = 0,
+    EMBED_SERVER_MODEL_CONTEXTUAL = 1,
+    EMBED_SERVER_MODEL_LATE = 2,
+} embed_server_model_kind_t;
+
+typedef enum {
+    EMBED_SERVER_API_DEFAULT = 0, /* currently OpenAI-compatible float output */
+    EMBED_SERVER_API_OPENAI = 1,
+    EMBED_SERVER_API_PERPLEXITY = 2,
+} embed_server_embedding_api_t;
+
 typedef struct {
-    const char *id;
+    const char *id; /* served label; requests match this string exactly */
     const char *path;
+    embed_server_model_kind_t kind;
+    embed_server_embedding_api_t api;
+    int min_dim;                /* 0 means the loaded model's full hidden size */
+    const char *query_instruct; /* NULL means use config_sentence_transformers.json if present */
 } embed_server_model_spec_t;
 
 typedef struct {

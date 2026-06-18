@@ -1,6 +1,7 @@
 #include "server_internal.h"
 #include "server_util.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,63 +9,137 @@
 #include <unistd.h>
 
 /* ========================================================================
- * Model registry, load/lifecycle, and tokenize/inference dispatch
+ * Model load/lifecycle, and tokenize/inference dispatch
  *
- * k_models is the static table of every model the server can serve (name,
- * dimensions, attention/pooling mode, API family). load_one_model resolves a
- * served id to a slot, picks the tokenizer by the files present (WordPiece
- * vocab.txt, SentencePiece .model, else byte-level BPE vocab.json), and loads the CPU model
- * (GPU backends load on the worker thread). The tokenize_* and model_embed_*
+ * Each loaded model owns resolved serving metadata for the operator-chosen
+ * label. Transformer behavior comes from the model files through embed_config;
+ * server-only facts absent from those files, such as output API family and
+ * Matryoshka floor, come from the load spec. The tokenize_* and model_embed_*
  * helpers are the single dispatch point the request handlers call, hiding the
  * CPU/MLX/CUDA backend choice behind one signature.
  * ======================================================================== */
 
-const model_info k_models[] = {
-    {"pplx-embed-v1-0.6b", MODEL_KIND_STANDARD, 1024, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
-    {"pplx-embed-v1-4b", MODEL_KIND_STANDARD, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
-    {"Qwen3-Embedding-0.6B", MODEL_KIND_STANDARD, 1024, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
-    {"Qwen3-Embedding-4B", MODEL_KIND_STANDARD, 2560, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
-    {"Qwen3-Embedding-8B", MODEL_KIND_STANDARD, 4096, 32, 0, EMBED_ATTENTION_CAUSAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_QWEN3_QUERY_INSTRUCT},
-    {"gte-Qwen2-1.5B-instruct", MODEL_KIND_STANDARD, 1536, 1536, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_LAST_TOKEN, 1, EMBED_API_OPENAI, EMBED_GTE_QWEN2_QUERY_INSTRUCT},
-    /* BERT encoders: WordPiece tokenizer, learned positions, no instruction
-     * prefix. all-MiniLM-L6-v2 mean-pools; bge-small-en-v1.5 pools the [CLS]
-     * token. Both emit L2-normalized float32, so they speak the OpenAI API. */
-    {"all-MiniLM-L6-v2", MODEL_KIND_STANDARD, 384, 384, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 1, EMBED_API_OPENAI, NULL},
-    {"bge-small-en-v1.5", MODEL_KIND_STANDARD, 384, 384, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
-    {"bge-base-en-v1.5", MODEL_KIND_STANDARD, 768, 768, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
-    {"bge-large-en-v1.5", MODEL_KIND_STANDARD, 1024, 1024, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_CLS, 1, EMBED_API_OPENAI, NULL},
-    {"multilingual-e5-large-instruct", MODEL_KIND_STANDARD, 1024, 1024, 0,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 1, EMBED_API_OPENAI,
-     EMBED_E5_QUERY_INSTRUCT},
-    {"snowflake-arctic-embed-l-v2.0", MODEL_KIND_STANDARD, 1024, 256, 0,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_CLS, 1, EMBED_API_OPENAI,
-     EMBED_SNOWFLAKE_QUERY_INSTRUCT},
-    {"pplx-embed-context-v1-0.6b", MODEL_KIND_CONTEXTUAL, 1024, 128, 0,
-     EMBED_ATTENTION_BIDIRECTIONAL, EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
-    {"pplx-embed-context-v1-4b", MODEL_KIND_CONTEXTUAL, 2560, 128, 0, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
-    {"pplx-embed-v1-late-0.6b", MODEL_KIND_LATE, 1024, 128, 128, EMBED_ATTENTION_BIDIRECTIONAL,
-     EMBED_POOL_MEAN, 0, EMBED_API_PERPLEXITY, NULL},
-};
-
-model_slot model_slot_for_id(const char *id) {
-    if (!id)
-        return MODEL_UNKNOWN;
-    for (int i = 0; i < MODEL_COUNT; i++) {
-        if (!strcmp(id, k_models[i].id))
-            return (model_slot)i;
+loaded_model *loaded_model_for_label(http_server *s, const char *label) {
+    if (!label)
+        return NULL;
+    for (int i = 0; i < s->n_models; i++) {
+        if (s->models[i].info && !strcmp(label, s->models[i].info->id))
+            return &s->models[i];
     }
-    return MODEL_UNKNOWN;
+    return NULL;
+}
+
+static model_kind model_kind_from_public(embed_server_model_kind_t kind) {
+    switch (kind) {
+    case EMBED_SERVER_MODEL_CONTEXTUAL:
+        return MODEL_KIND_CONTEXTUAL;
+    case EMBED_SERVER_MODEL_LATE:
+        return MODEL_KIND_LATE;
+    case EMBED_SERVER_MODEL_STANDARD:
+    default:
+        return MODEL_KIND_STANDARD;
+    }
+}
+
+static embedding_api_t embedding_api_from_public(embed_server_embedding_api_t api) {
+    return api == EMBED_SERVER_API_PERPLEXITY ? EMBED_API_PERPLEXITY : EMBED_API_OPENAI;
+}
+
+static int read_optional_text_file(const char *model_dir, const char *relative, char **out) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", model_dir, relative);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        server_log("embed-server: model path too long");
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f && errno == ENOENT)
+        return 0;
+    if (!f) {
+        server_log("embed-server: failed to open %s", path);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long sz = ftell(f);
+    if (sz < 0 || (size_t)sz == SIZE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    buf[sz] = '\0';
+    *out = buf;
+    return 1;
+}
+
+static int read_query_instruct_from_files(const char *model_dir, char **out) {
+    char *buf = NULL;
+    int rc = read_optional_text_file(model_dir, "config_sentence_transformers.json", &buf);
+    if (rc <= 0)
+        return rc;
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        server_log("embed-server: invalid config_sentence_transformers.json: %s", model_dir);
+        return -1;
+    }
+    cJSON *prompts = cJSON_GetObjectItemCaseSensitive(root, "prompts");
+    cJSON *query = prompts ? cJSON_GetObjectItemCaseSensitive(prompts, "query") : NULL;
+    if (query && !cJSON_IsString(query)) {
+        cJSON_Delete(root);
+        server_log("embed-server: prompts.query must be a string: %s", model_dir);
+        return -1;
+    }
+    if (query && query->valuestring && query->valuestring[0]) {
+        *out = xstrdup(query->valuestring);
+        cJSON_Delete(root);
+        return *out ? 1 : -1;
+    }
+    cJSON_Delete(root);
+    return 0;
+}
+
+static int init_model_info(model_info **out, const embed_server_model_spec_t *spec) {
+    model_info *info = xcalloc(1, sizeof(*info));
+    info->id = xstrdup(spec->id);
+    info->kind = model_kind_from_public(spec->kind);
+    info->api = embedding_api_from_public(spec->api);
+    info->min_dim = spec->min_dim;
+    if (spec->query_instruct) {
+        info->query_instruct = xstrdup(spec->query_instruct);
+    } else if (read_query_instruct_from_files(spec->path, &info->query_instruct) < 0) {
+        free(info->id);
+        free(info);
+        return -1;
+    }
+    if (!info->id || (spec->query_instruct && !info->query_instruct)) {
+        free(info->query_instruct);
+        free(info->id);
+        free(info);
+        return -1;
+    }
+    *out = info;
+    return 0;
+}
+
+static void free_model_info(model_info *info) {
+    if (!info)
+        return;
+    free(info->id);
+    free(info->query_instruct);
+    free(info);
 }
 
 void free_token_bufs(token_buf *t, int n) {
@@ -307,14 +382,35 @@ int inference_batch_accepts_input(
 }
 
 int configure_loaded_model(loaded_model *m, const embed_config_t *config, int token_dim) {
-    if (!m || !m->info || !config || config->hidden_size != m->info->dim ||
-        token_dim != m->info->token_dim || config->attention_mode != m->info->attention_mode ||
-        config->pooling_mode != m->info->pooling_mode ||
-        config->normalize_embeddings != m->info->normalize_embeddings) {
-        if (m && m->info && config)
-            server_log("embed-server: model %s has incompatible config", m->info->id);
+    if (!m || !m->info || !config || config->hidden_size <= 0) {
+        if (m && m->info)
+            server_log("embed-server: model %s has invalid config", m->info->id);
         return -1;
     }
+    if (m->info->kind == MODEL_KIND_LATE) {
+        if (token_dim <= 0) {
+            server_log("embed-server: late model %s is missing token projection metadata",
+                       m->info->id);
+            return -1;
+        }
+    } else if (token_dim != 0) {
+        server_log("embed-server: non-late model %s unexpectedly has token projection metadata",
+                   m->info->id);
+        return -1;
+    }
+
+    int min_dim = m->info->min_dim > 0 ? m->info->min_dim : config->hidden_size;
+    if (min_dim <= 0 || min_dim > config->hidden_size) {
+        server_log("embed-server: model %s has invalid min_dim=%d for dim=%d", m->info->id,
+                   min_dim, config->hidden_size);
+        return -1;
+    }
+    m->info->dim = config->hidden_size;
+    m->info->min_dim = min_dim;
+    m->info->token_dim = token_dim;
+    m->info->attention_mode = config->attention_mode;
+    m->info->pooling_mode = config->pooling_mode;
+    m->info->normalize_embeddings = config->normalize_embeddings;
     m->append_terminal_token = config->append_terminal_token;
     /* m->terminal_token_id is resolved from the tokenizer in load_one_model. */
     m->renormalize_truncated =
@@ -322,9 +418,19 @@ int configure_loaded_model(loaded_model *m, const embed_config_t *config, int to
     return 0;
 }
 
-int load_one_model(http_server *s, model_slot slot, const char *path) {
-    loaded_model *m = &s->models[slot];
-    m->info = &k_models[slot];
+int load_one_model(http_server *s, const embed_server_model_spec_t *spec) {
+    /* Grow the model list by one entry. */
+    loaded_model *nm = realloc(s->models, (size_t)(s->n_models + 1) * sizeof(*s->models));
+    if (!nm)
+        return -1;
+    s->models = nm;
+    loaded_model *m = &s->models[s->n_models];
+    memset(m, 0, sizeof(*m));
+    s->n_models++;
+
+    if (init_model_info(&m->info, spec) != 0)
+        return -1;
+    const char *path = spec->path;
     m->path = xstrdup(path);
     m->terminal_token_id = -1;
     m->cls_id = -1;
@@ -478,8 +584,9 @@ int load_one_model(http_server *s, model_slot slot, const char *path) {
 }
 
 void free_models(http_server *s) {
-    for (int i = 0; i < MODEL_COUNT; i++) {
+    for (int i = 0; i < s->n_models; i++) {
         loaded_model *m = &s->models[i];
+        free_model_info(m->info);
         free(m->path);
         if (m->tok_ws)
             embed_tokenizer_workspace_free(m->tok_ws);
@@ -514,4 +621,7 @@ void free_models(http_server *s) {
             embed_cuda_late_free(m->cuda_late_ctx);
 #endif
     }
+    free(s->models);
+    s->models = NULL;
+    s->n_models = 0;
 }

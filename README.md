@@ -1,59 +1,18 @@
 # embed.c
 
-`embed.c` implements inference for several text embedding model families —
-[pplx-embed](https://huggingface.co/collections/perplexity-ai/pplx-embed),
-[Qwen3-Embedding](https://huggingface.co/collections/Qwen/qwen3-embedding),
-GTE-Qwen2, BERT/BGE encoders, and multilingual XLM-R encoders (multilingual-E5,
-Snowflake Arctic). It serves them through an OpenAI/Perplexity-compatible HTTP
-API and runs on CPU, Apple MLX, and NVIDIA CUDA. See
-[Supported models](#supported-models).
+`embed.c` implements high-performance embedding inference for Hugging Face
+safetensors checkpoints, with CPU, Apple MLX, and NVIDIA CUDA backends.
 
-## Supported models
-
-The server registers these model IDs out of the box; pass any of them as
-`--model ID=DIR`, loading a Hugging Face safetensors checkpoint from `DIR`.
-Weights load directly from F32, BF16, or F16 safetensors. Every model runs on
-all three backends, and `dimensions` truncates Matryoshka-trained vectors
-(pplx-embed down to 128, Qwen3-Embedding down to 32, arctic-embed down to 256).
-
-**Pooled embeddings** — one vector per text, via `POST /v1/embeddings`:
-
-| Model ID                       | Family          | Dim  | Pooling    | Output                 |
-| ------------------------------ | --------------- | ---- | ---------- | ---------------------- |
-| pplx-embed-v1-0.6b             | pplx-embed      | 1024 | mean       | int8, unnormalized     |
-| pplx-embed-v1-4b               | pplx-embed      | 2560 | mean       | int8, unnormalized     |
-| Qwen3-Embedding-0.6B           | Qwen3-Embedding | 1024 | last token | float32, L2-normalized |
-| Qwen3-Embedding-4B             | Qwen3-Embedding | 2560 | last token | float32, L2-normalized |
-| Qwen3-Embedding-8B             | Qwen3-Embedding | 4096 | last token | float32, L2-normalized |
-| gte-Qwen2-1.5B-instruct        | GTE-Qwen2       | 1536 | last token | float32, L2-normalized |
-| all-MiniLM-L6-v2               | BERT (MiniLM)   | 384  | mean       | float32, L2-normalized |
-| bge-small-en-v1.5              | BERT (BGE)      | 384  | CLS        | float32, L2-normalized |
-| bge-base-en-v1.5               | BERT (BGE)      | 768  | CLS        | float32, L2-normalized |
-| bge-large-en-v1.5              | BERT (BGE)      | 1024 | CLS        | float32, L2-normalized |
-| multilingual-e5-large-instruct | XLM-R (E5)      | 1024 | mean       | float32, L2-normalized |
-| snowflake-arctic-embed-l-v2.0  | XLM-R (Arctic)  | 1024 | CLS        | float32, L2-normalized |
-
-**Contextual embeddings** — one vector per document chunk, each embedded with
-its document as context, via `POST /v1/contextualizedembeddings`:
-
-| Model ID                   | Dim  | Output             |
-| -------------------------- | ---- | ------------------ |
-| pplx-embed-context-v1-0.6b | 1024 | int8, unnormalized |
-| pplx-embed-context-v1-4b   | 2560 | int8, unnormalized |
-
-**Late interaction** — token-level vectors scored with MaxSim for reranking, via
-`POST /v1/rerank`:
-
-| Model ID                | Token dim | Output              |
-| ----------------------- | --------- | ------------------- |
-| pplx-embed-v1-late-0.6b | 128       | MaxSim rerank score |
+Tested model families include pplx-embed, Qwen3-Embedding, GTE-Qwen2, BERT/BGE
+encoders, and XLM-R encoders such as multilingual-E5 and Snowflake Arctic.
+Weights load directly from F32, BF16, or F16 safetensors.
 
 The engine handles three transformer blocks — the Qwen3 block (pplx-embed and
-Qwen3-Embedding), the Qwen2 block (GTE-Qwen2), and the BERT/RoBERTa block (MiniLM,
-BGE, and the XLM-R multilingual encoders E5 and Arctic) — and selects the
-tokenizer from the model files: byte-level BPE for the Qwen families, WordPiece
-for BERT, and SentencePiece (Unigram) for XLM-R. Pooling and L2-normalization
-are read from the checkpoint's Sentence Transformers config
+Qwen3-Embedding), the Qwen2 block (GTE-Qwen2), and the BERT/RoBERTa block
+(MiniLM, BGE, and the XLM-R multilingual encoders E5 and Arctic) — and selects
+the tokenizer from the model files: byte-level BPE for the Qwen families,
+WordPiece for BERT, and SentencePiece (Unigram) for XLM-R. Pooling and
+L2-normalization are read from the checkpoint's Sentence Transformers config
 (`1_Pooling/config.json` and `modules.json`), so a model's pooling mode does not
 have to be hardcoded. pplx-embed vectors are unnormalized int8 (rank them by
 cosine similarity); the other families emit L2-normalized float32.
@@ -134,20 +93,35 @@ build date, target, and compiler.
 
 ## embed-server
 
-Serves the Perplexity/OpenAI-compatible HTTP API. Takes one or more
-`--model ID=DIR` pairs:
+Serves the Perplexity/OpenAI-compatible HTTP API. Each loaded model gets an
+operator-chosen label, and requests use that label in the `model` field. The
+label is only a routing name; architecture, pooling, normalization, tokenizer,
+and dimensionality are read from the model directory.
+
+Use a separate load flag for each endpoint contract:
+
+- `--model LABEL=DIR` serves `/v1/embeddings`.
+- `--contextual-model LABEL=DIR` serves `/v1/contextualizedembeddings`.
+- `--late-model LABEL=DIR` serves `/v1/rerank`.
+
+Scalar serving options that are not in standard model files can be appended to
+the load argument: `:api=openai|perplexity`, `:min_dim=N`, and a final
+`:query=TEXT` prompt override. `api` defaults to `openai`; use
+`api=perplexity` for pplx-compatible base64-int8 output. `min_dim` defaults to
+the model's full embedding size; set it for Matryoshka truncation floors.
 
 ```bash
 ./embed-server \
-  --model pplx-embed-v1-0.6b=./model \
-  --model pplx-embed-context-v1-0.6b=./context-model \
-  --model Qwen3-Embedding-0.6B=./qwen3-model \
+  --model pplx=./pplx-model:api=perplexity:min_dim=128 \
+  --contextual-model pplx-context=./pplx-context-model:api=perplexity:min_dim=128 \
+  --late-model pplx-late=./pplx-late-model \
+  --model qwen=./qwen3-model:min_dim=32 \
   --port 8000
 ```
 
 ### API
 
-Every request body takes a `model` parameter and returns results in input order.
+Every request body takes a `model` label and returns results in input order.
 
 | Endpoint                            | Returns                          |
 | ----------------------------------- | -------------------------------- |
@@ -161,7 +135,7 @@ Every request body takes a `model` parameter and returns results in input order.
 curl http://127.0.0.1:8000/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-Embedding-0.6B",
+    "model": "qwen",
     "input": [
       "What is the capital of France?",
       "Paris is the capital of France."
@@ -178,7 +152,7 @@ Returns a list of embeddings, one per input text:
     {"object": "embedding", "index": 0, "embedding": [0.013, -0.021, ...]},
     {"object": "embedding", "index": 1, "embedding": [0.046, 0.009, ...]}
   ],
-  "model": "Qwen3-Embedding-0.6B",
+  "model": "qwen",
   "usage": {"prompt_tokens": 16, "total_tokens": 16}
 }
 ```
@@ -186,18 +160,17 @@ Returns a list of embeddings, one per input text:
 | Field             | Type            | Description                                             |
 | ----------------- | --------------- | ------------------------------------------------------- |
 | `input`           | string or array | One text, or up to 512 texts. Required.                 |
-| `dimensions`      | integer         | Truncate the embedding (Matryoshka), 32 up to its size. |
+| `dimensions`      | integer         | Truncate the embedding, from the configured `min_dim` up to its size. |
 | `encoding_format` | string          | Output encoding (see below).                            |
 
 **Encoding format:**
 
-`encoding_format` follows the model family:
+`encoding_format` follows the serving API selected at load time:
 
-- The OpenAI-API models (Qwen3-Embedding, GTE-Qwen2, MiniLM, BGE,
-  multilingual-E5, Snowflake Arctic) default to `float` (the true float32 vector)
-  and also accept `base64` (base64 of float32).
-- pplx-embed (Perplexity-compatible) defaults to `base64_int8` and also accepts
-  `base64_binary` and `float` (the decoded int8 view).
+- `api=openai` defaults to `float` and also accepts `base64` (base64 of
+  little-endian float32).
+- `api=perplexity` defaults to `base64_int8` and also accepts `base64_binary`
+  and `float` (the decoded int8 view).
 
 #### POST /v1/contextualizedembeddings
 
@@ -209,7 +182,7 @@ one list per document, one embedding per chunk.
 curl http://127.0.0.1:8000/v1/contextualizedembeddings \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "pplx-embed-context-v1-0.6b",
+    "model": "pplx-context",
     "input": [
       ["Intro paragraph.", "Methods paragraph."],
       ["A single-chunk note."]
@@ -237,7 +210,7 @@ Returns a list of chunk embeddings per document, in order:
       "data": [{ "object": "embedding", "index": 0, "embedding": "<base64>" }]
     }
   ],
-  "model": "pplx-embed-context-v1-0.6b",
+  "model": "pplx-context",
   "usage": { "prompt_tokens": 12, "total_tokens": 12 }
 }
 ```
@@ -251,7 +224,7 @@ documents ranked by raw score.
 curl http://127.0.0.1:8000/v1/rerank \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "pplx-embed-v1-late-0.6b",
+    "model": "pplx-late",
     "query": "scientific curiosity",
     "documents": [
       "Scientists explore from curiosity.",
@@ -265,7 +238,7 @@ Documents ranked by descending relevance score:
 ```json
 {
   "object": "list",
-  "model": "pplx-embed-v1-late-0.6b",
+  "model": "pplx-late",
   "results": [
     { "index": 0, "relevance_score": 2.14 },
     { "index": 1, "relevance_score": 0.87 }
@@ -282,8 +255,8 @@ Documents ranked by descending relevance score:
 
 - A request allows up to 512 inputs (1000 documents for `/v1/rerank`), 32768
   tokens per item, 120000 tokens total, and a 64 MiB body.
-- Invalid input returns `422` with a `detail` list naming the offending field; a
-  registered model that is not loaded returns `503`.
+- Invalid input returns `422` with a `detail` list naming the offending field.
+  Unknown labels and labels loaded for another endpoint also return `422`.
 
 #### Deployment
 
@@ -291,7 +264,7 @@ The server runs one inference worker and serves one in-flight request per
 connection (HTTP/1.1 keep-alive).
 
 For concurrency and availability, run several processes behind a load balancer
-and route by model ID; keep one large model per process. Terminate TLS and
+and route by model label; keep one large model per process. Terminate TLS and
 authenticate requests at the proxy.
 
 ## Acknowledgements

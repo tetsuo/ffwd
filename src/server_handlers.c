@@ -271,37 +271,31 @@ static int validate_common(cJSON *root,
                            http_server *s) {
     cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
     const char *model_id = NULL;
+    loaded_model *m = NULL;
     if (!model_item) {
         ve_add(detail, "[\"body\",\"model\"]", "field required", "missing");
     } else if (!cJSON_IsString(model_item) || !model_item->valuestring) {
         ve_add(detail, "[\"body\",\"model\"]", "model must be a string", "type_error.string");
     } else {
         model_id = model_item->valuestring;
-        model_slot slot = model_slot_for_id(model_id);
-        if (slot == MODEL_UNKNOWN || k_models[slot].kind != expected_kind) {
+        m = loaded_model_for_label(s, model_id);
+        if (!m) {
             ve_add(detail, "[\"body\",\"model\"]",
                    "value is not a valid enum member for this endpoint", "enum");
-        } else {
-            loaded_model *m = &s->models[slot];
-            if (!m->info) {
-                *out_model = NULL;
-            } else {
-                *out_model = m;
-            }
+        } else if (m->info->kind != expected_kind) {
+            ve_add(detail, "[\"body\",\"model\"]",
+                   "model is not available on this endpoint", "enum");
+            m = NULL;
         }
     }
-    model_slot slot = model_id ? model_slot_for_id(model_id) : MODEL_UNKNOWN;
-    embedding_api_t api = slot != MODEL_UNKNOWN ? k_models[slot].api : EMBED_API_PERPLEXITY;
-    const char *enc = encoding_from_root(root, detail, api);
-    int min_dim = slot != MODEL_UNKNOWN ? k_models[slot].min_dim : 128;
-    int max_dim = slot != MODEL_UNKNOWN ? k_models[slot].dim : 2560;
+    *out_model = m;
+    const char *enc = encoding_from_root(root, detail, m ? m->info->api : EMBED_API_OPENAI);
+    int min_dim = m ? m->info->min_dim : 128;
+    int max_dim = m ? m->info->dim : 2560;
     int dims = dimensions_from_root(root, detail, min_dim, max_dim, enc);
     *out_encoding = enc;
     *out_dims = dims;
-    return model_id && model_slot_for_id(model_id) != MODEL_UNKNOWN &&
-                   !s->models[model_slot_for_id(model_id)].info
-               ? 503
-               : 0;
+    return 0;
 }
 
 void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_request *out) {
@@ -313,22 +307,15 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
-    int unloaded = validate_common(root, detail, MODEL_KIND_STANDARD, &m, &dims, &encoding, s);
+    validate_common(root, detail, MODEL_KIND_STANDARD, &m, &dims, &encoding, s);
     out->model = m;
     out->dims = dims;
     out->encoding = encoding;
 
-    /* Resolve request behavior from the model registry independent of load
-     * state. The query instruction, when requested, applies to every input. */
-    cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
-    model_slot api_slot = (model_item && cJSON_IsString(model_item) && model_item->valuestring)
-                              ? model_slot_for_id(model_item->valuestring)
-                              : MODEL_UNKNOWN;
-    const char *query_instruct =
-        api_slot != MODEL_UNKNOWN &&
-                text_type_is_query(root, detail, k_models[api_slot].query_instruct)
-            ? k_models[api_slot].query_instruct
-            : NULL;
+    /* The query instruction, when requested, applies to every input. */
+    const char *query_instruct = m && text_type_is_query(root, detail, m->info->query_instruct)
+                                     ? m->info->query_instruct
+                                     : NULL;
 
     cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
     int n_inputs = 0;
@@ -361,12 +348,6 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
     } else {
         ve_add(detail, "[\"body\",\"input\"]", "input must be a string or an array of strings",
                "type_error");
-    }
-
-    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
-        job_set_error(j, 503, "requested model is valid but not loaded", "model_not_loaded");
-        cJSON_Delete(detail);
-        return;
     }
 
     if (cJSON_GetArraySize(detail) == 0 && m && input) {
@@ -436,7 +417,7 @@ void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
-    int unloaded = validate_common(root, detail, MODEL_KIND_CONTEXTUAL, &m, &dims, &encoding, s);
+    validate_common(root, detail, MODEL_KIND_CONTEXTUAL, &m, &dims, &encoding, s);
     out->model = m;
     out->dims = dims;
     out->encoding = encoding;
@@ -495,12 +476,6 @@ void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_
         if (total_chunks > EMBED_API_MAX_CONTEXT_CHUNKS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 16000 chunks",
                    "value_error.list.max_items");
-    }
-
-    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
-        job_set_error(j, 503, "requested model is valid but not loaded", "model_not_loaded");
-        cJSON_Delete(detail);
-        return;
     }
 
     if (cJSON_GetArraySize(detail) == 0 && m) {
@@ -594,14 +569,18 @@ validate_rerank_model(cJSON *root, cJSON *detail, http_server *s, loaded_model *
         ve_add(detail, "[\"body\",\"model\"]", "model must be a string", "type_error.string");
         return 0;
     }
-    model_slot slot = model_slot_for_id(item->valuestring);
-    if (slot == MODEL_UNKNOWN || k_models[slot].kind != MODEL_KIND_LATE) {
+    loaded_model *m = loaded_model_for_label(s, item->valuestring);
+    if (!m) {
         ve_add(detail, "[\"body\",\"model\"]", "value is not a valid enum member for this endpoint",
                "enum");
         return 0;
     }
-    *out_model = s->models[slot].info ? &s->models[slot] : NULL;
-    return *out_model ? 0 : 503;
+    if (m->info->kind != MODEL_KIND_LATE) {
+        ve_add(detail, "[\"body\",\"model\"]", "model is not available on this endpoint", "enum");
+        return 0;
+    }
+    *out_model = m;
+    return 0;
 }
 
 void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out) {
@@ -610,7 +589,7 @@ void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request 
     out->root = root;
 
     cJSON *detail = cJSON_CreateArray();
-    int unloaded = validate_rerank_model(root, detail, s, &out->model);
+    validate_rerank_model(root, detail, s, &out->model);
     cJSON *query = cJSON_GetObjectItemCaseSensitive(root, "query");
     cJSON *documents = cJSON_GetObjectItemCaseSensitive(root, "documents");
     /* query_str is set only once query passes every check; the tokenize step
@@ -680,12 +659,6 @@ void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request 
                    "type_error.bool");
         else
             out->return_documents = cJSON_IsTrue(return_documents);
-    }
-
-    if (cJSON_GetArraySize(detail) == 0 && unloaded) {
-        job_set_error(j, 503, "requested model is valid but not loaded", "model_not_loaded");
-        cJSON_Delete(detail);
-        return;
     }
 
     if (cJSON_GetArraySize(detail) == 0 && out->model) {

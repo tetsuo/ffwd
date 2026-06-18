@@ -143,10 +143,7 @@ bool cjson_is_integer(cJSON *item) {
 }
 
 const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api) {
-    /* Default and accepted encodings follow the model's API family: Perplexity
-     * defaults to base64_int8 and accepts {base64_int8, base64_binary, float};
-     * OpenAI/DashScope (Qwen3) defaults to float and accepts {float, base64}. */
-    const char *dflt = api == EMBED_API_OPENAI ? "float" : "base64_int8";
+    const char *dflt = api == EMBED_API_PERPLEXITY ? "base64_int8" : "float";
     cJSON *encoding = cJSON_GetObjectItemCaseSensitive(root, "encoding_format");
     if (!encoding)
         return dflt;
@@ -156,15 +153,16 @@ const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api) 
         return dflt;
     }
     const char *v = encoding->valuestring;
-    int ok = api == EMBED_API_OPENAI ? (!strcmp(v, "float") || !strcmp(v, "base64"))
-                                     : (!strcmp(v, "base64_int8") || !strcmp(v, "base64_binary") ||
-                                        !strcmp(v, "float"));
+    int ok = api == EMBED_API_PERPLEXITY
+                 ? (!strcmp(v, "base64_int8") || !strcmp(v, "base64_binary") ||
+                    !strcmp(v, "float"))
+                 : (!strcmp(v, "float") || !strcmp(v, "base64"));
     if (!ok) {
         ve_add(detail, "[\"body\",\"encoding_format\"]",
-               api == EMBED_API_OPENAI
-                   ? "value is not a valid enum member; permitted: 'float', 'base64'"
-                   : "value is not a valid enum member; permitted: "
-                     "'base64_int8', 'base64_binary', 'float'",
+               api == EMBED_API_PERPLEXITY
+                   ? "value is not a valid enum member; permitted: "
+                     "'base64_int8', 'base64_binary', 'float'"
+                   : "value is not a valid enum member; permitted: 'float', 'base64'",
                "enum");
         return dflt;
     }

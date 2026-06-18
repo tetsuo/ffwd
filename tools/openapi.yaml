@@ -3,12 +3,10 @@ info:
   title: embed.c server API
   version: "1.0.0"
   description: >
-    HTTP API served by `embed-server` for pplx-embed, Qwen3-Embedding, GTE-Qwen2,
-    BERT/BGE, and multilingual XLM-R (E5, Arctic) embedding models. Requests
-    follow one of two conventions by model family: the Perplexity API (pplx-embed)
-    or the Qwen/DashScope OpenAI-compatible API (every other family). How an
-    embedding is encoded on the wire depends on the model family; see
-    `encoding_format`. Always compare embeddings with cosine similarity.
+    HTTP API served by `embed-server`. Each loaded model has an operator-chosen
+    label; request `model` fields match that label. Embedding encoding follows
+    the serving API selected at load time (`api=openai` or `api=perplexity`).
+    Always compare embeddings with cosine similarity.
   license:
     name: MIT
 servers:
@@ -35,7 +33,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/EmbeddingsResponse" }
         "422": { $ref: "#/components/responses/ValidationError" }
-        "503": { $ref: "#/components/responses/ModelNotLoaded" }
   /v1/contextualizedembeddings:
     post:
       summary: Create contextual (late-chunking) document embeddings
@@ -55,7 +52,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ContextualResponse" }
         "422": { $ref: "#/components/responses/ValidationError" }
-        "503": { $ref: "#/components/responses/ModelNotLoaded" }
   /v1/rerank:
     post:
       summary: Late-interaction (MaxSim) reranking
@@ -75,7 +71,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RerankResponse" }
         "422": { $ref: "#/components/responses/ValidationError" }
-        "503": { $ref: "#/components/responses/ModelNotLoaded" }
 components:
   securitySchemes:
     bearerAuth:
@@ -91,7 +86,8 @@ components:
       properties:
         model:
           type: string
-          example: Qwen3-Embedding-0.6B
+          description: Served label chosen when starting `embed-server`.
+          example: qwen
         input:
           description: A single string or an array of up to 512 strings.
           oneOf:
@@ -103,19 +99,19 @@ components:
         encoding_format:
           type: string
           description: >
-            Output encoding, validated against the model's API family.
-            Qwen3-Embedding accepts `float` (default; true float32) and `base64`
-            (base64 of little-endian float32). pplx-embed accepts `base64_int8`
-            (default), `base64_binary` (sign bits, needs `dimensions` divisible
-            by 8), and `float` (the int8-decoded view). A format outside the
-            model's family returns 422.
+            Output encoding, validated against the serving API selected for the
+            loaded label. `api=openai` accepts `float` (default; true float32)
+            and `base64` (base64 of little-endian float32). `api=perplexity`
+            accepts `base64_int8` (default), `base64_binary` (sign bits, needs
+            `dimensions` divisible by 8), and `float` (the int8-decoded view).
+            A format outside the label's serving API returns 422.
           enum: [float, base64, base64_int8, base64_binary]
         dimensions:
           type: integer
           description: >
-            Matryoshka truncation, from the model minimum (32 for Qwen3, 128 for
-            pplx, 256 for arctic-embed) up to the model's native dimension.
-            Truncated vectors are re-normalized.
+            Matryoshka truncation, from the configured load-time `min_dim` up to
+            the model's native dimension. Truncated normalized vectors are
+            re-normalized.
     EmbeddingsResponse:
       type: object
       properties:
@@ -144,7 +140,8 @@ components:
       properties:
         model:
           type: string
-          example: pplx-embed-context-v1-0.6b
+          description: Served contextual-model label.
+          example: pplx-context
         input:
           description: Array of documents; each document is an array of chunk strings.
           type: array
@@ -180,7 +177,8 @@ components:
       properties:
         model:
           type: string
-          example: pplx-embed-v1-late-0.6b
+          description: Served late-model label.
+          example: pplx-late
         query: { type: string }
         documents:
           type: array
@@ -243,22 +241,9 @@ components:
         detail:
           type: array
           items: { $ref: "#/components/schemas/ValidationDetail" }
-    Error:
-      type: object
-      properties:
-        error:
-          type: object
-          properties:
-            message: { type: string }
-            type: { type: string }
   responses:
     ValidationError:
       description: Request body failed validation.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ValidationError" }
-    ModelNotLoaded:
-      description: The model ID is valid for this build but is not loaded.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }

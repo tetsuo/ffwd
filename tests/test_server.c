@@ -1,9 +1,9 @@
 /* tests/test_server.c - tests for embed_server.c.
- * ds4-style: includes the whole server translation unit with the real main
- * compiled out, so statics are directly testable. Unit-tests the encoding
- * helpers, then boots the real server in-process (tiny 1024-dim hermetic
- * model + byte-vocab tokenizer fixture) and drives the full HTTP request
- * path over loopback sockets. Runs via `make test`. */
+ * Includes the whole server translation unit with the real main compiled out,
+ * so statics are directly testable. Unit-tests the encoding helpers, then boots
+ * the real server in-process (tiny 1024-dim hermetic model + byte-vocab tokenizer
+ * fixture) and drives the full HTTP request path over loopback sockets.
+ * Runs via make test. */
 
 #define EMBED_SERVER_TEST
 #include "../src/server.c"
@@ -16,6 +16,12 @@
 #include <netinet/in.h>
 
 static int test_failures = 0;
+
+static const char *TEST_QWEN3_QUERY_INSTRUCT =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+static const char *TEST_GTE_QUERY_INSTRUCT =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the "
+    "query\nQuery: ";
 
 #define TEST_ASSERT(cond)                                                   \
     do {                                                                    \
@@ -197,13 +203,13 @@ static void test_encode_embedding_base64_float32(void) {
 static void test_append_embedding_value_float(void) {
     float emb[1] = {0.5f};
 
-    /* OpenAI/DashScope (Qwen3): the true float32 value. */
+    /* OpenAI-compatible models render the true float32 value. */
     sbuf b = {0};
     append_embedding_value(&b, 0, emb, 1, "float", EMBED_API_OPENAI);
     TEST_ASSERT(strstr(b.ptr, "\"embedding\":[0.5]") != NULL);
     sbuf_free(&b);
 
-    /* Perplexity: the int8-decoded view, round(tanh(0.5)*127)/128 = 59/128. */
+    /* Perplexity-compatible models render the int8-decoded view. */
     sbuf b2 = {0};
     append_embedding_value(&b2, 0, emb, 1, "float", EMBED_API_PERPLEXITY);
     TEST_ASSERT(strstr(b2.ptr, "0.4609375") != NULL);
@@ -213,7 +219,7 @@ static void test_append_embedding_value_float(void) {
 static void test_encoding_from_root_family(void) {
     cJSON *detail = cJSON_CreateArray();
 
-    /* Default encoding differs by family when the field is absent. */
+    /* Default encoding follows the explicit serving API. */
     cJSON *empty = cJSON_CreateObject();
     TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_OPENAI), "float") == 0);
     TEST_ASSERT(strcmp(encoding_from_root(empty, detail, EMBED_API_PERPLEXITY), "base64_int8") ==
@@ -234,6 +240,13 @@ static void test_encoding_from_root_family(void) {
     TEST_ASSERT(cJSON_GetArraySize(detail) == 2);
     cJSON_Delete(p);
 
+    /* An unknown format is rejected. */
+    cJSON *bad = cJSON_CreateObject();
+    cJSON_AddStringToObject(bad, "encoding_format", "base64_fp16");
+    encoding_from_root(bad, detail, EMBED_API_OPENAI);
+    TEST_ASSERT(cJSON_GetArraySize(detail) == 3);
+    cJSON_Delete(bad);
+
     cJSON_Delete(detail);
 }
 
@@ -242,7 +255,7 @@ static void test_text_type(void) {
 
     /* Absent: no-op for both model types, no error. */
     cJSON *empty = cJSON_CreateObject();
-    TEST_ASSERT(text_type_is_query(empty, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
+    TEST_ASSERT(text_type_is_query(empty, detail, TEST_QWEN3_QUERY_INSTRUCT) == 0);
     TEST_ASSERT(text_type_is_query(empty, detail, NULL) == 0);
     cJSON_Delete(empty);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
@@ -250,22 +263,22 @@ static void test_text_type(void) {
     /* Qwen3: query -> 1, document -> 0, both accepted. */
     cJSON *q = cJSON_CreateObject();
     cJSON_AddStringToObject(q, "text_type", "query");
-    TEST_ASSERT(text_type_is_query(q, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 1);
+    TEST_ASSERT(text_type_is_query(q, detail, TEST_QWEN3_QUERY_INSTRUCT) == 1);
     cJSON_Delete(q);
     cJSON *d = cJSON_CreateObject();
     cJSON_AddStringToObject(d, "text_type", "document");
-    TEST_ASSERT(text_type_is_query(d, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
+    TEST_ASSERT(text_type_is_query(d, detail, TEST_QWEN3_QUERY_INSTRUCT) == 0);
     cJSON_Delete(d);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 0);
 
     /* Invalid enum value on Qwen3 is reported. */
     cJSON *bad = cJSON_CreateObject();
     cJSON_AddStringToObject(bad, "text_type", "passage");
-    TEST_ASSERT(text_type_is_query(bad, detail, EMBED_QWEN3_QUERY_INSTRUCT) == 0);
+    TEST_ASSERT(text_type_is_query(bad, detail, TEST_QWEN3_QUERY_INSTRUCT) == 0);
     TEST_ASSERT(cJSON_GetArraySize(detail) == 1);
     cJSON_Delete(bad);
 
-    /* text_type on a Perplexity-family model is rejected. */
+    /* text_type on a model with no query instruction is rejected. */
     cJSON *p = cJSON_CreateObject();
     cJSON_AddStringToObject(p, "text_type", "query");
     TEST_ASSERT(text_type_is_query(p, detail, NULL) == 0);
@@ -275,17 +288,19 @@ static void test_text_type(void) {
     cJSON_Delete(detail);
 }
 
-static void test_model_registry(void) {
-    model_slot slot = model_slot_for_id("gte-Qwen2-1.5B-instruct");
-    TEST_ASSERT(slot == MODEL_GTE_QWEN2_15);
-    if (slot == MODEL_UNKNOWN)
-        return;
-    TEST_ASSERT(k_models[slot].dim == 1536);
-    TEST_ASSERT(k_models[slot].min_dim == 1536);
-    TEST_ASSERT(k_models[slot].attention_mode == EMBED_ATTENTION_BIDIRECTIONAL);
-    TEST_ASSERT(k_models[slot].pooling_mode == EMBED_POOL_LAST_TOKEN);
-    TEST_ASSERT(k_models[slot].normalize_embeddings == 1);
-    TEST_ASSERT(strcmp(k_models[slot].query_instruct, EMBED_GTE_QWEN2_QUERY_INSTRUCT) == 0);
+static void test_loaded_model_lookup(void) {
+    model_info info;
+    memset(&info, 0, sizeof(info));
+    info.id = "served-label";
+    loaded_model models[1];
+    memset(models, 0, sizeof(models));
+    models[0].info = &info;
+    http_server s;
+    memset(&s, 0, sizeof(s));
+    s.models = models;
+    s.n_models = 1;
+    TEST_ASSERT(loaded_model_for_label(&s, "served-label") == &models[0]);
+    TEST_ASSERT(loaded_model_for_label(&s, "compiled-name") == NULL);
 }
 
 static void test_collect_job_batch_deadline(void) {
@@ -552,7 +567,7 @@ static void test_http_embeddings(int port) {
     TEST_ASSERT(http_req(port, "POST", "/nope", TEST_API_KEY, "{}", NULL, NULL) == 404);
 
     /* Auth: required, and the exact key. */
-    const char *ok_req = "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello world\","
+    const char *ok_req = "{\"model\":\"std-main\",\"input\":\"hello world\","
                          "\"encoding_format\":\"float\"}";
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", NULL, ok_req, NULL, NULL) == 401);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", "wrong-key", ok_req, NULL, NULL) == 401);
@@ -561,42 +576,41 @@ static void test_http_embeddings(int port) {
     TEST_ASSERT(http_req(port, NULL, NULL, NULL, NULL, "GARBAGE\r\n\r\n", NULL) == 400);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, "{nope", NULL, NULL) == 422);
 
-    /* Validation: missing/unknown model, wrong endpoint family, valid but
-     * unloaded id, bad encoding enum, dimensions out of range; the
-     * API answers validation errors with 422 detail arrays. */
+    /* Validation: missing/unknown model, wrong endpoint family, bad encoding
+     * enum, dimensions out of range; validation errors return 422 detail arrays. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, "{\"input\":\"hi\"}", NULL,
                          NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
                          "{\"model\":\"foo\",\"input\":\"hi\"}", NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"ctx-main\","
                          "\"input\":\"hi\"}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-4b\",\"input\":\"hi\"}", NULL, NULL) == 503);
+                         "{\"model\":\"std-missing\",\"input\":\"hi\"}", NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hi\","
+                         "{\"model\":\"std-main\",\"input\":\"hi\","
                          "\"encoding_format\":\"yaml\"}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hi\","
+                         "{\"model\":\"std-main\",\"input\":\"hi\","
                          "\"dimensions\":64}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":[]}",
                          NULL, NULL) == 422);
 
-    /* Contextual endpoint: standard id is the wrong enum, the 4B contextual
-     * id is valid but not loaded. */
+    /* Contextual endpoint: a standard label is the wrong endpoint contract,
+     * and an unloaded label is unknown. */
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":[[\"a\"]]}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-4b\","
+                         "{\"model\":\"ctx-missing\","
                          "\"input\":[[\"a\"]]}",
-                         NULL, NULL) == 503);
+                         NULL, NULL) == 422);
 
     /* Happy path, float encoding, single string input. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY, ok_req, NULL, &body) == 200);
@@ -628,7 +642,7 @@ static void test_http_embeddings(int port) {
     /* Batch order: one embedding per input, indexes 0..n-1, and different
      * texts produce different vectors. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":[\"hello\",\"world\",\"held\"],"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -652,9 +666,9 @@ static void test_http_embeddings(int port) {
     free(body);
     body = NULL;
 
-    /* Default encoding is base64_int8: a string of 1024 quantized bytes. */
+    /* Perplexity-compatible default encoding is base64_int8. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":\"hello\"}",
                          NULL, &body) == 200);
     root = body ? parse_embeddings_body(body, 1) : NULL;
@@ -668,9 +682,32 @@ static void test_http_embeddings(int port) {
     free(body);
     body = NULL;
 
+    /* base64_int8 is also accepted when requested explicitly. */
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"std-main\","
+                         "\"input\":\"hello\",\"encoding_format\":\"base64_int8\"}",
+                         NULL, &body) == 200);
+    root = body ? parse_embeddings_body(body, 1) : NULL;
+    if (root) {
+        cJSON *emb = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "data"), 0), "embedding");
+        TEST_ASSERT(cJSON_IsString(emb));
+        TEST_ASSERT(strlen(emb->valuestring) == ((1024 + 2) / 3) * 4);
+        cJSON_Delete(root);
+    }
+    free(body);
+    body = NULL;
+
+    TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
+                         "{\"model\":\"std-main\","
+                         "\"input\":\"hello\",\"encoding_format\":\"base64\"}",
+                         NULL, &body) == 422);
+    free(body);
+    body = NULL;
+
     /* Matryoshka truncation via dimensions. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":\"hello\",\"dimensions\":128,"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -687,14 +724,14 @@ static void test_http_embeddings(int port) {
     /* Qwen3 appends its terminal token, supports 32D MRL output, and
      * re-normalizes the truncated prefix. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"Qwen3-Embedding-0.6B\","
+                         "{\"model\":\"qwen-search\","
                          "\"input\":\"hello\",\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
     cJSON *embed_full = body ? parse_embeddings_body(body, 1) : NULL;
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"Qwen3-Embedding-0.6B\","
+                         "{\"model\":\"qwen-search\","
                          "\"input\":\"hello\",\"dimensions\":32,"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -728,14 +765,14 @@ static void test_http_embeddings(int port) {
     /* text_type=query must equal manually prepending the Qwen3 instruction with
      * text_type=document: both produce the same tokens, hence the same vector. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"hello\","
+                         "{\"model\":\"qwen-search\",\"input\":\"hello\","
                          "\"text_type\":\"query\",\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
     cJSON *tt_query = body ? parse_embeddings_body(body, 1) : NULL;
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"Instruct: Given a web "
+                         "{\"model\":\"qwen-search\",\"input\":\"Instruct: Given a web "
                          "search query, retrieve relevant passages that answer the "
                          "query\\nQuery:hello\",\"text_type\":\"document\","
                          "\"encoding_format\":\"float\"}",
@@ -764,17 +801,17 @@ static void test_http_embeddings(int port) {
     cJSON_Delete(tt_query);
     cJSON_Delete(tt_manual);
 
-    /* GTE-Qwen2 uses the same retrieval task text but publishes a space after
-     * "Query:". Verify the registry-specific prompt through the full path. */
+    /* GTE-Qwen2 uses the same retrieval task text but with a space after
+     * "Query:". Verify the explicit prompt override through the full path. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"gte-Qwen2-1.5B-instruct\",\"input\":\"hello\","
+                         "{\"model\":\"gte-search\",\"input\":\"hello\","
                          "\"text_type\":\"query\",\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
     cJSON *gte_query = body ? parse_embeddings_body(body, 1) : NULL;
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"gte-Qwen2-1.5B-instruct\",\"input\":\"Instruct: Given a "
+                         "{\"model\":\"gte-search\",\"input\":\"Instruct: Given a "
                          "web search query, retrieve relevant passages that answer the "
                          "query\\nQuery: hello\",\"text_type\":\"document\","
                          "\"encoding_format\":\"float\"}",
@@ -803,15 +840,15 @@ static void test_http_embeddings(int port) {
     cJSON_Delete(gte_query);
     cJSON_Delete(gte_manual);
 
-    /* text_type is rejected on a Perplexity-family model, and bad values 422. */
+    /* text_type is rejected on a model with no query instruction, and bad values 422. */
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\",\"input\":\"hello\","
+                         "{\"model\":\"std-main\",\"input\":\"hello\","
                          "\"text_type\":\"query\"}",
                          NULL, &body) == 422);
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"Qwen3-Embedding-0.6B\",\"input\":\"hello\","
+                         "{\"model\":\"qwen-search\",\"input\":\"hello\","
                          "\"text_type\":\"passage\"}",
                          NULL, &body) == 422);
     free(body);
@@ -863,16 +900,37 @@ static double emb_max_absdiff(cJSON *a, cJSON *b) {
     return m;
 }
 
+static int write_query_prompt_config(const char *dir, const char *query) {
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/config_sentence_transformers.json", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs("{\"prompts\":{\"query\":\"", f);
+    for (const char *p = query; *p; p++) {
+        if (*p == '\\' || *p == '"')
+            fputc('\\', f);
+        if (*p == '\n') {
+            fputs("\\n", f);
+        } else {
+            fputc(*p, f);
+        }
+    }
+    fputs("\",\"document\":\"\"}}", f);
+    fclose(f);
+    return 0;
+}
+
 static void test_http_contextual(int port) {
     char *body = NULL;
 
     /* Input must be an array of chunk arrays; chunks must be non-empty. */
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"ctx-main\","
                          "\"input\":\"hi\"}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"ctx-main\","
                          "\"input\":[[\"\"]]}",
                          NULL, NULL) == 422);
 
@@ -881,7 +939,7 @@ static void test_http_contextual(int port) {
      * token counts: hello=1, world=3, held=2, one separator in doc 0, so
      * usage must report 7. */
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"ctx-main\","
                          "\"input\":[[\"hello\",\"world\"],[\"held\"]],"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -916,7 +974,7 @@ static void test_http_contextual(int port) {
      * the whole sequence, so it must match the standard embedding of the
      * same text from the same weights. */
     TEST_ASSERT(http_req(port, "POST", "/v1/contextualizedembeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-context-v1-0.6b\","
+                         "{\"model\":\"ctx-main\","
                          "\"input\":[[\"hello\"]],"
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -925,7 +983,7 @@ static void test_http_contextual(int port) {
     free(body);
     body = NULL;
     TEST_ASSERT(http_req(port, "POST", "/v1/embeddings", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"input\":\"hello\","
                          "\"encoding_format\":\"float\"}",
                          NULL, &body) == 200);
@@ -953,24 +1011,24 @@ static void test_http_rerank(int port) {
     char *body = NULL;
 
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-0.6b\","
+                         "{\"model\":\"std-main\","
                          "\"query\":\"hello\",\"documents\":[\"world\"]}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "{\"model\":\"late-main\","
                          "\"query\":\"\",\"documents\":[\"world\"]}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "{\"model\":\"late-main\","
                          "\"query\":\"hello\",\"documents\":[]}",
                          NULL, NULL) == 422);
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "{\"model\":\"late-main\","
                          "\"query\":\"hello\",\"documents\":[\"world\"],"
                          "\"top_n\":1,\"top_k\":1}",
                          NULL, NULL) == 422);
 
-    const char *request = "{\"model\":\"pplx-embed-v1-late-0.6b\","
+    const char *request = "{\"model\":\"late-main\","
                           "\"query\":\"hello\",\"documents\":["
                           "\"hello!\",\"world\",\"quoted \\\"document\\\"\"],"
                           "\"top_n\":2,\"return_documents\":true}";
@@ -982,8 +1040,7 @@ static void test_http_rerank(int port) {
         cJSON *model = cJSON_GetObjectItemCaseSensitive(root, "model");
         cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
         TEST_ASSERT(cJSON_IsString(object) && strcmp(object->valuestring, "list") == 0);
-        TEST_ASSERT(cJSON_IsString(model) &&
-                    strcmp(model->valuestring, "pplx-embed-v1-late-0.6b") == 0);
+        TEST_ASSERT(cJSON_IsString(model) && strcmp(model->valuestring, "late-main") == 0);
         TEST_ASSERT(cJSON_IsArray(results) && cJSON_GetArraySize(results) == 2);
         double previous = INFINITY;
         int seen[3] = {0};
@@ -1025,7 +1082,7 @@ static void test_http_rerank(int port) {
     body = NULL;
 
     TEST_ASSERT(http_req(port, "POST", "/v1/rerank", TEST_API_KEY,
-                         "{\"model\":\"pplx-embed-v1-late-0.6b\","
+                         "{\"model\":\"late-main\","
                          "\"query\":\"hello\","
                          "\"documents\":[\"hello\",\"world\"],\"top_k\":1}",
                          NULL, &body) == 200);
@@ -1081,6 +1138,7 @@ static void test_http_server(void) {
         tm_write_late_projection(late_dir, "F32", 128, 1024) != 0 ||
         tf_write_vocab(embed_dir) != 0 ||
         tm_write_qwen3_model_dims(embed_dir, "F32", &dims, TF_EOT_ID) != 0 ||
+        write_query_prompt_config(embed_dir, TEST_QWEN3_QUERY_INSTRUCT) != 0 ||
         tf_write_vocab(gte_dir) != 0 ||
         tm_write_qwen2_model_dims(gte_dir, "F32", &gte_dims, TF_EOT_ID, 0) != 0) {
         fprintf(stderr, "FAIL: fixture write\n");
@@ -1095,16 +1153,27 @@ static void test_http_server(void) {
     memset(&ctx, 0, sizeof(ctx));
     /* Both 0.6b slots serve the same tiny weights; the contextual slot
      * resolves its separator from the fixture's <|endoftext|>. */
-    ctx.spec[0].id = "pplx-embed-v1-0.6b";
+    ctx.spec[0].id = "std-main";
     ctx.spec[0].path = dir;
-    ctx.spec[1].id = "pplx-embed-context-v1-0.6b";
+    ctx.spec[0].api = EMBED_SERVER_API_PERPLEXITY;
+    ctx.spec[0].min_dim = 128;
+    ctx.spec[1].id = "ctx-main";
     ctx.spec[1].path = dir;
-    ctx.spec[2].id = "pplx-embed-v1-late-0.6b";
+    ctx.spec[1].kind = EMBED_SERVER_MODEL_CONTEXTUAL;
+    ctx.spec[1].api = EMBED_SERVER_API_PERPLEXITY;
+    ctx.spec[1].min_dim = 128;
+    ctx.spec[2].id = "late-main";
     ctx.spec[2].path = late_dir;
-    ctx.spec[3].id = "Qwen3-Embedding-0.6B";
+    ctx.spec[2].kind = EMBED_SERVER_MODEL_LATE;
+    ctx.spec[2].api = EMBED_SERVER_API_PERPLEXITY;
+    ctx.spec[2].min_dim = 128;
+    ctx.spec[3].id = "qwen-search";
     ctx.spec[3].path = embed_dir;
-    ctx.spec[4].id = "gte-Qwen2-1.5B-instruct";
+    ctx.spec[3].min_dim = 32;
+    ctx.spec[4].id = "gte-search";
     ctx.spec[4].path = gte_dir;
+    ctx.spec[4].min_dim = 1536;
+    ctx.spec[4].query_instruct = TEST_GTE_QUERY_INSTRUCT;
     ctx.cfg.models = ctx.spec;
     ctx.cfg.n_models = 5;
     ctx.cfg.port = port;
@@ -1154,7 +1223,7 @@ int main(void) {
     test_append_embedding_value_float();
     test_encoding_from_root_family();
     test_text_type();
-    test_model_registry();
+    test_loaded_model_lookup();
     test_collect_job_batch_deadline();
     test_collect_job_batch_zero_wait();
     test_http_server();
