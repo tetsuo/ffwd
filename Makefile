@@ -44,6 +44,19 @@ ifeq ($(strip $(CJSON_LDFLAGS)),-lcjson)
 endif
 endif
 
+# OpenBLAS lives in different places across distros (/usr/include/openblas on
+# Debian/Ubuntu, plain /usr/include on Arch/Alpine, openblas-openmp variants).
+# Prefer pkg-config and fall back to the Debian layout so existing setups keep
+# working. Used by the Linux/CUDA backends and the test/bench BLAS flags below.
+OPENBLAS_CFLAGS  ?= $(shell sh -c 'pkg-config --cflags openblas 2>/dev/null')
+OPENBLAS_LDFLAGS ?= $(shell sh -c 'pkg-config --libs openblas 2>/dev/null')
+ifeq ($(strip $(OPENBLAS_CFLAGS)),)
+    OPENBLAS_CFLAGS = -I/usr/include/openblas
+endif
+ifeq ($(strip $(OPENBLAS_LDFLAGS)),)
+    OPENBLAS_LDFLAGS = -lopenblas
+endif
+
 BACKEND ?= cpu
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
 MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
@@ -58,21 +71,29 @@ BACKEND_LDFLAGS = -framework Accelerate -framework Metal -framework Foundation \
                   -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
 EXTRA_OBJS = src/mlx.o
 else ifeq ($(BACKEND),cuda)
-BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_HOME)/include
-BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 -lopenblas -lcudart -lcublas
+BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA $(OPENBLAS_CFLAGS) -I$(CUDA_HOME)/include
+BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 $(OPENBLAS_LDFLAGS) -lcudart -lcublas
 EXTRA_OBJS = src/cuda.o
 else ifeq ($(UNAME_S),Darwin)
 BACKEND_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 BACKEND_LDFLAGS = -framework Accelerate
 else
-BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-BACKEND_LDFLAGS = -lopenblas
+BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_CFLAGS)
+BACKEND_LDFLAGS = $(OPENBLAS_LDFLAGS)
 endif
 
 # -Isrc so frontends, tests, and benches resolve the public/internal headers
-# now that every source lives under src/.
-CFLAGS  = $(CFLAGS_BASE) $(BACKEND_CFLAGS) -Isrc
-LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS)
+# now that every source lives under src/. EXTRA_CFLAGS/EXTRA_LDFLAGS are the
+# append points the debug and prof targets use to layer on sanitizers and
+# debug info without dropping the architecture, visibility, or backend flags.
+# -MMD -MP make the compiler emit a .d sidecar per object recording the headers
+# it included (-MP adds phony targets so a deleted header is not a hard error);
+# these are -include'd at the foot of the file so a header edit rebuilds only
+# the objects that use it. They live here, not in CFLAGS_BASE, so the one-shot
+# test/bench compile+link commands (which reuse CFLAGS_BASE) do not emit stray
+# .d files next to their output binaries.
+CFLAGS  = $(CFLAGS_BASE) $(BACKEND_CFLAGS) -Isrc -MMD -MP $(EXTRA_CFLAGS)
+LDFLAGS = -lm -lpthread $(BACKEND_LDFLAGS) $(EXTRA_LDFLAGS)
 
 # Source groups. CORE_SRCS is the engine the tests and benches reuse; keeping it
 # in one variable stops the per-test source lists from drifting apart.
@@ -109,8 +130,8 @@ SHARED_LIB   = libembed.so
 SHARED_FLAGS = -shared
 endif
 
-.PHONY: all cpu mlx cuda gpu test test-bf16 test-safetensors coverage bench \
-        bench-model bench-tokenizer bench-server-utils debug clean help
+.PHONY: all cpu mlx cuda gpu prof test test-bf16 test-safetensors coverage bench \
+        bench-model bench-tokenizer bench-server-utils debug clean help force
 
 all: help
 
@@ -128,13 +149,27 @@ help:
 	@echo "  make bench-server-utils"
 	@echo "                Base64 and server string-buffer microbenchmarks"
 	@echo "  make debug    Debug build"
+	@echo "  make prof     Profiling build"
 	@echo "  make clean    Remove build artifacts"
 
 # =============================================================================
-# Backend builds: clean, then build both binaries and the shared library.
+# Backend builds: build both binaries and the shared library for one backend.
 # =============================================================================
+# Switching BACKEND changes CFLAGS but not the source mtimes, so Make alone
+# would relink stale objects on a backend switch. The .backend stamp below
+# tracks the active backend so these targets keep incremental builds within a
+# backend and still rebuild correctly across one.
 cpu mlx cuda:
-	$(MAKE) clean && $(MAKE) BACKEND=$@ $(TARGET) $(SERVER_TARGET) $(SHARED_LIB)
+	$(MAKE) BACKEND=$@ $(TARGET) $(SERVER_TARGET) $(SHARED_LIB)
+
+# Stamp recording the backend the current objects were built for. `force` makes
+# the recipe run every build, but it rewrites the file (bumping its mtime) only
+# when BACKEND actually changed - so the engine objects, which list it as a
+# prerequisite, rebuild on a switch and stay untouched otherwise.
+.backend: force
+	@cur=`cat $@ 2>/dev/null || true`; \
+	 [ "$$cur" = "$(BACKEND)" ] || { echo "$(BACKEND)" > $@; }
+force:
 
 ifeq ($(UNAME_S),Darwin)
 gpu: mlx
@@ -147,29 +182,37 @@ endif
 # =============================================================================
 # Generic rule for the plain core/kernel/tokenizer/safetensors/mlx objects.
 # Sibling headers in src/ resolve via the quote-include search; -Isrc (in
-# CFLAGS) makes it explicit. -arch=native for CUDA targets the GPU at build.
-src/%.o: src/%.c $(HEADERS)
+# CFLAGS) makes it explicit. Header prerequisites come from the -MMD-generated
+# .d files (-include'd at the foot of the file), which track them per object.
+# The .backend prerequisite is attached in bulk further down.
+src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # -fPIC so the same object links into both binaries and the shared library.
 src/cuda.o: src/cuda.cu src/cuda.h src/internal.h src/embed.h
-	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC,-fvisibility=hidden -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -Isrc -I/usr/include/openblas -I$(CUDA_HOME)/include -x cu -c -o $@ $<
+	$(NVCC) -O3 -std=c++17 -arch=native -Xcompiler -fPIC,-fvisibility=hidden -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -Isrc $(OPENBLAS_CFLAGS) -I$(CUDA_HOME)/include -x cu -c -o $@ $<
 
 # server.c reaches deps/ae via "deps/ae/ae.h", so it needs -I. (repo root).
-src/server.o: src/server.c $(HEADERS) deps/ae/ae.h deps/ae/anet.h
+src/server.o: src/server.c
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae -c -o $@ $<
 
 # Server concern objects: server_internal.h pulls deps/ae/ae.h and cJSON, so
 # they need the same -I. and cJSON flags as server.o (the leaf util/sbuf/base64
 # objects do not include it but are unharmed by the extra search paths).
-$(SERVER_OBJS): src/%.o: src/%.c $(HEADERS) deps/ae/ae.h
+$(SERVER_OBJS): src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(CJSON_CFLAGS) -I. -Ideps/ae -c -o $@ $<
 
-src/cli.o: src/cli.c $(HEADERS)
+src/cli.o: src/cli.c
 	$(CC) $(CFLAGS) $(VERSION_CFLAGS) -c -o $@ $<
 
-deps/ae/%.o: deps/ae/%.c deps/ae/ae.h deps/ae/anet.h deps/ae/monotonic.h
+deps/ae/%.o: deps/ae/%.c
 	$(CC) $(CFLAGS) -Ideps/ae -c -o $@ $<
+
+# Every engine object is built for one backend; attach the .backend stamp to
+# all of them at once (the recipes come from the pattern rules above) so a
+# backend switch invalidates them. cli.o/server.o are listed too because they
+# inline backend-specific paths through the shared headers.
+$(OBJS) $(EXTRA_OBJS) $(SERVER_OBJS) src/cli.o src/server.o: .backend
 
 # =============================================================================
 # Shared library (built by every backend target from the same objects)
@@ -196,8 +239,8 @@ ifeq ($(UNAME_S),Darwin)
 TEST_BLAS_CFLAGS  = -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 TEST_BLAS_LDFLAGS = -framework Accelerate
 else
-TEST_BLAS_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-TEST_BLAS_LDFLAGS = -lopenblas
+TEST_BLAS_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_CFLAGS)
+TEST_BLAS_LDFLAGS = $(OPENBLAS_LDFLAGS)
 endif
 
 # Source lists shared by test and coverage targets so the two cannot drift.
@@ -280,10 +323,8 @@ test-safetensors:
 	    $(TEST_SAFETENSORS_SRCS) -lm -lpthread
 	./tests/test_safetensors
 
-# =============================================================================
 # Test-suite line coverage (requires clang + llvm-cov/llvm-profdata. Writes a
 # per-file text summary to stdout and an HTML report to coverage/html/index.html.)
-# =============================================================================
 COV_DIR   = coverage
 # Source-based coverage; -O0 so no line is folded away by the optimizer.
 COV_FLAGS = -fprofile-instr-generate -fcoverage-mapping -O0 \
@@ -370,16 +411,14 @@ bench-tokenizer:
 	    bench/bench_tokenizer.c $(TOKENIZER_SRCS) $(KERNEL_SRCS) -lm -lpthread
 	@echo "run: bench/bench_tokenizer <model_dir-or-vocab.json> [runs] TEXT..."
 
-# =============================================================================
 # Regression microbenchmarks (see bench/bench.h). Each run records a JSON
 # sample set under bench/results/, keyed by commit; compare two records with
 # tools/benchstat.py to see if a change helped or hurt.
-# =============================================================================
-# Dirtiness ignores .gitignore so local-only ignore entries do not mark
-# every record as -dirty.
 BENCH_STAMP = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet -- ':!.gitignore' 2>/dev/null || echo -dirty)-$(shell date +%Y%m%d-%H%M%S)
 BENCH_CC_FLAGS = -Wall -Wextra $(CFLAGS_BASE) $(TEST_BLAS_CFLAGS) -Isrc
-BENCH_SERVER_UTILS_BIN ?= /private/tmp/embed-bench-server-utils
+# In-tree alongside the other bench binaries (cleaned by `make clean`) so the
+# default works on any OS; the old /private/tmp default existed only on macOS.
+BENCH_SERVER_UTILS_BIN ?= bench/bench_server_utils
 BENCH_ARGS ?=
 
 bench:
@@ -404,24 +443,38 @@ bench-server-utils:
 	$(BENCH_SERVER_UTILS_BIN) $(BENCH_ARGS)
 
 # =============================================================================
-# Debug build
+# Debug and profiling builds
 # =============================================================================
+# Both layer extra flags onto the normal build through EXTRA_CFLAGS/EXTRA_LDFLAGS.
+# Backend defaults to cpu; override with BACKEND=mlx or BACKEND=cuda.
 SANITIZE ?= address,undefined
+DEBUG_CFLAGS  = -pedantic -fno-omit-frame-pointer -g -O0 -DDEBUG -fsanitize=$(SANITIZE)
+DEBUG_LDFLAGS = -fsanitize=$(SANITIZE)
 
-debug: CFLAGS  = -Wall -Wextra -g -O0 -DDEBUG -Isrc -fsanitize=$(SANITIZE)
-debug: LDFLAGS  = -lm -lpthread -fsanitize=$(SANITIZE)
-debug:
-	$(MAKE) clean
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+debug: clean
+	$(MAKE) BACKEND=$(BACKEND) \
+	    EXTRA_CFLAGS="$(DEBUG_CFLAGS)" EXTRA_LDFLAGS="$(DEBUG_LDFLAGS)" \
+	    $(TARGET) $(SERVER_TARGET) $(SHARED_LIB)
+
+prof: clean
+	$(MAKE) BACKEND=$(BACKEND) \
+	    EXTRA_CFLAGS="-g -fno-omit-frame-pointer" \
+	    $(TARGET) $(SERVER_TARGET) $(SHARED_LIB)
+
 
 # =============================================================================
 clean:
-	rm -f src/*.o deps/ae/*.o \
+	rm -f src/*.o src/*.d deps/ae/*.o deps/ae/*.d .backend \
 	      $(TARGET) $(SERVER_TARGET) $(LIB) libembed.dylib libembed.so \
 	      tests/test_kernels_generic tests/test_kernels_blas \
 	      tests/test_safetensors tests/test_bf16_model tests/test_server \
 	      tests/test_qwen3 tests/test_qwen2 tests/test_cls tests/test_xlm_roberta \
 	      tests/test_tokenizer tests/test_wordpiece tests/test_sentencepiece \
 	      tests/test_workspace tests/test_cli tests/test_late \
-	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels bench/bench_model
+	      tests/cli_under_test bench/bench_tokenizer bench/bench_kernels \
+	      bench/bench_model bench/bench_server_utils
 	rm -rf $(COV_DIR)
+
+# Per-object header dependencies emitted by -MMD -MP. Missing on a clean tree;
+# -include ignores them until the first build creates them.
+-include $(OBJS:.o=.d) $(EXTRA_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) src/cli.d src/server.d
