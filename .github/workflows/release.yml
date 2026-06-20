@@ -152,7 +152,7 @@ jobs:
           *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
         esac
 
-        NAME="embed-linux-${ARCH}"
+        NAME="ffwd-linux-${ARCH}"
 
         make cpu \
           ARCH_FLAGS="-march=x86-64" \
@@ -163,7 +163,7 @@ jobs:
           BUILD_ARCH="$ARCH"
 
         mkdir -p "tmp/$NAME"
-        cp embed embed-server LICENSE README.md "tmp/$NAME/"
+        cp ffwd-cli ffwd-server LICENSE README.md "tmp/$NAME/"
         tar -C tmp -czf "tmp/${NAME}.tar.gz" "$NAME"
 
         cd tmp
@@ -199,7 +199,7 @@ jobs:
         git push origin "$TAG_NAME"
 
         gh release create "$TAG_NAME" \
-          tmp/embed-linux-*.tar.gz \
+          tmp/ffwd-linux-*.tar.gz \
           tmp/SHA256SUMS \
           --title "$TAG_NAME" \
           --generate-notes
