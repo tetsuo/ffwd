@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
-  title: embed.c server API
+  title: ffwd server API
   version: "1.0.0"
   description: >
-    HTTP API served by `embed-server`. Each loaded model has an operator-chosen
+    HTTP API served by `ffwd-server`. Each loaded model has an operator-chosen
     label; request `model` fields match that label. Embedding encoding follows
     the serving API selected at load time (`api=openai` or `api=perplexity`).
     Always compare embeddings with cosine similarity.
@@ -12,7 +12,7 @@ info:
 servers:
   - url: http://127.0.0.1:8000
 # Auth is optional: it applies only when the server is started with --api-key
-# (or EMBED_API_KEY). The empty requirement allows unauthenticated calls.
+# (or FFWD_API_KEY). The empty requirement allows unauthenticated calls.
 security:
   - {}
   - bearerAuth: []
@@ -86,7 +86,7 @@ components:
       properties:
         model:
           type: string
-          description: Served label chosen when starting `embed-server`.
+          description: Served label chosen when starting `ffwd-server`.
           example: qwen
         input:
           description: A single string or an array of up to 512 strings.

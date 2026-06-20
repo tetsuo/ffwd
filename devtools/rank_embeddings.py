@@ -2,7 +2,7 @@
 """Rank stdin JSON embeddings by cosine similarity to a query row.
 
 Usage:
-  ./embed ... --stream <<'EOF' | tools/rank_embeddings.py
+  ./tools/ffwd-cli ... --stream <<'EOF' | ./devtools/rank_embeddings.py
   query: what is the capital of France?
   document: Paris is the capital of France.
   document: Berlin is the capital of Germany.
