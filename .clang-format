@@ -1,0 +1,16 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 102
+PointerAlignment: Right
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossComments: false
+  AcrossEmptyLines: false
+AlignConsecutiveDeclarations:
+  Enabled: false
+ReflowComments: false
+SortIncludes: false
+BreakBeforeBraces: Attach
+BinPackParameters: false
+AlignEscapedNewlines: Left
+IndentPPDirectives: AfterHash
