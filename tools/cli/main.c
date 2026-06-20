@@ -1,0 +1,556 @@
+/* main.c - ffwd-cli command-line tool */
+
+#include "ffwd.h"
+#include "internal.h"
+#include "build.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <limits.h>
+#include <unistd.h>
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s -d <model_dir> [options] [text...]\n"
+            "\n"
+            "Options:\n"
+            "  -d <dir>     Model directory (required)\n"
+            "  --stream     Read lines from stdin, write one JSON embedding per line\n"
+            "  --json       Emit JSON instead of plain text (embedding or matrix)\n"
+            "  -b, --batch-size N\n"
+            "               Max texts per inference batch (default: all; --stream: 1)\n",
+            prog);
+    ffwd_cli_help(stderr);
+    fprintf(stderr,
+            "  -e, --embeddings\n"
+            "               Print raw embeddings (with multiple texts)\n"
+            "  -v, --verbose\n"
+            "               Verbose (-vv for debug)\n"
+            "  -V, --version\n"
+            "               Print version and exit\n"
+            "  --build-info Print build details and exit\n"
+            "  -h           Show this help\n"
+            "\n"
+            "Modes:\n"
+            "  1  text arg     Embedding as space-separated floats (JSON with --json)\n"
+            "  2+ text args    Cosine similarity matrix, one row per line (JSON with --json)\n"
+            "  no args         Batch: read all stdin lines, then similarity matrix\n"
+            "  --stream        Streaming: read stdin lines, write JSON per line\n"
+            "\n"
+            "Examples:\n"
+            "  %s -d ./model \"what is AI?\"\n"
+            "  %s -d ./model --stream < texts.txt\n",
+            prog, prog);
+}
+
+/* ========================================================================
+ * Embed one text: tokenize > forward > return float[dim]
+ * ======================================================================== */
+
+typedef struct {
+    ffwd_t *backend;
+    ffwd_tok_t *tok; /* tokenizer: text -> ids + the model's special tokens */
+    int dim;
+} runner_t;
+
+static void runner_free_tokenizers(runner_t *e) { ffwd_tok_free(e->tok); }
+
+typedef struct {
+    int *ids;
+    int n_tokens;
+} token_buf_t;
+
+static int
+runner_ffwd_batch(runner_t *e, const ffwd_input_t *inputs, int batch, float *out_embeddings) {
+    return ffwd_encode_batch(e->backend, inputs, batch, out_embeddings);
+}
+
+static int tokenize_text(runner_t *e, const char *text, token_buf_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->ids = ffwd_tokenize(e->tok, text, NULL, &out->n_tokens);
+    if (!out->ids) {
+        fprintf(stderr, "tokenization failed: %s\n", text);
+        return -1;
+    }
+
+    if (ffwd_verbose >= 1) {
+        fprintf(stderr, "tokens (%d): ", out->n_tokens);
+        for (int i = 0; i < out->n_tokens && i < 20; i++)
+            fprintf(stderr, "%d ", out->ids[i]);
+        if (out->n_tokens > 20)
+            fprintf(stderr, "...");
+        fprintf(stderr, "\n");
+    }
+    return 0;
+}
+
+static void free_tokens(token_buf_t *tokens, int n) {
+    if (!tokens)
+        return;
+    for (int i = 0; i < n; i++)
+        free(tokens[i].ids);
+}
+
+/* ========================================================================
+ * Output helpers
+ * ======================================================================== */
+
+static void print_embedding_raw(const float *emb, int dim) {
+    for (int i = 0; i < dim; i++) {
+        if (i > 0)
+            putchar(' ');
+        printf("%.8f", (double)emb[i]);
+    }
+    putchar('\n');
+}
+
+/* Single embedding as a JSON array of floats. */
+static void print_embedding_array(const float *emb, int dim) {
+    putchar('[');
+    for (int i = 0; i < dim; i++) {
+        if (i)
+            putchar(',');
+        printf("%.8f", (double)emb[i]);
+    }
+    puts("]");
+}
+
+static size_t runner_workspace_nbytes(const runner_t *e) {
+    return e ? ffwd_scratch_nbytes(e->backend) : 0;
+}
+
+static void
+print_embedding_json(const float *emb, int dim, int n_tokens, double ms, size_t workspace_bytes) {
+    printf("{\"embedding\":[");
+    for (int i = 0; i < dim; i++) {
+        if (i > 0)
+            putchar(',');
+        printf("%.8f", (double)emb[i]);
+    }
+    printf("],\"dim\":%d,\"tokens\":%d,\"ms\":%.1f,\"workspace_bytes\":%zu}\n", dim, n_tokens, ms,
+           workspace_bytes);
+    fflush(stdout);
+}
+
+/* ========================================================================
+ * Stdin mode: read lines from stdin, write JSON to stdout
+ * ======================================================================== */
+
+static int process_stdin_batch(runner_t *e, char **lines, int n_lines) {
+    if (n_lines <= 0)
+        return 0;
+
+    token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_lines, sizeof(token_buf_t));
+    ffwd_input_t *inputs = (ffwd_input_t *)malloc((size_t)n_lines * sizeof(ffwd_input_t));
+    int *input_to_line = (int *)malloc((size_t)n_lines * sizeof(int));
+    float *embs = (float *)malloc((size_t)n_lines * e->dim * sizeof(float));
+    if (!tokens || !inputs || !input_to_line || !embs) {
+        fprintf(stderr, "OOM\n");
+        free(tokens);
+        free(inputs);
+        free(input_to_line);
+        free(embs);
+        for (int i = 0; i < n_lines; i++)
+            printf("{\"error\":\"embedding failed\"}\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    int n_inputs = 0;
+    for (int i = 0; i < n_lines; i++) {
+        if (tokenize_text(e, lines[i], &tokens[i]) == 0) {
+            inputs[n_inputs].ids = tokens[i].ids;
+            inputs[n_inputs].n_tokens = tokens[i].n_tokens;
+            input_to_line[n_inputs] = i;
+            n_inputs++;
+        }
+    }
+
+    double ms = 0.0;
+    int rc = 0;
+    if (n_inputs > 0) {
+        double t0 = now_ms();
+        rc = runner_ffwd_batch(e, inputs, n_inputs, embs);
+        ms = now_ms() - t0;
+        if (ffwd_verbose >= 1)
+            fprintf(stderr, "embed batch: %d texts in %.1f ms\n", n_inputs, ms);
+    }
+
+    int next_valid = 0;
+    for (int i = 0; i < n_lines; i++) {
+        if (!tokens[i].ids) {
+            printf("{\"error\":\"tokenization failed\"}\n");
+            continue;
+        }
+        if (rc != 0) {
+            printf("{\"error\":\"embedding failed\"}\n");
+            continue;
+        }
+        while (next_valid < n_inputs && input_to_line[next_valid] != i)
+            next_valid++;
+        if (next_valid >= n_inputs) {
+            printf("{\"error\":\"embedding failed\"}\n");
+            continue;
+        }
+        print_embedding_json(embs + (size_t)next_valid * e->dim, e->dim, tokens[i].n_tokens, ms,
+                             runner_workspace_nbytes(e));
+        next_valid++;
+    }
+    fflush(stdout);
+
+    free_tokens(tokens, n_lines);
+    free(tokens);
+    free(inputs);
+    free(input_to_line);
+    free(embs);
+    return rc == 0 ? 0 : 1;
+}
+
+static int run_stdin(runner_t *e, int batch_size) {
+    char line[65536];
+    if (batch_size <= 0)
+        batch_size = 1;
+
+    if (ffwd_verbose >= 1)
+        fprintf(stderr, "stdin: ready, reading from stdin (batch_size=%d)\n", batch_size);
+
+    char **batch_lines = (char **)calloc((size_t)batch_size, sizeof(char *));
+    if (!batch_lines) {
+        fprintf(stderr, "OOM\n");
+        return 1;
+    }
+    int n_batch = 0;
+    int rc = 0;
+
+    while (fgets(line, sizeof(line), stdin)) {
+        /* Strip newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0)
+            continue;
+
+        if (ffwd_verbose >= 1)
+            fprintf(stderr, "stdin: \"%.*s%s\"\n", (int)(len > 60 ? 60 : len), line,
+                    len > 60 ? "..." : "");
+
+        batch_lines[n_batch] = strdup(line);
+        if (!batch_lines[n_batch]) {
+            fprintf(stderr, "OOM\n");
+            rc = 1;
+            break;
+        }
+        n_batch++;
+
+        if (n_batch == batch_size) {
+            if (process_stdin_batch(e, batch_lines, n_batch) != 0)
+                rc = 1;
+            for (int i = 0; i < n_batch; i++) {
+                free(batch_lines[i]);
+                batch_lines[i] = NULL;
+            }
+            n_batch = 0;
+        }
+    }
+
+    if (n_batch > 0) {
+        if (process_stdin_batch(e, batch_lines, n_batch) != 0)
+            rc = 1;
+        for (int i = 0; i < n_batch; i++)
+            free(batch_lines[i]);
+    }
+    free(batch_lines);
+
+    if (ffwd_verbose >= 1)
+        fprintf(stderr, "stdin: EOF\n");
+
+    return rc;
+}
+
+/* ========================================================================
+ * Batch mode: embed args or stdin lines, then print similarity or vectors
+ * ======================================================================== */
+
+static int append_text(char ***texts, int *n_texts, int *cap, const char *s) {
+    if (*n_texts == *cap) {
+        int new_cap = *cap ? *cap * 2 : 8;
+        char **new_texts = (char **)realloc(*texts, (size_t)new_cap * sizeof(char *));
+        if (!new_texts)
+            return -1;
+        *texts = new_texts;
+        *cap = new_cap;
+    }
+
+    (*texts)[*n_texts] = strdup(s);
+    if (!(*texts)[*n_texts])
+        return -1;
+    (*n_texts)++;
+    return 0;
+}
+
+/* Cosine similarity matrix. --json emits a JSON array of rows; otherwise one
+ * row of space-separated values per line. With print_embs the raw embeddings
+ * follow, one per line after a blank line (plain-text output only). */
+static void print_matrix(const float *embs, int n, int dim, int json, int print_embs) {
+    if (json) {
+        putchar('[');
+        for (int i = 0; i < n; i++) {
+            if (i)
+                putchar(',');
+            putchar('[');
+            for (int j = 0; j < n; j++) {
+                if (j)
+                    putchar(',');
+                printf("%.6f", (double)ffwd_cosine_similarity(embs + (size_t)i * dim,
+                                                                 embs + (size_t)j * dim, dim));
+            }
+            putchar(']');
+        }
+        puts("]");
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            if (j)
+                putchar(' ');
+            printf("%.6f", (double)ffwd_cosine_similarity(embs + (size_t)i * dim,
+                                                             embs + (size_t)j * dim, dim));
+        }
+        putchar('\n');
+    }
+    if (print_embs) {
+        putchar('\n');
+        for (int i = 0; i < n; i++)
+            print_embedding_raw(embs + (size_t)i * dim, dim);
+    }
+}
+
+static int run_batch(
+    runner_t *e, int argc, char **argv, int arg_start, int print_embs, int batch_size, int json) {
+    int n_texts = 0, cap = 0;
+    char **texts = NULL;
+    int rc = 0;
+
+    if (arg_start < argc) {
+        for (int i = arg_start; i < argc; i++) {
+            if (append_text(&texts, &n_texts, &cap, argv[i]) != 0)
+                goto oom_texts;
+        }
+    } else {
+        char line[65536];
+        while (fgets(line, sizeof(line), stdin)) {
+            size_t l = strlen(line);
+            while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+                line[--l] = '\0';
+            if (l == 0)
+                continue;
+            if (append_text(&texts, &n_texts, &cap, line) != 0)
+                goto oom_texts;
+        }
+    }
+
+    if (n_texts == 0) {
+        fprintf(stderr, "no input texts\n");
+        free(texts);
+        return 1;
+    }
+
+    int dim = e->dim;
+    token_buf_t *tokens = (token_buf_t *)calloc((size_t)n_texts, sizeof(token_buf_t));
+    ffwd_input_t *inputs = (ffwd_input_t *)malloc((size_t)n_texts * sizeof(ffwd_input_t));
+    float *embs = (float *)malloc((size_t)n_texts * dim * sizeof(float));
+    if (!tokens || !inputs || !embs) {
+        fprintf(stderr, "OOM\n");
+        free(tokens);
+        free(inputs);
+        free(embs);
+        for (int i = 0; i < n_texts; i++)
+            free(texts[i]);
+        free(texts);
+        return 1;
+    }
+
+    for (int i = 0; i < n_texts; i++) {
+        if (ffwd_verbose >= 1)
+            fprintf(stderr, "[%d/%d] \"%s\"\n", i + 1, n_texts, texts[i]);
+        if (tokenize_text(e, texts[i], &tokens[i]) != 0) {
+            rc = 1;
+            goto done;
+        }
+        inputs[i].ids = tokens[i].ids;
+        inputs[i].n_tokens = tokens[i].n_tokens;
+    }
+
+    int max_batch = batch_size > 0 ? batch_size : n_texts;
+    for (int start = 0; start < n_texts; start += max_batch) {
+        int cur = n_texts - start;
+        if (cur > max_batch)
+            cur = max_batch;
+
+        double t0 = now_ms();
+        if (runner_ffwd_batch(e, inputs + start, cur, embs + (size_t)start * dim) != 0) {
+            fprintf(stderr, "forward pass failed\n");
+            rc = 1;
+            goto done;
+        }
+        if (ffwd_verbose >= 1)
+            fprintf(stderr, "embed batch: [%d..%d] %d texts in %.1f ms\n", start, start + cur - 1,
+                    cur, now_ms() - t0);
+    }
+
+    if (n_texts == 1) {
+        if (json)
+            print_embedding_array(embs, dim);
+        else
+            print_embedding_raw(embs, dim);
+    } else {
+        print_matrix(embs, n_texts, dim, json, print_embs);
+    }
+
+done:
+    free_tokens(tokens, n_texts);
+    for (int i = 0; i < n_texts; i++)
+        free(texts[i]);
+    free(texts);
+    free(tokens);
+    free(inputs);
+    free(embs);
+    return rc;
+
+oom_texts:
+    fprintf(stderr, "OOM\n");
+    for (int i = 0; i < n_texts; i++)
+        free(texts[i]);
+    free(texts);
+    return 1;
+}
+
+/* ========================================================================
+ * Main
+ * ======================================================================== */
+
+int main(int argc, char *argv[]) {
+    const char *model_dir = NULL;
+    int print_embs = 0;
+    int verbose = 0;
+    int stdin_mode = 0;
+    int batch_size = 0;
+    int json = 0;
+    const char *prog = ffwd_prog_name(argv[0]);
+    /* All backend tuning flags parse unconditionally into opts; each backend
+     * uses the fields it understands and ignores the rest. */
+    ffwd_options_t opts = {.gpu_quant_group_size = 64};
+
+    int arg_start = 1;
+    while (arg_start < argc && argv[arg_start][0] == '-') {
+        const char *f = argv[arg_start];
+        if (!strcmp(f, "-d")) {
+            model_dir = argv[++arg_start];
+        } else if (!strcmp(f, "-V") || !strcmp(f, "--version")) {
+            ffwd_print_version(prog);
+            return 0;
+        } else if (!strcmp(f, "--build-info")) {
+            ffwd_print_build_info(prog);
+            return 0;
+        } else if (!strcmp(f, "-t") || !strcmp(f, "--threads")) {
+            opts.n_threads = atoi(argv[++arg_start]);
+        } else if (!strcmp(f, "-b") || !strcmp(f, "--batch-size")) {
+            batch_size = atoi(argv[++arg_start]);
+        } else if (!strcmp(f, "--json")) {
+            json = 1;
+        } else if (!strcmp(f, "--gpu-quant-bits")) {
+            opts.gpu_quant_bits = atoi(argv[++arg_start]);
+        } else if (!strcmp(f, "--gpu-quant-group-size")) {
+            opts.gpu_quant_group_size = atoi(argv[++arg_start]);
+        } else if (!strcmp(f, "--gpu-gemm-mode")) {
+            opts.gpu_gemm_mode = argv[++arg_start];
+        } else if (!strcmp(f, "--gpu-weight-dtype")) {
+            opts.gpu_weight_dtype = argv[++arg_start];
+        } else if (!strcmp(f, "-e") || !strcmp(f, "--embeddings")) {
+            print_embs = 1;
+        } else if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) {
+            verbose++;
+        } else if (!strcmp(f, "-vv")) {
+            verbose = 2;
+        } else if (!strcmp(f, "--stream")) {
+            stdin_mode = 1;
+        } else if (!strcmp(f, "-h") || !strcmp(f, "--help")) {
+            print_usage(prog);
+            return 0;
+        } else if (!strcmp(f, "--")) {
+            /* End of options: everything after is positional text, even if it
+             * starts with a dash. */
+            arg_start++;
+            break;
+        } else if (f[0] == '-' && f[1] == '-') {
+            /* An unrecognized --option is a hard error, not silently-embedded
+             * text. Catches typos and stale flags (e.g. the removed --backend)
+             * loudly instead of running the default path or embedding the flag. */
+            fprintf(stderr, "unknown option: %s\n", f);
+            print_usage(prog);
+            return 1;
+        } else
+            break;
+        arg_start++;
+    }
+
+    ffwd_verbose = verbose;
+
+    if (!model_dir || !model_dir[0]) {
+        fprintf(stderr, "model directory required (-d <dir>)\n");
+        print_usage(prog);
+        return 1;
+    }
+
+    char err[256];
+    if (ffwd_init(&opts, err, sizeof(err)) != 0) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+
+    /* Tokenizer (file probe + special-token layout) is owned by libffwd */
+    runner_t e = {0};
+    double t0 = now_ms();
+    e.tok = ffwd_tok_open(model_dir, 0, err, sizeof(err));
+    if (!e.tok) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+    if (verbose >= 1)
+        fprintf(stderr, "Tokenizer: %.0f ms\n", now_ms() - t0);
+
+    /* Model */
+    t0 = now_ms();
+    e.backend = ffwd_open(model_dir, 0, &opts, err, sizeof(err));
+    if (!e.backend || ffwd_activate(e.backend, err, sizeof(err)) != 0) {
+        fprintf(stderr, "%s\n", err);
+        ffwd_free(e.backend);
+        runner_free_tokenizers(&e);
+        return 1;
+    }
+    e.dim = ffwd_config(e.backend)->hidden_size;
+    ffwd_tok_set_append_terminal(e.tok, ffwd_config(e.backend)->append_terminal_token);
+    if (verbose >= 1)
+        fprintf(stderr, "Model: %d-dim, %.0f ms\n", e.dim, now_ms() - t0);
+
+    /* Run */
+    int rc;
+    if (stdin_mode)
+        rc = run_stdin(&e, batch_size > 0 ? batch_size : 1);
+    else
+        rc = run_batch(&e, argc, argv, arg_start, print_embs, batch_size, json);
+
+    /* Cleanup */
+    ffwd_free(e.backend);
+    runner_free_tokenizers(&e);
+    return rc;
+}
