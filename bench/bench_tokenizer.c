@@ -1,17 +1,15 @@
 /* bench/bench_tokenizer.c - tokenizer encode-path benchmark.
  * Build via `make bench-tokenizer`; accepts a model dir or vocab.json. */
 
-#include "tokenizer_bpe.h"
-#include "tokenizer_sentencepiece.h"
-#include "tokenizer_wordpiece.h"
+#include "bpe.h"
+#include "sentencepiece.h"
+#include "wordpiece.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-
-int embed_verbose = 0;
 
 static double now_ms(void) {
     struct timespec ts;
@@ -50,8 +48,8 @@ static int load_tokenizer(bench_tok_t *bt, const char *path) {
     snprintf(p, sizeof(p), "%s/vocab.txt", path);
     if (path_exists(p)) {
         bt->kind = TOK_WORDPIECE;
-        bt->tok = wordpiece_tokenizer_load(path);
-        bt->ws = wordpiece_workspace_new();
+        bt->tok = tok_wp_load(path);
+        bt->ws = tok_wp_workspace_new();
         return bt->tok && bt->ws ? 0 : -1;
     }
     snprintf(p, sizeof(p), "%s/sentencepiece.bpe.model", path);
@@ -62,8 +60,8 @@ static int load_tokenizer(bench_tok_t *bt, const char *path) {
     }
     if (path_exists(p)) {
         bt->kind = TOK_SENTENCEPIECE;
-        bt->tok = sentencepiece_tokenizer_load(path);
-        bt->ws = sentencepiece_workspace_new();
+        bt->tok = tok_spm_load(path);
+        bt->ws = tok_spm_workspace_new();
         return bt->tok && bt->ws ? 0 : -1;
     }
     bt->kind = TOK_BPE;
@@ -71,64 +69,63 @@ static int load_tokenizer(bench_tok_t *bt, const char *path) {
     snprintf(p, sizeof(p), "%s/vocab.json", path);
     if (path_exists(p))
         vocab = p;
-    bt->tok = embed_tokenizer_load(vocab);
-    bt->ws = embed_tokenizer_workspace_new();
+    bt->tok = tok_bpe_load(vocab);
+    bt->ws = tok_bpe_workspace_new();
     return bt->tok && bt->ws ? 0 : -1;
 }
 
 static int *tok_encode(bench_tok_t *bt, const char *text, int *n) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        return wordpiece_tokenizer_encode((wordpiece_tokenizer_t *)bt->tok, text, n);
+        return tok_wp_encode((tok_wp_t *)bt->tok, text, n);
     case TOK_SENTENCEPIECE:
-        return sentencepiece_tokenizer_encode((sentencepiece_tokenizer_t *)bt->tok, text, n);
+        return tok_spm_encode((tok_spm_t *)bt->tok, text, n);
     default:
-        return embed_tokenizer_encode((embed_tokenizer_t *)bt->tok, text, n);
+        return tok_bpe_encode((tok_bpe_t *)bt->tok, text, n);
     }
 }
 
 static int *tok_encode_ws(bench_tok_t *bt, const char *text, int *n) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        return wordpiece_tokenizer_encode_with_workspace((wordpiece_tokenizer_t *)bt->tok,
-                                                         (wordpiece_workspace_t *)bt->ws, text, n);
+        return tok_wp_encode_with_workspace((tok_wp_t *)bt->tok,
+                                            (tok_wp_workspace_t *)bt->ws, text, n);
     case TOK_SENTENCEPIECE:
-        return sentencepiece_tokenizer_encode_with_workspace(
-            (sentencepiece_tokenizer_t *)bt->tok, (sentencepiece_workspace_t *)bt->ws, text, n);
+        return tok_spm_encode_with_workspace(
+            (tok_spm_t *)bt->tok, (tok_spm_workspace_t *)bt->ws, text, n);
     default:
-        return embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)bt->tok,
-                                                     (embed_tokenizer_workspace_t *)bt->ws, text, n);
+        return tok_bpe_encode_with_workspace((tok_bpe_t *)bt->tok,
+                                             (tok_bpe_workspace_t *)bt->ws, text, n);
     }
 }
 
 static int tok_encode_into(bench_tok_t *bt, const char *text, int *out, int cap, int *n) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        return wordpiece_tokenizer_encode_into((wordpiece_tokenizer_t *)bt->tok,
-                                               (wordpiece_workspace_t *)bt->ws, text, out, cap, n);
+        return tok_wp_encode_into((tok_wp_t *)bt->tok,
+                                  (tok_wp_workspace_t *)bt->ws, text, out, cap, n);
     case TOK_SENTENCEPIECE:
-        return sentencepiece_tokenizer_encode_into((sentencepiece_tokenizer_t *)bt->tok,
-                                                   (sentencepiece_workspace_t *)bt->ws, text, out,
-                                                   cap, n);
+        return tok_spm_encode_into((tok_spm_t *)bt->tok,
+                                   (tok_spm_workspace_t *)bt->ws, text, out, cap, n);
     default:
-        return embed_tokenizer_encode_into((embed_tokenizer_t *)bt->tok,
-                                           (embed_tokenizer_workspace_t *)bt->ws, text, out, cap, n);
+        return tok_bpe_encode_into((tok_bpe_t *)bt->tok,
+                                   (tok_bpe_workspace_t *)bt->ws, text, out, cap, n);
     }
 }
 
 static void free_tokenizer(bench_tok_t *bt) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        wordpiece_workspace_free((wordpiece_workspace_t *)bt->ws);
-        wordpiece_tokenizer_free((wordpiece_tokenizer_t *)bt->tok);
+        tok_wp_workspace_free((tok_wp_workspace_t *)bt->ws);
+        tok_wp_free((tok_wp_t *)bt->tok);
         break;
     case TOK_SENTENCEPIECE:
-        sentencepiece_workspace_free((sentencepiece_workspace_t *)bt->ws);
-        sentencepiece_tokenizer_free((sentencepiece_tokenizer_t *)bt->tok);
+        tok_spm_workspace_free((tok_spm_workspace_t *)bt->ws);
+        tok_spm_free((tok_spm_t *)bt->tok);
         break;
     default:
-        embed_tokenizer_workspace_free((embed_tokenizer_workspace_t *)bt->ws);
-        embed_tokenizer_free((embed_tokenizer_t *)bt->tok);
+        tok_bpe_workspace_free((tok_bpe_workspace_t *)bt->ws);
+        tok_bpe_free((tok_bpe_t *)bt->tok);
         break;
     }
 }

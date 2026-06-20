@@ -4,15 +4,14 @@
  * 8 KV heads x head_dim 128, intermediate 3072) so a slowdown here predicts
  * a slowdown in inference. Single-threaded by default for stable numbers;
  * --threads N opts into the pool. Build and record via `make bench`,
- * compare records with tools/benchstat.py.
+ * compare records with bench/benchstat.py.
  */
 
 #include "bench.h"
 #include "kernels.h"
+#include "threadpool.h"
 
 #include <stdint.h>
-
-int embed_verbose = 0; /* defined by embed.c in full builds */
 
 enum {
     HIDDEN = 1024,
@@ -71,7 +70,7 @@ static void bm_linear_f32(bench_state_t *b, int seq, int in, int out) {
     float *y = alloc_f32((size_t)seq * out, 3);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_linear_nobias(y, x, w, seq, in, out);
+        linear_nobias(y, x, w, seq, in, out);
     bench_sink += y[0];
     free(y);
     free(w);
@@ -91,7 +90,7 @@ static void bm_linear_bf16(bench_state_t *b, int seq, int in, int out) {
     float *y = alloc_f32((size_t)seq * out, 6);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_linear_nobias_bf16(y, x, w, seq, in, out);
+        linear_nobias_bf16(y, x, w, seq, in, out);
     bench_sink += y[0];
     free(y);
     free(w);
@@ -111,7 +110,7 @@ static void bm_qkv_bf16(bench_state_t *b) {
     float *v = alloc_f32((size_t)SEQ * KV_DIM, 13);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_linear_nobias_bf16_qkv(q, k, v, x, wq, wk, wv, SEQ, HIDDEN, Q_DIM, KV_DIM);
+        linear_nobias_bf16_qkv(q, k, v, x, wq, wk, wv, SEQ, HIDDEN, Q_DIM, KV_DIM);
     bench_sink += q[0] + k[0] + v[0];
     free(v);
     free(k);
@@ -128,7 +127,7 @@ static void bm_bf16_widen(bench_state_t *b) {
     float *dst = alloc_f32(n, 15);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_bf16_to_f32_buf(dst, src, n);
+        bf16_to_f32_buf(dst, src, n);
     bench_sink += dst[0];
     free(dst);
     free(src);
@@ -143,7 +142,7 @@ static void bm_attn_scores(bench_state_t *b) {
     float *s = alloc_f32((size_t)ATTN_SEQ * ATTN_SEQ, 18);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_matmul_t(s, qm, km, ATTN_SEQ, HEAD_DIM, ATTN_SEQ);
+        matmul_t(s, qm, km, ATTN_SEQ, HEAD_DIM, ATTN_SEQ);
     bench_sink += s[0];
     free(s);
     free(km);
@@ -154,7 +153,7 @@ static void bm_softmax(bench_state_t *b) {
     float *x = alloc_f32((size_t)ATTN_SEQ * ATTN_SEQ, 19);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_softmax(x, ATTN_SEQ, ATTN_SEQ);
+        softmax(x, ATTN_SEQ, ATTN_SEQ);
     bench_sink += x[0];
     free(x);
 }
@@ -165,7 +164,7 @@ static void bm_rope(bench_state_t *b) {
     float *sinv = alloc_f32((size_t)ATTN_SEQ * HEAD_DIM, 22);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_apply_rope_neox(x, cosv, sinv, ATTN_SEQ, Q_DIM / HEAD_DIM, HEAD_DIM);
+        apply_rope_neox(x, cosv, sinv, ATTN_SEQ, Q_DIM / HEAD_DIM, HEAD_DIM);
     bench_sink += x[0];
     free(sinv);
     free(cosv);
@@ -180,7 +179,7 @@ static void bm_rms_norm(bench_state_t *b) {
     float *y = alloc_f32((size_t)SEQ * HIDDEN, 25);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        embed_rms_norm(y, x, w, SEQ, HIDDEN, 1e-6f);
+        rms_norm(y, x, w, SEQ, HIDDEN, 1e-6f);
     bench_sink += y[0];
     free(y);
     free(w);
@@ -197,7 +196,7 @@ static void bm_silu_mul(bench_state_t *b) {
     bench_begin(b);
     for (long i = 0; i < b->n; i++) {
         memcpy(gate, gate0, n * sizeof(float));
-        embed_silu_mul_inplace(gate, up, (int)n);
+        silu_mul_inplace(gate, up, (int)n);
     }
     bench_sink += gate[0];
     free(up);
@@ -210,7 +209,7 @@ static void bm_dot(bench_state_t *b) {
     float *y = alloc_f32(HIDDEN, 29);
     bench_begin(b);
     for (long i = 0; i < b->n; i++)
-        bench_sink += embed_dot_f32(x, y, HIDDEN);
+        bench_sink += dot_f32(x, y, HIDDEN);
     free(y);
     free(x);
 }
@@ -240,7 +239,7 @@ int main(int argc, char **argv) {
     }
     if (threads < 1)
         threads = 1;
-    embed_set_threads(threads);
+    tp_set_threads(threads);
 
     char meta[128];
 #ifdef USE_BLAS

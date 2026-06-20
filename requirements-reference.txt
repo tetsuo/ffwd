@@ -1,0 +1,5 @@
+numpy==2.4.6
+onnxruntime==1.26.0
+sentence-transformers==5.5.1
+torch==2.12.0
+transformers==5.4.0

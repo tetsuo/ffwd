@@ -10,16 +10,16 @@
  */
 
 #include "bench.h"
-#include "embed.h"
-#include "kernels.h"
+#include "internal.h"
+#include "threadpool.h"
 
-static embed_model_t *g_model;
-static embed_workspace_t *g_ws;
+static ffwd_model_t *g_model;
+static ffwd_workspace_t *g_ws;
 static int g_hidden;
 
 enum { MAX_BATCH = 8 };
 
-static void bm_embed(bench_state_t *b, int batch, int len) {
+static void bm_ffwd(bench_state_t *b, int batch, int len) {
     int *ids = (int *)malloc((size_t)batch * len * sizeof(int));
     float *out = (float *)malloc((size_t)batch * g_hidden * sizeof(float));
     if (!ids || !out)
@@ -29,14 +29,14 @@ static void bm_embed(bench_state_t *b, int batch, int len) {
         s = s * 1664525u + 1013904223u;
         ids[i] = (int)(s % 1000u); /* ordinary vocab rows */
     }
-    embed_input_t inputs[MAX_BATCH];
+    ffwd_input_t inputs[MAX_BATCH];
     for (int i = 0; i < batch; i++) {
         inputs[i].ids = ids + (size_t)i * len;
         inputs[i].n_tokens = len;
     }
     bench_begin(b);
     for (long i = 0; i < b->n; i++) {
-        if (embed_model_encode_batch(g_model, g_ws, inputs, batch, out) != 0)
+        if (ffwd_model_encode_batch(g_model, g_ws, inputs, batch, out) != 0)
             exit(2);
         bench_sink += out[0];
     }
@@ -44,14 +44,14 @@ static void bm_embed(bench_state_t *b, int batch, int len) {
     free(ids);
 }
 
-static void bm_embed_b1_len32(bench_state_t *b) { bm_embed(b, 1, 32); }
-static void bm_embed_b8_len32(bench_state_t *b) { bm_embed(b, 8, 32); }
-static void bm_embed_b1_len256(bench_state_t *b) { bm_embed(b, 1, 256); }
+static void bm_ffwd_b1_len32(bench_state_t *b) { bm_ffwd(b, 1, 32); }
+static void bm_ffwd_b8_len32(bench_state_t *b) { bm_ffwd(b, 8, 32); }
+static void bm_ffwd_b1_len256(bench_state_t *b) { bm_ffwd(b, 1, 256); }
 
 static const bench_case_t CASES[] = {
-    {"embed/b1_len32", bm_embed_b1_len32},
-    {"embed/b8_len32", bm_embed_b8_len32},
-    {"embed/b1_len256", bm_embed_b1_len256},
+    {"ffwd/b1_len32", bm_ffwd_b1_len32},
+    {"ffwd/b8_len32", bm_ffwd_b8_len32},
+    {"ffwd/b1_len256", bm_ffwd_b1_len256},
 };
 
 int main(int argc, char **argv) {
@@ -67,19 +67,19 @@ int main(int argc, char **argv) {
     }
     if (threads < 1)
         threads = 1;
-    embed_set_threads(threads);
+    tp_set_threads(threads);
 
-    g_model = embed_model_load(argv[1]);
+    g_model = ffwd_model_load(argv[1]);
     if (!g_model) {
         fprintf(stderr, "failed to load model from %s\n", argv[1]);
         return 1;
     }
-    g_ws = embed_workspace_new(g_model);
+    g_ws = ffwd_workspace_new(g_model);
     if (!g_ws) {
-        embed_model_free(g_model);
+        ffwd_model_free(g_model);
         return 1;
     }
-    g_hidden = embed_model_config(g_model)->hidden_size;
+    g_hidden = ffwd_model_config(g_model)->hidden_size;
 
     char meta[160];
     snprintf(meta, sizeof(meta), "suite=model threads=%d hidden=%d", threads, g_hidden);
@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
     bench_parse_args(&opts, argc - 1, argv + 1);
     int rc = bench_main(&opts, CASES, (int)(sizeof(CASES) / sizeof(CASES[0])));
 
-    embed_workspace_free(g_ws);
-    embed_model_free(g_model);
+    ffwd_workspace_free(g_ws);
+    ffwd_model_free(g_model);
     return rc;
 }
