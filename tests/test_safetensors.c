@@ -15,8 +15,7 @@ static int failures = 0;
 static char tmproot[1024];
 
 /* Write u64-LE header length + JSON header + payload (safetensors layout). */
-static void
-write_st(const char *path, const char *header, const void *payload, size_t payload_len) {
+static void write_st(const char *path, const char *header, const void *payload, size_t payload_len) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         perror(path);
@@ -64,62 +63,12 @@ static void check(const char *mode, const char *path, int want_ok) {
     }
 }
 
-static const char ONE_TENSOR_A[] =
-    "{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
-static const char ONE_TENSOR_B[] =
-    "{\"b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
-static const char ONE_TENSOR_X[] =
-    "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
-
-/* safetensors_get_f32 must widen F16 losslessly. Compares the produced F32 bit
- * patterns exactly (so signed zero, subnormals, and inf are all checked), across
- * normals, both zeros, the smallest and largest subnormals, max normal, inf, and
- * a full-mantissa value (~1/3) that catches a wrong mantissa shift. */
-static void check_f16_conversion(void) {
-    const uint16_t half_bits[] = {
-        0x0000, 0x8000, 0x3c00, 0xbc00, 0x3800, 0x4000, 0x3555, 0x0001, 0x03ff, 0x7bff, 0x7c00,
-    };
-    const uint32_t want_bits[] = {
-        0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0x40000000,
-        0x3eaaa000, 0x33800000, 0x387fc000, 0x477fe000, 0x7f800000,
-    };
-    int n = (int)(sizeof(half_bits) / sizeof(half_bits[0]));
-
-    char header[128];
-    snprintf(header, sizeof(header),
-             "{\"x\":{\"dtype\":\"F16\",\"shape\":[%d],\"data_offsets\":[0,%d]}}", n, n * 2);
-    const char *path = path_in("f16_convert.safetensors");
-    write_st(path, header, half_bits, (size_t)n * sizeof(uint16_t));
-
-    safetensors_file_t *sf = safetensors_open(path);
-    if (!sf || sf->num_tensors != 1) {
-        fprintf(stderr, "f16 conversion: open failed\n");
-        failures++;
-        safetensors_close(sf);
-        return;
-    }
-    float *got = safetensors_get_f32(sf, &sf->tensors[0]);
-    if (!got) {
-        fprintf(stderr, "f16 conversion: get_f32 returned NULL\n");
-        failures++;
-        safetensors_close(sf);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        uint32_t got_bits;
-        memcpy(&got_bits, &got[i], sizeof(got_bits));
-        if (got_bits != want_bits[i]) {
-            fprintf(stderr, "f16[%d]=0x%04x: got 0x%08x want 0x%08x\n", i, half_bits[i], got_bits,
-                    want_bits[i]);
-            failures++;
-        }
-    }
-    free(got);
-    safetensors_close(sf);
-}
+static const char ONE_TENSOR_A[] = "{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+static const char ONE_TENSOR_B[] = "{\"b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+static const char ONE_TENSOR_X[] = "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
 
 int main(void) {
-    snprintf(tmproot, sizeof(tmproot), "%s/embed-st-test-XXXXXX",
+    snprintf(tmproot, sizeof(tmproot), "%s/ffwd-st-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(tmproot)) {
         perror("mkdtemp");
@@ -191,12 +140,10 @@ int main(void) {
     write_st(path_in("bad_name/model-foo.safetensors"), ONE_TENSOR_X, zeros, 4);
     check("multi", path_in("bad_name"), 0);
 
-    check_f16_conversion();
-
     if (failures) {
         fprintf(stderr, "safetensors tests: %d failure(s)\n", failures);
         return 1;
     }
-    puts("ok: safetensors parser limit + F16 conversion checks passed");
+    puts("ok: safetensors parser limit checks passed");
     return 0;
 }

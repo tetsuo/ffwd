@@ -1,6 +1,6 @@
 /* tests/test_sentencepiece.c - hermetic SentencePiece Unigram checks. */
 
-#include "tokenizer_sentencepiece.h"
+#include "sentencepiece.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -134,14 +134,14 @@ static int write_model(const char *dir, int xlm_roberta) {
     return 0;
 }
 
-static int check_ids(const sentencepiece_tokenizer_t *tok,
-                     sentencepiece_workspace_t *ws,
+static int check_ids(const tok_spm_t *tok,
+                     tok_spm_workspace_t *ws,
                      const char *text,
                      const int *want,
                      int want_n,
                      const char *name) {
     int n = 0;
-    int *ids = sentencepiece_tokenizer_encode_with_workspace(tok, ws, text, &n);
+    int *ids = tok_spm_encode_with_workspace(tok, ws, text, &n);
     int ok = n == want_n;
     for (int i = 0; ok && i < n; i++)
         ok = ids[i] == want[i];
@@ -161,7 +161,7 @@ static int check_ids(const sentencepiece_tokenizer_t *tok,
 static int run_hermetic(void) {
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/embed-sp-test-XXXXXX", tmp);
+    snprintf(dir, sizeof(dir), "%s/ffwd-sp-test-XXXXXX", tmp);
     if (!mkdtemp(dir) || write_model(dir, 1) != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
@@ -169,14 +169,14 @@ static int run_hermetic(void) {
 
     /* A directory with no SentencePiece model must fail cleanly, not crash. */
     char empty[1024];
-    snprintf(empty, sizeof(empty), "%s/embed-sp-empty-XXXXXX", tmp);
-    if (mkdtemp(empty) && sentencepiece_tokenizer_load(empty) != NULL) {
+    snprintf(empty, sizeof(empty), "%s/ffwd-sp-empty-XXXXXX", tmp);
+    if (mkdtemp(empty) && tok_spm_load(empty) != NULL) {
         fprintf(stderr, "load of model-less dir should fail\n");
         return 1;
     }
 
-    sentencepiece_tokenizer_t *tok = sentencepiece_tokenizer_load(dir);
-    sentencepiece_workspace_t *ws = sentencepiece_workspace_new();
+    tok_spm_t *tok = tok_spm_load(dir);
+    tok_spm_workspace_t *ws = tok_spm_workspace_new();
     if (!tok || !ws) {
         fprintf(stderr, "load failed\n");
         return 1;
@@ -186,13 +186,11 @@ static int run_hermetic(void) {
         fprintf(stderr, "metadata wrong\n");
         return 1;
     }
-    if (sentencepiece_tokenizer_token_id(tok, "<s>") != 0 ||
-        sentencepiece_tokenizer_token_id(tok, "</s>") != 2 ||
-        sentencepiece_tokenizer_token_id(tok, "<unk>") != 3 ||
-        sentencepiece_tokenizer_token_id(tok, ",") != 4 ||
-        sentencepiece_tokenizer_token_id(tok, "<mask>") != 13 ||
-        strcmp(sentencepiece_tokenizer_decode(tok, 8), "\xe2\x96\x81Hello") != 0 ||
-        strcmp(sentencepiece_tokenizer_decode(tok, 1), "<pad>") != 0) {
+    if (tok_spm_token_id(tok, "<s>") != 0 || tok_spm_token_id(tok, "</s>") != 2 ||
+        tok_spm_token_id(tok, "<unk>") != 3 || tok_spm_token_id(tok, ",") != 4 ||
+        tok_spm_token_id(tok, "<mask>") != 13 ||
+        strcmp(tok_spm_decode(tok, 8), "\xe2\x96\x81Hello") != 0 ||
+        strcmp(tok_spm_decode(tok, 1), "<pad>") != 0) {
         fprintf(stderr, "special id/decode mapping wrong\n");
         return 1;
     }
@@ -204,15 +202,14 @@ static int run_hermetic(void) {
     rc |= check_ids(tok, ws, "missing", (int[]){6, 3}, 2, "unknown-collapse");
 
     int tiny[1], need = 0;
-    if (sentencepiece_tokenizer_encode_into(tok, ws, "Hello world!", tiny, 1, &need) != -2 ||
-        need != 3) {
+    if (tok_spm_encode_into(tok, ws, "Hello world!", tiny, 1, &need) != -2 || need != 3) {
         fprintf(stderr, "small-buffer handling wrong\n");
         return 1;
     }
 
     /* The no-workspace encode entry point must agree with the workspace path. */
     int plain_n = -1;
-    int *plain = sentencepiece_tokenizer_encode(tok, "Hello world!", &plain_n);
+    int *plain = tok_spm_encode(tok, "Hello world!", &plain_n);
     if (plain_n != 3 || !plain || plain[0] != 8 || plain[1] != 9 || plain[2] != 7) {
         fprintf(stderr, "plain encode mismatch: n=%d\n", plain_n);
         free(plain);
@@ -220,20 +217,20 @@ static int run_hermetic(void) {
     }
     free(plain);
 
-    sentencepiece_workspace_free(ws);
-    sentencepiece_tokenizer_free(tok);
+    tok_spm_workspace_free(ws);
+    tok_spm_free(tok);
 
     char direct[1024];
-    snprintf(direct, sizeof(direct), "%s/embed-sp-direct-XXXXXX", tmp);
+    snprintf(direct, sizeof(direct), "%s/ffwd-sp-direct-XXXXXX", tmp);
     if (!mkdtemp(direct) || write_model(direct, 0) != 0)
         return 2;
-    tok = sentencepiece_tokenizer_load(direct);
-    ws = sentencepiece_workspace_new();
+    tok = tok_spm_load(direct);
+    ws = tok_spm_workspace_new();
     if (!tok || !ws)
         return 1;
     rc |= check_ids(tok, ws, "Hello world!", (int[]){7, 8, 6}, 3, "direct-map");
-    sentencepiece_workspace_free(ws);
-    sentencepiece_tokenizer_free(tok);
+    tok_spm_workspace_free(ws);
+    tok_spm_free(tok);
     if (rc)
         return 1;
 
@@ -242,8 +239,8 @@ static int run_hermetic(void) {
 }
 
 static int run_live(const char *model_dir) {
-    sentencepiece_tokenizer_t *tok = sentencepiece_tokenizer_load(model_dir);
-    sentencepiece_workspace_t *ws = sentencepiece_workspace_new();
+    tok_spm_t *tok = tok_spm_load(model_dir);
+    tok_spm_workspace_t *ws = tok_spm_workspace_new();
     if (!tok || !ws) {
         fprintf(stderr, "live load failed\n");
         return 1;
@@ -267,16 +264,14 @@ static int run_live(const char *model_dir) {
                     (int[]){665, 193478, 258, 1705, 77796}, 5, "live-arabic");
     rc |= check_ids(tok, ws, "", NULL, 0, "live-empty");
     rc |= check_ids(tok, ws, "   ", NULL, 0, "live-spaces");
-    if (sentencepiece_tokenizer_token_id(tok, "<s>") != 0 ||
-        sentencepiece_tokenizer_token_id(tok, "<pad>") != 1 ||
-        sentencepiece_tokenizer_token_id(tok, "</s>") != 2 ||
-        sentencepiece_tokenizer_token_id(tok, "<unk>") != 3 ||
-        sentencepiece_tokenizer_token_id(tok, "<mask>") != 250001) {
+    if (tok_spm_token_id(tok, "<s>") != 0 || tok_spm_token_id(tok, "<pad>") != 1 ||
+        tok_spm_token_id(tok, "</s>") != 2 || tok_spm_token_id(tok, "<unk>") != 3 ||
+        tok_spm_token_id(tok, "<mask>") != 250001) {
         fprintf(stderr, "live special ids wrong\n");
         rc = 1;
     }
-    sentencepiece_workspace_free(ws);
-    sentencepiece_tokenizer_free(tok);
+    tok_spm_workspace_free(ws);
+    tok_spm_free(tok);
     return rc ? 1 : 0;
 }
 

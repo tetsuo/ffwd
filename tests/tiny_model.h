@@ -229,10 +229,8 @@ tm_write_prefixed_model_dims(const char *dir, const char *dtype, const tm_dims_t
     return tm_write_model_dims_with_prefix(dir, dtype, d, "model.");
 }
 
-static inline int tm_write_qwen3_model_dims(const char *dir,
-                                            const char *dtype,
-                                            const tm_dims_t *d,
-                                            int eos_token_id) {
+static inline int
+tm_write_qwen3_model_dims(const char *dir, const char *dtype, const tm_dims_t *d, int eos_token_id) {
     if (tm_write_model_dims(dir, dtype, d) != 0)
         return -1;
     return tm_write_config(dir, d, "qwen3", eos_token_id);

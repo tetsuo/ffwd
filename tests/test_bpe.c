@@ -4,7 +4,7 @@
  * integer-pair fast path, and that dropping the integer tables (forcing the
  * string-based fallback) produces identical ids. Runs via `make test`. */
 
-#include "tokenizer_bpe.h"
+#include "bpe.h"
 #include "tok_fixture.h"
 
 #include <stdio.h>
@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 static int failures = 0;
-int embed_verbose = 0;
+int ffwd_verbose = 0;
 
 #define TEST_ASSERT(cond)                                                   \
     do {                                                                    \
@@ -24,14 +24,14 @@ int embed_verbose = 0;
         }                                                                   \
     } while (0)
 
-static void check_ids(const embed_tokenizer_t *tok,
-                      embed_tokenizer_workspace_t *ws,
+static void check_ids(const tok_bpe_t *tok,
+                      tok_bpe_workspace_t *ws,
                       const char *text,
                       const int *want,
                       int n_want,
                       const char *label) {
     int n = 0;
-    int *ids = embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)tok, ws, text, &n);
+    int *ids = tok_bpe_encode_with_workspace((tok_bpe_t *)tok, ws, text, &n);
     TEST_ASSERT(ids != NULL);
     if (!ids)
         return;
@@ -52,19 +52,19 @@ static void check_ids(const embed_tokenizer_t *tok,
 
 /* Concatenated decode of an encoding must reproduce the (NFC-normalized)
  * input - byte-level BPE is lossless. */
-static void check_roundtrip(const embed_tokenizer_t *tok,
-                            embed_tokenizer_workspace_t *ws,
+static void check_roundtrip(const tok_bpe_t *tok,
+                            tok_bpe_workspace_t *ws,
                             const char *text,
                             const char *want,
                             const char *label) {
     int n = 0;
-    int *ids = embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)tok, ws, text, &n);
+    int *ids = tok_bpe_encode_with_workspace((tok_bpe_t *)tok, ws, text, &n);
     TEST_ASSERT(ids != NULL && n > 0);
     if (!ids)
         return;
     size_t cap = 1;
     for (int i = 0; i < n; i++)
-        cap += strlen(embed_tokenizer_decode(tok, ids[i]));
+        cap += strlen(tok_bpe_decode(tok, ids[i]));
     char *got = (char *)malloc(cap);
     if (!got) {
         free(ids);
@@ -73,10 +73,9 @@ static void check_roundtrip(const embed_tokenizer_t *tok,
     }
     got[0] = '\0';
     for (int i = 0; i < n; i++)
-        strcat(got, embed_tokenizer_decode(tok, ids[i]));
+        strcat(got, tok_bpe_decode(tok, ids[i]));
     if (strcmp(got, want) != 0) {
-        fprintf(stderr, "FAIL %s roundtrip \"%s\": got \"%s\" want \"%s\"\n", label, text, got,
-                want);
+        fprintf(stderr, "FAIL %s roundtrip \"%s\": got \"%s\" want \"%s\"\n", label, text, got, want);
         failures++;
     }
     free(got);
@@ -84,18 +83,15 @@ static void check_roundtrip(const embed_tokenizer_t *tok,
 }
 
 /* Two spellings of the same text must encode identically. */
-static void check_same_ids(const embed_tokenizer_t *tok,
-                           embed_tokenizer_workspace_t *ws,
-                           const char *a,
-                           const char *b,
-                           const char *label) {
+static void check_same_ids(
+    const tok_bpe_t *tok, tok_bpe_workspace_t *ws, const char *a, const char *b, const char *label) {
     int na = 0, nb = 0;
-    int *ia = embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)tok, ws, a, &na);
+    int *ia = tok_bpe_encode_with_workspace((tok_bpe_t *)tok, ws, a, &na);
     if (!ia) {
         TEST_ASSERT(0);
         return;
     }
-    int *ib = embed_tokenizer_encode_with_workspace((embed_tokenizer_t *)tok, ws, b, &nb);
+    int *ib = tok_bpe_encode_with_workspace((tok_bpe_t *)tok, ws, b, &nb);
     if (!ib) {
         free(ia);
         TEST_ASSERT(0);
@@ -109,8 +105,7 @@ static void check_same_ids(const embed_tokenizer_t *tok,
     free(ia);
 }
 
-static void
-run_cases(const embed_tokenizer_t *tok, embed_tokenizer_workspace_t *ws, const char *label) {
+static void run_cases(const tok_bpe_t *tok, tok_bpe_workspace_t *ws, const char *label) {
     /* h e l l o -> he -> he,ll -> hell -> hello */
     const int hello[] = {259};
     check_ids(tok, ws, "hello", hello, 1, label);
@@ -212,7 +207,7 @@ static void write_file(const char *dir, const char *name, const char *body) {
 static void test_loader_edges(const char *root) {
     char dir[1152], path[2048];
 
-    TEST_ASSERT(embed_tokenizer_load("/nonexistent/vocab.json") == NULL);
+    TEST_ASSERT(tok_bpe_load("/nonexistent/vocab.json") == NULL);
 
     /* Not a JSON object. */
     snprintf(dir, sizeof(dir), "%s/badjson", root);
@@ -223,7 +218,7 @@ static void test_loader_edges(const char *root) {
     write_file(dir, "vocab.json", "[1, 2]\n");
     write_file(dir, "merges.txt", "a b\n");
     snprintf(path, sizeof(path), "%s/vocab.json", dir);
-    TEST_ASSERT(embed_tokenizer_load(path) == NULL);
+    TEST_ASSERT(tok_bpe_load(path) == NULL);
 
     /* Missing or pair-less merges.txt is tolerated: the tokenizer loads
      * and encoding falls back to byte/vocab-level (no merges applied). */
@@ -234,16 +229,16 @@ static void test_loader_edges(const char *root) {
     }
     write_file(dir, "vocab.json", "{\"a\":0,\"b\":1}\n");
     snprintf(path, sizeof(path), "%s/vocab.json", dir);
-    embed_tokenizer_t *nom = embed_tokenizer_load(path);
+    tok_bpe_t *nom = tok_bpe_load(path);
     TEST_ASSERT(nom != NULL);
     if (nom) {
-        embed_tokenizer_workspace_t *nws = embed_tokenizer_workspace_new();
+        tok_bpe_workspace_t *nws = tok_bpe_workspace_new();
         int n = 0;
-        int *ids = embed_tokenizer_encode_with_workspace(nom, nws, "ab", &n);
+        int *ids = tok_bpe_encode_with_workspace(nom, nws, "ab", &n);
         TEST_ASSERT(ids && n == 2 && ids[0] == 0 && ids[1] == 1);
         free(ids);
-        embed_tokenizer_workspace_free(nws);
-        embed_tokenizer_free(nom);
+        tok_bpe_workspace_free(nws);
+        tok_bpe_free(nom);
     }
 
     snprintf(dir, sizeof(dir), "%s/emptymerges", root);
@@ -254,9 +249,9 @@ static void test_loader_edges(const char *root) {
     write_file(dir, "vocab.json", "{\"a\":0,\"b\":1}\n");
     write_file(dir, "merges.txt", "#version: 0.2\n\n   \n");
     snprintf(path, sizeof(path), "%s/vocab.json", dir);
-    embed_tokenizer_t *emp = embed_tokenizer_load(path);
+    tok_bpe_t *emp = tok_bpe_load(path);
     TEST_ASSERT(emp != NULL);
-    embed_tokenizer_free(emp);
+    tok_bpe_free(emp);
 
     /* Escape forms in vocab keys; a malformed merge line is skipped. */
     snprintf(dir, sizeof(dir), "%s/escapes", root);
@@ -270,28 +265,28 @@ static void test_loader_edges(const char *root) {
                " \"s\\\\t\":6, \"p\\/q\":7, \"u\\tv\":8, \"\\u0041Z\":9}\n");
     write_file(dir, "merges.txt", "#version: 0.2\nmalformed-line\na b\n");
     snprintf(path, sizeof(path), "%s/vocab.json", dir);
-    embed_tokenizer_t *tok = embed_tokenizer_load(path);
+    tok_bpe_t *tok = tok_bpe_load(path);
     TEST_ASSERT(tok != NULL);
     if (tok) {
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "\xE2\x82\xAC") == 3);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "x\ny") == 4);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "q\"r") == 5);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "s\\t") == 6);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "p/q") == 7);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "u\tv") == 8);
-        TEST_ASSERT(embed_tokenizer_token_id(tok, "AZ") == 9);
-        TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, 2), "ab") == 0);
+        TEST_ASSERT(tok_bpe_token_id(tok, "\xE2\x82\xAC") == 3);
+        TEST_ASSERT(tok_bpe_token_id(tok, "x\ny") == 4);
+        TEST_ASSERT(tok_bpe_token_id(tok, "q\"r") == 5);
+        TEST_ASSERT(tok_bpe_token_id(tok, "s\\t") == 6);
+        TEST_ASSERT(tok_bpe_token_id(tok, "p/q") == 7);
+        TEST_ASSERT(tok_bpe_token_id(tok, "u\tv") == 8);
+        TEST_ASSERT(tok_bpe_token_id(tok, "AZ") == 9);
+        TEST_ASSERT(strcmp(tok_bpe_decode(tok, 2), "ab") == 0);
         /* Keys outside the GPT-2 byte alphabet decode to replacement. */
-        TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, 3), "?") == 0);
-        embed_tokenizer_free(tok);
+        TEST_ASSERT(strcmp(tok_bpe_decode(tok, 3), "?") == 0);
+        tok_bpe_free(tok);
     }
 
     /* A bare filename exercises the no-directory merges-path branch. */
     char saved_cwd[1024];
     if (getcwd(saved_cwd, sizeof(saved_cwd)) && chdir(dir) == 0) {
-        embed_tokenizer_t *rel = embed_tokenizer_load("vocab.json");
+        tok_bpe_t *rel = tok_bpe_load("vocab.json");
         TEST_ASSERT(rel != NULL);
-        embed_tokenizer_free(rel);
+        tok_bpe_free(rel);
         if (chdir(saved_cwd) != 0) {
             perror("chdir back");
             exit(2);
@@ -301,7 +296,7 @@ static void test_loader_edges(const char *root) {
 
 int main(void) {
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/embed-tok-test-XXXXXX",
+    snprintf(dir, sizeof(dir), "%s/ffwd-tok-test-XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(dir) || tf_write_vocab(dir) != 0) {
         fprintf(stderr, "fixture creation failed\n");
@@ -310,7 +305,7 @@ int main(void) {
 
     char vocab_path[2048];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", dir);
-    embed_tokenizer_t *tok = embed_tokenizer_load(vocab_path);
+    tok_bpe_t *tok = tok_bpe_load(vocab_path);
     TEST_ASSERT(tok != NULL);
     if (!tok)
         return 1;
@@ -319,48 +314,48 @@ int main(void) {
     TEST_ASSERT(tok->int_merges != NULL);
     TEST_ASSERT(tok->cp_to_id != NULL);
 
-    embed_tokenizer_workspace_t *ws = embed_tokenizer_workspace_new();
+    tok_bpe_workspace_t *ws = tok_bpe_workspace_new();
     TEST_ASSERT(ws != NULL);
 
     run_cases(tok, ws, "fast");
 
     /* decode: byte tokens, merged tokens, and out-of-range ids. */
-    TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, 'a'), "a") == 0);
-    TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, 259), "hello") == 0);
-    TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, -1), "") == 0);
-    TEST_ASSERT(strcmp(embed_tokenizer_decode(tok, TF_VOCAB_SIZE), "") == 0);
-    TEST_ASSERT(strcmp(embed_tokenizer_decode(NULL, 0), "") == 0);
+    TEST_ASSERT(strcmp(tok_bpe_decode(tok, 'a'), "a") == 0);
+    TEST_ASSERT(strcmp(tok_bpe_decode(tok, 259), "hello") == 0);
+    TEST_ASSERT(strcmp(tok_bpe_decode(tok, -1), "") == 0);
+    TEST_ASSERT(strcmp(tok_bpe_decode(tok, TF_VOCAB_SIZE), "") == 0);
+    TEST_ASSERT(strcmp(tok_bpe_decode(NULL, 0), "") == 0);
 
     /* token_id lookups. */
-    TEST_ASSERT(embed_tokenizer_token_id(tok, "hello") == 259);
-    TEST_ASSERT(embed_tokenizer_token_id(tok, "<|endoftext|>") == TF_EOT_ID);
-    TEST_ASSERT(embed_tokenizer_token_id(tok, "no-such-token") == -1);
-    TEST_ASSERT(embed_tokenizer_token_id(NULL, "a") == -1);
-    TEST_ASSERT(embed_tokenizer_token_id(tok, NULL) == -1);
+    TEST_ASSERT(tok_bpe_token_id(tok, "hello") == 259);
+    TEST_ASSERT(tok_bpe_token_id(tok, "<|endoftext|>") == TF_EOT_ID);
+    TEST_ASSERT(tok_bpe_token_id(tok, "no-such-token") == -1);
+    TEST_ASSERT(tok_bpe_token_id(NULL, "a") == -1);
+    TEST_ASSERT(tok_bpe_token_id(tok, NULL) == -1);
 
     /* encode_into: exact fit, truncation (-2 plus the untruncated prefix),
      * zero capacity, empty text, and argument guards. */
     {
         int out[8];
         int n = -1;
-        TEST_ASSERT(embed_tokenizer_encode_into(tok, ws, "hello world", out, 8, &n) == 0 && n == 3);
+        TEST_ASSERT(tok_bpe_encode_into(tok, ws, "hello world", out, 8, &n) == 0 && n == 3);
         TEST_ASSERT(out[0] == 259 && out[1] == 263 && out[2] == 262);
         /* On overflow the prefix is written and n reports the total
          * required count, so a caller can re-size and retry. */
         n = -1;
-        TEST_ASSERT(embed_tokenizer_encode_into(tok, ws, "hello world", out, 2, &n) == -2 && n == 3);
+        TEST_ASSERT(tok_bpe_encode_into(tok, ws, "hello world", out, 2, &n) == -2 && n == 3);
         TEST_ASSERT(out[0] == 259 && out[1] == 263);
         n = -1;
-        TEST_ASSERT(embed_tokenizer_encode_into(tok, ws, "hello world", out, 0, &n) == -2 && n == 3);
+        TEST_ASSERT(tok_bpe_encode_into(tok, ws, "hello world", out, 0, &n) == -2 && n == 3);
         n = -1;
-        TEST_ASSERT(embed_tokenizer_encode_into(tok, ws, "", out, 8, &n) == 0 && n == 0);
-        TEST_ASSERT(embed_tokenizer_encode_into(tok, ws, NULL, out, 8, &n) == -1);
-        TEST_ASSERT(embed_tokenizer_encode_into(NULL, ws, "x", out, 8, &n) == -1);
+        TEST_ASSERT(tok_bpe_encode_into(tok, ws, "", out, 8, &n) == 0 && n == 0);
+        TEST_ASSERT(tok_bpe_encode_into(tok, ws, NULL, out, 8, &n) == -1);
+        TEST_ASSERT(tok_bpe_encode_into(NULL, ws, "x", out, 8, &n) == -1);
     }
-    TEST_ASSERT(embed_tokenizer_encode(tok, "", NULL) == NULL);
-    TEST_ASSERT(embed_tokenizer_encode(NULL, "x", NULL) == NULL);
-    embed_tokenizer_workspace_free(NULL);
-    embed_tokenizer_free(NULL);
+    TEST_ASSERT(tok_bpe_encode(tok, "", NULL) == NULL);
+    TEST_ASSERT(tok_bpe_encode(NULL, "x", NULL) == NULL);
+    tok_bpe_workspace_free(NULL);
+    tok_bpe_free(NULL);
 
     /* Drop the integer tables: the string-based fallback must produce the
      * exact same ids. */
@@ -371,8 +366,8 @@ int main(void) {
     tok->cp_to_id = NULL;
     run_cases(tok, ws, "slow");
 
-    embed_tokenizer_workspace_free(ws);
-    embed_tokenizer_free(tok);
+    tok_bpe_workspace_free(ws);
+    tok_bpe_free(tok);
 
     test_loader_edges(dir);
 

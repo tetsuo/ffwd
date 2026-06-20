@@ -1,9 +1,10 @@
 /* tests/test_kernels.c - golden tests for the low-level math kernels.
  * Runs via `make test` (generic and BLAS variants) and
- * scripts/check_kernel_golden.py. No model files required. */
+ * tests/quality/check_kernel_golden.sh. No model files required. */
 
 #include "kernels.h"
-#include "kernels_impl.h"
+#include "threadpool.h"
+#include "impl.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -12,7 +13,6 @@
 #include <string.h>
 
 static int failures = 0;
-int embed_verbose = 0;
 
 static void expect_close(const char *name, float got, float want, float tol) {
     float diff = fabsf(got - want);
@@ -42,7 +42,7 @@ static void test_rms_norm(void) {
     const float w[4] = {1.0f, 0.5f, -1.0f, 2.0f};
     float out[8];
 
-    embed_rms_norm(out, x, w, seq, hidden, 1e-6f);
+    rms_norm(out, x, w, seq, hidden, 1e-6f);
 
     for (int s = 0; s < seq; s++) {
         float ss = 0.0f;
@@ -65,7 +65,7 @@ static void test_layer_norm(void) {
     const float b[4] = {0.1f, -0.2f, 0.3f, -0.4f};
     float out[8];
 
-    embed_layer_norm(out, x, g, b, seq, hidden, 1e-12f);
+    layer_norm(out, x, g, b, seq, hidden, 1e-12f);
 
     for (int s = 0; s < seq; s++) {
         float mean = 0.0f;
@@ -88,7 +88,7 @@ static void test_layer_norm(void) {
     /* In-place (out aliases x) must match the out-of-place result. */
     float z[8];
     memcpy(z, x, sizeof(z));
-    embed_layer_norm(z, z, g, b, seq, hidden, 1e-12f);
+    layer_norm(z, z, g, b, seq, hidden, 1e-12f);
     for (int i = 0; i < 8; i++)
         expect_close("layer_norm_inplace", z[i], out[i], 1e-6f);
 }
@@ -97,7 +97,7 @@ static void test_gelu(void) {
     float x[5] = {0.0f, 1.0f, -1.0f, 2.5f, -3.0f};
     float out[5];
     memcpy(out, x, sizeof(out));
-    embed_gelu_inplace(out, 5);
+    gelu_inplace(out, 5);
     for (int i = 0; i < 5; i++) {
         float want = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
         expect_close("gelu", out[i], want, 1e-6f);
@@ -112,7 +112,7 @@ static void test_gelu_tanh(void) {
     float x[5] = {0.0f, 1.0f, -1.0f, 2.5f, -3.0f};
     float out[5];
     memcpy(out, x, sizeof(out));
-    embed_gelu_tanh_inplace(out, 5);
+    gelu_tanh_inplace(out, 5);
     for (int i = 0; i < 5; i++) {
         float v = x[i];
         float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
@@ -134,8 +134,8 @@ static void test_rope_neox(void) {
     float orig[8];
     memcpy(orig, x, sizeof(x));
 
-    embed_compute_rope_neox(cosv, sinv, positions, seq, head_dim, 10000.0f);
-    embed_apply_rope_neox(x, cosv, sinv, seq, heads, head_dim);
+    compute_rope_neox(cosv, sinv, positions, seq, head_dim, 10000.0f);
+    apply_rope_neox(x, cosv, sinv, seq, heads, head_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int d = 0; d < head_dim / 2; d++) {
@@ -225,8 +225,8 @@ static void test_packed_gqa_attention(void) {
         V[i] = sinf((float)i * 0.07f) - cosf((float)i * 0.13f);
     }
 
-    embed_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
-                                            1.0f / sqrtf((float)head_dim));
+    bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
+                                       1.0f / sqrtf((float)head_dim));
     reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 0);
 
@@ -254,12 +254,12 @@ static void test_packed_gqa_attention_long(void) {
         V[i] = sinf((float)i * 0.007f) - cosf((float)i * 0.013f);
     }
 
-    embed_set_threads(4);
-    embed_bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
-                                            1.0f / sqrtf((float)head_dim));
+    tp_set_threads(4);
+    bidirectional_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
+                                       1.0f / sqrtf((float)head_dim));
     reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 0);
-    embed_set_threads(1);
+    tp_set_threads(1);
 
     for (int i = 0; i < total * q_hidden; i++)
         expect_close("packed_gqa_long", got[i], want[i], 2e-5f);
@@ -290,12 +290,12 @@ static void test_packed_causal_gqa_attention(void) {
         V[i] = sinf((float)i * 0.009f) - cosf((float)i * 0.015f);
     }
 
-    embed_set_threads(4);
-    embed_causal_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
-                                     1.0f / sqrtf((float)head_dim));
+    tp_set_threads(4);
+    causal_gqa_attention_packed(got, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
+                                1.0f / sqrtf((float)head_dim));
     reference_packed_gqa(want, Q, K, V, offsets, 2, n_heads, n_kv_heads, head_dim,
                          1.0f / sqrtf((float)head_dim), 1);
-    embed_set_threads(1);
+    tp_set_threads(1);
 
     for (int i = 0; i < total * q_hidden; i++)
         expect_close("packed_causal_gqa", got[i], want[i], 2e-5f);
@@ -315,7 +315,7 @@ static void test_bf16_linear(void) {
 
     for (int i = 0; i < 6; i++)
         wbf16[i] = f32_to_bf16(wf32[i]);
-    embed_linear_nobias_bf16(got, x, wbf16, seq, in_dim, out_dim);
+    linear_nobias_bf16(got, x, wbf16, seq, in_dim, out_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int o = 0; o < out_dim; o++) {
@@ -351,8 +351,8 @@ static void check_bf16_qkv(int n_threads) {
         wv[i] = f32_to_bf16(wv_f32[i]);
     }
 
-    embed_set_threads(n_threads);
-    embed_linear_nobias_bf16_qkv(got_q, got_k, got_v, x, wq, wk, wv, seq, in_dim, q_dim, kv_dim);
+    tp_set_threads(n_threads);
+    linear_nobias_bf16_qkv(got_q, got_k, got_v, x, wq, wk, wv, seq, in_dim, q_dim, kv_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int o = 0; o < q_dim; o++) {
@@ -376,7 +376,7 @@ static void check_bf16_qkv(int n_threads) {
 static void test_bf16_qkv(void) {
     check_bf16_qkv(1);
     check_bf16_qkv(3);
-    embed_set_threads(1);
+    tp_set_threads(1);
 }
 
 /* seq==1 routes through bf16_matvec_threaded; a pool splits the output
@@ -392,8 +392,8 @@ static void check_bf16_matvec(int n_threads) {
     for (int i = 0; i < out_dim * in_dim; i++)
         w[i] = f32_to_bf16(cosf((float)i * 0.21f) + 0.05f);
 
-    embed_set_threads(n_threads);
-    embed_linear_nobias_bf16(got, x, w, 1, in_dim, out_dim);
+    tp_set_threads(n_threads);
+    linear_nobias_bf16(got, x, w, 1, in_dim, out_dim);
 
     for (int o = 0; o < out_dim; o++) {
         float want = 0.0f;
@@ -406,10 +406,10 @@ static void check_bf16_matvec(int n_threads) {
 static void test_bf16_matvec(void) {
     check_bf16_matvec(1);
     check_bf16_matvec(4);
-    embed_set_threads(1);
+    tp_set_threads(1);
 }
 
-/* Above EMBED_RMS_NORM_PARALLEL_ELEMS (256k elements) rms_norm fans out to
+/* Above TKERN_RMS_NORM_PARALLEL_ELEMS (256k elements) rms_norm fans out to
  * rms_norm_worker; row-wise math is identical, so results must match the
  * single-thread run exactly. */
 static void test_rms_norm_threaded(void) {
@@ -436,11 +436,11 @@ static void test_rms_norm_threaded(void) {
     for (int i = 0; i < hidden; i++)
         w[i] = 0.8f + 0.01f * (float)(i % 7);
 
-    embed_set_threads(1);
-    embed_rms_norm(one, x, w, seq, hidden, 1e-6f);
-    embed_set_threads(4);
-    embed_rms_norm(many, x, w, seq, hidden, 1e-6f);
-    embed_set_threads(1);
+    tp_set_threads(1);
+    rms_norm(one, x, w, seq, hidden, 1e-6f);
+    tp_set_threads(4);
+    rms_norm(many, x, w, seq, hidden, 1e-6f);
+    tp_set_threads(1);
 
     for (size_t i = 0; i < elems; i++) {
         if (one[i] != many[i]) {
@@ -469,7 +469,7 @@ static void test_bf16_widen_buf(void) {
     for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
         int n = sizes[t];
         memset(got, 0, sizeof(got));
-        embed_bf16_to_f32_buf(got, src, (size_t)n);
+        bf16_to_f32_buf(got, src, (size_t)n);
         for (int i = 0; i < n; i++) {
             float want = bf16_to_f32(src[i]);
             uint32_t got_bits, want_bits;
@@ -503,8 +503,8 @@ static void check_bf16_pair(int n_threads) {
         wb[i] = f32_to_bf16(wb_f32[i]);
     }
 
-    embed_set_threads(n_threads);
-    embed_linear_nobias_bf16_pair(got_a, got_b, x, wa, wb, seq, in_dim, a_dim, b_dim);
+    tp_set_threads(n_threads);
+    linear_nobias_bf16_pair(got_a, got_b, x, wa, wb, seq, in_dim, a_dim, b_dim);
 
     for (int s = 0; s < seq; s++) {
         for (int o = 0; o < a_dim; o++) {
@@ -525,10 +525,10 @@ static void check_bf16_pair(int n_threads) {
 static void test_bf16_pair(void) {
     check_bf16_pair(1);
     check_bf16_pair(4);
-    embed_set_threads(1);
+    tp_set_threads(1);
 }
 
-/* The dispatch macros in embed_kernels_impl.h pick the SIMD variant at
+/* The dispatch macros in impl.h pick the SIMD variant at
  * compile time, so on arm64/x86 the generic C kernels are linked but never
  * called. Run them directly against the selected implementation on
  * remainder-lane-hostile sizes; on a plain build impl == generic and the
@@ -554,46 +554,45 @@ static void test_generic_vs_impl(void) {
     }
 
     float yg[OUT], yi[OUT];
-    embed_bf16_matvec_fused_generic(yg, x, W, bias, IN, OUT);
-    embed_bf16_matvec_fused_impl(yi, x, W, bias, IN, OUT);
+    bf16_matvec_fused_generic(yg, x, W, bias, IN, OUT);
+    bf16_matvec_fused_impl(yi, x, W, bias, IN, OUT);
     for (int o = 0; o < OUT; o++)
         expect_close("matvec_fused generic-vs-impl", yg[o], yi[o], 1e-5f);
-    embed_bf16_matvec_fused_generic(yg, x, W, NULL, IN, OUT);
-    embed_bf16_matvec_fused_impl(yi, x, W, NULL, IN, OUT);
+    bf16_matvec_fused_generic(yg, x, W, NULL, IN, OUT);
+    bf16_matvec_fused_impl(yi, x, W, NULL, IN, OUT);
     for (int o = 0; o < OUT; o++)
         expect_close("matvec_fused nobias generic-vs-impl", yg[o], yi[o], 1e-5f);
 
     const int sizes[] = {1, 7, 64, NMAX};
     for (size_t t = 0; t < sizeof(sizes) / sizeof(sizes[0]); t++) {
         int n = sizes[t];
-        expect_close("dot generic-vs-impl", embed_dot_f32_generic(a, b, n),
-                     embed_dot_f32_impl(a, b, n), 1e-5f);
+        expect_close("dot generic-vs-impl", dot_f32_generic(a, b, n), dot_f32_impl(a, b, n), 1e-5f);
 
         memcpy(d0, a, (size_t)n * sizeof(float));
         memcpy(d1, a, (size_t)n * sizeof(float));
-        embed_vec_scale_inplace_generic(d0, 1.37f, n);
-        embed_vec_scale_inplace_impl(d1, 1.37f, n);
+        vec_scale_inplace_generic(d0, 1.37f, n);
+        vec_scale_inplace_impl(d1, 1.37f, n);
         for (int i = 0; i < n; i++)
             expect_close("scale generic-vs-impl", d0[i], d1[i], 1e-6f);
 
         memcpy(d0, a, (size_t)n * sizeof(float));
         memcpy(d1, a, (size_t)n * sizeof(float));
-        embed_vec_axpy_inplace_generic(d0, b, -0.61f, n);
-        embed_vec_axpy_inplace_impl(d1, b, -0.61f, n);
+        vec_axpy_inplace_generic(d0, b, -0.61f, n);
+        vec_axpy_inplace_impl(d1, b, -0.61f, n);
         for (int i = 0; i < n; i++)
             expect_close("axpy generic-vs-impl", d0[i], d1[i], 1e-6f);
 
         memcpy(d0, a, (size_t)n * sizeof(float));
         memcpy(d1, a, (size_t)n * sizeof(float));
-        embed_vec_scale_add_generic(d0, b, 0.83f, n);
-        embed_vec_scale_add_impl(d1, b, 0.83f, n);
+        vec_scale_add_generic(d0, b, 0.83f, n);
+        vec_scale_add_impl(d1, b, 0.83f, n);
         for (int i = 0; i < n; i++)
             expect_close("scale_add generic-vs-impl", d0[i], d1[i], 1e-6f);
     }
 }
 
 int main(void) {
-    embed_set_threads(1);
+    tp_set_threads(1);
     test_rms_norm();
     test_layer_norm();
     test_gelu();

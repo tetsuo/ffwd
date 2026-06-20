@@ -3,7 +3,7 @@
  * punctuation splitting, CJK char-splitting, special-token resolution, and the
  * workspace encode paths. No model files or network needed. */
 
-#include "tokenizer_wordpiece.h"
+#include "wordpiece.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,13 +37,10 @@ static int write_fixture(const char *dir, int lower_case) {
     return 0;
 }
 
-static int check(const wordpiece_tokenizer_t *tok,
-                 const char *text,
-                 const int *want,
-                 int want_n,
-                 const char *name) {
+static int
+check(const tok_wp_t *tok, const char *text, const int *want, int want_n, const char *name) {
     int n = 0;
-    int *ids = wordpiece_tokenizer_encode(tok, text, &n);
+    int *ids = tok_wp_encode(tok, text, &n);
     if (!ids) {
         fprintf(stderr, "%s: encode returned NULL\n", name);
         return -1;
@@ -67,13 +64,13 @@ static int check(const wordpiece_tokenizer_t *tok,
 int main(void) {
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/embed-wp-test-XXXXXX", tmp);
+    snprintf(dir, sizeof(dir), "%s/ffwd-wp-test-XXXXXX", tmp);
     if (!mkdtemp(dir) || write_fixture(dir, 1) != 0) {
         fprintf(stderr, "fixture creation failed\n");
         return 2;
     }
 
-    wordpiece_tokenizer_t *tok = wordpiece_tokenizer_load(dir);
+    tok_wp_t *tok = tok_wp_load(dir);
     if (!tok) {
         fprintf(stderr, "load failed\n");
         return 1;
@@ -106,25 +103,22 @@ int main(void) {
         return 1;
 
     /* named special-token resolution */
-    if (wordpiece_tokenizer_token_id(tok, "[CLS]") != 2 ||
-        wordpiece_tokenizer_token_id(tok, "[SEP]") != 3 ||
-        wordpiece_tokenizer_token_id(tok, "[UNK]") != 1 ||
-        wordpiece_tokenizer_token_id(tok, "[MISSING]") != -1) {
+    if (tok_wp_token_id(tok, "[CLS]") != 2 || tok_wp_token_id(tok, "[SEP]") != 3 ||
+        tok_wp_token_id(tok, "[UNK]") != 1 || tok_wp_token_id(tok, "[MISSING]") != -1) {
         fprintf(stderr, "special-token resolution wrong\n");
         return 1;
     }
-    if (strcmp(wordpiece_tokenizer_decode(tok, 5), "the") != 0 ||
-        wordpiece_tokenizer_decode(tok, -1) != NULL) {
+    if (strcmp(tok_wp_decode(tok, 5), "the") != 0 || tok_wp_decode(tok, -1) != NULL) {
         fprintf(stderr, "decode wrong\n");
         return 1;
     }
 
     /* the three encode entry points must agree */
-    wordpiece_workspace_t *ws = wordpiece_workspace_new();
+    tok_wp_workspace_t *ws = tok_wp_workspace_new();
     int n_alloc = 0;
-    int *alloc = wordpiece_tokenizer_encode_with_workspace(tok, ws, "the unaffable cafe", &n_alloc);
+    int *alloc = tok_wp_encode_with_workspace(tok, ws, "the unaffable cafe", &n_alloc);
     int into[16], n_into = 0;
-    int rc2 = wordpiece_tokenizer_encode_into(tok, ws, "the unaffable cafe", into, 16, &n_into);
+    int rc2 = tok_wp_encode_into(tok, ws, "the unaffable cafe", into, 16, &n_into);
     if (!alloc || rc2 != 0 || n_alloc != n_into || n_alloc <= 0) {
         fprintf(stderr, "encode-path counts disagree (%d vs %d, rc=%d)\n", n_alloc, n_into, rc2);
         return 1;
@@ -137,29 +131,29 @@ int main(void) {
     }
     /* a too-small buffer reports the needed count and -2 */
     int tiny[1], n_need = 0;
-    if (wordpiece_tokenizer_encode_into(tok, ws, "the unaffable cafe", tiny, 1, &n_need) != -2 ||
+    if (tok_wp_encode_into(tok, ws, "the unaffable cafe", tiny, 1, &n_need) != -2 ||
         n_need != n_alloc) {
         fprintf(stderr, "small-buffer handling wrong\n");
         return 1;
     }
     free(alloc);
-    wordpiece_workspace_free(ws);
+    tok_wp_workspace_free(ws);
 
     /* cased mode keeps capitals distinct (here -> [UNK] since vocab is lower). */
     char cdir[1024];
-    snprintf(cdir, sizeof(cdir), "%s/embed-wp-cased-XXXXXX", tmp);
+    snprintf(cdir, sizeof(cdir), "%s/ffwd-wp-cased-XXXXXX", tmp);
     if (!mkdtemp(cdir) || write_fixture(cdir, 0) != 0)
         return 2;
-    wordpiece_tokenizer_t *cased = wordpiece_tokenizer_load(cdir);
+    tok_wp_t *cased = tok_wp_load(cdir);
     if (!cased || cased->do_lower_case)
         return 1;
     rc |= check(cased, "The", (int[]){1}, 1, "cased-unknown");
     rc |= check(cased, "the", (int[]){5}, 1, "cased-known");
-    wordpiece_tokenizer_free(cased);
+    tok_wp_free(cased);
     if (rc)
         return 1;
 
-    wordpiece_tokenizer_free(tok);
+    tok_wp_free(tok);
     puts("ok: WordPiece basic+subword tokenization, casing, accents, CJK, specials");
     return 0;
 }

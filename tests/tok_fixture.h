@@ -1,7 +1,7 @@
 /* tests/tok_fixture.h - synthesize a complete GPT-2-style byte-level BPE
  * tokenizer fixture into a directory: vocab.json with all 256 byte tokens
  * (ids 0-255, so any input tokenizes) plus a few merged tokens (ids 256+),
- * and the matching merges.txt. Shared by the tokenizer and server tests. */
+ * and the matching merges.txt. */
 
 #ifndef TOK_FIXTURE_H
 #define TOK_FIXTURE_H

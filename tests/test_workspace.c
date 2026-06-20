@@ -1,14 +1,13 @@
 /* tests/test_workspace.c - model/workspace API lifecycle tests.
  * Hermetic by default (synthesizes a tiny model + tokenizer fixture);
  * pass a MODEL_DIR to run the same checks against real weights, which is
- * what scripts/check_workspace_api.py does. Runs via `make test`. */
+ * what tests/integration/check_workspace_api.py does. Runs via `make test`. */
 
-#include "embed.h"
-#include "tokenizer_bpe.h"
-#include "tiny_model.h"
-#include "tok_fixture.h"
+#include "internal.h"
+#include "bpe.h"
+#include "model_fixture.h"
 
-#include "../src/alloc.h"
+#include "alloc.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -46,14 +45,14 @@ static int check_alloc_helpers(void) {
 static int check_vector_helpers(void) {
     float a[1] = {1.0e19f};
     float b[1] = {1.0e19f};
-    float cos = embed_cosine_similarity(a, b, 1);
+    float cos = ffwd_cosine_similarity(a, b, 1);
     if (fabsf(cos - 1.0f) > 1e-5f) {
         fprintf(stderr, "large finite cosine failed: got %.9g\n", cos);
         return -1;
     }
 
     float z[2] = {0.0f, 0.0f};
-    if (embed_l2_normalize(z, 2) == 0 || embed_cosine_similarity(z, a, 1) != 0.0f) {
+    if (ffwd_l2_normalize(z, 2) == 0 || ffwd_cosine_similarity(z, a, 1) != 0.0f) {
         fprintf(stderr, "zero-vector helpers accepted invalid input\n");
         return -1;
     }
@@ -62,19 +61,19 @@ static int check_vector_helpers(void) {
 
 /* The allocating and pooling API variants must agree with the *_into
  * results validated in main. reference is the batched row for ids0. */
-static int check_alloc_and_pooling_variants(const embed_model_t *model,
-                                            embed_workspace_t *ws,
+static int check_alloc_and_pooling_variants(const ffwd_model_t *model,
+                                            ffwd_workspace_t *ws,
                                             const int *ids0,
                                             int n0,
                                             const float *states,
                                             const float *reference,
-                                            const embed_config_t *cfg) {
+                                            const ffwd_config_t *cfg) {
     int rc = 1;
     int dim = cfg->hidden_size;
     float *emb = NULL, *fwd = NULL, *pooled = NULL, *span_out = NULL;
 
-    emb = embed_model_encode(model, ws, ids0, n0);
-    fwd = embed_model_forward(model, ws, ids0, n0);
+    emb = ffwd_model_encode(model, ws, ids0, n0);
+    fwd = ffwd_model_forward(model, ws, ids0, n0);
     pooled = (float *)calloc((size_t)dim, sizeof(float));
     span_out = (float *)calloc((size_t)2 * dim, sizeof(float));
     if (!emb || !fwd || !pooled || !span_out) {
@@ -82,42 +81,42 @@ static int check_alloc_and_pooling_variants(const embed_model_t *model,
         goto done;
     }
 
-    if (embed_model_encode(NULL, ws, ids0, n0) != NULL ||
-        embed_model_encode(model, ws, NULL, n0) != NULL ||
-        embed_model_forward(model, ws, ids0, 0) != NULL ||
-        embed_pool_batch(cfg, states, NULL, 1, pooled) == 0) {
+    if (ffwd_model_encode(NULL, ws, ids0, n0) != NULL ||
+        ffwd_model_encode(model, ws, NULL, n0) != NULL ||
+        ffwd_model_forward(model, ws, ids0, 0) != NULL ||
+        ffwd_pool_batch(cfg, states, NULL, 1, pooled) == 0) {
         fprintf(stderr, "alloc variants accepted invalid arguments\n");
         goto done;
     }
 
     if (max_abs_diff(emb, reference, dim) > 0.00005f) {
-        fprintf(stderr, "embed_model_encode disagrees with batched row\n");
+        fprintf(stderr, "ffwd_model_encode disagrees with batched row\n");
         goto done;
     }
     if (max_abs_diff(fwd, states, n0 * dim) > 0.000001f) {
-        fprintf(stderr, "embed_model_forward disagrees with forward_into\n");
+        fprintf(stderr, "ffwd_model_forward disagrees with forward_into\n");
         goto done;
     }
 
     /* Mean-pooling the final states reproduces the embedding. */
-    if (embed_pool_batch(cfg, states, &n0, 1, pooled) != 0 ||
+    if (ffwd_pool_batch(cfg, states, &n0, 1, pooled) != 0 ||
         max_abs_diff(pooled, reference, dim) > 0.00005f) {
-        fprintf(stderr, "embed_pool_batch disagrees with embedding\n");
+        fprintf(stderr, "ffwd_pool_batch disagrees with embedding\n");
         goto done;
     }
 
     /* One span covering the whole sequence pools to the embedding, and
      * two halves recombine into it by token-count weighting. */
-    embed_span_t whole = {0, n0};
-    if (embed_model_encode_spans(model, ws, ids0, n0, &whole, 1, span_out) != 0 ||
+    ffwd_span_t whole = {0, n0};
+    if (ffwd_model_encode_spans(model, ws, ids0, n0, &whole, 1, span_out) != 0 ||
         max_abs_diff(span_out, reference, dim) > 0.00005f) {
         fprintf(stderr, "whole-sequence span disagrees with embedding\n");
         goto done;
     }
     int h = n0 / 2;
-    embed_span_t halves[2] = {{0, h}, {h, n0 - h}};
-    if (embed_model_encode_spans(model, ws, ids0, n0, halves, 2, span_out) != 0) {
-        fprintf(stderr, "embed_model_encode_spans failed for two spans\n");
+    ffwd_span_t halves[2] = {{0, h}, {h, n0 - h}};
+    if (ffwd_model_encode_spans(model, ws, ids0, n0, halves, 2, span_out) != 0) {
+        fprintf(stderr, "ffwd_model_encode_spans failed for two spans\n");
         goto done;
     }
     for (int d = 0; d < dim; d++) {
@@ -139,12 +138,12 @@ done:
 
 /* A multi-document contextual batch must match per-document runs.
  * doc0 is chunks 0 and 1 joined by a separator token; doc1 is chunk 2. */
-static int check_spans_batch_parity(const embed_model_t *model,
-                                    embed_workspace_t *ws,
+static int check_spans_batch_parity(const ffwd_model_t *model,
+                                    ffwd_workspace_t *ws,
                                     int *const ids[],
                                     const int *ntok,
                                     int separator_id,
-                                    const embed_config_t *cfg) {
+                                    const ffwd_config_t *cfg) {
     int rc = 1;
     int dim = cfg->hidden_size;
     int n0 = ntok[0] + 1 + ntok[1];
@@ -159,25 +158,25 @@ static int check_spans_batch_parity(const embed_model_t *model,
     doc0[ntok[0]] = separator_id;
     memcpy(doc0 + ntok[0] + 1, ids[1], (size_t)ntok[1] * sizeof(int));
 
-    embed_span_t spans0[2] = {{0, ntok[0]}, {ntok[0] + 1, ntok[1]}};
-    embed_span_t span1 = {0, ntok[2]};
-    if (embed_model_encode_spans(model, ws, doc0, n0, spans0, 2, expected) != 0 ||
-        embed_model_encode_spans(model, ws, ids[2], ntok[2], &span1, 1,
-                                 expected + (size_t)2 * dim) != 0) {
+    ffwd_span_t spans0[2] = {{0, ntok[0]}, {ntok[0] + 1, ntok[1]}};
+    ffwd_span_t span1 = {0, ntok[2]};
+    if (ffwd_model_encode_spans(model, ws, doc0, n0, spans0, 2, expected) != 0 ||
+        ffwd_model_encode_spans(model, ws, ids[2], ntok[2], &span1, 1,
+                                   expected + (size_t)2 * dim) != 0) {
         fprintf(stderr, "singleton contextual embedding failed\n");
         goto done;
     }
 
-    embed_context_input_t inputs[2] = {
+    ffwd_context_input_t inputs[2] = {
         {{doc0, n0}, spans0, 2},
         {{ids[2], ntok[2]}, &span1, 1},
     };
-    if (embed_model_encode_spans_batch(model, ws, inputs, 2, actual) != 0) {
+    if (ffwd_model_encode_spans_batch(model, ws, inputs, 2, actual) != 0) {
         fprintf(stderr, "batched contextual embedding failed\n");
         goto done;
     }
-    if (embed_model_encode_spans_batch(model, ws, NULL, 2, actual) == 0 ||
-        embed_model_encode_spans_batch(model, ws, inputs, 0, actual) == 0) {
+    if (ffwd_model_encode_spans_batch(model, ws, NULL, 2, actual) == 0 ||
+        ffwd_model_encode_spans_batch(model, ws, inputs, 0, actual) == 0) {
         fprintf(stderr, "spans batch accepted invalid arguments\n");
         goto done;
     }
@@ -207,11 +206,11 @@ int main(int argc, char **argv) {
     } else if (argc == 1) {
         /* Tiny hidden size keeps it fast; the vocab must cover every id the
          * byte-complete tokenizer fixture can emit. */
-        tm_dims_t dims = {4, 2, 1, 2, 8, TF_VOCAB_SIZE};
-        snprintf(fixture_dir, sizeof(fixture_dir), "%s/embed-ws-test-XXXXXX",
+        tm_dims_t dims = mf_default_dims();
+        snprintf(fixture_dir, sizeof(fixture_dir), "%s/ffwd-ws-test-XXXXXX",
                  getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-        if (!mkdtemp(fixture_dir) || tf_write_vocab(fixture_dir) != 0 ||
-            tm_write_model_dims(fixture_dir, "F32", &dims) != 0) {
+        if (!mkdtemp(fixture_dir) ||
+            mf_write_fixture(fixture_dir, "F32", &dims, MF_MODEL_BASE, TF_EOT_ID, 1, 0) != 0) {
             fprintf(stderr, "fixture creation failed\n");
             return 2;
         }
@@ -223,28 +222,28 @@ int main(int argc, char **argv) {
     char vocab_path[4096];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
 
-    embed_model_t *model = embed_model_load(model_dir);
+    ffwd_model_t *model = ffwd_model_load(model_dir);
     if (!model) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
 
-    const embed_config_t *cfg = embed_model_config(model);
+    const ffwd_config_t *cfg = ffwd_model_config(model);
     if (!cfg || cfg->hidden_size <= 0) {
         fprintf(stderr, "invalid model config\n");
-        embed_model_free(model);
+        ffwd_model_free(model);
         return 1;
     }
 
-    embed_workspace_t *batch_ws = embed_workspace_new(model);
-    embed_workspace_t *single_ws = embed_workspace_new(model);
-    embed_tokenizer_t *tok = embed_tokenizer_load(vocab_path);
+    ffwd_workspace_t *batch_ws = ffwd_workspace_new(model);
+    ffwd_workspace_t *single_ws = ffwd_workspace_new(model);
+    tok_bpe_t *tok = tok_bpe_load(vocab_path);
     if (!batch_ws || !single_ws || !tok) {
         fprintf(stderr, "failed to allocate workspace or tokenizer\n");
-        embed_tokenizer_free(tok);
-        embed_workspace_free(single_ws);
-        embed_workspace_free(batch_ws);
-        embed_model_free(model);
+        tok_bpe_free(tok);
+        ffwd_workspace_free(single_ws);
+        ffwd_workspace_free(batch_ws);
+        ffwd_model_free(model);
         return 1;
     }
 
@@ -257,16 +256,16 @@ int main(int argc, char **argv) {
      * sees indeterminate pointers. */
     int *ids[4] = {0};
     int ntok[4] = {0};
-    embed_input_t inputs[4];
+    ffwd_input_t inputs[4];
 
-    size_t initial_ws_bytes = embed_workspace_nbytes(batch_ws);
+    size_t initial_ws_bytes = ffwd_workspace_nbytes(batch_ws);
     if (initial_ws_bytes == 0) {
         fprintf(stderr, "workspace byte accounting returned zero\n");
         goto fail;
     }
 
     for (int i = 0; i < batch; i++) {
-        ids[i] = embed_tokenizer_encode(tok, texts[i], &ntok[i]);
+        ids[i] = tok_bpe_encode(tok, texts[i], &ntok[i]);
         if (!ids[i] || ntok[i] <= 0) {
             fprintf(stderr, "failed to tokenize input %d\n", i);
             goto fail;
@@ -289,8 +288,8 @@ int main(int argc, char **argv) {
         goto fail;
     }
 
-    if (embed_model_encode_batch(model, batch_ws, inputs, batch, batched) != 0) {
-        fprintf(stderr, "embed_model_encode_batch failed\n");
+    if (ffwd_model_encode_batch(model, batch_ws, inputs, batch, batched) != 0) {
+        fprintf(stderr, "ffwd_model_encode_batch failed\n");
         free(states);
         free(normalized);
         free(single);
@@ -298,7 +297,7 @@ int main(int argc, char **argv) {
         goto fail;
     }
 
-    size_t batch_ws_bytes = embed_workspace_nbytes(batch_ws);
+    size_t batch_ws_bytes = ffwd_workspace_nbytes(batch_ws);
     if (batch_ws_bytes <= initial_ws_bytes) {
         fprintf(stderr, "workspace byte accounting did not grow after embedding\n");
         free(states);
@@ -311,8 +310,8 @@ int main(int argc, char **argv) {
     float worst_diff = 0.0f;
     float worst_cos = 1.0f;
     for (int i = 0; i < batch; i++) {
-        if (embed_model_encode_into(model, single_ws, ids[i], ntok[i], single) != 0) {
-            fprintf(stderr, "embed_model_encode_into failed at %d\n", i);
+        if (ffwd_model_encode_into(model, single_ws, ids[i], ntok[i], single) != 0) {
+            fprintf(stderr, "ffwd_model_encode_into failed at %d\n", i);
             free(states);
             free(normalized);
             free(single);
@@ -322,7 +321,7 @@ int main(int argc, char **argv) {
 
         const float *row = batched + (size_t)i * dim;
         float diff = max_abs_diff(row, single, dim);
-        float cos = embed_cosine_similarity(row, single, dim);
+        float cos = ffwd_cosine_similarity(row, single, dim);
         if (diff > worst_diff)
             worst_diff = diff;
         if (cos < worst_cos)
@@ -330,8 +329,8 @@ int main(int argc, char **argv) {
     }
 
     memcpy(normalized, batched, (size_t)dim * sizeof(float));
-    if (embed_l2_normalize(normalized, dim) != 0) {
-        fprintf(stderr, "embed_l2_normalize failed\n");
+    if (ffwd_l2_normalize(normalized, dim) != 0) {
+        fprintf(stderr, "ffwd_l2_normalize failed\n");
         free(states);
         free(normalized);
         free(single);
@@ -342,7 +341,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < dim; i++)
         normalized_norm_sq += normalized[i] * normalized[i];
     if (fabsf(normalized_norm_sq - 1.0f) > 0.00005f) {
-        fprintf(stderr, "embed_l2_normalize produced norm_sq=%g\n", normalized_norm_sq);
+        fprintf(stderr, "ffwd_l2_normalize produced norm_sq=%g\n", normalized_norm_sq);
         free(states);
         free(normalized);
         free(single);
@@ -350,8 +349,8 @@ int main(int argc, char **argv) {
         goto fail;
     }
 
-    if (embed_model_forward_into(model, batch_ws, ids[0], ntok[0], states) != 0) {
-        fprintf(stderr, "embed_model_forward_into failed\n");
+    if (ffwd_model_forward_into(model, batch_ws, ids[0], ntok[0], states) != 0) {
+        fprintf(stderr, "ffwd_model_forward_into failed\n");
         free(states);
         free(normalized);
         free(single);
@@ -370,9 +369,9 @@ int main(int argc, char **argv) {
 
     /* Same separator resolution as the server: the fixture vocab defines
      * <|endoftext|>, real snapshots use the reserved id. */
-    int sep_id = embed_tokenizer_token_id(tok, "<|endoftext|>");
+    int sep_id = tok_bpe_token_id(tok, "<|endoftext|>");
     if (sep_id < 0)
-        sep_id = EMBED_CONTEXT_SEPARATOR_TOKEN_ID;
+        sep_id = FFWD_CONTEXT_SEPARATOR_TOKEN_ID;
     if (check_spans_batch_parity(model, batch_ws, ids, ntok, sep_id, cfg) != 0) {
         free(states);
         free(normalized);
@@ -388,10 +387,10 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < batch; i++)
         free(ids[i]);
-    embed_tokenizer_free(tok);
-    embed_workspace_free(single_ws);
-    embed_workspace_free(batch_ws);
-    embed_model_free(model);
+    tok_bpe_free(tok);
+    ffwd_workspace_free(single_ws);
+    ffwd_workspace_free(batch_ws);
+    ffwd_model_free(model);
 
     if (worst_diff > 0.00005f || worst_cos < 0.99999f) {
         fprintf(stderr, "workspace API parity failed: max_abs_diff=%g cosine=%g\n", worst_diff,
@@ -406,9 +405,9 @@ int main(int argc, char **argv) {
 fail:
     for (int i = 0; i < batch; i++)
         free(ids[i]);
-    embed_tokenizer_free(tok);
-    embed_workspace_free(single_ws);
-    embed_workspace_free(batch_ws);
-    embed_model_free(model);
+    tok_bpe_free(tok);
+    ffwd_workspace_free(single_ws);
+    ffwd_workspace_free(batch_ws);
+    ffwd_model_free(model);
     return 1;
 }
