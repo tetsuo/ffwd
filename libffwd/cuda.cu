@@ -1131,10 +1131,14 @@ static int ensure_weight_f32(ffwd_cuda_ctx_t *ctx, size_t elems) {
 
 // y = w @ x (+ beta*y). With BF16 weights and an already-BF16 activation
 // (x_is_bf16 - the Qwen fused path) both inputs are BF16 with F32 accumulation.
-// For the BERT family the activation stays F32 and the BF16 weight is widened
-// back to F32 here, so the GEMM is exact (honoring gemm_compute): BF16 is then a
-// storage choice that costs no quality, which the post-norm LayerNorm needs.
-// With F32 weights this is the exact path.
+// For the BERT family in an exact-or-TF32 compute mode the activation stays F32
+// and the BF16 weight is widened back to F32 here, so the GEMM is exact (or
+// TF32, which needs F32 operands): BF16 is then a storage choice that costs no
+// quality, which the mean-subtracting post-attention LayerNorm needs. When the
+// caller opts into 16-bit float compute (gemm mode bf16/16f) exactness is
+// already given up, so BERT takes the direct BF16xBF16 path too: widening to F32
+// would only read full F32 weight bandwidth for a result the tensor core rounds
+// to BF16 anyway. With F32 weights this is the exact path.
 static int linear_ex(ffwd_cuda_ctx_t *ctx,
                      const cuda_matrix_t *w,
                      const void *x,
@@ -1147,7 +1151,11 @@ static int linear_ex(ffwd_cuda_ctx_t *ctx,
                      float beta) {
     const float alpha = 1.0f;
     if (w->bf16) {
-        if (!x_is_bf16 && ctx->config.family == FFWD_FAMILY_BERT) {
+        // 16-bit float compute (bf16/16f) reads bf16 weights directly; exact F32
+        // and TF32 need F32 weight operands, so BERT widens its bf16 weight then.
+        cublasComputeType_t gc = gemm_compute();
+        int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
+        if (!x_is_bf16 && ctx->config.family == FFWD_FAMILY_BERT && !compute_16bit) {
             size_t welems = (size_t)out_dim * (size_t)in_dim;
             if (ensure_weight_f32(ctx, welems) != 0)
                 return -1;
@@ -1158,7 +1166,7 @@ static int linear_ex(ffwd_cuda_ctx_t *ctx,
                 return -1;
             CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim,
                                       &alpha, ctx->weight_f32, CUDA_R_32F, in_dim, x, CUDA_R_32F,
-                                      x_stride, &beta, y, CUDA_R_32F, out_dim, gemm_compute(),
+                                      x_stride, &beta, y, CUDA_R_32F, out_dim, gc,
                                       CUBLAS_GEMM_DEFAULT));
             return 0;
         }
