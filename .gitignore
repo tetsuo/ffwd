@@ -1,34 +1,46 @@
+*.a
+*.dylib
 *.o
-embed
-embed-server
-libembed.*
-tests/test_kernels_*
-tests/test_safetensors
-tests/test_bf16_model
-tests/test_server
-tests/test_tokenizer
-tests/test_workspace
-tests/test_late
-tests/test_qwen2
-tests/test_qwen3
-tests/test_cli
-tests/test_cls
-tests/test_wordpiece
-test_sentencepiece
-test_xlm_roberta
-tests/cli_under_test
-bench/bench_tokenizer
-bench/bench_kernels
-bench/bench_model
-bench/results/
-coverage/
+*.d
+*.dSYM
 *.profraw
+*.pyc
+*.dSYM/
+.DS_Store
 .venv/
 __pycache__/
-*.pyc
-.DS_Store
-tmp
-private
-.vscode
+.vscode/
 Launch_*.trace/
+
+# Ignore binary artifacts in tests/ but keep source files and Makefile
+tests/*
+!tests/*/
+!tests/*.*
+!tests/Makefile
+!tests/test-vectors
+
+# Ignore bench binaries and recorded results, keep sources and Makefile.
+bench/*
+!bench/*.*
+!bench/Makefile
+bench/results/
+
+tools/cli/ffwd-cli
+tools/server/ffwd-server
+
+# Ignore compiled ffwd-server unit-test binaries, keep their sources.
+tools/server/test_*
+!tools/server/test_*.c
+!tools/server/test_*.h
+
+# Symlinks
+/ffwd-cli
+/ffwd-server
+
+# Public-ABI export map, generated from ffwd.h by devtools/gen_exports.py
+/ffwd.exports
+/ffwd.map
+
+tests/coverage/
+build/
 
