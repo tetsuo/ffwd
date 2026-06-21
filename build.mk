@@ -57,7 +57,12 @@ MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
 # -fapprox-func are the unsafe parts and stay off).
 # -fvisibility=hidden pairs with FFWD_API in the public headers: a new
 # public function without the annotation will be missing from the shared lib.
+# _DEFAULT_SOURCE exposes POSIX/BSD declarations (strdup, strndup, ...) under
+# -std=c11: strict C11 defines __STRICT_ANSI__, so glibc otherwise hides them,
+# and an implicit int return truncates the 64-bit pointer (crashes on Linux;
+# macOS declares them regardless, which hid this).
 CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -fPIC -fvisibility=hidden \
+              -D_DEFAULT_SOURCE \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
 
