@@ -892,7 +892,15 @@ static int gemm_strided_batched(cublasHandle_t blas,
 // layer-invariant). attn_G stays 0 - per-sequence fallback - for ragged
 // batches, single sequences, or when one sequence's scores exceed the
 // budget.
-static int attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim) {
+// use_bf16 must match the out_bf16 branch the caller will take in
+// cuda_attention_gemm: the V/probability/output pointer layout chosen here has to
+// agree with the data type that GEMM reads. BERT runs attention in F32 (passes
+// out_bf16=NULL) even with BF16 weights, so it must pass use_bf16=0; the Qwen
+// path runs BF16 attention when its weights are BF16. Keying this off the global
+// g_weights_bf16 instead silently mismatched the BERT path (BF16 layout, F32
+// GEMM) and corrupted equal-length batched attention.
+static int
+attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, int use_bf16) {
     const ffwd_config_t *c = &ctx->config;
     ctx->attn_G = 0;
     if (batch < 2)
@@ -913,7 +921,7 @@ static int attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int
     if (G < 2)
         return 0;
 
-    int bf16 = g_weights_bf16;
+    int bf16 = use_bf16;
     long long want = (long long)G * per;
     if (want > ctx->attn_scores_elems) {
         cudaFree(ctx->attn_scores);
@@ -1504,7 +1512,9 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     if (launch_check() != 0)
         return -1;
 
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim) != 0)
+    // BERT attention runs in F32 (cuda_attention_gemm is called with NULL below),
+    // so the batched layout must be F32 too, regardless of weight storage dtype.
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, 0) != 0)
         return -1;
 
     for (int layer = 0; layer < c->n_layers; layer++) {
@@ -1593,7 +1603,9 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     // projection GEMM consumes before any later producer reuses the buffer
     // (single stream). No cast launches remain in the layer loop.
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim) != 0)
+    // BF16-weight layers run attention in BF16 (cuda_attention_gemm gets `act`);
+    // the batched layout must match. Weight dtype is uniform across layers.
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, g_weights_bf16) != 0)
         return -1;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];

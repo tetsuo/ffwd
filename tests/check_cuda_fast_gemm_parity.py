@@ -42,6 +42,12 @@ DEFAULT_TEXTS = [
 # (BERT/MiniLM/BGE max_position 512, XLM-R 514) accept it; larger 8x/14x inputs
 # overflowed their position tables and were (correctly) rejected, which looked
 # like a CUDA failure. Still long enough to stress packed-sequence attention.
+#
+# NOTE on coverage: these defaults are all DIFFERENT lengths, so they exercise
+# only the per-sequence (ragged) attention path. The CUDA batched-attention path
+# (cublasGemmBatchedEx) engages only when every sequence in the batch is the SAME
+# length (see attn_batched_setup). To exercise it, pass >=2 identical texts as
+# positional args, e.g. the same sentence four times with --batch-size 4.
 
 
 def run_cuda(binary: str, model_dir: str, mode: str, weights: str,
