@@ -81,10 +81,15 @@ def local_embeddings(
     emb_lines = nonempty[-len(texts):]
     rows = [[float(x) for x in ln.split()] for ln in emb_lines]
 
+    if len(rows) != len(texts):
+        raise RuntimeError(f"local output did not contain {len(texts)} embedding rows")
+
+    # Per-text "tokens (N):" is only printed with -v on the single/stream path;
+    # the multi-arg batched path used here does not emit it, so token counts are
+    # best-effort. The C-vs-HF tokenizer is covered by check_tokenizer_parity.
     token_counts = [int(x) for x in re.findall(r"tokens \((\d+)\):", proc.stderr)]
-    if len(rows) != len(texts) or len(token_counts) != len(texts):
-        raise RuntimeError(
-            f"expected {len(texts)} rows/tokens, got {len(rows)}/{len(token_counts)}")
+    if len(token_counts) != len(texts):
+        token_counts = []
     return np.asarray(rows, dtype=np.float32), token_counts
 
 
@@ -115,14 +120,15 @@ def main() -> int:
     for i, (got, want) in enumerate(zip(actual, expected)):
         diff = float(np.max(np.abs(got - want)))
         score = cosine(got, want)
-        tokens_ok = token_counts[i] == len(hf_tokens[i])
+        have_tokens = i < len(token_counts)
+        tokens_ok = (not have_tokens) or token_counts[i] == len(hf_tokens[i])
         passed = tokens_ok and diff <= args.max_diff and score >= args.min_cosine
         ok = ok and passed
         worst_diff = max(worst_diff, diff)
         worst_cosine = min(worst_cosine, score)
+        tok_str = f"{token_counts[i]}/{len(hf_tokens[i])}" if have_tokens else f"?/{len(hf_tokens[i])}"
         print(
-            f"{'ok' if passed else 'FAIL'}: row={i} "
-            f"tokens={token_counts[i]}/{len(hf_tokens[i])} "
+            f"{'ok' if passed else 'FAIL'}: row={i} tokens={tok_str} "
             f"max_abs_diff={diff:.8g} cosine={score:.8f}")
 
     print(
