@@ -45,7 +45,7 @@ struct ffwd_cuda_ctx {
     ffwd_config_t config;
     cudaStream_t stream;
     cublasHandle_t blas;
-    cuda_matrix_t ffwd_tokens;
+    cuda_matrix_t embed_tokens;
     cuda_layer_t *layers;
     float *norm;
     /* BERT family (NULL for Qwen3): learned absolute position embeddings, the
@@ -1292,7 +1292,7 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
      * file's dtype: BF16 snapshots load as BF16 (bit-exact pass-through),
      * F32 snapshots keep the exact F32 default. */
     if (!g_weights_bf16_set) {
-        g_weights_bf16 = cpu->weights.ffwd_tokens.dtype == DTYPE_BF16;
+        g_weights_bf16 = cpu->weights.embed_tokens.dtype == DTYPE_BF16;
         if (g_weights_bf16)
             fprintf(stderr, "cuda: BF16 model file; storing weights as BF16 "
                             "(use --gpu-weight-dtype f32 to override)\n");
@@ -1311,7 +1311,7 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
-    if (load_matrix(&ctx->ffwd_tokens, &cpu->weights.ffwd_tokens, c->vocab_size, c->hidden_size) !=
+    if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size, c->hidden_size) !=
         0) {
         ffwd_cuda_free(ctx);
         return NULL;
@@ -1354,7 +1354,7 @@ ffwd_cuda_ctx_t *ffwd_cuda_load(const char *model_dir) {
 void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     if (!ctx)
         return;
-    cuda_matrix_free(&ctx->ffwd_tokens);
+    cuda_matrix_free(&ctx->embed_tokens);
     if (ctx->layers) {
         for (int i = 0; i < ctx->config.n_layers; i++)
             free_layer(&ctx->layers[i]);
@@ -1491,7 +1491,7 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     int blocks_hidden = (total * hidden + threads - 1) / threads;
 
     ffwd_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->ffwd_tokens.d, ctx->ffwd_tokens.bf16, total, hidden,
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, hidden,
         c->vocab_size);
     if (launch_check() != 0)
         return -1;
@@ -1578,7 +1578,7 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
     ffwd_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->ffwd_tokens.d, ctx->ffwd_tokens.bf16, total, c->hidden_size,
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, c->hidden_size,
         c->vocab_size);
     if (launch_check() != 0)
         return -1;
