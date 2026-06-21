@@ -321,8 +321,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     float device_scores[NDOCS];
-    if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, NDOCS,
-                                             device_scores) != 0) {
+    if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, NDOCS, device_scores) !=
+        0) {
         fprintf(stderr, "late MLX device MaxSim failed\n");
         ffwd_mlx_late_vectors_free(packed_dev);
         return 1;
@@ -346,8 +346,8 @@ int main(int argc, char **argv) {
     if (runs > 0) {
         double start = now_ms();
         for (int i = 0; i < runs; i++) {
-            if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed_docs, offsets, NDOCS, dim,
-                                          scores) != 0) {
+            if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed_docs, offsets, NDOCS, dim, scores) !=
+                0) {
                 fprintf(stderr, "timed late MaxSim failed at run %d\n", i);
                 return 1;
             }
@@ -366,7 +366,7 @@ int main(int argc, char **argv) {
         start = now_ms();
         for (int i = 0; i < runs; i++) {
             if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, NDOCS,
-                                                     device_scores) != 0) {
+                                                  device_scores) != 0) {
                 fprintf(stderr, "timed late MLX device MaxSim failed at run %d\n", i);
                 ffwd_mlx_late_vectors_free(packed_dev);
                 return 1;

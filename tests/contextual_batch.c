@@ -42,16 +42,15 @@ static void test_model_free(test_model_t *m) { ffwd_mlx_free(m); }
 static test_workspace_t *test_workspace_new(test_model_t *m) { return m; }
 static void test_workspace_free(test_workspace_t *ws) { (void)ws; }
 static const ffwd_config_t *test_config(test_model_t *m) { return ffwd_mlx_config(m); }
-static int
-test_ffwd_spans(test_model_t *m, test_workspace_t *ws, const test_doc_t *doc, float *out) {
+static int test_ffwd_spans(test_model_t *m, test_workspace_t *ws, const test_doc_t *doc, float *out) {
     (void)ws;
     return ffwd_mlx_encode_spans(m, doc->ids, doc->n_tokens, doc->spans, doc->n_spans, out);
 }
 static int test_ffwd_spans_batch(test_model_t *m,
-                                    test_workspace_t *ws,
-                                    const ffwd_context_input_t *inputs,
-                                    int batch,
-                                    float *out) {
+                                 test_workspace_t *ws,
+                                 const ffwd_context_input_t *inputs,
+                                 int batch,
+                                 float *out) {
     (void)ws;
     return ffwd_mlx_encode_spans_batch(m, inputs, batch, out);
 }
@@ -63,15 +62,14 @@ static void test_model_free(test_model_t *m) { ffwd_model_free(m); }
 static test_workspace_t *test_workspace_new(test_model_t *m) { return ffwd_workspace_new(m); }
 static void test_workspace_free(test_workspace_t *ws) { ffwd_workspace_free(ws); }
 static const ffwd_config_t *test_config(test_model_t *m) { return ffwd_model_config(m); }
-static int
-test_ffwd_spans(test_model_t *m, test_workspace_t *ws, const test_doc_t *doc, float *out) {
+static int test_ffwd_spans(test_model_t *m, test_workspace_t *ws, const test_doc_t *doc, float *out) {
     return ffwd_model_encode_spans(m, ws, doc->ids, doc->n_tokens, doc->spans, doc->n_spans, out);
 }
 static int test_ffwd_spans_batch(test_model_t *m,
-                                    test_workspace_t *ws,
-                                    const ffwd_context_input_t *inputs,
-                                    int batch,
-                                    float *out) {
+                                 test_workspace_t *ws,
+                                 const ffwd_context_input_t *inputs,
+                                 int batch,
+                                 float *out) {
     return ffwd_model_encode_spans_batch(m, ws, inputs, batch, out);
 }
 #endif
