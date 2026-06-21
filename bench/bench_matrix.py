@@ -15,6 +15,36 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Each backend is its own binary now: `make <backend>` builds the CLI into
+# build/release/<dir>/ffwd-cli (and refreshes the ./ffwd-cli root symlink).
+BUILD_DIR = {"cpu": "blas", "mlx": "mlx", "cuda": "cuda"}
+
+
+def default_binary(backend):
+    return ROOT / "build" / "release" / BUILD_DIR[backend] / "ffwd-cli"
+
+
+def resolve_binary(backend, args):
+    """Pick the CLI for one backend: an explicit --<backend>-binary, then the
+    shared --binary override, then the per-backend build-tree default."""
+    explicit = {"cpu": args.cpu_binary, "mlx": args.mlx_binary,
+                "cuda": args.cuda_binary}.get(backend, "")
+    if explicit:
+        return Path(explicit)
+    if args.binary:
+        return Path(args.binary)
+    return default_binary(backend)
+
+
+def ensure_binary(backend, binary):
+    """Build the backend's CLI on demand when using the build-tree default."""
+    if binary == default_binary(backend) and not binary.exists():
+        subprocess.run(["make", backend], cwd=ROOT, check=True,
+                       stdout=subprocess.DEVNULL)
+    if not binary.exists():
+        raise SystemExit(f"binary not found for backend {backend}: {binary}")
+
+
 try:
     import psutil
 except Exception:  # pragma: no cover - optional dependency
@@ -304,7 +334,11 @@ def markdown_table(results):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--binary", default=str(ROOT / "tools" / "cli" / "ffwd-cli"))
+    ap.add_argument("--binary", default="",
+                    help="single CLI for every backend; overrides the per-backend default")
+    ap.add_argument("--cpu-binary", default="", help="CLI for cpu runs")
+    ap.add_argument("--mlx-binary", default="", help="CLI for mlx runs")
+    ap.add_argument("--cuda-binary", default="", help="CLI for cuda runs")
     ap.add_argument("--backends", default="cpu",
                     help="Comma-separated list: cpu,mlx,cuda")
     ap.add_argument("--batch-sizes", default="1,2,4,8")
@@ -342,10 +376,14 @@ def main():
     for case in cases:
         if case <= 0:
             raise SystemExit(f"case token count must be a positive integer, got: {case}")
+    for backend in backends:
+        if backend not in BUILD_DIR:
+            raise SystemExit(f"unknown backend: {backend} (expected cpu, mlx, or cuda)")
 
     report = {
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "binary": os.path.abspath(args.binary),
+        "binary": args.binary or "per-backend (build/release/<backend>/ffwd-cli)",
+        "binaries": {b: str(resolve_binary(b, args)) for b in backends},
         "model_dir": os.path.abspath(args.model_dir),
         "model": read_model_config(args.model_dir),
         "host": {
@@ -367,10 +405,12 @@ def main():
     }
 
     for backend in backends:
+        binary = resolve_binary(backend, args)
+        ensure_binary(backend, binary)
         for batch_size in batch_sizes:
-            print(f"\n== backend={backend} batch={batch_size} ==")
+            print(f"\n== backend={backend} batch={batch_size} binary={binary} ==")
             stdin_runner = StdinRunner(
-                args.binary, args.model_dir, backend, batch_size, args.threads,
+                str(binary), args.model_dir, backend, batch_size, args.threads,
                 common_binary_args, backend_binary_args.get(backend, []))
             try:
                 stdin_runner.start()
@@ -383,6 +423,7 @@ def main():
                     r = run_case(stdin_runner, case, args.runs, args.warmups)
                     r.update({
                         "backend": backend,
+                        "binary": str(binary),
                         "load_ms": stdin_runner.load_ms,
                         "rss_mb": stdin_runner.rss_mb() or rss_after_warmup,
                     })
