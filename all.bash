@@ -35,7 +35,7 @@ err() { printf '%sERROR: %s%s\n' "$RED" "$*" "$NORMAL" >&2; }
 _ALL_CMDS="help checks check-code-quality check-sanitize check-kernel-golden check-batch-parity \
 check-context-batch-parity check-late-interaction check-cuda-fast-gemm-parity \
 check-embedding-parity check-mlx-model-limits check-mlx-quantized-parity \
-check-precision-drift check-reference-parity check-bert-parity check-e5-parity \
+check-reference-parity check-bert-parity check-e5-parity \
 check-qwen3-parity check-tokenizer-parity check-wordpiece-parity check-model-matrix \
 check-server-api check-cli check-workspace-api check-perplexity-sdk-compat \
 check-openai-sdk-compat bench-contextual-api bench-late-rerank bench-late-api \
@@ -82,7 +82,7 @@ run_reference() {
 }
 
 check_code_quality() {
-  run ./devtools/check_code_quality.sh "$@"
+  run ./tests/check_code_quality.sh "$@"
 }
 
 # The dynamic-analysis counterpart to check-code-quality (which is static only:
@@ -271,7 +271,7 @@ check_cuda_fast_gemm_parity() {
 }
 
 check_embedding_parity() {
-  run_uv ./devtools/compare_model_embeddings.py "$@"
+  run_uv ./tests/check_embedding_parity.py "$@"
 }
 
 check_mlx_model_limits() {
@@ -288,10 +288,6 @@ check_mlx_quantized_parity() {
     return 0
   fi
   run_uv ./tests/check_mlx_quantized_parity.py "$@"
-}
-
-check_quant_precision_drift() {
-  run_reference ./devtools/quant_precision_drift.py "$@"
 }
 
 check_reference_parity() {
@@ -396,7 +392,6 @@ usage() {
   ┃  check-late-interaction        Check late-interaction vectors  ┃
   ┃  check-mlx-model-limits        Check MLX metadata rejection    ┃
   ┃  check-mlx-quantized-parity    Compare quantized embeddings    ┃
-  ┃  check-precision-drift         Compare low-precision drift     ┃
   ┃  check-reference-parity        Compare server vs Python ref    ┃
   ┃  check-bert-parity             Compare BERT embeddings         ┃
   ┃  check-e5-parity               Compare XLM-R/E5 embeddings     ┃
@@ -444,7 +439,6 @@ main() {
     check-embedding-parity) check_embedding_parity "$@" ;;
     check-mlx-model-limits) check_mlx_model_limits "$@" ;;
     check-mlx-quantized-parity) check_mlx_quantized_parity "$@" ;;
-    check-precision-drift) check_quant_precision_drift "$@" ;;
     check-reference-parity) check_reference_parity "$@" ;;
     check-bert-parity) check_bert_parity "$@" ;;
     check-e5-parity) check_e5_parity "$@" ;;
