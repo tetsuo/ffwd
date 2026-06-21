@@ -1,6 +1,6 @@
 /* tests/test_kernels.c - golden tests for the low-level math kernels.
- * Runs via `make test` (generic and BLAS variants) and
- * tests/quality/check_kernel_golden.sh. No model files required. */
+ * Runs via `make test`, `make -C tests test_kernels test_kernels_generic`,
+ * or `./all.bash check-kernel-golden`. No model files required. */
 
 #include "kernels.h"
 #include "threadpool.h"

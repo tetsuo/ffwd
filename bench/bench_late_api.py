@@ -159,7 +159,7 @@ def main() -> int:
         except ImportError as exc:
             raise SystemExit(
                 "PyLate is missing; run with `uv run --with pylate "
-                "scripts/bench_late_api.py ...`"
+                "bench/bench_late_api.py ...`"
             ) from exc
 
         model = models.ColBERT(
