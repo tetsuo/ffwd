@@ -221,13 +221,12 @@ int main(int argc, char **argv) {
         return 1;
     for (int i = 0; i < candidates; i++)
         dev_docs[i] = docs[i].dev;
-    ffwd_mlx_late_vectors_t *packed_dev =
-        ffwd_mlx_late_vectors_concat(model, dev_docs, candidates);
+    ffwd_mlx_late_vectors_t *packed_dev = ffwd_mlx_late_vectors_concat(model, dev_docs, candidates);
     free(dev_docs);
     if (!packed_dev)
         return 1;
     if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, candidates,
-                                             device_scores) != 0)
+                                          device_scores) != 0)
         return 1;
     float worst_diff = 0.0f;
     for (int i = 0; i < candidates; i++) {
@@ -244,8 +243,7 @@ int main(int argc, char **argv) {
 
     double start = now_ms();
     for (int r = 0; r < runs; r++) {
-        if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed, offsets, candidates, dim, scores) !=
-            0)
+        if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed, offsets, candidates, dim, scores) != 0)
             return 1;
     }
     double cpu_ms = now_ms() - start;
@@ -267,7 +265,7 @@ int main(int argc, char **argv) {
     start = now_ms();
     for (int r = 0; r < runs; r++) {
         if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, candidates,
-                                                 device_scores) != 0)
+                                              device_scores) != 0)
             return 1;
     }
     double mlx_ms = now_ms() - start;
