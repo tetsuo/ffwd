@@ -403,6 +403,10 @@ __device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v) {
     out[i] = __float2bfloat16(v);
 }
 
+__device__ static inline float load_embedding_value(const void *emb, int emb_bf16, size_t i) {
+    return emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[i]) : ((const float *)emb)[i];
+}
+
 // OUT_T is float, or __nv_bfloat16 when the result feeds a BF16-weight
 // projection GEMM directly (same rounding as a separate cast kernel).
 template <typename OUT_T>
@@ -665,66 +669,104 @@ __global__ static void span_pool_kernel(
     }
 }
 
-// BERT LayerNorm: mean-subtract, biased variance (/dim), scale by gamma, shift
-// by beta. One block per row, two block reductions before any write, so it is
-// safe in place (out == x). Matches the CPU layer_norm.
-__global__ static void layer_norm_kernel(
-    float *out, const float *x, const float *gamma, const float *beta, int rows, int dim, float eps) {
+// BERT embedding LayerNorm: token lookup + absolute position + token type +
+// LayerNorm in one row kernel. It avoids writing the pre-normalized embedding
+// row to global memory only to read it back for LayerNorm.
+__global__ static void bert_embed_layer_norm_kernel(float *out,
+                                                    const int *ids,
+                                                    const int *positions,
+                                                    const void *emb,
+                                                    int emb_bf16,
+                                                    const float *pos_emb,
+                                                    const float *token_type,
+                                                    const float *gamma,
+                                                    const float *beta,
+                                                    int total,
+                                                    int hidden,
+                                                    int vocab,
+                                                    float eps) {
+    extern __shared__ float rowbuf[];
     int row = blockIdx.x;
     int tid = threadIdx.x;
+    if (row >= total)
+        return;
+    int id = ids[row];
+    int pos = positions[row];
+
+    float s = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float tok = 0.0f;
+        if (id >= 0 && id < vocab)
+            tok = load_embedding_value(emb, emb_bf16, (size_t)id * hidden + d);
+        float v = tok + (pos_emb[(size_t)pos * hidden + d] + token_type[d]);
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)hidden;
+    float vs = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)hidden + eps);
+    for (int d = tid; d < hidden; d += blockDim.x)
+        out[(size_t)row * hidden + d] = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+}
+
+// BERT SkipLayerNorm variant for the common post-GEMM shape. The residual has
+// already been accumulated by cuBLAS beta=1, so this fuses the remaining row
+// bias with LayerNorm and keeps the pre-normalized row in shared memory.
+__global__ static void layer_norm_bias_kernel(float *out,
+                                              const float *x,
+                                              const float *bias,
+                                              const float *gamma,
+                                              const float *beta,
+                                              int rows,
+                                              int dim,
+                                              float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows)
+        return;
     const float *xr = x + (size_t)row * dim;
     float s = 0.0f;
-    for (int d = tid; d < dim; d += blockDim.x)
-        s += xr[d];
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float v = xr[d] + bias[d];
+        rowbuf[d] = v;
+        s += v;
+    }
     float mean = block_sum(s) / (float)dim;
     float vs = 0.0f;
     for (int d = tid; d < dim; d += blockDim.x) {
-        float c = xr[d] - mean;
+        float c = rowbuf[d] - mean;
         vs += c * c;
     }
     float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
     float *o = out + (size_t)row * dim;
     for (int d = tid; d < dim; d += blockDim.x)
-        o[d] = (xr[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
 }
 
-// Exact-erf GeLU in place: 0.5 x (1 + erf(x / sqrt(2))). The released encoders
-// use this; the tanh approximation below is for gelu_new / gelu_pytorch_tanh.
-__global__ static void gelu_kernel(float *x, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = x[i];
-        x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
-    }
-}
-
-// Tanh-approximation GeLU in place: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))).
-__global__ static void gelu_tanh_kernel(float *x, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = x[i];
-        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
-        x[i] = 0.5f * v * (1.0f + tanhf(inner));
-    }
-}
-
-// Add the learned absolute position embedding (indexed by the within-sequence
-// position) and the token-type[0] embedding to the token embeddings already in
-// x. token_type holds row 0 only; every input token has segment id 0.
-__global__ static void bert_pos_type_add_kernel(float *x,
-                                                const int *positions,
-                                                const float *pos_emb,
-                                                const float *token_type,
-                                                int total,
-                                                int hidden) {
+__global__ static void bias_gelu_kernel(float *x, const float *bias, int rows, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t count = (size_t)total * hidden;
-    if (idx >= count)
-        return;
-    int tok = (int)(idx / hidden);
-    int d = (int)(idx - (size_t)tok * hidden);
-    int pos = positions[tok];
-    x[idx] += pos_emb[(size_t)pos * hidden + d] + token_type[d];
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        x[idx] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+    }
+}
+
+__global__ static void bias_gelu_tanh_kernel(float *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        x[idx] = 0.5f * v * (1.0f + tanhf(inner));
+    }
 }
 
 static int launch_check(void) {
@@ -1496,19 +1538,12 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     float scale = 1.0f / sqrtf((float)c->head_dim);
     float eps = c->layer_norm_eps;
     int threads = 256;
-    int blocks_hidden = (total * hidden + threads - 1) / threads;
+    size_t ln_smem = (size_t)hidden * sizeof(float);
 
-    ffwd_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, hidden,
-        c->vocab_size);
-    if (launch_check() != 0)
-        return -1;
-    bert_pos_type_add_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->positions, ctx->position_embeddings, ctx->token_type_embedding, total, hidden);
-    if (launch_check() != 0)
-        return -1;
-    layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, ctx->ffwd_ln_w, ctx->ffwd_ln_b,
-                                                      total, hidden, eps);
+    bert_embed_layer_norm_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+        ctx->x, ctx->token_ids, ctx->positions, ctx->embed_tokens.d, ctx->embed_tokens.bf16,
+        ctx->position_embeddings, ctx->token_type_embedding, ctx->ffwd_ln_w, ctx->ffwd_ln_b, total,
+        hidden, c->vocab_size, eps);
     if (launch_check() != 0)
         return -1;
 
@@ -1535,12 +1570,8 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         // Output dense(+bias), residual into x, then post-attention LayerNorm.
         if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0)
             return -1;
-        add_row_bias_kernel<<<(total * hidden + 255) / 256, 256, 0, ctx->stream>>>(ctx->x, l->o_bias,
-                                                                                   total, hidden);
-        if (launch_check() != 0)
-            return -1;
-        layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, l->input_norm,
-                                                          l->attn_ln_bias, total, hidden, eps);
+        layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+            ctx->x, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total, hidden, eps);
         if (launch_check() != 0)
             return -1;
 
@@ -1548,26 +1579,18 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
             return -1;
         int inter_count = total * inter;
-        add_row_bias_kernel<<<(inter_count + 255) / 256, 256, 0, ctx->stream>>>(
-            ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
-        if (launch_check() != 0)
-            return -1;
         if (c->ffn_act == FFWD_ACT_GELU_TANH)
-            gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-                ctx->ffn_gate_up, (size_t)inter_count);
+            bias_gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
         else
-            gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-                ctx->ffn_gate_up, (size_t)inter_count);
+            bias_gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
         if (launch_check() != 0)
             return -1;
         if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
             return -1;
-        add_row_bias_kernel<<<(total * hidden + 255) / 256, 256, 0, ctx->stream>>>(
-            ctx->x, l->ffn_out_bias, total, hidden);
-        if (launch_check() != 0)
-            return -1;
-        layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, l->post_attn_norm,
-                                                          l->ffn_ln_bias, total, hidden, eps);
+        layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+            ctx->x, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias, total, hidden, eps);
         if (launch_check() != 0)
             return -1;
     }
