@@ -61,8 +61,12 @@ MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
 # -std=c11: strict C11 defines __STRICT_ANSI__, so glibc otherwise hides them,
 # and an implicit int return truncates the 64-bit pointer (crashes on Linux;
 # macOS declares them regardless, which hid this).
+# -Werror=implicit-function-declaration turns a missing prototype into a build
+# failure instead of a buried -Wall warning: that is exactly how the strdup
+# truncation above slipped through (an implicit int return -> mangled pointer,
+# crashing only on Linux). It is a hard error in C23 anyway.
 CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -fPIC -fvisibility=hidden \
-              -D_DEFAULT_SOURCE \
+              -D_DEFAULT_SOURCE -Werror=implicit-function-declaration \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
               -fno-signed-zeros -fassociative-math -freciprocal-math
 
