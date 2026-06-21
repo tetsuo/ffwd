@@ -10,14 +10,32 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = ROOT / "ffwd-cli"
+# Each backend is its own binary; the backend label alone does not change the
+# CLI's behaviour, so cpu-vs-cuda comparisons must run two different binaries.
+BUILD_DIR = {"cpu": "blas", "mlx": "mlx", "cuda": "cuda"}
 
 
-def ensure_cli(binary: Path) -> None:
-    """Build the CLI if the default binary is missing."""
-    if binary == DEFAULT_BINARY and not binary.exists():
-        subprocess.run(["make", "-C", "tools/cli", "all"], cwd=ROOT, check=True,
+def default_binary(backend: str) -> Path:
+    return ROOT / "build" / "release" / BUILD_DIR[backend] / "ffwd-cli"
+
+
+def resolve_binary(backend: str, explicit: str, shared: str) -> Path:
+    """Pick the CLI for one side: an explicit --binary-{a,b}, then the shared
+    --binary override, then the per-backend build-tree default."""
+    if explicit:
+        return Path(explicit)
+    if shared:
+        return Path(shared)
+    return default_binary(backend)
+
+
+def ensure_binary(backend: str, binary: Path) -> None:
+    """Build the backend's CLI on demand when using the build-tree default."""
+    if binary == default_binary(backend) and not binary.exists():
+        subprocess.run(["make", backend], cwd=ROOT, check=True,
                        stdout=subprocess.DEVNULL)
+    if not binary.exists():
+        raise SystemExit(f"binary not found for backend {backend}: {binary}")
 
 
 TEXTS = [
@@ -77,7 +95,10 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--binary", default=str(DEFAULT_BINARY))
+    ap.add_argument("--binary", default="",
+                    help="shared CLI override for both sides; default resolves per backend")
+    ap.add_argument("--binary-a", default="", help="CLI for --a (overrides --binary)")
+    ap.add_argument("--binary-b", default="", help="CLI for --b (overrides --binary)")
     ap.add_argument("--a", required=True, help="reference model directory")
     ap.add_argument("--b", required=True, help="comparison model directory")
     ap.add_argument("--backend", choices=["cpu", "mlx", "cuda"], default="cpu")
@@ -93,15 +114,16 @@ def main() -> int:
 
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be > 0")
-    ensure_cli(Path(args.binary))
-    if not Path(args.binary).exists():
-        raise SystemExit(f"binary not found: {args.binary}")
 
     backend_a = args.backend_a or args.backend
     backend_b = args.backend_b or args.backend
-    emb_a = run_model(args.binary, args.a, TEXTS, args.batch_size,
+    binary_a = resolve_binary(backend_a, args.binary_a, args.binary)
+    binary_b = resolve_binary(backend_b, args.binary_b, args.binary)
+    ensure_binary(backend_a, binary_a)
+    ensure_binary(backend_b, binary_b)
+    emb_a = run_model(str(binary_a), args.a, TEXTS, args.batch_size,
                       backend_a, args.threads)
-    emb_b = run_model(args.binary, args.b, TEXTS, args.batch_size,
+    emb_b = run_model(str(binary_b), args.b, TEXTS, args.batch_size,
                       backend_b, args.threads)
 
     worst_diff = 0.0
