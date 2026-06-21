@@ -85,8 +85,117 @@ check_code_quality() {
   run ./devtools/check_code_quality.sh "$@"
 }
 
+# The comprehensive local suite, folded in from the old verify_builds.sh so
+# all.bash is the single entry point. It builds, runs the hermetic C tests and
+# the math-kernel goldens and the hermetic tokenizer checks (all model-free),
+# then the CPU model checks and - on macOS - the MLX model checks, and finishes
+# with the compiler/analyzer/tidy gate. Model-dependent steps run only when
+# --model-dir is given. CUDA validation stays a separate RunPod step.
 run_checks() {
-  run ./devtools/verify_builds.sh "$@"
+  local model_dir="" context_model_dir="" late_model_dir=""
+  local batch_size=4 context_runs=0
+  local long=0 skip_build=0 skip_hermetic=0 skip_mlx=0
+  local skip_code_quality=0 skip_tokenizer=0 skip_mlx_quantized=0
+  local platform_skip_mlx=0
+
+  while (($#)); do
+    case "$1" in
+      --model-dir) model_dir="$2"; shift 2 ;;
+      --model-dir=*) model_dir="${1#*=}"; shift ;;
+      --context-model-dir) context_model_dir="$2"; shift 2 ;;
+      --context-model-dir=*) context_model_dir="${1#*=}"; shift ;;
+      --late-model-dir) late_model_dir="$2"; shift 2 ;;
+      --late-model-dir=*) late_model_dir="${1#*=}"; shift ;;
+      --batch-size) batch_size="$2"; shift 2 ;;
+      --batch-size=*) batch_size="${1#*=}"; shift ;;
+      --context-runs) context_runs="$2"; shift 2 ;;
+      --context-runs=*) context_runs="${1#*=}"; shift ;;
+      --long) long=1; shift ;;
+      --skip-build) skip_build=1; shift ;;
+      --skip-hermetic) skip_hermetic=1; shift ;;
+      --skip-mlx) skip_mlx=1; shift ;;
+      --skip-code-quality) skip_code_quality=1; shift ;;
+      --skip-tokenizer) skip_tokenizer=1; shift ;;
+      --skip-mlx-quantized) skip_mlx_quantized=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+Usage: ./all.bash checks [options]
+  --model-dir DIR            model for the workspace/batch parity checks
+  --context-model-dir DIR    contextual model (enables contextual parity)
+  --late-model-dir DIR       late-interaction model (enables late checks)
+  --batch-size N             batch size for the parity checks (default 4)
+  --context-runs N           timed contextual batches per backend
+  --long                     also run the long CPU attention parity check
+  --skip-build               skip make cpu / make gpu
+  --skip-hermetic            skip the model-free make test suite
+  --skip-mlx                 stop after the CPU build and CPU checks
+  --skip-tokenizer           skip the hermetic tokenizer parity checks
+  --skip-mlx-quantized       skip the MLX Q8 parity check
+  --skip-code-quality        skip the compiler/analyzer/tidy gate
+USAGE
+        return 0 ;;
+      *) err "checks: unknown option: $1"; return 2 ;;
+    esac
+  done
+
+  if [[ "$(uname -s)" != "Darwin" && $skip_mlx -eq 0 ]]; then
+    warn "MLX checks require macOS; skipping the MLX phase on $(uname -s)"
+    skip_mlx=1
+    platform_skip_mlx=1
+  fi
+
+  # Any failing step aborts the suite with a non-zero exit, as the old script did.
+  _step() { "$@" || { err "checks: step failed -> $*"; exit 1; }; }
+
+  local long_args=()
+  (( long )) && long_args=(--long)
+
+  # Model-free: build, hermetic C tests, kernel goldens, hermetic tokenizers.
+  (( skip_hermetic )) || _step run make test
+  (( skip_build )) || _step run make cpu
+  _step check_kernel_golden
+  if (( ! skip_tokenizer )); then
+    _step check_tokenizer_parity
+    _step check_wordpiece_parity
+  fi
+
+  # CPU model checks (need a model directory).
+  if [[ -n "$model_dir" ]]; then
+    _step check_workspace_api --model-dir "$model_dir"
+    _step check_batch_parity --model-dir "$model_dir" --backend cpu \
+      --batch-size "$batch_size" "${long_args[@]}"
+    if [[ -n "$context_model_dir" ]]; then
+      _step check_contextual_batch_parity --model-dir "$context_model_dir" \
+        --backend cpu --runs "$context_runs"
+    fi
+    if [[ -n "$late_model_dir" ]]; then
+      _step check_late_interaction --model-dir "$late_model_dir" --backend cpu
+    fi
+  else
+    warn "checks: no --model-dir; skipping CPU model checks (workspace, batch/contextual/late parity)"
+  fi
+
+  # MLX phase (macOS only): rebuild as the GPU backend, rerun the model checks.
+  if (( ! skip_mlx )); then
+    (( skip_build )) || _step run make gpu
+    if [[ -n "$model_dir" ]]; then
+      _step check_batch_parity --model-dir "$model_dir" --backend mlx \
+        --batch-size "$batch_size"
+      _step check_mlx_model_limits --model-dir "$model_dir"
+      (( skip_mlx_quantized )) || _step check_mlx_quantized_parity \
+        --model-dir "$model_dir" --batch-size "$batch_size"
+      if [[ -n "$context_model_dir" ]]; then
+        _step check_contextual_batch_parity --model-dir "$context_model_dir" \
+          --backend mlx --runs "$context_runs"
+      fi
+      if [[ -n "$late_model_dir" ]]; then
+        _step check_late_interaction --model-dir "$late_model_dir" --backend mlx
+      fi
+    fi
+  fi
+
+  (( skip_code_quality )) || _step check_code_quality
+  info "checks: all green"
 }
 
 check_kernel_golden() {
@@ -232,6 +341,10 @@ usage() {
   ╚═╝     ╚═╝      ╚══╝╚══╝ ╚═════╝
 
   Usage: ./all.bash COMMAND [ARGS...]
+
+  Aggregate:  checks   full local suite: build + hermetic tests + CPU/MLX
+                       model checks + code quality. Pass --model-dir DIR to
+                       add the model checks; `checks --help` for options.
 
   ┏━━[ checks ]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃                                                                ┃
