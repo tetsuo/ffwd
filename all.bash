@@ -147,9 +147,6 @@ USAGE
   # Any failing step aborts the suite with a non-zero exit, as the old script did.
   _step() { "$@" || { err "checks: step failed -> $*"; exit 1; }; }
 
-  local long_args=()
-  (( long )) && long_args=(--long)
-
   # Model-free: build, hermetic C tests, kernel goldens, hermetic tokenizers.
   (( skip_hermetic )) || _step run make test
   (( skip_build )) || _step run make cpu
@@ -162,8 +159,15 @@ USAGE
   # CPU model checks (need a model directory).
   if [[ -n "$model_dir" ]]; then
     _step check_workspace_api --model-dir "$model_dir"
-    _step check_batch_parity --model-dir "$model_dir" --backend cpu \
-      --batch-size "$batch_size" "${long_args[@]}"
+    # An empty array under `set -u` errors on bash 3.2 (macOS default), so pass
+    # --long with an explicit branch rather than expanding a maybe-empty array.
+    if (( long )); then
+      _step check_batch_parity --model-dir "$model_dir" --backend cpu \
+        --batch-size "$batch_size" --long
+    else
+      _step check_batch_parity --model-dir "$model_dir" --backend cpu \
+        --batch-size "$batch_size"
+    fi
     if [[ -n "$context_model_dir" ]]; then
       _step check_contextual_batch_parity --model-dir "$context_model_dir" \
         --backend cpu --runs "$context_runs"
