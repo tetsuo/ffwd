@@ -32,7 +32,7 @@ info() { printf '%sINFO: %s%s\n' "$GREEN" "$*" "$NORMAL" >&2; }
 warn() { printf '%sWARN: %s%s\n' "$YELLOW" "$*" "$NORMAL" >&2; }
 err() { printf '%sERROR: %s%s\n' "$RED" "$*" "$NORMAL" >&2; }
 
-_ALL_CMDS="help checks check-code-quality check-kernel-golden check-batch-parity \
+_ALL_CMDS="help checks check-code-quality check-sanitize check-kernel-golden check-batch-parity \
 check-context-batch-parity check-late-interaction check-cuda-fast-gemm-parity \
 check-embedding-parity check-mlx-model-limits check-mlx-quantized-parity \
 check-precision-drift check-reference-parity check-bert-parity check-e5-parity \
@@ -85,17 +85,46 @@ check_code_quality() {
   run ./devtools/check_code_quality.sh "$@"
 }
 
+# The dynamic-analysis counterpart to check-code-quality (which is static only:
+# the clang analyzer + clang-tidy). It rebuilds the hermetic C suites - the
+# library test_* and the server test_* - with the address and undefined-behavior
+# sanitizers (MODE=debug; see build.mk) and runs them. This catches the
+# memory-safety and undefined-behavior class of bug the static analyzer misses:
+# the 2026-06-21 strdup pointer corruption was exactly such a bug (ASan and
+# valgrind caught it, the analyzer did not). It is model-free, so it runs on both
+# macOS and Linux. The debug build lands in build/debug/blas, a tree separate
+# from the release artifacts and the root ffwd-cli/ffwd-server symlinks, so it
+# never disturbs them. Extra args pass through to make (e.g. SANITIZE=thread to
+# swap the sanitizer set). Note on leaks: the leak detector inside ASan
+# (LeakSanitizer) is Linux-only - on macOS `-fsanitize=address` does memory-error
+# and UB checking but not leak detection (detect_leaks is unsupported there), so
+# a Linux run of this check is stronger. macOS leak detection is a separate tool
+# (`leaks`, or Instruments), not part of this command.
+check_sanitize() {
+  run make MODE=debug test "$@"
+  # The test rules compile-and-link each .c in a single step, so -g makes macOS
+  # auto-run dsymutil and drop *.dSYM symbol bundles next to the in-tree binaries
+  # (Linux produces none). They are regenerable debug-symbol output, not build
+  # inputs, and tests/*.dSYM is not gitignored - remove the bundles so the run
+  # leaves the tree as clean as a release `make test` does. The binaries stay.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    rm -rf "$ROOT"/tests/*.dSYM "$ROOT"/tools/server/*.dSYM
+  fi
+}
+
 # The comprehensive local suite, folded in from the old verify_builds.sh so
-# all.bash is the single entry point. It builds, runs the hermetic C tests and
-# the math-kernel goldens and the hermetic tokenizer checks (all model-free),
-# then the CPU model checks and - on macOS - the MLX model checks, and finishes
-# with the compiler/analyzer/tidy gate. Model-dependent steps run only when
-# --model-dir is given. CUDA validation stays a separate RunPod step.
+# all.bash is the single entry point. It builds, runs the hermetic C tests, then
+# reruns them under the address and undefined-behavior sanitizers (the dynamic
+# gate), then the math-kernel goldens and the hermetic tokenizer checks (all
+# model-free), then the CPU model checks and - on macOS - the MLX model checks,
+# and finishes with the static compiler/analyzer/tidy gate. Model-dependent steps
+# run only when --model-dir is given. CUDA validation stays a separate RunPod
+# step.
 run_checks() {
   local model_dir="" context_model_dir="" late_model_dir=""
   local batch_size=4 context_runs=0
   local long=0 skip_build=0 skip_hermetic=0 skip_mlx=0
-  local skip_code_quality=0 skip_tokenizer=0 skip_mlx_quantized=0
+  local skip_code_quality=0 skip_sanitize=0 skip_tokenizer=0 skip_mlx_quantized=0
   local platform_skip_mlx=0
 
   while (($#)); do
@@ -115,6 +144,7 @@ run_checks() {
       --skip-hermetic) skip_hermetic=1; shift ;;
       --skip-mlx) skip_mlx=1; shift ;;
       --skip-code-quality) skip_code_quality=1; shift ;;
+      --skip-sanitize) skip_sanitize=1; shift ;;
       --skip-tokenizer) skip_tokenizer=1; shift ;;
       --skip-mlx-quantized) skip_mlx_quantized=1; shift ;;
       -h|--help)
@@ -128,6 +158,7 @@ Usage: ./all.bash checks [options]
   --long                     also run the long CPU attention parity check
   --skip-build               skip make cpu / make gpu
   --skip-hermetic            skip the model-free make test suite
+  --skip-sanitize            skip the ASan/UBSan hermetic run (MODE=debug)
   --skip-mlx                 stop after the CPU build and CPU checks
   --skip-tokenizer           skip the hermetic tokenizer parity checks
   --skip-mlx-quantized       skip the MLX Q8 parity check
@@ -147,8 +178,11 @@ USAGE
   # Any failing step aborts the suite with a non-zero exit, as the old script did.
   _step() { "$@" || { err "checks: step failed -> $*"; exit 1; }; }
 
-  # Model-free: build, hermetic C tests, kernel goldens, hermetic tokenizers.
+  # Model-free: build, hermetic C tests, the ASan/UBSan rerun of those tests,
+  # kernel goldens, hermetic tokenizers. The sanitize step is itself a hermetic
+  # run, so --skip-hermetic suppresses it too.
   (( skip_hermetic )) || _step run make test
+  (( skip_sanitize || skip_hermetic )) || _step check_sanitize
   (( skip_build )) || _step run make cpu
   _step check_kernel_golden
   if (( ! skip_tokenizer )); then
@@ -353,6 +387,7 @@ usage() {
   ┏━━[ checks ]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃                                                                ┃
   ┃  check-code-quality            Run clang builds, analysis      ┃
+  ┃  check-sanitize                Run hermetic tests under ASan   ┃
   ┃  check-kernel-golden           Run math-kernel golden tests    ┃
   ┃  check-batch-parity            Compare singleton vs batched    ┃
   ┃  check-context-batch-parity    Compare contextual execution    ┃
@@ -400,6 +435,7 @@ main() {
     help|-h|--help) usage ;;
     checks) run_checks "$@" ;;
     check-code-quality) check_code_quality "$@" ;;
+    check-sanitize) check_sanitize "$@" ;;
     check-kernel-golden) check_kernel_golden "$@" ;;
     check-batch-parity) check_batch_parity "$@" ;;
     check-context-batch-parity) check_contextual_batch_parity "$@" ;;
