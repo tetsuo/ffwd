@@ -6,7 +6,7 @@ include build.mk
 LIBS  := libffwd
 TOOLS := tools/cli tools/server
 
-.PHONY: all libs tools test clean debug profile profiling release blas cpu mlx cuda gpu \
+.PHONY: all libs tools test clean debug profile release blas cpu mlx cuda gpu \
         bench bench-model bench-tokenizer bench-server-utils $(LIBS) $(TOOLS)
 
 all: libs tools
@@ -58,7 +58,7 @@ release:
 debug:
 	$(MAKE) MODE=debug BACKEND=$(BACKEND) all
 
-profile profiling:
+profile:
 	$(MAKE) MODE=profile BACKEND=$(BACKEND) all
 
 bench bench-model bench-tokenizer bench-server-utils:
