@@ -137,7 +137,7 @@ main() {
   run_analyze "${ANALYZE_COMMON[@]}" "${PLATFORM_CFLAGS[@]}" \
     -I. -Ilibffwd -Itests "${TEST_C_SOURCES[@]}"
   run_analyze "${ANALYZE_COMMON[@]}" "${PLATFORM_CFLAGS[@]}" \
-    -I. -Ilibffwd -Ibench "${BENCH_C_SOURCES[@]}"
+    -I. -Ilibffwd -Ibench -Itools/server "${BENCH_C_SOURCES[@]}"
 
   if (( ${#CU_SOURCES[@]} > 0 )); then
     run_analyze "${ANALYZE_COMMON[@]}" "${CUDA_CFLAGS[@]}" \
@@ -156,6 +156,7 @@ main() {
       -Ilibffwd \
       -Itests \
       -Ibench \
+      -Itools/server \
       -Ideps/ae
 
     if (( ${#CU_SOURCES[@]} > 0 )); then
