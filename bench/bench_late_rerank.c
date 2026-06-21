@@ -175,35 +175,40 @@ int main(int argc, char **argv) {
     }
 
     late_item_t q = {0};
+    int rc = 1;
+    float *packed = NULL;
+#ifdef CHECK_MLX
+    ffwd_mlx_late_vectors_t *packed_dev = NULL;
+#endif
     late_item_t *docs = (late_item_t *)calloc((size_t)candidates, sizeof(*docs));
     int *offsets = (int *)calloc((size_t)candidates + 1, sizeof(*offsets));
     float *scores = (float *)malloc((size_t)candidates * sizeof(float));
     float *device_scores = (float *)malloc((size_t)candidates * sizeof(float));
     if (!docs || !offsets || !scores || !device_scores)
-        return 1;
+        goto cleanup;
 
     if (encode_with_prefix_id(tok, QUERY_PREFIX_ID, "What motivates scientific discovery?", 1, &q) !=
             0 ||
         encode_late_item(model, ws, &q, dim) != 0)
-        return 1;
+        goto cleanup;
 
     int total_doc_tokens = 0;
     offsets[0] = 0;
     for (int i = 0; i < candidates; i++) {
         char *text = make_doc_text(i, doc_repeat);
         if (!text)
-            return 1;
-        int rc = encode_with_prefix_id(tok, DOC_PREFIX_ID, text, 0, &docs[i]);
+            goto cleanup;
+        int enc = encode_with_prefix_id(tok, DOC_PREFIX_ID, text, 0, &docs[i]);
         free(text);
-        if (rc != 0 || encode_late_item(model, ws, &docs[i], dim) != 0)
-            return 1;
+        if (enc != 0 || encode_late_item(model, ws, &docs[i], dim) != 0)
+            goto cleanup;
         total_doc_tokens += docs[i].n_vecs;
         offsets[i + 1] = total_doc_tokens;
     }
 
-    float *packed = (float *)malloc((size_t)total_doc_tokens * dim * sizeof(float));
+    packed = (float *)malloc((size_t)total_doc_tokens * dim * sizeof(float));
     if (!packed)
-        return 1;
+        goto cleanup;
     int pos = 0;
     for (int i = 0; i < candidates; i++) {
         memcpy(packed + (size_t)pos * dim, docs[i].vecs,
@@ -212,22 +217,22 @@ int main(int argc, char **argv) {
     }
 
     if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed, offsets, candidates, dim, scores) != 0)
-        return 1;
+        goto cleanup;
 
 #ifdef CHECK_MLX
     const ffwd_mlx_late_vectors_t **dev_docs =
         (const ffwd_mlx_late_vectors_t **)malloc((size_t)candidates * sizeof(*dev_docs));
     if (!dev_docs)
-        return 1;
+        goto cleanup;
     for (int i = 0; i < candidates; i++)
         dev_docs[i] = docs[i].dev;
-    ffwd_mlx_late_vectors_t *packed_dev = ffwd_mlx_late_vectors_concat(model, dev_docs, candidates);
+    packed_dev = ffwd_mlx_late_vectors_concat(model, dev_docs, candidates);
     free(dev_docs);
     if (!packed_dev)
-        return 1;
+        goto cleanup;
     if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, candidates,
                                           device_scores) != 0)
-        return 1;
+        goto cleanup;
     float worst_diff = 0.0f;
     for (int i = 0; i < candidates; i++) {
         float d = fabsf(scores[i] - device_scores[i]);
@@ -236,7 +241,7 @@ int main(int argc, char **argv) {
         if (d > 3e-4f) {
             fprintf(stderr, "device score mismatch at %d: %.9g %.9g\n", i, device_scores[i],
                     scores[i]);
-            return 1;
+            goto cleanup;
         }
     }
 #endif
@@ -244,7 +249,7 @@ int main(int argc, char **argv) {
     double start = now_ms();
     for (int r = 0; r < runs; r++) {
         if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed, offsets, candidates, dim, scores) != 0)
-            return 1;
+            goto cleanup;
     }
     double cpu_ms = now_ms() - start;
 
@@ -266,18 +271,23 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, candidates,
                                               device_scores) != 0)
-            return 1;
+            goto cleanup;
     }
     double mlx_ms = now_ms() - start;
     printf("mlx_device_maxsim_ms %.6f candidates/s %.0f token_pairs/s %.0f "
            "max_diff %.8g\n",
            mlx_ms / (double)runs, ((double)runs * candidates) / (mlx_ms / 1000.0),
            ((double)runs * q.n_vecs * total_doc_tokens) / (mlx_ms / 1000.0), worst_diff);
-    ffwd_mlx_late_vectors_free(packed_dev);
 #endif
 
-    for (int i = 0; i < candidates; i++)
-        free_item(&docs[i]);
+    rc = 0;
+cleanup:
+#ifdef CHECK_MLX
+    ffwd_mlx_late_vectors_free(packed_dev);
+#endif
+    if (docs)
+        for (int i = 0; i < candidates; i++)
+            free_item(&docs[i]);
     free_item(&q);
     free(packed);
     free(device_scores);
@@ -287,5 +297,5 @@ int main(int argc, char **argv) {
     test_workspace_free(ws);
     test_model_free(model);
     tok_bpe_free(tok);
-    return 0;
+    return rc;
 }
