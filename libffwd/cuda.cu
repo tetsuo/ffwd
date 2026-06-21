@@ -282,8 +282,7 @@ static int load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd
     return r;
 }
 
-static int
-load_gate_up_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c) {
+static int load_gate_up_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c) {
     if (!m || !src || !c)
         return -1;
     int rows = 2 * c->intermediate_size;
@@ -1312,8 +1311,8 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
-    if (load_matrix(&ctx->ffwd_tokens, &cpu->weights.ffwd_tokens, c->vocab_size,
-                    c->hidden_size) != 0) {
+    if (load_matrix(&ctx->ffwd_tokens, &cpu->weights.ffwd_tokens, c->vocab_size, c->hidden_size) !=
+        0) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
@@ -1476,8 +1475,7 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // F32 activations: BERT checkpoints are F32, so the linear/linear_accum F32
 // entry points are used throughout (they still handle bf16 weights via an
 // internal cast, which keeps a future bf16 BERT correct if not yet optimized).
-static int
-cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
+static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
     const ffwd_config_t *c = &ctx->config;
     int total = 0;
     if (cuda_upload_packed_inputs(ctx, inputs, batch, &total) != 0)
@@ -1501,8 +1499,8 @@ cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int ba
         ctx->x, ctx->positions, ctx->position_embeddings, ctx->token_type_embedding, total, hidden);
     if (launch_check() != 0)
         return -1;
-    layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, ctx->ffwd_ln_w,
-                                                      ctx->ffwd_ln_b, total, hidden, eps);
+    layer_norm_kernel<<<total, 256, 0, ctx->stream>>>(ctx->x, ctx->x, ctx->ffwd_ln_w, ctx->ffwd_ln_b,
+                                                      total, hidden, eps);
     if (launch_check() != 0)
         return -1;
 
@@ -1580,8 +1578,8 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
     ffwd_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->ffwd_tokens.d, ctx->ffwd_tokens.bf16, total,
-        c->hidden_size, c->vocab_size);
+        ctx->x, ctx->token_ids, ctx->ffwd_tokens.d, ctx->ffwd_tokens.bf16, total, c->hidden_size,
+        c->vocab_size);
     if (launch_check() != 0)
         return -1;
 
@@ -1691,9 +1689,9 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
 }
 
 int ffwd_cuda_encode_batch(ffwd_cuda_ctx_t *ctx,
-                              const ffwd_input_t *inputs,
-                              int batch,
-                              float *out_embeddings) {
+                           const ffwd_input_t *inputs,
+                           int batch,
+                           float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
         return -1;
     const ffwd_config_t *c = &ctx->config;
@@ -1723,8 +1721,7 @@ int ffwd_cuda_encode_batch(ffwd_cuda_ctx_t *ctx,
     }
     if (c->normalize_embeddings) {
         for (int b = 0; b < batch; b++) {
-            if (ffwd_l2_normalize(out_embeddings + (size_t)b * c->hidden_size, c->hidden_size) !=
-                0)
+            if (ffwd_l2_normalize(out_embeddings + (size_t)b * c->hidden_size, c->hidden_size) != 0)
                 return -1;
         }
     }
@@ -1732,9 +1729,9 @@ int ffwd_cuda_encode_batch(ffwd_cuda_ctx_t *ctx,
 }
 
 int ffwd_cuda_encode_spans_batch(ffwd_cuda_ctx_t *ctx,
-                                    const ffwd_context_input_t *inputs,
-                                    int batch,
-                                    float *out_embeddings) {
+                                 const ffwd_context_input_t *inputs,
+                                 int batch,
+                                 float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
         return -1;
     const ffwd_config_t *c = &ctx->config;
@@ -1817,9 +1814,9 @@ cleanup:
 }
 
 int ffwd_cuda_encode_into(ffwd_cuda_ctx_t *ctx,
-                             const int *token_ids,
-                             int n_tokens,
-                             float *out_embedding) {
+                          const int *token_ids,
+                          int n_tokens,
+                          float *out_embedding) {
     ffwd_input_t input = {token_ids, n_tokens};
     return ffwd_cuda_encode_batch(ctx, &input, 1, out_embedding);
 }
@@ -1850,9 +1847,9 @@ float *ffwd_cuda_encode(ffwd_cuda_ctx_t *ctx, const int *token_ids, int n_tokens
 struct ffwd_cuda_late_ctx {
     ffwd_cuda_ctx_t *base;       // device base model; does not own its CPU model
     ffwd_late_model_t *cpu_late; // owns the CPU base model + projection host data
-    cuda_matrix_t projection;       // device [token_dim, hidden]
-    float *proj_dev;                // device scratch [total_tokens, token_dim], grown on demand
-    size_t proj_cap;                // capacity of proj_dev in floats
+    cuda_matrix_t projection;    // device [token_dim, hidden]
+    float *proj_dev;             // device scratch [total_tokens, token_dim], grown on demand
+    size_t proj_cap;             // capacity of proj_dev in floats
     int token_dim;
 };
 
@@ -1900,9 +1897,7 @@ const ffwd_config_t *ffwd_cuda_late_config(const ffwd_cuda_late_ctx_t *ctx) {
     return ctx ? &ctx->base->config : NULL;
 }
 
-int ffwd_cuda_late_token_dim(const ffwd_cuda_late_ctx_t *ctx) {
-    return ctx ? ctx->token_dim : 0;
-}
+int ffwd_cuda_late_token_dim(const ffwd_cuda_late_ctx_t *ctx) { return ctx ? ctx->token_dim : 0; }
 
 static int ensure_late_proj(ffwd_cuda_late_ctx_t *ctx, int total) {
     size_t need = (size_t)total * (size_t)ctx->token_dim;
@@ -1955,10 +1950,10 @@ static int cuda_late_forward_project(ffwd_cuda_late_ctx_t *ctx,
 }
 
 int ffwd_cuda_late_encode_tokens(ffwd_cuda_late_ctx_t *ctx,
-                                    const int *token_ids,
-                                    int n_tokens,
-                                    int normalize,
-                                    float *out_vectors) {
+                                 const int *token_ids,
+                                 int n_tokens,
+                                 int normalize,
+                                 float *out_vectors) {
     if (!ctx || !token_ids || n_tokens <= 0 || !out_vectors || ctx->token_dim <= 0)
         return -1;
     ffwd_input_t input = {token_ids, n_tokens};
@@ -1977,14 +1972,14 @@ int ffwd_cuda_late_encode_tokens(ffwd_cuda_late_ctx_t *ctx,
 }
 
 int ffwd_cuda_late_encode_docs(ffwd_cuda_late_ctx_t *ctx,
-                                  const int *const *doc_ids,
-                                  const int *n_tokens,
-                                  const int *const *keep,
-                                  const int *n_keep,
-                                  int n_docs,
-                                  int normalize,
-                                  float *out_vectors,
-                                  int *out_offsets) {
+                               const int *const *doc_ids,
+                               const int *n_tokens,
+                               const int *const *keep,
+                               const int *n_keep,
+                               int n_docs,
+                               int normalize,
+                               float *out_vectors,
+                               int *out_offsets) {
     if (!ctx || !doc_ids || !n_tokens || !keep || !n_keep || n_docs <= 0 || !out_vectors ||
         !out_offsets || ctx->token_dim <= 0)
         return -1;
