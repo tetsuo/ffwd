@@ -76,36 +76,43 @@ static int test_ffwd_spans_batch(test_model_t *m,
 
 static int
 init_doc(test_doc_t *doc, tok_bpe_t *tok, const char **chunks, int n_chunks, int separator_id) {
+    /* doc->ids/doc->spans escape to the caller (freed by free_doc, including on
+     * failure); only the ids/lengths scratch is local, so the cleanup frees just
+     * those on every exit. */
+    int rc = -1;
     int **ids = calloc((size_t)n_chunks, sizeof(*ids));
     int *lengths = calloc((size_t)n_chunks, sizeof(*lengths));
     doc->spans = calloc((size_t)n_chunks, sizeof(*doc->spans));
     if (!ids || !lengths || !doc->spans)
-        return -1;
+        goto done;
     doc->n_spans = n_chunks;
     doc->n_tokens = n_chunks > 1 ? n_chunks - 1 : 0;
     for (int i = 0; i < n_chunks; i++) {
         ids[i] = tok_bpe_encode(tok, chunks[i], &lengths[i]);
         if (!ids[i] || lengths[i] <= 0)
-            return -1;
+            goto done;
         doc->n_tokens += lengths[i];
     }
     doc->ids = malloc((size_t)doc->n_tokens * sizeof(*doc->ids));
     if (!doc->ids)
-        return -1;
+        goto done;
     int pos = 0;
     for (int i = 0; i < n_chunks; i++) {
         doc->spans[i].start = pos;
         doc->spans[i].n_tokens = lengths[i];
         memcpy(doc->ids + pos, ids[i], (size_t)lengths[i] * sizeof(*doc->ids));
         pos += lengths[i];
-        if (i + 1 < n_chunks) {
+        if (i + 1 < n_chunks)
             doc->ids[pos++] = separator_id;
-        }
-        free(ids[i]);
     }
+    rc = 0;
+done:
+    if (ids)
+        for (int i = 0; i < n_chunks; i++)
+            free(ids[i]);
     free(lengths);
     free(ids);
-    return 0;
+    return rc;
 }
 
 static void free_doc(test_doc_t *doc) {
@@ -200,19 +207,23 @@ int main(int argc, char **argv) {
 
     int batch = synthetic_docs > 0 ? synthetic_docs : 3;
     int total_spans = 0;
+    int rc = 1;
+    float *expected = NULL, *actual = NULL;
     test_doc_t *docs = calloc((size_t)batch, sizeof(*docs));
     ffwd_context_input_t *inputs = calloc((size_t)batch, sizeof(*inputs));
     if (!docs || !inputs)
-        return 1;
+        goto cleanup;
 
     if (synthetic_docs > 0) {
-        if (synthetic_chunks <= 0)
-            return 2;
+        if (synthetic_chunks <= 0) {
+            rc = 2;
+            goto cleanup;
+        }
         for (int i = 0; i < batch; i++) {
             int doc_chunks = synthetic_ragged ? synthetic_chunks * (i + 1) : synthetic_chunks;
             char **texts = calloc((size_t)doc_chunks, sizeof(*texts));
             if (!texts)
-                return 1;
+                goto cleanup;
             int ok = 1;
             for (int c = 0; c < doc_chunks; c++) {
                 texts[c] = make_synthetic_chunk(i, c, synthetic_repeats);
@@ -224,7 +235,7 @@ int main(int argc, char **argv) {
                 for (int c = 0; c < doc_chunks; c++)
                     free(texts[c]);
                 free(texts);
-                return 1;
+                goto cleanup;
             }
             for (int c = 0; c < doc_chunks; c++)
                 free(texts[c]);
@@ -243,7 +254,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < batch; i++) {
             if (init_doc(&docs[i], tok, chunks[i], chunk_counts[i], separator_id) != 0) {
                 fprintf(stderr, "failed to prepare document %d\n", i);
-                return 1;
+                goto cleanup;
             }
             total_spans += docs[i].n_spans;
         }
@@ -257,22 +268,22 @@ int main(int argc, char **argv) {
     }
 
     int hidden = test_config(model)->hidden_size;
-    float *expected = calloc((size_t)total_spans * hidden, sizeof(*expected));
-    float *actual = calloc((size_t)total_spans * hidden, sizeof(*actual));
+    expected = calloc((size_t)total_spans * hidden, sizeof(*expected));
+    actual = calloc((size_t)total_spans * hidden, sizeof(*actual));
     if (!expected || !actual)
-        return 1;
+        goto cleanup;
 
     int span_offset = 0;
     for (int i = 0; i < batch; i++) {
         if (test_ffwd_spans(model, ws, &docs[i], expected + (size_t)span_offset * hidden) != 0) {
             fprintf(stderr, "singleton contextual embedding failed at %d\n", i);
-            return 1;
+            goto cleanup;
         }
         span_offset += docs[i].n_spans;
     }
     if (test_ffwd_spans_batch(model, ws, inputs, batch, actual) != 0) {
         fprintf(stderr, "batched contextual embedding failed\n");
-        return 1;
+        goto cleanup;
     }
 
     float worst_diff = 0.0f;
@@ -291,12 +302,13 @@ int main(int argc, char **argv) {
     if (runs > 0) {
         double *times = calloc((size_t)runs, sizeof(*times));
         if (!times)
-            return 1;
+            goto cleanup;
         for (int i = 0; i < runs; i++) {
             double start = now_ms();
             if (test_ffwd_spans_batch(model, ws, inputs, batch, actual) != 0) {
                 fprintf(stderr, "timed contextual batch failed at %d\n", i);
-                return 1;
+                free(times);
+                goto cleanup;
             }
             times[i] = now_ms() - start;
         }
@@ -306,22 +318,25 @@ int main(int argc, char **argv) {
         free(times);
     }
 
+    if (worst_diff > max_allowed_diff || worst_cosine < min_allowed_cosine) {
+        fprintf(stderr, "contextual batch parity failed: max_abs_diff=%g cosine=%g\n", worst_diff,
+                worst_cosine);
+    } else {
+        rc = 0;
+        printf("ok: contextual batch parity docs=%d spans=%d max_abs_diff=%g cosine=%g\n", batch,
+               total_spans, worst_diff, worst_cosine);
+    }
+
+cleanup:
     free(actual);
     free(expected);
-    for (int i = 0; i < batch; i++)
-        free_doc(&docs[i]);
+    if (docs)
+        for (int i = 0; i < batch; i++)
+            free_doc(&docs[i]);
     free(inputs);
     free(docs);
     tok_bpe_free(tok);
     test_workspace_free(ws);
     test_model_free(model);
-
-    if (worst_diff > max_allowed_diff || worst_cosine < min_allowed_cosine) {
-        fprintf(stderr, "contextual batch parity failed: max_abs_diff=%g cosine=%g\n", worst_diff,
-                worst_cosine);
-        return 1;
-    }
-    printf("ok: contextual batch parity docs=%d spans=%d max_abs_diff=%g cosine=%g\n", batch,
-           total_spans, worst_diff, worst_cosine);
-    return 0;
+    return rc;
 }

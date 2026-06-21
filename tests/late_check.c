@@ -255,17 +255,22 @@ int main(int argc, char **argv) {
 
     late_item_t q = {0};
     late_item_t d[NDOCS] = {{0}};
+    float *packed_docs = NULL;
+    int best = -1;
+    int rc = 1;
+#ifdef CHECK_MLX
+    ffwd_mlx_late_vectors_t *packed_dev = NULL;
+#endif
     if (encode_with_prefix_id(tok, QUERY_PREFIX_ID, query, 1, &q) != 0 ||
         encode_late_item(model, ws, &q, dim, NULL, 0) != 0)
-        return 1;
+        goto cleanup;
 
     for (int i = 0; i < NDOCS; i++) {
         if (encode_with_prefix_id(tok, DOC_PREFIX_ID, docs[i], 0, &d[i]) != 0 ||
             encode_late_item(model, ws, &d[i], dim, skip, n_skip) != 0)
-            return 1;
+            goto cleanup;
     }
 
-    int best = -1;
     float best_score = -FLT_MAX;
     float scores[NDOCS];
     float scalar_scores[NDOCS];
@@ -277,9 +282,9 @@ int main(int argc, char **argv) {
         offsets[i + 1] = total_doc_tokens;
     }
 
-    float *packed_docs = (float *)malloc((size_t)total_doc_tokens * dim * sizeof(float));
+    packed_docs = (float *)malloc((size_t)total_doc_tokens * dim * sizeof(float));
     if (!packed_docs)
-        return 1;
+        goto cleanup;
     int packed_pos = 0;
     for (int i = 0; i < NDOCS; i++) {
         memcpy(packed_docs + (size_t)packed_pos * dim, d[i].vecs,
@@ -292,14 +297,14 @@ int main(int argc, char **argv) {
     }
     if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed_docs, offsets, NDOCS, dim, scores) != 0) {
         fprintf(stderr, "late batch MaxSim failed\n");
-        return 1;
+        goto cleanup;
     }
     for (int i = 0; i < NDOCS; i++) {
         float score = scores[i];
         if (fabsf(score - scalar_scores[i]) > 1e-5f) {
             fprintf(stderr, "late batch MaxSim mismatch at doc%d: %.9g %.9g\n", i, score,
                     scalar_scores[i]);
-            return 1;
+            goto cleanup;
         }
         if (!json_mode) {
             printf("% .6f  doc%d  q_tokens=%d d_tokens=%d  %s\n", score, i, q.n_vecs, d[i].n_vecs,
@@ -315,17 +320,16 @@ int main(int argc, char **argv) {
     const ffwd_mlx_late_vectors_t *dev_docs[NDOCS];
     for (int i = 0; i < NDOCS; i++)
         dev_docs[i] = d[i].dev;
-    ffwd_mlx_late_vectors_t *packed_dev = ffwd_mlx_late_vectors_concat(model, dev_docs, NDOCS);
+    packed_dev = ffwd_mlx_late_vectors_concat(model, dev_docs, NDOCS);
     if (!packed_dev) {
         fprintf(stderr, "late MLX device doc concat failed\n");
-        return 1;
+        goto cleanup;
     }
     float device_scores[NDOCS];
     if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, NDOCS, device_scores) !=
         0) {
         fprintf(stderr, "late MLX device MaxSim failed\n");
-        ffwd_mlx_late_vectors_free(packed_dev);
-        return 1;
+        goto cleanup;
     }
     float worst_device_diff = 0.0f;
     for (int i = 0; i < NDOCS; i++) {
@@ -335,8 +339,7 @@ int main(int argc, char **argv) {
         if (diff > 2e-4f) {
             fprintf(stderr, "late MLX device MaxSim mismatch at doc%d: %.9g %.9g\n", i,
                     device_scores[i], scores[i]);
-            ffwd_mlx_late_vectors_free(packed_dev);
-            return 1;
+            goto cleanup;
         }
     }
     if (!json_mode)
@@ -349,7 +352,7 @@ int main(int argc, char **argv) {
             if (ffwd_late_maxsim_batch(q.vecs, q.n_vecs, packed_docs, offsets, NDOCS, dim, scores) !=
                 0) {
                 fprintf(stderr, "timed late MaxSim failed at run %d\n", i);
-                return 1;
+                goto cleanup;
             }
         }
         double elapsed = now_ms() - start;
@@ -368,8 +371,7 @@ int main(int argc, char **argv) {
             if (ffwd_mlx_late_maxsim_batch_device(model, q.dev, packed_dev, offsets, NDOCS,
                                                   device_scores) != 0) {
                 fprintf(stderr, "timed late MLX device MaxSim failed at run %d\n", i);
-                ffwd_mlx_late_vectors_free(packed_dev);
-                return 1;
+                goto cleanup;
             }
         }
         elapsed = now_ms() - start;
@@ -403,6 +405,15 @@ int main(int argc, char **argv) {
         printf("]}\n");
     }
 
+    if (best == 0) {
+        rc = 0;
+        if (!json_mode)
+            printf("ok: late token_dim=%d best=doc%d\n", dim, best);
+    } else {
+        fprintf(stderr, "late ranking failed: expected doc0, got doc%d\n", best);
+    }
+
+cleanup:
 #ifdef CHECK_MLX
     ffwd_mlx_late_vectors_free(packed_dev);
 #endif
@@ -413,12 +424,5 @@ int main(int argc, char **argv) {
     test_workspace_free(ws);
     test_model_free(model);
     tok_bpe_free(tok);
-
-    if (best != 0) {
-        fprintf(stderr, "late ranking failed: expected doc0, got doc%d\n", best);
-        return 1;
-    }
-    if (!json_mode)
-        printf("ok: late token_dim=%d best=doc%d\n", dim, best);
-    return 0;
+    return rc;
 }

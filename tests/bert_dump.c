@@ -48,6 +48,9 @@ int main(int argc, char **argv) {
         float *emb = (float *)malloc((size_t)dim * sizeof(float));
         if (ffwd_model_encode_into(model, ws, full, n + 2, emb) != 0) {
             fprintf(stderr, "embed failed\n");
+            free(ids);
+            free(full);
+            free(emb);
             return 1;
         }
         printf("%d", dim);
