@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 API_KEY = "tt-test-key"
-SERVER_BIN = ROOT / "tools/server/ffwd-server"
+SERVER_BIN = ROOT / "ffwd-server"
 
 DEFAULT_TEXTS = [
     "document: Your text string goes here",
@@ -44,7 +44,7 @@ DEFAULT_TEXTS = [
 def ensure_server() -> None:
     """Build ffwd-server if its binary is missing."""
     if not SERVER_BIN.exists():
-        subprocess.run(["make", "-C", "tools/server", "all"], cwd=ROOT, check=True,
+        subprocess.run(["make", "cpu"], cwd=ROOT, check=True,
                        stdout=subprocess.DEVNULL)
     if not SERVER_BIN.exists():
         sys.exit(f"ffwd-server not found and could not be built: {SERVER_BIN}")

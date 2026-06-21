@@ -7,7 +7,7 @@ runs a hermetic synthetic model (written by the gen_fixture test helper, the
 same fixture the C tests build) so the CLI has something to load, then drives
 the binary through its modes and asserts only exit codes and output shapes.
 
-The binary path is an argument (default tools/cli/ffwd-cli), so this works
+The binary path is an argument (default ./ffwd-cli), so this works
 against any backend build - CPU, MLX, or CUDA. Backend-specific checks (the CPU
 thread-count line) are gated on the binary's reported backend.
 
@@ -77,12 +77,12 @@ def backend_label(binary):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default=os.path.join(ROOT, "tools", "cli", "ffwd-cli"),
-                    help="path to the embed CLI binary")
+    ap.add_argument("--bin", default=os.path.join(ROOT, "ffwd-cli"),
+                    help="path to the ffwd CLI binary")
     args = ap.parse_args()
 
     binary = args.bin
-    ensure_tool(binary, "tools/cli", "all")
+    ensure_tool(binary, ".", "cpu")
 
     gen = os.path.join(ROOT, "tests", "gen_fixture")
     ensure_tool(gen, "tests", "gen_fixture")

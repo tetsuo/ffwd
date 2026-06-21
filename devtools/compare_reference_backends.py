@@ -546,7 +546,7 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
     ap.add_argument("--native-mode", choices=("http", "stdin", "none"), default="http")
     ap.add_argument("--native-backend", choices=("cpu", "mlx"), default="mlx")
-    ap.add_argument("--native-binary", default=str(repo_root() / "tools/cli/ffwd-cli"))
+    ap.add_argument("--native-binary", default=str(repo_root() / "ffwd-cli"))
     ap.add_argument("--max-native-rss-mb", type=float, default=32768.0)
     ap.add_argument("--skip-native", action="store_true")
     ap.add_argument("--server-pid", type=int)

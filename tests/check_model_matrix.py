@@ -244,7 +244,7 @@ def print_failure(backend: str, proc: subprocess.CompletedProcess[str]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--binary", default=str(ROOT / "tools" / "cli" / "ffwd-cli"))
+    ap.add_argument("--binary", default=str(ROOT / "ffwd-cli"))
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS),
                     help="Comma-separated model keys")
     ap.add_argument("--model", action="append",

@@ -9,13 +9,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = ROOT / "tools/cli/ffwd-cli"
+DEFAULT_BINARY = ROOT / "ffwd-cli"
 
 
 def ensure_cli(binary: Path) -> None:
     """Build the CLI if the default binary is missing."""
     if binary == DEFAULT_BINARY and not binary.exists():
-        subprocess.run(["make", "-C", "tools/cli", "all"], cwd=ROOT, check=True,
+        subprocess.run(["make", "cpu"], cwd=ROOT, check=True,
                        stdout=subprocess.DEVNULL)
 
 

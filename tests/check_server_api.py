@@ -524,8 +524,7 @@ def test_keepalive() -> None:
 def main() -> int:
     global PORT, VERBOSE
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--server", default=os.path.join(ROOT, "tools", "server",
-                                                      "ffwd-server"),
+    ap.add_argument("--server", default=os.path.join(ROOT, "ffwd-server"),
                     help="path to the ffwd-server binary")
     ap.add_argument("--gen", default=os.path.join(ROOT, "tests", "gen_fixture"),
                     help="path to the gen_fixture helper")
@@ -533,7 +532,7 @@ def main() -> int:
     args = ap.parse_args()
     VERBOSE = args.verbose
 
-    ensure_tool(args.server, "tools/server", "all")
+    ensure_tool(args.server, ".", "cpu")
     ensure_tool(args.gen, "tests", "gen_fixture")
 
     with tempfile.TemporaryDirectory(prefix="ffwd-server-check-") as workdir:

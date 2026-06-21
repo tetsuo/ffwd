@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = ROOT / "tools/cli/ffwd-cli"
+DEFAULT_BINARY = ROOT / "ffwd-cli"
 
 
 def main() -> int:

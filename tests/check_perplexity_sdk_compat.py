@@ -40,7 +40,7 @@ except ImportError as e:
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
-SERVER_BIN = ROOT / "tools/server/ffwd-server"
+SERVER_BIN = ROOT / "ffwd-server"
 
 
 STANDARD_DOCS = [
@@ -72,7 +72,7 @@ CONTEXT_DOCS = {
 
 def ensure_server() -> None:
     if not SERVER_BIN.exists():
-        subprocess.run(["make", "-C", "tools/server", "all"], cwd=ROOT, check=True,
+        subprocess.run(["make", "cpu"], cwd=ROOT, check=True,
                        stdout=subprocess.DEVNULL)
     if not SERVER_BIN.exists():
         sys.exit(f"ffwd-server not found and could not be built: {SERVER_BIN}")
