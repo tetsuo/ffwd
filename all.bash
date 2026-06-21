@@ -2,7 +2,11 @@
 
 set -uo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  ROOT="$(cd -- "$(dirname -- "${(%):-%x}")" && pwd -P)"
+else
+  ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$ROOT/.venv/uv-cache}"
 
 RED=""
@@ -27,6 +31,34 @@ fi
 info() { printf '%sINFO: %s%s\n' "$GREEN" "$*" "$NORMAL" >&2; }
 warn() { printf '%sWARN: %s%s\n' "$YELLOW" "$*" "$NORMAL" >&2; }
 err() { printf '%sERROR: %s%s\n' "$RED" "$*" "$NORMAL" >&2; }
+
+_ALL_CMDS="help checks check-code-quality check-kernel-golden check-batch-parity \
+check-context-batch-parity check-late-interaction check-cuda-fast-gemm-parity \
+check-embedding-parity check-mlx-model-limits check-mlx-quantized-parity \
+check-precision-drift check-reference-parity check-bert-parity check-e5-parity \
+check-qwen3-parity check-tokenizer-parity check-wordpiece-parity check-model-matrix \
+check-server-api check-cli check-workspace-api check-perplexity-sdk-compat \
+check-openai-sdk-compat bench-contextual-api bench-late-rerank bench-late-api \
+bench-matrix bench-qwen-tokenizer bench-server-api"
+
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  _all_complete_zsh() {
+    # shellcheck disable=SC2296
+    local -a cmds=("${(ps: :)_ALL_CMDS}")
+    _arguments "1: :(${cmds[*]})"
+  }
+  compdef _all_complete_zsh ./all.bash all.bash all 2>/dev/null || true
+else
+  _all_complete() {
+    local cur
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    # shellcheck disable=SC2207
+    COMPREPLY=( $(compgen -W "$_ALL_CMDS" -- "$cur") )
+  }
+  complete -F _all_complete ./all.bash
+  complete -F _all_complete all.bash
+  complete -F _all_complete all
+fi
 
 run() {
   local rendered
@@ -191,42 +223,53 @@ bench_server_api() {
 
 usage() {
   cat <<'EOF'
-Usage: ./all.bash COMMAND [ARGS...]
 
-Aggregate:
-  checks                        Build and run the comprehensive local check suite
+  ███████╗███████╗██╗    ██╗██████╗
+  ██╔════╝██╔════╝██║    ██║██╔══██╗
+  █████╗  █████╗  ██║ █╗ ██║██║  ██║
+  ██╔══╝  ██╔══╝  ██║███╗██║██║  ██║
+  ██║     ██║     ╚███╔███╔╝██████╔╝
+  ╚═╝     ╚═╝      ╚══╝╚══╝ ╚═════╝
 
-Checks:
-  check-code-quality            Run clang builds, analysis, and linting
-  check-kernel-golden           Run math-kernel golden tests
-  check-batch-parity            Compare singleton and true batched stdin execution
-  check-context-batch-parity    Compare contextual batch and singleton execution
-  check-cuda-fast-gemm-parity   Gate CUDA reduced-precision modes against exact F32
-  check-embedding-parity        Compare embeddings from two model directories
-  check-late-interaction        Check late-interaction vectors and MaxSim ranking
-  check-mlx-model-limits        Check MLX model metadata rejection
-  check-mlx-quantized-parity    Compare normal and quantized MLX embeddings
-  check-precision-drift         Compare low-precision drift across engines
-  check-reference-parity        Compare a running server with the Python reference
-  check-bert-parity             Compare BERT embeddings with SentenceTransformers
-  check-e5-parity               Compare XLM-R/E5 embeddings with SentenceTransformers
-  check-qwen3-parity            Compare Qwen3 embeddings with SentenceTransformers
-  check-tokenizer-parity        Compare the C BPE tokenizer with stored vectors
-  check-wordpiece-parity        Compare the C WordPiece tokenizer with stored vectors
-  check-model-matrix            Smoke-check supported model variants
-  check-server-api              Verify a running local HTTP server
-  check-cli                     Drive the CLI binary through its modes and flags
-  check-workspace-api           Check the model/workspace API with real weights
-  check-perplexity-sdk-compat   Verify a running server through the Perplexity SDK
-  check-openai-sdk-compat       Verify a running server through the OpenAI SDK
+  Usage: ./all.bash COMMAND [ARGS...]
 
-Benchmarks:
-  bench-contextual-api          Benchmark contextual inference through HTTP
-  bench-late-rerank             Benchmark late-interaction MaxSim reranking
-  bench-late-api                Benchmark HTTP reranking; optionally compare PyLate
-  bench-matrix                  Run the batch-aware stdin benchmark matrix
-  bench-qwen-tokenizer          Benchmark tokenizer encode paths
-  bench-server-api              Benchmark concurrent HTTP embedding requests
+  ┏━━[ checks ]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  ┃                                                                ┃
+  ┃  check-code-quality            Run clang builds, analysis      ┃
+  ┃  check-kernel-golden           Run math-kernel golden tests    ┃
+  ┃  check-batch-parity            Compare singleton vs batched    ┃
+  ┃  check-context-batch-parity    Compare contextual execution    ┃
+  ┃  check-cuda-fast-gemm-parity   Gate CUDA reduced-precision     ┃
+  ┃  check-embedding-parity        Compare embeddings              ┃
+  ┃  check-late-interaction        Check late-interaction vectors  ┃
+  ┃  check-mlx-model-limits        Check MLX metadata rejection    ┃
+  ┃  check-mlx-quantized-parity    Compare quantized embeddings    ┃
+  ┃  check-precision-drift         Compare low-precision drift     ┃
+  ┃  check-reference-parity        Compare server vs Python ref    ┃
+  ┃  check-bert-parity             Compare BERT embeddings         ┃
+  ┃  check-e5-parity               Compare XLM-R/E5 embeddings     ┃
+  ┃  check-qwen3-parity            Compare Qwen3 embeddings        ┃
+  ┃  check-tokenizer-parity        Compare BPE tokenizer           ┃
+  ┃  check-wordpiece-parity        Compare WordPiece tokenizer     ┃
+  ┃  check-model-matrix            Smoke-check model variants      ┃
+  ┃  check-server-api              Verify running HTTP server      ┃
+  ┃  check-cli                     Drive CLI through modes/flags   ┃
+  ┃  check-workspace-api           Check model/workspace API       ┃
+  ┃  check-perplexity-sdk-compat   Verify via Perplexity SDK       ┃
+  ┃  check-openai-sdk-compat       Verify via OpenAI SDK           ┃
+  ┃                                                                ┃
+  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+  ┏━━[ benchmarks ]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  ┃                                                                ┃
+  ┃  bench-contextual-api          Benchmark contextual inference  ┃
+  ┃  bench-late-rerank             Benchmark late-interaction      ┃
+  ┃  bench-late-api                Benchmark HTTP reranking        ┃
+  ┃  bench-matrix                  Run batch-aware stdin matrix    ┃
+  ┃  bench-qwen-tokenizer          Benchmark tokenizer encode      ┃
+  ┃  bench-server-api              Benchmark concurrent HTTP       ┃
+  ┃                                                                ┃
+  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 EOF
 }
 
@@ -275,4 +318,8 @@ main() {
   esac
 }
 
-main "$@"
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  [[ "${ZSH_EVAL_CONTEXT:-}" == "toplevel" ]] && main "$@"
+else
+  [[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"
+fi
