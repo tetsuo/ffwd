@@ -16,9 +16,12 @@ run_in_container() {
 
     echo "==================== apt bootstrap ===================="
     apt-get update -qq
+    # python3 is a build dependency, not just tooling: the shared library's
+    # export map (ffwd.map) is generated at build time by devtools/gen_exports.py
+    # (see libffwd/Makefile), so `make cpu` fails without it.
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates libcjson-dev libopenblas-dev \
-        pkg-config git >/dev/null
+        pkg-config git python3 >/dev/null
 
     echo "==================== system / toolchain ===================="
     uname -a
@@ -53,7 +56,14 @@ run_in_container() {
     else
         echo "==================== make clean ===================="
         make clean
-        residual=$(ls -d build ffwd-cli ffwd-server 2>/dev/null | wc -l | tr -d ' ')
+        # Count leftover artifacts with a per-path test, not `ls -d a b c`: when
+        # clean succeeds and none exist, ls exits non-zero, which under
+        # `set -e -o pipefail` would abort the run exactly when cleanup worked.
+        # (bash 5 aborts here; macOS bash 3.2 does not - it hid this.)
+        residual=0
+        for f in build ffwd-cli ffwd-server; do
+            if [ -e "$f" ]; then residual=$((residual + 1)); fi
+        done
         echo "residual build artifacts: $residual (want 0)"
     fi
 
