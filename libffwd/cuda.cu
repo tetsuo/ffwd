@@ -5,7 +5,9 @@ extern "C" {
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <mma.h>
 
 #include <limits.h>
 #include <math.h>
@@ -397,6 +399,12 @@ __device__ static float block_sum(float v) {
     return total;
 }
 
+__device__ static float warp_sum(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    return __shfl_sync(0xffffffff, v, 0);
+}
+
 __device__ static inline void store_act(float *out, size_t i, float v) { out[i] = v; }
 
 __device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v) {
@@ -405,6 +413,12 @@ __device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v) {
 
 __device__ static inline float load_embedding_value(const void *emb, int emb_bf16, size_t i) {
     return emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[i]) : ((const float *)emb)[i];
+}
+
+__device__ static inline float load_attn_value(const float *v, size_t i) { return v[i]; }
+
+__device__ static inline float load_attn_value(const __nv_bfloat16 *v, size_t i) {
+    return __bfloat162float(v[i]);
 }
 
 // OUT_T is float, or __nv_bfloat16 when the result feeds a BF16-weight
@@ -621,6 +635,283 @@ __global__ static void attn_causal_softmax_kernel(float *scores, P_T *probs, int
         store_act(p, (size_t)j, j < keys ? s[j] * inv : 0.0f);
 }
 
+// One block computes one (sequence, head, query) row using the online-softmax
+// recurrence. Scores stay in registers and the output accumulator; no LxL score
+// matrix is written to global memory. This first version is intentionally
+// simple and handles the head_dim <= blockDim.x shapes used by BERT/BGE and the
+// current Qwen blocks.
+template <typename V_T, typename OUT_T>
+__global__ static void attn_stream_row_kernel(OUT_T *out,
+                                              const float *qkv,
+                                              const float *kexp,
+                                              const V_T *vexp,
+                                              const int *offsets,
+                                              int head_dim,
+                                              int q_dim,
+                                              int qkv_dim,
+                                              int q_offset,
+                                              float scale,
+                                              int causal) {
+    int qrow = blockIdx.x;
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    if (qrow >= L || head_dim > blockDim.x)
+        return;
+
+    int tid = threadIdx.x;
+    size_t q_base = (size_t)(start + qrow) * qkv_dim + q_offset + (size_t)head * head_dim;
+    size_t hv = (size_t)head * head_dim;
+    float qv = tid < head_dim ? qkv[q_base + tid] : 0.0f;
+    float acc = 0.0f;
+    float m = -3.402823466e+38F;
+    float denom = 0.0f;
+    int keys = causal ? qrow + 1 : L;
+
+    for (int j = 0; j < keys; j++) {
+        size_t k_base = (size_t)(start + j) * q_dim + hv;
+        float dot_part = tid < head_dim ? qv * kexp[k_base + tid] : 0.0f;
+        float score = block_sum(dot_part) * scale;
+        float m_new = fmaxf(m, score);
+        float old_scale = __expf(m - m_new);
+        float p = __expf(score - m_new);
+        denom = denom * old_scale + p;
+        if (tid < head_dim) {
+            float vv = load_attn_value(vexp, k_base + tid);
+            acc = acc * old_scale + p * vv;
+        }
+        m = m_new;
+    }
+
+    if (tid < head_dim)
+        store_act(out, (size_t)(start + qrow) * q_dim + hv + tid, acc / denom);
+}
+
+// BERT/BGE non-causal head_dim=64 specialization. One block owns one query
+// tile for one (sequence, head); each warp accumulates one query row while the
+// block loads a K/V row into shared memory once and reuses it across the query
+// warps.
+__global__ static void attn_stream_bert64_kernel(float *out,
+                                                 const float *qkv,
+                                                 const float *kexp,
+                                                 const float *vexp,
+                                                 const int *offsets,
+                                                 int q_dim,
+                                                 int qkv_dim,
+                                                 int q_offset,
+                                                 float scale) {
+    __shared__ float kbuf[64];
+    __shared__ float vbuf[64];
+    int q_per_block = blockDim.x >> 5;
+    int q_tile = blockIdx.x * q_per_block;
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int qrow = q_tile + warp;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    int active = qrow < L;
+    size_t hv = (size_t)head * 64;
+    size_t q_base = (size_t)(start + qrow) * qkv_dim + q_offset + hv;
+    float q0 = active ? qkv[q_base + lane] : 0.0f;
+    float q1 = active ? qkv[q_base + lane + 32] : 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -3.402823466e+38F;
+    float denom = 0.0f;
+
+    for (int j = 0; j < L; j++) {
+        size_t kv_base = (size_t)(start + j) * q_dim + hv;
+        if (threadIdx.x < 64) {
+            kbuf[threadIdx.x] = kexp[kv_base + threadIdx.x];
+            vbuf[threadIdx.x] = vexp[kv_base + threadIdx.x];
+        }
+        __syncthreads();
+
+        float dot = q0 * kbuf[lane] + q1 * kbuf[lane + 32];
+        float score = warp_sum(dot) * scale;
+        if (active) {
+            float m_new = fmaxf(m, score);
+            float old_scale = __expf(m - m_new);
+            float p = __expf(score - m_new);
+            denom = denom * old_scale + p;
+            acc0 = acc0 * old_scale + p * vbuf[lane];
+            acc1 = acc1 * old_scale + p * vbuf[lane + 32];
+            m = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        size_t o_base = (size_t)(start + qrow) * q_dim + hv;
+        out[o_base + lane] = acc0 / denom;
+        out[o_base + lane + 32] = acc1 / denom;
+    }
+}
+
+// Tensor-core prototype for 16-row query tiles. It keeps the online-softmax
+// state in shared memory and computes each 16x16 QK/PV tile with WMMA using
+// half-rounded Q/K/P/V operands. The output accumulator stays F32.
+template <int HD, typename V_T, typename OUT_T, int CAUSAL>
+__global__ static void attn_stream_wmma_kernel(OUT_T *out,
+                                               const float *qkv,
+                                               const float *kexp,
+                                               const V_T *vexp,
+                                               const int *offsets,
+                                               int q_dim,
+                                               int qkv_dim,
+                                               int q_offset,
+                                               float scale) {
+    enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
+    __shared__ half qh[QT * HD];
+    __shared__ half kh[HD * KT];
+    __shared__ half ph[QT * KT];
+    __shared__ half vh[KT * HD];
+    __shared__ float scores[QT * KT];
+    __shared__ float acc[QT * HD];
+    __shared__ float delta[DCHUNKS * QT * 16];
+    __shared__ float row_m[QT];
+    __shared__ float row_d[QT];
+    __shared__ float row_old_scale[QT];
+
+    int tid = threadIdx.x;
+    int q_tile = blockIdx.x * QT;
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    size_t hv = (size_t)head * HD;
+
+    for (int idx = tid; idx < QT * HD; idx += blockDim.x) {
+        int qr = idx / HD;
+        int d = idx - qr * HD;
+        int qrow = q_tile + qr;
+        float qv = qrow < L ? qkv[(size_t)(start + qrow) * qkv_dim + q_offset + hv + d] : 0.0f;
+        qh[idx] = __float2half(qv);
+        acc[idx] = 0.0f;
+    }
+    if (tid < QT) {
+        row_m[tid] = -3.402823466e+38F;
+        row_d[tid] = 0.0f;
+        row_old_scale[tid] = 1.0f;
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < L; k0 += KT) {
+        for (int idx = tid; idx < HD * KT; idx += blockDim.x) {
+            int d = idx / KT;
+            int kk = idx - d * KT;
+            int key = k0 + kk;
+            float kv = key < L ? kexp[(size_t)(start + key) * q_dim + hv + d] : 0.0f;
+            kh[idx] = __float2half(kv);
+        }
+        __syncthreads();
+
+        if (tid < 32) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major>
+                a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major>
+                b_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c_frag;
+            nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+            for (int kd = 0; kd < HD; kd += 16) {
+                nvcuda::wmma::load_matrix_sync(a_frag, qh + kd, HD);
+                nvcuda::wmma::load_matrix_sync(b_frag, kh + kd * KT, KT);
+                nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            nvcuda::wmma::store_matrix_sync(scores, c_frag, KT, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        if (tid < QT) {
+            int qrow = q_tile + tid;
+            if (qrow < L) {
+                float tile_m = -3.402823466e+38F;
+                for (int kk = 0; kk < KT; kk++) {
+                    int key = k0 + kk;
+                    if (key < L && (!CAUSAL || key <= qrow))
+                        tile_m = fmaxf(tile_m, scores[tid * KT + kk] * scale);
+                }
+                float m_new = fmaxf(row_m[tid], tile_m);
+                float old_scale = __expf(row_m[tid] - m_new);
+                float tile_sum = 0.0f;
+                for (int kk = 0; kk < KT; kk++) {
+                    int key = k0 + kk;
+                    float p = 0.0f;
+                    if (key < L && (!CAUSAL || key <= qrow))
+                        p = __expf(scores[tid * KT + kk] * scale - m_new);
+                    scores[tid * KT + kk] = p;
+                    tile_sum += p;
+                }
+                row_m[tid] = m_new;
+                row_d[tid] = row_d[tid] * old_scale + tile_sum;
+                row_old_scale[tid] = old_scale;
+            } else {
+                row_old_scale[tid] = 1.0f;
+                for (int kk = 0; kk < KT; kk++)
+                    scores[tid * KT + kk] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < QT * HD; idx += blockDim.x) {
+            int qr = idx / HD;
+            int qrow = q_tile + qr;
+            if (qrow < L)
+                acc[idx] *= row_old_scale[qr];
+        }
+        for (int idx = tid; idx < QT * KT; idx += blockDim.x)
+            ph[idx] = __float2half(scores[idx]);
+        for (int idx = tid; idx < KT * HD; idx += blockDim.x) {
+            int kk = idx / HD;
+            int d = idx - kk * HD;
+            int key = k0 + kk;
+            float vv = key < L ? load_attn_value(vexp, (size_t)(start + key) * q_dim + hv + d) : 0.0f;
+            vh[idx] = __float2half(vv);
+        }
+        __syncthreads();
+
+        int warp_id = tid >> 5;
+        if (warp_id < DCHUNKS) {
+            int d0 = warp_id * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major>
+                p_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major>
+                v_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> o_frag;
+            nvcuda::wmma::fill_fragment(o_frag, 0.0f);
+            nvcuda::wmma::load_matrix_sync(p_frag, ph, KT);
+            nvcuda::wmma::load_matrix_sync(v_frag, vh + d0, HD);
+            nvcuda::wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+            nvcuda::wmma::store_matrix_sync(delta + warp_id * QT * 16, o_frag, 16,
+                                            nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < QT * HD; idx += blockDim.x) {
+            int qr = idx / HD;
+            int d = idx - qr * HD;
+            int qrow = q_tile + qr;
+            if (qrow < L) {
+                int chunk = d >> 4;
+                int col = d & 15;
+                acc[idx] += delta[chunk * QT * 16 + qr * 16 + col];
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < QT * HD; idx += blockDim.x) {
+        int qr = idx / HD;
+        int d = idx - qr * HD;
+        int qrow = q_tile + qr;
+        if (qrow < L)
+            store_act(out, (size_t)(start + qrow) * q_dim + hv + d, acc[idx] / row_d[qr]);
+    }
+}
+
 __global__ static void
 mean_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
     int b = blockIdx.x;
@@ -791,6 +1082,38 @@ static cublasComputeType_t gemm_compute(void) {
         env_init = 1;
     }
     return g_gemm_compute;
+}
+
+// Experimental streaming attention selector. Off by default; use
+// FFWD_CUDA_STREAMING_ATTN=bert for the scalar BERT tile, or =wmma for the
+// half-rounded tensor-core prototype. =1/=all forces the generic row kernel for
+// every head_dim<=128 attention call.
+static int streaming_attention_mode(void) {
+    static int init = 0;
+    static int mode = 0; // 0 off, 1 all, 2 BERT scalar tile, 3 WMMA tile
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_STREAMING_ATTN");
+        if (e && (!strcmp(e, "1") || !strcmp(e, "all")))
+            mode = 1;
+        else if (e && !strcmp(e, "bert"))
+            mode = 2;
+        else if (e && (!strcmp(e, "wmma") || !strcmp(e, "bert_wmma")))
+            mode = 3;
+        init = 1;
+    }
+    return mode;
+}
+
+static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
+    int mode = streaming_attention_mode();
+    if (!mode || head_dim > 128)
+        return 0;
+    if (mode == 2)
+        return c->family == FFWD_FAMILY_BERT && !out_bf16;
+    if (mode == 3)
+        return (c->family == FFWD_FAMILY_BERT && !out_bf16 && head_dim == 64) ||
+               (c->family == FFWD_FAMILY_QWEN3 && head_dim == 128);
+    return 1;
 }
 
 // Grow the F32 weight-widen scratch to hold `elems` floats. The memory-only
@@ -1061,6 +1384,66 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     }
     if (launch_check() != 0)
         return -1;
+
+    if (use_streaming_attention(c, out_bf16 != NULL, hd)) {
+        int stream_mode = streaming_attention_mode();
+        int max_L = 0;
+        for (int b = 0; b < batch; b++) {
+            int L = h_offsets[b + 1] - h_offsets[b];
+            if (L > max_L)
+                max_L = L;
+        }
+        if (stream_mode == 3 && c->family == FFWD_FAMILY_BERT && !out_bf16 && !causal && hd == 64) {
+            dim3 grid((max_L + 15) / 16, H, batch);
+            attn_stream_wmma_kernel<64, float, float, 0>
+                <<<grid, 256, 0, ctx->stream>>>(ctx->attn_out, ctx->qkv, ctx->kexp, ctx->vexp,
+                                                ctx->offsets, q_dim, qkv_dim, q_offset, scale);
+            return launch_check();
+        }
+        if (stream_mode == 3 && hd == 128) {
+            dim3 grid((max_L + 15) / 16, H, batch);
+            if (out_bf16) {
+                if (causal)
+                    attn_stream_wmma_kernel<128, __nv_bfloat16, __nv_bfloat16, 1>
+                        <<<grid, 256, 0, ctx->stream>>>(
+                            out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp,
+                            ctx->offsets, q_dim, qkv_dim, q_offset, scale);
+                else
+                    attn_stream_wmma_kernel<128, __nv_bfloat16, __nv_bfloat16, 0>
+                        <<<grid, 256, 0, ctx->stream>>>(
+                            out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp,
+                            ctx->offsets, q_dim, qkv_dim, q_offset, scale);
+            } else {
+                if (causal)
+                    attn_stream_wmma_kernel<128, float, float, 1><<<grid, 256, 0, ctx->stream>>>(
+                        ctx->attn_out, ctx->qkv, ctx->kexp, ctx->vexp, ctx->offsets, q_dim, qkv_dim,
+                        q_offset, scale);
+                else
+                    attn_stream_wmma_kernel<128, float, float, 0><<<grid, 256, 0, ctx->stream>>>(
+                        ctx->attn_out, ctx->qkv, ctx->kexp, ctx->vexp, ctx->offsets, q_dim, qkv_dim,
+                        q_offset, scale);
+            }
+            return launch_check();
+        }
+        if (stream_mode == 2 && c->family == FFWD_FAMILY_BERT && !out_bf16 && !causal && hd == 64) {
+            dim3 grid((max_L + 15) / 16, H, batch);
+            attn_stream_bert64_kernel<<<grid, 512, 0, ctx->stream>>>(
+                ctx->attn_out, ctx->qkv, ctx->kexp, ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,
+                scale);
+            return launch_check();
+        }
+        dim3 grid(max_L, H, batch);
+        if (out_bf16) {
+            attn_stream_row_kernel<<<grid, 128, 0, ctx->stream>>>(
+                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, hd,
+                q_dim, qkv_dim, q_offset, scale, causal);
+        } else {
+            attn_stream_row_kernel<<<grid, 128, 0, ctx->stream>>>(ctx->attn_out, ctx->qkv, ctx->kexp,
+                                                                  ctx->vexp, ctx->offsets, hd, q_dim,
+                                                                  qkv_dim, q_offset, scale, causal);
+        }
+        return launch_check();
+    }
 
     if (ctx->attn_G >= 2) {
         int G = ctx->attn_G, L = ctx->attn_L;
