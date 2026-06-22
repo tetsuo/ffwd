@@ -1060,6 +1060,34 @@ __device__ static __forceinline__ void tc_load_a_p_bf16(uint32_t a[4], const __n
     }
 }
 
+// Head-dim-parametric Q and V fragment loaders for the flash kernels. The QK S
+// tile and the PV O tile are 16x16 regardless of head_dim, so only the Q-tile
+// swizzle stride (HD) and the V row stride (HD) depend on it; these are the
+// HD=128 tc3 loaders generalized so a head_dim-64 kernel can reuse the same
+// fragment layout. (The K loader tc_load_b_qk_ldmatrix_swz_bf16 is already
+// HD-independent: K is staged transposed with stride KT=16.)
+template <int HD>
+__device__ static __forceinline__ void
+tc_load_a_q_ldmatrix_swz_hd(uint32_t a[4], const __nv_bfloat16 *qsh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int row = ((mat & 1) << 3) + (lane & 7);
+    int col = d0 + ((mat >> 1) << 3);
+    tc_ldmatrix_x4_b16(a, qsh + tc_swz_idx<HD>(row, col));
+}
+
+template <int HD>
+__device__ static __forceinline__ void
+tc_load_b_pv_hd(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
+    int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int col = d0 + ((r >> 1) << 3) + (lane >> 2);
+        int key = ((r & 1) << 3) + ((lane & 3) << 1);
+        b[r] = bf16_pair_bits(vsh[key * HD + col], vsh[(key + 1) * HD + col]);
+    }
+}
+
 // BF16 tensor-core flash attention for the Qwen-family HD=128 BF16-output path.
 // One warp owns a 16-query tile for one (sequence, head). Q/K are rounded to
 // BF16 before QK, matching the reduced-precision materialized baseline; scores,
@@ -1877,6 +1905,154 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
     }
 }
 
+// BF16 tensor-core flash attention for the BERT shape: head_dim 64, BIDIRECTIONAL
+// (no causal mask). The tc3 kernel for the Qwen shape (head_dim 128, K/V-sharing,
+// ldmatrix QK, online softmax) generalized to head_dim 64 - 4 d-chunks instead of
+// 8, a 64-wide Q swizzle and V row stride, and an every-key loop with only the
+// length mask. Replaces the materialized N×N scores/probs path for BERT: the
+// scores live in registers and never reach global memory, removing the O(n^2)
+// HBM that dominates BERT attention at batch 32. One block = WARPS query tiles
+// sharing one K/V staging tile; the math is otherwise identical to tc3.
+template <int WARPS>
+__global__ static void attn_stream_bert64_flash_kernel(__nv_bfloat16 *out,
+                                                       const float *qkv,
+                                                       const __nv_bfloat16 *kexp,
+                                                       const __nv_bfloat16 *vexp,
+                                                       const int *offsets,
+                                                       int q_dim,
+                                                       int qkv_dim,
+                                                       int q_offset,
+                                                       float scale) {
+    enum { QT = 16, KT = 16, HD = 64, DCHUNKS = 4 };
+    __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
+    __shared__ __align__(16) __nv_bfloat16 ksh[KT * HD];
+    __shared__ __align__(16) __nv_bfloat16 vsh[KT * HD];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.y;
+    int tid = warp * 32 + lane;
+    int nthreads = WARPS * 32;
+    int block_q0 = blockIdx.x * (WARPS * QT);
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    if (block_q0 >= L)
+        return;
+    int q0 = block_q0 + warp * QT;
+    size_t hv = (size_t)head * HD;
+    __nv_bfloat16 *myq = qsh + warp * QT * HD;
+
+    for (int idx = lane; idx < QT * HD; idx += 32) {
+        int qr = idx / HD;
+        int d = idx - qr * HD;
+        int row = q0 + qr;
+        float qv = row < L ? qkv[(size_t)(start + row) * qkv_dim + q_offset + hv + d] : 0.0f;
+        tc_store_swz_bf16<HD>(myq, qr, d, __float2bfloat16(qv));
+    }
+
+    float o[DCHUNKS][8];
+#pragma unroll
+    for (int dc = 0; dc < DCHUNKS; dc++)
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            o[dc][r] = 0.0f;
+    float m[2] = {-3.402823466e+38F, -3.402823466e+38F};
+    float denom[2] = {0.0f, 0.0f};
+
+    for (int k0 = 0; k0 < L; k0 += KT) { // bidirectional: every query attends every key
+        for (int idx = tid; idx < KT * HD; idx += nthreads) {
+            int kk = idx / HD;
+            int d = idx - kk * HD;
+            int key = k0 + kk;
+            size_t kb = (size_t)(start + key) * q_dim + hv + d;
+            __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
+            __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
+            tc_store_swz_bf16<16>(ksh, d, kk, kval);
+            vsh[idx] = vval;
+        }
+        __syncthreads();
+
+        float s[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            s[r] = 0.0f;
+#pragma unroll
+        for (int d0 = 0; d0 < HD; d0 += 16) {
+            uint32_t a[4], bb[4];
+            tc_load_a_q_ldmatrix_swz_hd<HD>(a, myq, d0);
+            tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh, d0);
+            mma_m16n16k16_bf16(s, a, bb);
+        }
+
+        const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+            int qrow = q0 + qr;
+            int key = k0 + kc;
+            if (qrow < L && key < L)
+                s[r] *= scale;
+            else
+                s[r] = neg_inf;
+        }
+
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int r0 = j * 2;
+            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+            denom[j] *= corr;
+#pragma unroll
+            for (int dc = 0; dc < DCHUNKS; dc++) {
+                o[dc][r0 + 0] *= corr;
+                o[dc][r0 + 1] *= corr;
+                o[dc][r0 + 4] *= corr;
+                o[dc][r0 + 5] *= corr;
+            }
+            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+            s[r0 + 0] = p0;
+            s[r0 + 1] = p1;
+            s[r0 + 4] = p4;
+            s[r0 + 5] = p5;
+            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+            m[j] = m_new;
+        }
+
+        uint32_t pfrag[4];
+        tc_probs_to_a_bf16(pfrag, s);
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            uint32_t vb[4];
+            tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
+            mma_m16n16k16_bf16(o[dc], pfrag, vb);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        int qrow = q0 + (lane >> 2) + j * 8;
+        if (qrow >= L)
+            continue;
+        float inv = denom[j] > 0.0f ? 1.0f / denom[j] : 0.0f;
+        size_t ob = (size_t)(start + qrow) * q_dim + hv;
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            int col = dc * 16 + ((lane & 3) << 1);
+            store_act(out, ob + col + 0, o[dc][j * 2 + 0] * inv);
+            store_act(out, ob + col + 1, o[dc][j * 2 + 1] * inv);
+            store_act(out, ob + col + 8, o[dc][j * 2 + 4] * inv);
+            store_act(out, ob + col + 9, o[dc][j * 2 + 5] * inv);
+        }
+    }
+}
+
 // Register-resident streaming (online-softmax) attention: the FlashAttention-2
 // tile for our packed layout. One warp owns RQ query rows of one (sequence,
 // head); its 32 lanes split head_dim into DPL = HD/32 lane-local elements. The
@@ -2562,6 +2738,20 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
     return 0;
 }
 
+// Opt-in BF16 tensor-core flash attention for the BERT shape (head_dim 64,
+// bidirectional), replacing the materialized N×N scores/probs path. Enabled by
+// FFWD_CUDA_BERT_FLASH=1; gated further on bf16 output + head_dim 64 at the call
+// site. FFWD_TC_WARPS (2/4/8) tunes the query tiles per block (default 8).
+static int bert_flash_enabled(void) {
+    static int init = 0, on = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_BERT_FLASH");
+        on = (e && (!strcmp(e, "1") || !strcmp(e, "on")));
+        init = 1;
+    }
+    return on;
+}
+
 // out_bf16 != NULL selects the BF16-weight layout: V and the softmax
 // probabilities are stored BF16 and the @V GEMM emits BF16 attention output
 // at out_bf16 (stride q_dim), ready for the wo projection without a cast.
@@ -2585,10 +2775,13 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     int use_stream = use_streaming_attention(c, out_bf16 != NULL, hd);
     int use_tc_kexp_bf16 = use_stream && out_bf16 && c->family == FFWD_FAMILY_QWEN3 && hd == 128 &&
                            (stream_mode == 0 || (stream_mode >= 5 && stream_mode <= 9));
+    // BERT bf16 flash attention: head_dim 64, bidirectional, K/V expanded BF16.
+    int use_bert_flash =
+        out_bf16 && c->family == FFWD_FAMILY_BERT && hd == 64 && bert_flash_enabled();
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
-    if (use_tc_kexp_bf16) {
+    if (use_tc_kexp_bf16 || use_bert_flash) {
         if (!ctx->kexp_bf16)
             return -1;
         attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
@@ -2604,6 +2797,32 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     }
     if (launch_check() != 0)
         return -1;
+
+    if (use_bert_flash) {
+        int max_L = 0;
+        for (int b = 0; b < batch; b++) {
+            int L = h_offsets[b + 1] - h_offsets[b];
+            if (L > max_L)
+                max_L = L;
+        }
+        int w = tc_kv_warps_or(8);
+#define BERT_FLASH_LAUNCH(W)                                                                  \
+    do {                                                                                      \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                             \
+        dim3 block(32, (W));                                                                  \
+        attn_stream_bert64_flash_kernel<(W)><<<grid, block, 0, ctx->stream>>>(                \
+            out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+            (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+    } while (0)
+        if (w == 2)
+            BERT_FLASH_LAUNCH(2);
+        else if (w == 4)
+            BERT_FLASH_LAUNCH(4);
+        else
+            BERT_FLASH_LAUNCH(8);
+#undef BERT_FLASH_LAUNCH
+        return launch_check();
+    }
 
     if (use_stream) {
         int max_L = 0;
@@ -3309,8 +3528,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     cublasComputeType_t gc = gemm_compute();
     int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
     int act_mode = bert_bf16_act_mode();
-    int bf16_act = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && act_mode >= 0 &&
-                   (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS);
+    // bf16 flash attention (head_dim 64): the attention output is written bf16 to
+    // `act` for wo to read with no cast. It implies the bf16-act norm path so the
+    // whole layer is one bf16 activation pipeline.
+    int flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && c->head_dim == 64 &&
+                bert_flash_enabled();
+    int bf16_act = flash || (compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
+                             act_mode >= 0 && (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
 
     bert_embed_layer_norm_kernel<<<total, 256, ln_smem, ctx->stream>>>(
@@ -3341,14 +3565,21 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
                                                                               total, qkv_dim);
         if (launch_check() != 0)
             return -1;
+        // flash writes the bf16 attention output into `act`; the materialized path
+        // (NULL) writes F32 attn_out (computed on bf16 tensor cores via FAST_16BF).
         if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset, qkv_dim,
-                                scale, NULL) != 0)
+                                scale, flash ? act : NULL) != 0)
             return -1;
 
         // Output dense(+bias), residual into x (F32), then post-attention LayerNorm
-        // (also emitting bf16 act for the FFN gate-up GEMM in the bf16 path).
-        if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0)
+        // (also emitting bf16 act for the FFN gate-up GEMM in the bf16 path). With
+        // flash the attn output is already bf16 in `act`, so wo reads it directly.
+        if (flash) {
+            if (linear_bf16x(ctx, &l->wo, act, ctx->x, total, c->q_dim, hidden, c->q_dim, 1.0f) != 0)
+                return -1;
+        } else if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0) {
             return -1;
+        }
         layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
             ctx->x, bf16_act ? act : nullptr, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias,
             total, hidden, eps);
