@@ -77,6 +77,7 @@ struct ffwd_cuda_ctx {
     int *offsets_host;
     int *positions;
     float *kexp;
+    void *kexp_bf16; // BF16 K expansion for tensor-core streaming attention
     float *vexp;
     float *attn_scores;
     void *attn_probs; // BF16 softmax output (bf16 weights)
@@ -526,9 +527,10 @@ silu_mul_packed_kernel(OUT_T *out, int out_stride, const float *gate_up, int row
 // Expand K and V from the n_kv_heads layout to a contiguous [total x q_dim]
 // per-query-head layout (GQA: each kv head repeated n_heads/n_kv_heads times)
 // so the attention GEMMs can stride uniformly over query heads.
-// V_T is float, or __nv_bfloat16 when V feeds a BF16 @V GEMM directly.
-template <typename V_T>
-__global__ static void attn_expand_kv_kernel(float *kexp,
+// K_T/V_T are float for materialized F32/cublas attention, or __nv_bfloat16 when
+// a tensor-core/BF16 path consumes the expanded tile directly.
+template <typename K_T, typename V_T>
+__global__ static void attn_expand_kv_kernel(K_T *kexp,
                                              V_T *vexp,
                                              const float *qkv,
                                              int total,
@@ -549,7 +551,7 @@ __global__ static void attn_expand_kv_kernel(float *kexp,
     int e = rem - h * head_dim;
     int kv = h / (n_heads / n_kv_heads);
     const float *base = qkv + (size_t)t * qkv_dim;
-    kexp[idx] = base[k_offset + kv * head_dim + e];
+    store_act(kexp, idx, base[k_offset + kv * head_dim + e]);
     store_act(vexp, idx, base[v_offset + kv * head_dim + e]);
 }
 
@@ -1066,7 +1068,7 @@ __device__ static __forceinline__ void tc_load_a_p_bf16(uint32_t a[4], const __n
 template <int CAUSAL>
 __global__ static void attn_stream_tc128_bf16_kernel(__nv_bfloat16 *out,
                                                      const float *qkv,
-                                                     const float *kexp,
+                                                     const __nv_bfloat16 *kexp,
                                                      const __nv_bfloat16 *vexp,
                                                      const int *offsets,
                                                      int q_dim,
@@ -1119,7 +1121,7 @@ __global__ static void attn_stream_tc128_bf16_kernel(__nv_bfloat16 *out,
             int d = idx - kk * HD;
             int key = k0 + kk;
             size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            ksh[idx] = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            ksh[idx] = key < L ? kexp[kb] : __float2bfloat16(0.0f);
             vsh[idx] = key < L ? vexp[kb] : __float2bfloat16(0.0f);
         }
         __syncwarp();
@@ -1216,7 +1218,7 @@ __global__ static void attn_stream_tc128_bf16_kernel(__nv_bfloat16 *out,
 template <int CAUSAL>
 __global__ static void attn_stream_tc128_bf16_pv_kernel(__nv_bfloat16 *out,
                                                         const float *qkv,
-                                                        const float *kexp,
+                                                        const __nv_bfloat16 *kexp,
                                                         const __nv_bfloat16 *vexp,
                                                         const int *offsets,
                                                         int q_dim,
@@ -1276,7 +1278,7 @@ __global__ static void attn_stream_tc128_bf16_pv_kernel(__nv_bfloat16 *out,
             int d = idx - kk * HD;
             int key = k0 + kk;
             size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            ksh[idx] = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            ksh[idx] = key < L ? kexp[kb] : __float2bfloat16(0.0f);
             vsh[idx] = key < L ? vexp[kb] : __float2bfloat16(0.0f);
         }
         __syncthreads();
@@ -1391,7 +1393,7 @@ __global__ static void attn_stream_tc128_bf16_pv_kernel(__nv_bfloat16 *out,
 template <int CAUSAL>
 __global__ static void attn_stream_tc128_bf16_pv_kv_kernel(__nv_bfloat16 *out,
                                                            const float *qkv,
-                                                           const float *kexp,
+                                                           const __nv_bfloat16 *kexp,
                                                            const __nv_bfloat16 *vexp,
                                                            const int *offsets,
                                                            int q_dim,
@@ -1461,7 +1463,7 @@ __global__ static void attn_stream_tc128_bf16_pv_kv_kernel(__nv_bfloat16 *out,
             int d = idx - kk * HD;
             int key = k0 + kk;
             size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            ksh[idx] = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            ksh[idx] = key < L ? kexp[kb] : __float2bfloat16(0.0f);
             vsh[idx] = key < L ? vexp[kb] : __float2bfloat16(0.0f);
         }
         __syncthreads();
@@ -1579,7 +1581,7 @@ __global__ static void attn_stream_tc128_bf16_pv_kv_kernel(__nv_bfloat16 *out,
 template <int CAUSAL, int WARPS>
 __global__ static void attn_stream_tc128_bf16_kv_kernel(__nv_bfloat16 *out,
                                                         const float *qkv,
-                                                        const float *kexp,
+                                                        const __nv_bfloat16 *kexp,
                                                         const __nv_bfloat16 *vexp,
                                                         const int *offsets,
                                                         int q_dim,
@@ -1638,7 +1640,7 @@ __global__ static void attn_stream_tc128_bf16_kv_kernel(__nv_bfloat16 *out,
             int d = idx - kk * HD;
             int key = k0 + kk;
             size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            ksh[idx] = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            ksh[idx] = key < L ? kexp[kb] : __float2bfloat16(0.0f);
             vsh[idx] = key < L ? vexp[kb] : __float2bfloat16(0.0f);
         }
         __syncthreads();
@@ -1724,14 +1726,14 @@ __global__ static void attn_stream_tc128_bf16_kv_kernel(__nv_bfloat16 *out,
 }
 
 // tc2 with ldmatrix QK fragment assembly. Q keeps the same logical row-major
-// tile but is stored with a grain-level XOR swizzle; K is staged transposed and
-// swizzled so ldmatrix.x4.trans feeds B fragments with the same element order as
-// the scalar tc_load_b_qk_bf16 path. P*V stays on the validated scalar fragment
-// loader. The numerical math is otherwise identical to tc2.
+// tile but is stored with a grain-level XOR swizzle; K is staged
+// transposed+swizzled so ldmatrix.x4.trans feeds B fragments with the same
+// element order as the scalar tc_load_b_qk_bf16 path. P*V stays on the validated
+// scalar fragment loader; numerical math is otherwise identical to tc2.
 template <int CAUSAL, int WARPS>
 __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             const float *qkv,
-                                                            const float *kexp,
+                                                            const __nv_bfloat16 *kexp,
                                                             const __nv_bfloat16 *vexp,
                                                             const int *offsets,
                                                             int q_dim,
@@ -1740,7 +1742,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             float scale) {
     enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
     __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
-    __shared__ __align__(16) __nv_bfloat16 ktsh[HD * KT];
+    __shared__ __align__(16) __nv_bfloat16 ksh[KT * HD];
     __shared__ __align__(16) __nv_bfloat16 vsh[KT * HD];
 
     int lane = threadIdx.x & 31;
@@ -1788,9 +1790,9 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
             int d = idx - kk * HD;
             int key = k0 + kk;
             size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            __nv_bfloat16 kval = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
             __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
-            tc_store_swz_bf16<16>(ktsh, d, kk, kval);
+            tc_store_swz_bf16<16>(ksh, d, kk, kval);
             vsh[idx] = vval;
         }
         __syncthreads();
@@ -1803,7 +1805,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         for (int d0 = 0; d0 < HD; d0 += 16) {
             uint32_t a[4], bb[4];
             tc_load_a_q_ldmatrix_swz_bf16(a, myq, d0);
-            tc_load_b_qk_ldmatrix_swz_bf16(bb, ktsh, d0);
+            tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh, d0);
             mma_m16n16k16_bf16(s, a, bb);
         }
 
@@ -2537,10 +2539,20 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     int total = h_offsets[batch];
     int causal = c->attention_mode == FFWD_ATTENTION_CAUSAL;
     const float alpha = scale, beta = 0.0f, one = 1.0f;
+    int stream_mode = streaming_attention_mode();
+    int use_stream = use_streaming_attention(c, out_bf16 != NULL, hd);
+    int use_tc_kexp_bf16 = use_stream && out_bf16 && c->family == FFWD_FAMILY_QWEN3 && hd == 128 &&
+                           (stream_mode == 0 || (stream_mode >= 5 && stream_mode <= 9));
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
-    if (out_bf16) {
+    if (use_tc_kexp_bf16) {
+        if (!ctx->kexp_bf16)
+            return -1;
+        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H,
+            c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+    } else if (out_bf16) {
         attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
             ctx->kexp, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim,
             k_offset, v_offset);
@@ -2551,8 +2563,7 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     if (launch_check() != 0)
         return -1;
 
-    if (use_streaming_attention(c, out_bf16 != NULL, hd)) {
-        int stream_mode = streaming_attention_mode();
+    if (use_stream) {
         int max_L = 0;
         for (int b = 0; b < batch; b++) {
             int L = h_offsets[b + 1] - h_offsets[b];
@@ -2564,24 +2575,24 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             dim3 block(32, 9);
             if (causal)
                 attn_stream_tc128_bf16_pv_kernel<1><<<grid, block, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             else
                 attn_stream_tc128_bf16_pv_kernel<0><<<grid, block, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             return launch_check();
         }
         if (stream_mode == 6 && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && hd == 128) {
             dim3 grid((max_L + 15) / 16, H, batch);
             if (causal)
                 attn_stream_tc128_bf16_kernel<1><<<grid, 32, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             else
                 attn_stream_tc128_bf16_kernel<0><<<grid, 32, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             return launch_check();
         }
         if (stream_mode == 7 && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && hd == 128) {
@@ -2597,12 +2608,14 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         dim3 block(32, (W));                                                                   \
         if (causal)                                                                            \
             attn_stream_tc128_bf16_kv_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(         \
-                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
-                q_dim, qkv_dim, q_offset, scale);                                              \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
+                scale);                                                                        \
         else                                                                                   \
             attn_stream_tc128_bf16_kv_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(         \
-                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
-                q_dim, qkv_dim, q_offset, scale);                                              \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
+                scale);                                                                        \
     } while (0)
             if (w == 2)
                 TC2_LAUNCH(2);
@@ -2627,12 +2640,14 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         dim3 block(32, (W));                                                                   \
         if (causal)                                                                            \
             attn_stream_tc128_bf16_kv_ldm_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(     \
-                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
-                q_dim, qkv_dim, q_offset, scale);                                              \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
+                scale);                                                                        \
         else                                                                                   \
             attn_stream_tc128_bf16_kv_ldm_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(     \
-                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
-                q_dim, qkv_dim, q_offset, scale);                                              \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
+                scale);                                                                        \
     } while (0)
             if (w == 2)
                 TC3_LAUNCH(2);
@@ -2649,12 +2664,12 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             dim3 block(32, 18);
             if (causal)
                 attn_stream_tc128_bf16_pv_kv_kernel<1><<<grid, block, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             else
                 attn_stream_tc128_bf16_pv_kv_kernel<0><<<grid, block, 0, ctx->stream>>>(
-                    out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
-                    q_dim, qkv_dim, q_offset, scale);
+                    out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);
             return launch_check();
         }
         if (stream_mode == 4) {
@@ -2842,12 +2857,14 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->token_ids);
         cudaFree(ctx->positions);
         cudaFree(ctx->kexp);
+        cudaFree(ctx->kexp_bf16);
         cudaFree(ctx->vexp);
         cudaFree(ctx->act_bf16);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
         ctx->token_ids = ctx->positions = NULL;
         ctx->kexp = ctx->vexp = NULL;
+        ctx->kexp_bf16 = NULL;
         ctx->act_bf16 = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x, (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm, (size_t)total * c->hidden_size * sizeof(float)));
@@ -2859,6 +2876,9 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
+        if (g_weights_bf16)
+            CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16,
+                                  (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
         if (g_weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
@@ -3107,6 +3127,7 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     free(ctx->offsets_host);
     cudaFree(ctx->positions);
     cudaFree(ctx->kexp);
+    cudaFree(ctx->kexp_bf16);
     cudaFree(ctx->vexp);
     cudaFree(ctx->act_bf16);
     cudaFree(ctx->weight_f32);
