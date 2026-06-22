@@ -932,22 +932,19 @@ __device__ static __forceinline__ float warp_group4_max(float v) {
     return v;
 }
 
-__device__ static __forceinline__ void mma_m16n16k16_bf16(float c[8],
-                                                          const uint32_t a[4],
-                                                          const uint32_t b[4]) {
+__device__ static __forceinline__ void
+mma_m16n16k16_bf16(float c[8], const uint32_t a[4], const uint32_t b[4]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-        : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]),
-          "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]),
+                   "f"(c[1]), "f"(c[2]), "f"(c[3]));
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "f"(c[4]),
+                   "f"(c[5]), "f"(c[6]), "f"(c[7]));
 #else
     (void)c;
     (void)a;
@@ -955,9 +952,8 @@ __device__ static __forceinline__ void mma_m16n16k16_bf16(float c[8],
 #endif
 }
 
-__device__ static __forceinline__ void tc_load_a_q_bf16(uint32_t a[4],
-                                                        const __nv_bfloat16 *qsh,
-                                                        int d0) {
+__device__ static __forceinline__ void
+tc_load_a_q_bf16(uint32_t a[4], const __nv_bfloat16 *qsh, int d0) {
     int lane = threadIdx.x & 31;
 #pragma unroll
     for (int r = 0; r < 4; r++) {
@@ -967,9 +963,8 @@ __device__ static __forceinline__ void tc_load_a_q_bf16(uint32_t a[4],
     }
 }
 
-__device__ static __forceinline__ void tc_load_b_qk_bf16(uint32_t b[4],
-                                                        const __nv_bfloat16 *ksh,
-                                                        int d0) {
+__device__ static __forceinline__ void
+tc_load_b_qk_bf16(uint32_t b[4], const __nv_bfloat16 *ksh, int d0) {
     int lane = threadIdx.x & 31;
 #pragma unroll
     for (int r = 0; r < 4; r++) {
@@ -979,9 +974,8 @@ __device__ static __forceinline__ void tc_load_b_qk_bf16(uint32_t b[4],
     }
 }
 
-__device__ static __forceinline__ void tc_load_b_pv_bf16(uint32_t b[4],
-                                                        const __nv_bfloat16 *vsh,
-                                                        int d0) {
+__device__ static __forceinline__ void
+tc_load_b_pv_bf16(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
     int lane = threadIdx.x & 31;
 #pragma unroll
     for (int r = 0; r < 4; r++) {
@@ -997,8 +991,7 @@ __device__ static __forceinline__ void tc_probs_to_a_bf16(uint32_t a[4], const f
         a[r] = bf16_pair_bits(s[2 * r], s[2 * r + 1]);
 }
 
-__device__ static __forceinline__ void tc_load_a_p_bf16(uint32_t a[4],
-                                                        const __nv_bfloat16 *psh) {
+__device__ static __forceinline__ void tc_load_a_p_bf16(uint32_t a[4], const __nv_bfloat16 *psh) {
     int lane = threadIdx.x & 31;
 #pragma unroll
     for (int r = 0; r < 4; r++) {
@@ -1333,6 +1326,161 @@ __global__ static void attn_stream_tc128_bf16_pv_kernel(__nv_bfloat16 *out,
     }
 }
 
+// K/V-sharing variant of the one-warp BF16 tensor-core tile. A block holds WARPS
+// warps; warp w owns the 16-query tile at block_q0 + w*16 of one (sequence,
+// head). All warps share ONE 16-key K/V staging tile in shared memory, so each
+// global K/V tile is read once per WARPS query tiles instead of once per query
+// tile. At long context the materialized and tc/tc1 paths re-read all of K/V for
+// every 16-query tile (O(N^2) K/V traffic); this cuts that by WARPS. Per-warp QK,
+// online softmax, and the 16x128 register output accumulator are unchanged from
+// attn_stream_tc128_bf16_kernel.
+template <int CAUSAL, int WARPS>
+__global__ static void attn_stream_tc128_bf16_kv_kernel(__nv_bfloat16 *out,
+                                                        const float *qkv,
+                                                        const float *kexp,
+                                                        const __nv_bfloat16 *vexp,
+                                                        const int *offsets,
+                                                        int q_dim,
+                                                        int qkv_dim,
+                                                        int q_offset,
+                                                        float scale) {
+    enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
+    __shared__ __nv_bfloat16 qsh[WARPS * QT * HD];
+    __shared__ __nv_bfloat16 ksh[KT * HD];
+    __shared__ __nv_bfloat16 vsh[KT * HD];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.y;
+    int tid = warp * 32 + lane;
+    int nthreads = WARPS * 32;
+    int block_q0 = blockIdx.x * (WARPS * QT);
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    if (block_q0 >= L) // no valid query row in this block (variable-length tail)
+        return;
+    int q0 = block_q0 + warp * QT; // this warp's query tile
+    size_t hv = (size_t)head * HD;
+    __nv_bfloat16 *myq = qsh + warp * QT * HD;
+
+    for (int idx = lane; idx < QT * HD; idx += 32) {
+        int qr = idx / HD;
+        int d = idx - qr * HD;
+        int row = q0 + qr;
+        float qv = row < L ? qkv[(size_t)(start + row) * qkv_dim + q_offset + hv + d] : 0.0f;
+        myq[idx] = __float2bfloat16(qv);
+    }
+
+    float o[DCHUNKS][8];
+#pragma unroll
+    for (int dc = 0; dc < DCHUNKS; dc++)
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            o[dc][r] = 0.0f;
+    float m[2] = {-3.402823466e+38F, -3.402823466e+38F};
+    float denom[2] = {0.0f, 0.0f};
+
+    // Block-level key bound: all warps load the same tiles; per-warp causality is
+    // applied in the score mask below. The block's last query row sets the bound.
+    int key_hi = L;
+    if (CAUSAL) {
+        int lim = block_q0 + WARPS * QT;
+        if (lim < key_hi)
+            key_hi = lim;
+    }
+
+    for (int k0 = 0; k0 < key_hi; k0 += KT) {
+        for (int idx = tid; idx < KT * HD; idx += nthreads) {
+            int kk = idx / HD;
+            int d = idx - kk * HD;
+            int key = k0 + kk;
+            size_t kb = (size_t)(start + key) * q_dim + hv + d;
+            ksh[idx] = key < L ? __float2bfloat16(kexp[kb]) : __float2bfloat16(0.0f);
+            vsh[idx] = key < L ? vexp[kb] : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+
+        float s[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            s[r] = 0.0f;
+#pragma unroll
+        for (int d0 = 0; d0 < HD; d0 += 16) {
+            uint32_t a[4], bb[4];
+            tc_load_a_q_bf16(a, myq, d0);
+            tc_load_b_qk_bf16(bb, ksh, d0);
+            mma_m16n16k16_bf16(s, a, bb);
+        }
+
+        const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+            int qrow = q0 + qr;
+            int key = k0 + kc;
+            if (qrow < L && key < L && (!CAUSAL || key <= qrow))
+                s[r] *= scale;
+            else
+                s[r] = neg_inf;
+        }
+
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int r0 = j * 2;
+            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+            denom[j] *= corr;
+#pragma unroll
+            for (int dc = 0; dc < DCHUNKS; dc++) {
+                o[dc][r0 + 0] *= corr;
+                o[dc][r0 + 1] *= corr;
+                o[dc][r0 + 4] *= corr;
+                o[dc][r0 + 5] *= corr;
+            }
+            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+            s[r0 + 0] = p0;
+            s[r0 + 1] = p1;
+            s[r0 + 4] = p4;
+            s[r0 + 5] = p5;
+            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+            m[j] = m_new;
+        }
+
+        uint32_t pfrag[4];
+        tc_probs_to_a_bf16(pfrag, s);
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            uint32_t vb[4];
+            tc_load_b_pv_bf16(vb, vsh, dc * 16);
+            mma_m16n16k16_bf16(o[dc], pfrag, vb);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        int qrow = q0 + (lane >> 2) + j * 8;
+        if (qrow >= L)
+            continue;
+        float inv = denom[j] > 0.0f ? 1.0f / denom[j] : 0.0f;
+        size_t ob = (size_t)(start + qrow) * q_dim + hv;
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            int col = dc * 16 + ((lane & 3) << 1);
+            store_act(out, ob + col + 0, o[dc][j * 2 + 0] * inv);
+            store_act(out, ob + col + 1, o[dc][j * 2 + 1] * inv);
+            store_act(out, ob + col + 8, o[dc][j * 2 + 4] * inv);
+            store_act(out, ob + col + 9, o[dc][j * 2 + 5] * inv);
+        }
+    }
+}
+
 // Register-resident streaming (online-softmax) attention: the FlashAttention-2
 // tile for our packed layout. One warp owns RQ query rows of one (sequence,
 // head); its 32 lanes split head_dim into DPL = HD/32 lane-local elements. The
@@ -1638,12 +1786,13 @@ static cublasComputeType_t gemm_compute(void) {
 
 // Experimental streaming attention selector. Off by default; use
 // FFWD_CUDA_STREAMING_ATTN=tc for the BF16 tensor-core Qwen tile, =tc1 for the
-// one-warp BF16 tensor-core fallback, =reg for the F32 register-resident tile,
-// =bert for the scalar BERT tile, or =wmma for the shared-memory WMMA prototype.
-// =1/=all forces the generic row kernel for every head_dim<=128 call.
+// one-warp BF16 tensor-core fallback, =tc2 for the K/V-sharing multi-warp tile,
+// =reg for the F32 register-resident tile, =bert for the scalar BERT tile, or
+// =wmma for the shared-memory WMMA prototype. =1/=all forces the generic row
+// kernel for every head_dim<=128 call.
 static int streaming_attention_mode(void) {
     static int init = 0;
-    static int mode = 0; // 0 off, 1 all, 2 BERT scalar, 3 WMMA, 4 reg, 5 BF16 TC, 6 TC fallback
+    static int mode = 0; // 0 off,1 all,2 BERT,3 WMMA,4 reg,5 BF16 TC,6 TC 1warp,7 TC kv-share
     if (!init) {
         const char *e = getenv("FFWD_CUDA_STREAMING_ATTN");
         if (e && (!strcmp(e, "1") || !strcmp(e, "all")))
@@ -1658,9 +1807,26 @@ static int streaming_attention_mode(void) {
             mode = 5;
         else if (e && (!strcmp(e, "tc1") || !strcmp(e, "mma1") || !strcmp(e, "mma_bf16_1warp")))
             mode = 6;
+        else if (e && (!strcmp(e, "tc2") || !strcmp(e, "mma_kv")))
+            mode = 7;
         init = 1;
     }
     return mode;
+}
+
+// Query tiles per block for the tc2 K/V-sharing kernel (FFWD_TC_WARPS, 2/4/8).
+static int tc_kv_warps(void) {
+    static int init = 0, w = 4;
+    if (!init) {
+        const char *e = getenv("FFWD_TC_WARPS");
+        if (e) {
+            int v = atoi(e);
+            if (v == 2 || v == 4 || v == 8)
+                w = v;
+        }
+        init = 1;
+    }
+    return w;
 }
 
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
@@ -1678,6 +1844,8 @@ static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int hea
     if (mode == 5)
         return c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
     if (mode == 6)
+        return c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
+    if (mode == 7)
         return c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
     return 1;
 }
@@ -1990,6 +2158,35 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                 attn_stream_tc128_bf16_kernel<0><<<grid, 32, 0, ctx->stream>>>(
                     out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets,
                     q_dim, qkv_dim, q_offset, scale);
+            return launch_check();
+        }
+        if (stream_mode == 7 && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && hd == 128) {
+            // WARPS query tiles per block share one K/V staging tile, so each
+            // global K/V tile is read once per WARPS query tiles (less re-read at
+            // long context). WARPS is tunable via FFWD_TC_WARPS (2/4/8); 4 by
+            // default. More warps = more reuse but more shared memory / lower
+            // occupancy, so the best value is length-dependent.
+            int w = tc_kv_warps();
+#define TC2_LAUNCH(W)                                                                          \
+    do {                                                                                       \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                              \
+        dim3 block(32, (W));                                                                   \
+        if (causal)                                                                            \
+            attn_stream_tc128_bf16_kv_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(         \
+                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
+                q_dim, qkv_dim, q_offset, scale);                                              \
+        else                                                                                   \
+            attn_stream_tc128_bf16_kv_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(         \
+                out_bf16, ctx->qkv, ctx->kexp, (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
+                q_dim, qkv_dim, q_offset, scale);                                              \
+    } while (0)
+            if (w == 2)
+                TC2_LAUNCH(2);
+            else if (w == 8)
+                TC2_LAUNCH(8);
+            else
+                TC2_LAUNCH(4);
+#undef TC2_LAUNCH
             return launch_check();
         }
         if (stream_mode == 4) {
