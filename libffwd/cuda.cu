@@ -2289,11 +2289,13 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // inputs (single short requests). So it is auto-enabled only above a measured
 // token-count crossover (~512 tokens; 1024 leaves margin). FFWD_CUDA_BERT_BF16_ACT
 // overrides: 1/on forces it on at any size, 0/off forces it off (for A/B).
-// FFWD_CUDA_BERT_RESIDUAL16=1 goes further: in the BF16 flash path it stores the
+// BF16 residual stream goes further: in the BF16 flash path it stores the
 // persistent residual stream itself as BF16, while doing residual-add and
-// LayerNorm reductions in F32. That is experimental and default-off until cosine
-// and batch-32 throughput are validated on CUDA.
+// LayerNorm reductions in F32. It is auto-enabled only for large packed BERT
+// batches where L4 validation showed a stable long-sequence win; the env override
+// remains for A/B.
 enum { BERT_BF16_ACT_MIN_TOKENS = 1024 };
+enum { BERT_RESIDUAL16_MIN_TOKENS = 16384 };
 // Returns 1 (force on), -1 (force off), or 0 (auto: gate on token count).
 static int bert_bf16_act_mode(void) {
     static int init = 0, mode = 0;
@@ -2308,10 +2310,9 @@ static int bert_bf16_act_mode(void) {
     return mode;
 }
 
-// Experimental BERT residual-stream storage. 0/default keeps the promoted F32
-// residual path; 1/on/bf16 stores the persistent residual as BF16 while keeping
-// LayerNorm reductions and residual-add arithmetic in F32. This is gated until
-// L4 cosine/perf validates the batch-32 scaling benefit.
+// BERT residual-stream storage. 0/default gates on total tokens; 1/on/bf16
+// forces it on; 0/off forces it off. The arithmetic stays mixed precision:
+// persistent storage is BF16, residual-add and LayerNorm reductions are F32.
 static int bert_residual16_mode(void) {
     static int init = 0, mode = 0;
     if (!init) {
@@ -2359,7 +2360,10 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
                              act_mode >= 0 && (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
     __nv_bfloat16 *resid = (__nv_bfloat16 *)ctx->x_bf16;
-    int bf16_resid = bf16_act && flash && resid && bert_residual16_mode() > 0;
+    int resid_mode = bert_residual16_mode();
+    int bf16_resid =
+        bf16_act && flash && resid && resid_mode >= 0 &&
+        (resid_mode > 0 || total >= BERT_RESIDUAL16_MIN_TOKENS);
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
