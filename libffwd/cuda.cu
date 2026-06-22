@@ -912,6 +912,137 @@ __global__ static void attn_stream_wmma_kernel(OUT_T *out,
     }
 }
 
+// Register-resident streaming (online-softmax) attention: the FlashAttention-2
+// tile for our packed layout. One warp owns RQ query rows of one (sequence,
+// head); its 32 lanes split head_dim into DPL = HD/32 lane-local elements. The
+// QK dot is then DPL per-lane FMAs plus a single warp_sum (one shuffle
+// butterfly), and the P*V accumulation is lane-local with no reduction. The
+// running max m, denom l, the query rows, and the output accumulator all stay in
+// registers; only the streaming K/V tile passes through shared memory, loaded
+// once per BC keys (not once per key, unlike attn_stream_bert64_kernel). No LxL
+// score matrix is written to global memory; HBM cost is O(N*d), not O(H*N^2).
+// V_T/OUT_T are __nv_bfloat16 when the BF16-weight Qwen path feeds the wo GEMM
+// directly. CAUSAL masks key > query and skips key tiles past the block.
+//
+// Output is bit-exact with the materialized path, but this stays behind
+// FFWD_CUDA_STREAMING_ATTN because cuBLAS attention is faster at F32 for our
+// sizes even at long context: the per-length cost there is dominated by the
+// O(N^2) attention *compute*, which cuBLAS does better than scalar FMA, so
+// removing the score-matrix HBM traffic does not pay off. A streaming win needs
+// tensor-core (fp16/bf16) MMAs, not F32 FMA; this tile is the correct scaffold
+// for that, with the softmax/accumulator state already register-resident.
+template <int HD, int RQ, int BC, typename V_T, typename OUT_T, int CAUSAL>
+__global__ static void attn_stream_reg_kernel(OUT_T *out,
+                                              const float *qkv,
+                                              const float *kexp,
+                                              const V_T *vexp,
+                                              const int *offsets,
+                                              int q_dim,
+                                              int qkv_dim,
+                                              int q_offset,
+                                              float scale) {
+    enum { DPL = HD / 32 };
+    __shared__ float ksh[BC * HD];
+    __shared__ float vsh[BC * HD];
+
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int nthreads = blockDim.y * 32;
+    int tid = warp * 32 + lane;
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+
+    int block_q0 = blockIdx.x * (blockDim.y * RQ);
+    if (block_q0 >= L) // this block owns no valid query row (variable length tail)
+        return;
+    int warp_row0 = block_q0 + warp * RQ;
+    size_t hv = (size_t)head * HD;
+
+    // Each warp loads its RQ query rows into registers, pre-scaled by `scale` so
+    // the inner product is already the scaled score. Invalid rows keep q=0.
+    float q[RQ][DPL], acc[RQ][DPL], m[RQ], l[RQ];
+#pragma unroll
+    for (int i = 0; i < RQ; i++) {
+        int row = warp_row0 + i;
+        size_t qb = (size_t)(start + row) * qkv_dim + q_offset + hv;
+#pragma unroll
+        for (int e = 0; e < DPL; e++) {
+            q[i][e] = row < L ? qkv[qb + lane + 32 * e] * scale : 0.0f;
+            acc[i][e] = 0.0f;
+        }
+        m[i] = -3.402823466e+38F;
+        l[i] = 0.0f;
+    }
+
+    // Non-causal scans all keys; causal stops at the block's last query row.
+    int key_hi = L;
+    if (CAUSAL) {
+        int lim = block_q0 + (int)blockDim.y * RQ;
+        if (lim < key_hi)
+            key_hi = lim;
+    }
+
+    for (int k0 = 0; k0 < key_hi; k0 += BC) {
+        // Cooperative tile load: BC keys x HD floats, contiguous writes are
+        // conflict-free. Out-of-range keys are zeroed (and masked out below).
+        for (int idx = tid; idx < BC * HD; idx += nthreads) {
+            int j = idx / HD;
+            int key = k0 + j;
+            size_t kb = (size_t)(start + key) * q_dim + hv + (idx - j * HD);
+            ksh[idx] = key < L ? kexp[kb] : 0.0f;
+            vsh[idx] = key < L ? load_attn_value(vexp, kb) : 0.0f;
+        }
+        __syncthreads();
+
+        int tile = key_hi - k0;
+        if (tile > BC)
+            tile = BC;
+        for (int j = 0; j < tile; j++) {
+            int key = k0 + j;
+            float kv[DPL], vv[DPL];
+#pragma unroll
+            for (int e = 0; e < DPL; e++) {
+                kv[e] = ksh[j * HD + lane + 32 * e];
+                vv[e] = vsh[j * HD + lane + 32 * e];
+            }
+#pragma unroll
+            for (int i = 0; i < RQ; i++) {
+                float part = 0.0f;
+#pragma unroll
+                for (int e = 0; e < DPL; e++)
+                    part += q[i][e] * kv[e];
+                float score = warp_sum(part); // full scaled dot, broadcast to all lanes
+                int row = warp_row0 + i;
+                if (row >= L || (CAUSAL && key > row))
+                    continue;
+                float m_new = fmaxf(m[i], score);
+                float corr = __expf(m[i] - m_new);
+                float p = __expf(score - m_new);
+                l[i] = l[i] * corr + p;
+#pragma unroll
+                for (int e = 0; e < DPL; e++)
+                    acc[i][e] = acc[i][e] * corr + p * vv[e];
+                m[i] = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < RQ; i++) {
+        int row = warp_row0 + i;
+        if (row >= L)
+            continue;
+        float inv = 1.0f / l[i];
+        size_t ob = (size_t)(start + row) * q_dim + hv;
+#pragma unroll
+        for (int e = 0; e < DPL; e++)
+            store_act(out, ob + lane + 32 * e, acc[i][e] * inv);
+    }
+}
+
 __global__ static void
 mean_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
     int b = blockIdx.x;
@@ -1085,12 +1216,12 @@ static cublasComputeType_t gemm_compute(void) {
 }
 
 // Experimental streaming attention selector. Off by default; use
-// FFWD_CUDA_STREAMING_ATTN=bert for the scalar BERT tile, or =wmma for the
-// half-rounded tensor-core prototype. =1/=all forces the generic row kernel for
-// every head_dim<=128 attention call.
+// FFWD_CUDA_STREAMING_ATTN=reg for the register-resident FlashAttention tile,
+// =bert for the scalar BERT tile, or =wmma for the half-rounded tensor-core
+// prototype. =1/=all forces the generic row kernel for every head_dim<=128 call.
 static int streaming_attention_mode(void) {
     static int init = 0;
-    static int mode = 0; // 0 off, 1 all, 2 BERT scalar tile, 3 WMMA tile
+    static int mode = 0; // 0 off, 1 all, 2 BERT scalar tile, 3 WMMA tile, 4 register tile
     if (!init) {
         const char *e = getenv("FFWD_CUDA_STREAMING_ATTN");
         if (e && (!strcmp(e, "1") || !strcmp(e, "all")))
@@ -1099,6 +1230,8 @@ static int streaming_attention_mode(void) {
             mode = 2;
         else if (e && (!strcmp(e, "wmma") || !strcmp(e, "bert_wmma")))
             mode = 3;
+        else if (e && (!strcmp(e, "reg") || !strcmp(e, "flash")))
+            mode = 4;
         init = 1;
     }
     return mode;
@@ -1113,6 +1246,9 @@ static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int hea
     if (mode == 3)
         return (c->family == FFWD_FAMILY_BERT && !out_bf16 && head_dim == 64) ||
                (c->family == FFWD_FAMILY_QWEN3 && head_dim == 128);
+    // Register tile handles both shapes: head_dim 64 (BERT/BGE) and 128 (Qwen).
+    if (mode == 4)
+        return head_dim == 64 || head_dim == 128;
     return 1;
 }
 
@@ -1400,6 +1536,38 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             int L = h_offsets[b + 1] - h_offsets[b];
             if (L > max_L)
                 max_L = L;
+        }
+        if (stream_mode == 4) {
+            // Register-resident tile: one warp owns RQ query rows, a block owns
+            // blockDim.y*RQ = 32 rows. hd=64: 4 warps x RQ=8, BC=16 keys/tile;
+            // hd=128: 8 warps x RQ=4, BC=32. Q/m/l/output accumulator in regs.
+            dim3 grid((max_L + 31) / 32, H, batch);
+            dim3 block(32, hd == 64 ? 4 : 8);
+#define REG_ATTN(HD, RQ, BC, CZ)                                                                  \
+    do {                                                                                          \
+        if (out_bf16)                                                                             \
+            attn_stream_reg_kernel<HD, RQ, BC, __nv_bfloat16, __nv_bfloat16, CZ>                  \
+                <<<grid, block, 0, ctx->stream>>>(out_bf16, ctx->qkv, ctx->kexp,                  \
+                                                  (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, \
+                                                  q_dim, qkv_dim, q_offset, scale);               \
+        else                                                                                      \
+            attn_stream_reg_kernel<HD, RQ, BC, float, float, CZ>                                  \
+                <<<grid, block, 0, ctx->stream>>>(ctx->attn_out, ctx->qkv, ctx->kexp, ctx->vexp,  \
+                                                  ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+    } while (0)
+            if (hd == 64) {
+                if (causal)
+                    REG_ATTN(64, 8, 16, 1);
+                else
+                    REG_ATTN(64, 8, 16, 0);
+            } else {
+                if (causal)
+                    REG_ATTN(128, 4, 32, 1);
+                else
+                    REG_ATTN(128, 4, 32, 0);
+            }
+#undef REG_ATTN
+            return launch_check();
         }
         if (stream_mode == 3 && c->family == FFWD_FAMILY_BERT && !out_bf16 && !causal && hd == 64) {
             dim3 grid((max_L + 15) / 16, H, batch);
