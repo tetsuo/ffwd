@@ -983,7 +983,7 @@ __device__ static __forceinline__ void tc_ldmatrix_x4_trans_b16(uint32_t out[4],
 template <int STRIDE> __device__ static __forceinline__ int tc_swz_idx(int row, int col) {
     int grain = col >> 3; // one ldmatrix row address names 8 contiguous bf16 values
     int in_grain = col & 7;
-    int mask = (STRIDE == 16) ? ((row >> 2) & 1) : (row & 7);
+    int mask = (STRIDE == 16) ? ((row >> 2) & 1) : (STRIDE == 32) ? (row & 3) : (row & 7);
     return row * STRIDE + ((grain ^ mask) << 3) + in_grain;
 }
 
@@ -1063,7 +1063,7 @@ __device__ static __forceinline__ void tc_load_a_p_bf16(uint32_t a[4], const __n
 // Head-dim-parametric Q and V fragment loaders for the flash kernels. The QK S
 // tile and the PV O tile are 16x16 regardless of head_dim, so only the Q-tile
 // swizzle stride (HD) and the V row stride (HD) depend on it; these are the
-// HD=128 tc3 loaders generalized so a head_dim-64 kernel can reuse the same
+// HD=128 tc3 loaders generalized so BERT-family flash kernels can reuse the same
 // fragment layout. (The K loader tc_load_b_qk_ldmatrix_swz_bf16 is already
 // HD-independent: K is staged transposed with stride KT=16.)
 template <int HD>
@@ -1905,25 +1905,25 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
     }
 }
 
-// BF16 tensor-core flash attention for the BERT shape: head_dim 64, BIDIRECTIONAL
+// BF16 tensor-core flash attention for the BERT shape: head_dim 32/64, BIDIRECTIONAL
 // (no causal mask). The tc3 kernel for the Qwen shape (head_dim 128, K/V-sharing,
-// ldmatrix QK, online softmax) generalized to head_dim 64 - 4 d-chunks instead of
-// 8, a 64-wide Q swizzle and V row stride, and an every-key loop with only the
-// length mask. Replaces the materialized N×N scores/probs path for BERT: the
+// ldmatrix QK, online softmax) generalized to smaller BERT head sizes: fewer
+// d-chunks, an HD-wide Q swizzle and V row stride, and an every-key loop with
+// only the length mask. Replaces the materialized N×N scores/probs path for BERT: the
 // scores live in registers and never reach global memory, removing the O(n^2)
 // HBM that dominates BERT attention at batch 32. One block = WARPS query tiles
 // sharing one K/V staging tile; the math is otherwise identical to tc3.
-template <int WARPS>
-__global__ static void attn_stream_bert64_flash_kernel(__nv_bfloat16 *out,
-                                                       const float *qkv,
-                                                       const __nv_bfloat16 *kexp,
-                                                       const __nv_bfloat16 *vexp,
-                                                       const int *offsets,
-                                                       int q_dim,
-                                                       int qkv_dim,
-                                                       int q_offset,
-                                                       float scale) {
-    enum { QT = 16, KT = 16, HD = 64, DCHUNKS = 4 };
+template <int HD, int WARPS>
+__global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
+                                                     const float *qkv,
+                                                     const __nv_bfloat16 *kexp,
+                                                     const __nv_bfloat16 *vexp,
+                                                     const int *offsets,
+                                                     int q_dim,
+                                                     int qkv_dim,
+                                                     int q_offset,
+                                                     float scale) {
+    enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
     __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
     __shared__ __align__(16) __nv_bfloat16 ksh[KT * HD];
     __shared__ __align__(16) __nv_bfloat16 vsh[KT * HD];
@@ -2738,21 +2738,26 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
     return 0;
 }
 
-// BF16 tensor-core flash attention for the BERT shape (head_dim 64,
+// BF16 tensor-core flash attention for the BERT shapes (head_dim 32/64,
 // bidirectional), replacing the materialized N×N scores/probs path. It is bit-
-// accurate (cosine vs F32 >= the materialized bf16 path) and faster at every
-// length (the win grows with length as it removes the O(n^2) scores HBM), so it
-// is the DEFAULT on the bf16w-bf16 head_dim-64 path. FFWD_CUDA_BERT_FLASH=0
-// forces the materialized path back for A/B. FFWD_TC_WARPS (2/4/8) tunes the
-// query tiles per block (default 8).
-static int bert_flash_enabled(void) {
-    static int init = 0, on = 1;
+// accurate (cosine vs F32 >= the materialized bf16 path). It is the DEFAULT on
+// the bf16w-bf16 head_dim-64 path, where the O(n^2) HBM removal wins at every
+// measured length. The head_dim-32 MiniLM shape is implemented but opt-in
+// (FFWD_CUDA_BERT_FLASH=1), because H100 validation did not show a reliable
+// default win. FFWD_CUDA_BERT_FLASH=0 forces the materialized path back for A/B.
+// FFWD_TC_WARPS (2/4/8) tunes the query tiles per block (default 8).
+static int bert_flash_mode(void) {
+    static int init = 0, mode = 0;
     if (!init) {
         const char *e = getenv("FFWD_CUDA_BERT_FLASH");
-        on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        else if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force") ||
+                       !strcmp(e, "all")))
+            mode = 1;
         init = 1;
     }
-    return on;
+    return mode;
 }
 
 // out_bf16 != NULL selects the BF16-weight layout: V and the softmax
@@ -2772,15 +2777,22 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     int hd = c->head_dim;
     int H = c->n_heads;
     int total = h_offsets[batch];
+    int max_L = 0;
+    for (int b = 0; b < batch; b++) {
+        int L = h_offsets[b + 1] - h_offsets[b];
+        if (L > max_L)
+            max_L = L;
+    }
     int causal = c->attention_mode == FFWD_ATTENTION_CAUSAL;
     const float alpha = scale, beta = 0.0f, one = 1.0f;
     int stream_mode = streaming_attention_mode();
     int use_stream = use_streaming_attention(c, out_bf16 != NULL, hd);
     int use_tc_kexp_bf16 = use_stream && out_bf16 && c->family == FFWD_FAMILY_QWEN3 && hd == 128 &&
                            (stream_mode == 0 || (stream_mode >= 5 && stream_mode <= 9));
-    // BERT bf16 flash attention: head_dim 64, bidirectional, K/V expanded BF16.
-    int use_bert_flash =
-        out_bf16 && c->family == FFWD_FAMILY_BERT && hd == 64 && bert_flash_enabled();
+    // BERT bf16 flash attention: head_dim 32/64, bidirectional, K/V expanded BF16.
+    int bert_flash = bert_flash_mode();
+    int use_bert_flash = out_bf16 && c->family == FFWD_FAMILY_BERT &&
+                         ((hd == 64 && bert_flash >= 0) || (hd == 32 && bert_flash > 0));
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
@@ -2802,27 +2814,30 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         return -1;
 
     if (use_bert_flash) {
-        int max_L = 0;
-        for (int b = 0; b < batch; b++) {
-            int L = h_offsets[b + 1] - h_offsets[b];
-            if (L > max_L)
-                max_L = L;
-        }
         int w = tc_kv_warps_or(8);
-#define BERT_FLASH_LAUNCH(W)                                                                  \
+#define BERT_FLASH_LAUNCH(HDV, W)                                                             \
     do {                                                                                      \
         dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                             \
         dim3 block(32, (W));                                                                  \
-        attn_stream_bert64_flash_kernel<(W)><<<grid, block, 0, ctx->stream>>>(                \
+        attn_stream_bert_flash_kernel<(HDV), (W)><<<grid, block, 0, ctx->stream>>>(           \
             out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
             (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
     } while (0)
-        if (w == 2)
-            BERT_FLASH_LAUNCH(2);
-        else if (w == 4)
-            BERT_FLASH_LAUNCH(4);
-        else
-            BERT_FLASH_LAUNCH(8);
+        if (hd == 32) {
+            if (w == 2)
+                BERT_FLASH_LAUNCH(32, 2);
+            else if (w == 4)
+                BERT_FLASH_LAUNCH(32, 4);
+            else
+                BERT_FLASH_LAUNCH(32, 8);
+        } else {
+            if (w == 2)
+                BERT_FLASH_LAUNCH(64, 2);
+            else if (w == 4)
+                BERT_FLASH_LAUNCH(64, 4);
+            else
+                BERT_FLASH_LAUNCH(64, 8);
+        }
 #undef BERT_FLASH_LAUNCH
         return launch_check();
     }
@@ -3531,11 +3546,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     cublasComputeType_t gc = gemm_compute();
     int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
     int act_mode = bert_bf16_act_mode();
-    // bf16 flash attention (head_dim 64): the attention output is written bf16 to
-    // `act` for wo to read with no cast. It implies the bf16-act norm path so the
-    // whole layer is one bf16 activation pipeline.
-    int flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && c->head_dim == 64 &&
-                bert_flash_enabled();
+    // bf16 flash attention: the attention output is written bf16 to `act` for wo
+    // to read with no cast. It implies the bf16-act norm path so the whole layer
+    // is one bf16 activation pipeline.
+    int bert_flash = bert_flash_mode();
+    int flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
+                ((c->head_dim == 64 && bert_flash >= 0) ||
+                 (c->head_dim == 32 && bert_flash > 0));
     int bf16_act = flash || (compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
                              act_mode >= 0 && (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
