@@ -2060,6 +2060,7 @@ __global__ static void span_pool_kernel(
 // LayerNorm in one row kernel. It avoids writing the pre-normalized embedding
 // row to global memory only to read it back for LayerNorm.
 __global__ static void bert_embed_layer_norm_kernel(float *out,
+                                                    __nv_bfloat16 *out_bf16,
                                                     const int *ids,
                                                     const int *positions,
                                                     const void *emb,
@@ -2096,14 +2097,21 @@ __global__ static void bert_embed_layer_norm_kernel(float *out,
         vs += c * c;
     }
     float inv = rsqrtf(block_sum(vs) / (float)hidden + eps);
-    for (int d = tid; d < hidden; d += blockDim.x)
-        out[(size_t)row * hidden + d] = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+    float *o = out + (size_t)row * hidden;
+    __nv_bfloat16 *ob = out_bf16 ? out_bf16 + (size_t)row * hidden : nullptr;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = nv;
+        if (ob)
+            ob[d] = __float2bfloat16(nv);
+    }
 }
 
 // BERT SkipLayerNorm variant for the common post-GEMM shape. The residual has
 // already been accumulated by cuBLAS beta=1, so this fuses the remaining row
 // bias with LayerNorm and keeps the pre-normalized row in shared memory.
 __global__ static void layer_norm_bias_kernel(float *out,
+                                              __nv_bfloat16 *out_bf16,
                                               const float *x,
                                               const float *bias,
                                               const float *gamma,
@@ -2131,8 +2139,17 @@ __global__ static void layer_norm_bias_kernel(float *out,
     }
     float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
     float *o = out + (size_t)row * dim;
-    for (int d = tid; d < dim; d += blockDim.x)
-        o[d] = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+    // Post-norm BERT: the LayerNorm output is both the F32 residual carried to
+    // the next add and the input to the next GEMM. The optional bf16 copy lets
+    // the bf16-activation path feed the GEMM directly (no per-GEMM F32->bf16
+    // cast) while the residual stays F32 for the mean-subtracting norm.
+    __nv_bfloat16 *ob = out_bf16 ? out_bf16 + (size_t)row * dim : nullptr;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = nv;
+        if (ob)
+            ob[d] = __float2bfloat16(nv);
+    }
 }
 
 __global__ static void bias_gelu_kernel(float *x, const float *bias, int rows, int dim) {
@@ -2145,6 +2162,19 @@ __global__ static void bias_gelu_kernel(float *x, const float *bias, int rows, i
     }
 }
 
+// bf16-output GELU variants for the bf16-activation BERT path: read the F32 FFN
+// intermediate, apply bias+GELU, write bf16 for the down-projection GEMM input.
+__global__ static void
+bias_gelu_to_bf16_kernel(__nv_bfloat16 *out, const float *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        out[idx] = __float2bfloat16(0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+    }
+}
+
 __global__ static void bias_gelu_tanh_kernel(float *x, const float *bias, int rows, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t n = (size_t)rows * dim;
@@ -2153,6 +2183,18 @@ __global__ static void bias_gelu_tanh_kernel(float *x, const float *bias, int ro
         float v = x[idx] + bias[d];
         float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
         x[idx] = 0.5f * v * (1.0f + tanhf(inner));
+    }
+}
+
+__global__ static void bias_gelu_tanh_to_bf16_kernel(
+    __nv_bfloat16 *out, const float *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        out[idx] = __float2bfloat16(0.5f * v * (1.0f + tanhf(inner)));
     }
 }
 
@@ -2602,20 +2644,18 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             // default. More warps = more reuse but more shared memory / lower
             // occupancy, so the best value is length-dependent.
             int w = tc_kv_warps_or(4);
-#define TC2_LAUNCH(W)                                                                          \
-    do {                                                                                       \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                              \
-        dim3 block(32, (W));                                                                   \
-        if (causal)                                                                            \
-            attn_stream_tc128_bf16_kv_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(         \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
-                scale);                                                                        \
-        else                                                                                   \
-            attn_stream_tc128_bf16_kv_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(         \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
-                scale);                                                                        \
+#define TC2_LAUNCH(W)                                                                             \
+    do {                                                                                          \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                 \
+        dim3 block(32, (W));                                                                      \
+        if (causal)                                                                               \
+            attn_stream_tc128_bf16_kv_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(            \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+        else                                                                                      \
+            attn_stream_tc128_bf16_kv_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(            \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
     } while (0)
             if (w == 2)
                 TC2_LAUNCH(2);
@@ -2634,20 +2674,18 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             // tc2 plus ldmatrix/swizzled QK fragment loads. Uses the same WARPS
             // knob so it can be compared directly with tc2.
             int w = tc_kv_warps_or(8);
-#define TC3_LAUNCH(W)                                                                          \
-    do {                                                                                       \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                              \
-        dim3 block(32, (W));                                                                   \
-        if (causal)                                                                            \
-            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(     \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
-                scale);                                                                        \
-        else                                                                                   \
-            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(     \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                     \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,      \
-                scale);                                                                        \
+#define TC3_LAUNCH(W)                                                                             \
+    do {                                                                                          \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                 \
+        dim3 block(32, (W));                                                                      \
+        if (causal)                                                                               \
+            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(        \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+        else                                                                                      \
+            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(        \
+                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
     } while (0)
             if (w == 2)
                 TC3_LAUNCH(2);
@@ -2877,8 +2915,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
         if (g_weights_bf16)
-            CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16,
-                                  (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16, (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
         if (g_weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
@@ -3225,6 +3262,19 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // F32 activations: BERT checkpoints are F32, so the linear/linear_accum F32
 // entry points are used throughout (they still handle bf16 weights via an
 // internal cast, which keeps a future bf16 BERT correct if not yet optimized).
+// Opt-in bf16-activation BERT path (FFWD_CUDA_BERT_BF16_ACT=1). It only engages
+// when weights are bf16 and the GEMM compute mode is 16-bit, i.e. the existing
+// bf16w-bf16 path; otherwise it is a no-op.
+static int bert_bf16_act_enabled(void) {
+    static int init = 0, on = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_BERT_BF16_ACT");
+        on = (e && (!strcmp(e, "1") || !strcmp(e, "on")));
+        init = 1;
+    }
+    return on;
+}
+
 static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
     const ffwd_config_t *c = &ctx->config;
     int total = 0;
@@ -3240,10 +3290,24 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     int threads = 256;
     size_t ln_smem = (size_t)hidden * sizeof(float);
 
+    // bf16-activation path: the residual stream ctx->x stays F32 (the
+    // mean-subtracting LayerNorm needs it), but each norm/GELU producer also
+    // emits a bf16 copy of its normalized output into `act`, which the next GEMM
+    // consumes directly. This removes the per-GEMM F32->bf16 cast (one extra HBM
+    // round trip per GEMM) the default bf16w path pays. Attention stays F32 here,
+    // so this lever is measured alone. `act` aliases the cast scratch ctx->act_bf16;
+    // the only F32-input GEMM (wo, reading F32 attn_out) casts into it after qkv
+    // has consumed it and before the post-attention norm rewrites it.
+    cublasComputeType_t gc = gemm_compute();
+    int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
+    int bf16_act =
+        compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && bert_bf16_act_enabled();
+    __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
+
     bert_embed_layer_norm_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->positions, ctx->embed_tokens.d, ctx->embed_tokens.bf16,
-        ctx->position_embeddings, ctx->token_type_embedding, ctx->ffwd_ln_w, ctx->ffwd_ln_b, total,
-        hidden, c->vocab_size, eps);
+        ctx->x, bf16_act ? act : nullptr, ctx->token_ids, ctx->positions, ctx->embed_tokens.d,
+        ctx->embed_tokens.bf16, ctx->position_embeddings, ctx->token_type_embedding, ctx->ffwd_ln_w,
+        ctx->ffwd_ln_b, total, hidden, c->vocab_size, eps);
     if (launch_check() != 0)
         return -1;
 
@@ -3256,8 +3320,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         cuda_layer_t *l = &ctx->layers[layer];
 
         // Self-attention (post-norm): QKV read x directly, then +bias.
-        if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
-            return -1;
+        if (bf16_act) {
+            if (linear_bf16x(ctx, &l->qkv, act, ctx->qkv, total, hidden, qkv_dim, hidden, 0.0f) != 0)
+                return -1;
+        } else {
+            if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
+                return -1;
+        }
         int qkv_count = total * qkv_dim;
         add_row_bias_kernel<<<(qkv_count + 255) / 256, 256, 0, ctx->stream>>>(ctx->qkv, l->qkv_bias,
                                                                               total, qkv_dim);
@@ -3267,30 +3336,55 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
                                 scale, NULL) != 0)
             return -1;
 
-        // Output dense(+bias), residual into x, then post-attention LayerNorm.
+        // Output dense(+bias), residual into x (F32), then post-attention LayerNorm
+        // (also emitting bf16 act for the FFN gate-up GEMM in the bf16 path).
         if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0)
             return -1;
         layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-            ctx->x, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total, hidden, eps);
+            ctx->x, bf16_act ? act : nullptr, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias,
+            total, hidden, eps);
         if (launch_check() != 0)
             return -1;
 
         // Feed-forward (post-norm): dense(+bias) -> GeLU -> dense(+bias).
-        if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
-            return -1;
+        if (bf16_act) {
+            if (linear_bf16x(ctx, &l->gate_up_proj, act, ctx->ffn_gate_up, total, hidden, inter,
+                             hidden, 0.0f) != 0)
+                return -1;
+        } else {
+            if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
+                return -1;
+        }
         int inter_count = total * inter;
-        if (c->ffn_act == FFWD_ACT_GELU_TANH)
+        if (bf16_act) {
+            // GELU reads the F32 gate-up result and writes bf16 act for down_proj.
+            if (c->ffn_act == FFWD_ACT_GELU_TANH)
+                bias_gelu_tanh_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                ctx->stream>>>(act, ctx->ffn_gate_up,
+                                                               l->ffn_inter_bias, total, inter);
+            else
+                bias_gelu_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                           ctx->stream>>>(act, ctx->ffn_gate_up, l->ffn_inter_bias,
+                                                          total, inter);
+        } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
             bias_gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
                 ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
-        else
+        } else {
             bias_gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
                 ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
+        }
         if (launch_check() != 0)
             return -1;
-        if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
-            return -1;
+        if (bf16_act) {
+            if (linear_bf16x(ctx, &l->down_proj, act, ctx->x, total, inter, hidden, inter, 1.0f) != 0)
+                return -1;
+        } else {
+            if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
+                return -1;
+        }
         layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-            ctx->x, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias, total, hidden, eps);
+            ctx->x, bf16_act ? act : nullptr, ctx->x, l->ffn_out_bias, l->post_attn_norm,
+            l->ffn_ln_bias, total, hidden, eps);
         if (launch_check() != 0)
             return -1;
     }
