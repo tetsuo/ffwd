@@ -44,6 +44,7 @@ struct ffwd_cuda_ctx {
     ffwd_model_t *cpu;
     int own_cpu; // free ctx->cpu in ffwd_cuda_free only when this context owns it
     ffwd_config_t config;
+    int weights_bf16;
     cudaStream_t stream;
     cublasHandle_t blas;
     cuda_matrix_t embed_tokens;
@@ -179,16 +180,14 @@ static uint16_t f32_to_bf16(float f) {
     return (uint16_t)(x >> 16);
 }
 
-// Store weights as native BF16 on the device when set (halves weight memory and
-// feeds BF16 tensor cores); default keeps exact F32 for F32 model files. When
-// the flag was never set explicitly, the loader follows the model file dtype,
-// matching the CPU and MLX backends.
-static int g_weights_bf16 = 0;
-static int g_weights_bf16_set = 0;
+// Explicit GPU weight-storage override. -1 means "follow the model file dtype"
+// at context creation time, matching the CPU and MLX backends. The resolved
+// choice is stored on ffwd_cuda_ctx_t; inference code must not read this global,
+// or mixed-dtype multi-model servers inherit whichever model loaded last.
+static int g_weights_bf16_override = -1;
 
 int ffwd_cuda_set_weights_bf16(int on) {
-    g_weights_bf16 = on ? 1 : 0;
-    g_weights_bf16_set = 1;
+    g_weights_bf16_override = on ? 1 : 0;
     return 0;
 }
 
@@ -208,11 +207,12 @@ static int copy_weight_host_f32(float *dst, const ffwd_weight_ref_t *w, size_t c
     return -1;
 }
 
-// Upload a host F32 weight buffer to the device, as BF16 when g_weights_bf16 is
+// Upload a host F32 weight buffer to the device, as BF16 when weights_bf16 is
 // set (rounding each value) or as F32 otherwise. Sets m->d, rows, cols, bf16.
-static int upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int cols) {
+static int
+upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int cols, int weights_bf16) {
     cudaError_t e;
-    if (g_weights_bf16) {
+    if (weights_bf16) {
         uint16_t *tmp16 = (uint16_t *)malloc(count * sizeof(uint16_t));
         if (!tmp16)
             return -1;
@@ -246,7 +246,8 @@ static int upload_weight(cuda_matrix_t *m, const float *src, size_t count, int r
     return 0;
 }
 
-static int load_matrix(cuda_matrix_t *m, const ffwd_weight_ref_t *w, int rows, int cols) {
+static int load_matrix(
+    cuda_matrix_t *m, const ffwd_weight_ref_t *w, int rows, int cols, int weights_bf16) {
     if (!m || !w || rows <= 0 || cols <= 0)
         return -1;
     size_t count = (size_t)rows * (size_t)cols;
@@ -257,12 +258,13 @@ static int load_matrix(cuda_matrix_t *m, const ffwd_weight_ref_t *w, int rows, i
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, count, rows, cols);
+    int r = upload_weight(m, tmp, count, rows, cols, weights_bf16);
     free(tmp);
     return r;
 }
 
-static int load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c) {
+static int
+load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
     if (!m || !src || !c)
         return -1;
     int rows = c->q_dim + 2 * c->kv_dim;
@@ -279,12 +281,13 @@ static int load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, total, rows, cols);
+    int r = upload_weight(m, tmp, total, rows, cols, weights_bf16);
     free(tmp);
     return r;
 }
 
-static int load_gate_up_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c) {
+static int load_gate_up_matrix(
+    cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
     if (!m || !src || !c)
         return -1;
     int rows = 2 * c->intermediate_size;
@@ -299,7 +302,7 @@ static int load_gate_up_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const 
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, total, rows, cols);
+    int r = upload_weight(m, tmp, total, rows, cols, weights_bf16);
     free(tmp);
     return r;
 }
@@ -1491,9 +1494,9 @@ static int gemm_strided_batched(cublasHandle_t blas,
 // cuda_attention_gemm: the V/probability/output pointer layout chosen here has to
 // agree with the data type that GEMM reads. BERT runs attention in F32 (passes
 // out_bf16=NULL) even with BF16 weights, so it must pass use_bf16=0; the Qwen
-// path runs BF16 attention when its weights are BF16. Keying this off the global
-// g_weights_bf16 instead silently mismatched the BERT path (BF16 layout, F32
-// GEMM) and corrupted equal-length batched attention.
+// path runs BF16 attention when its context's weights are BF16. This must stay
+// a caller-owned decision; deriving it inside this helper previously mismatched
+// the BERT path (BF16 layout, F32 GEMM) and corrupted equal-length batches.
 static int
 attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, int use_bf16) {
     const ffwd_config_t *c = &ctx->config;
@@ -1838,10 +1841,10 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
-        if (g_weights_bf16)
+        if (ctx->weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16, (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
-        if (g_weights_bf16)
+        if (ctx->weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
                                   (size_t)total * 2 * c->intermediate_size * sizeof(__nv_bfloat16)));
         ctx->seq_cap = total;
@@ -1866,7 +1869,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
             CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)score_elems * sizeof(float)));
             ctx->attn_scores_elems = score_elems;
         }
-        if (g_weights_bf16 && score_elems > ctx->attn_probs_elems) {
+        if (ctx->weights_bf16 && score_elems > ctx->attn_probs_elems) {
             cudaFree(ctx->attn_probs);
             ctx->attn_probs = NULL;
             ctx->attn_probs_elems = 0;
@@ -1932,34 +1935,39 @@ static int ensure_span_buffers(ffwd_cuda_ctx_t *ctx, int n_spans) {
     return 0;
 }
 
-static int load_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c) {
-    return load_qkv_matrix(&dst->qkv, src, c) ||
-           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
+static int
+load_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
+    return load_qkv_matrix(&dst->qkv, src, c, weights_bf16) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weights_bf16) ||
            (c->qkv_bias && load_qkv_bias(&dst->qkv_bias, src, c)) ||
            (c->qk_norm && load_vector(&dst->q_norm, src->q_norm, c->head_dim)) ||
            (c->qk_norm && load_vector(&dst->k_norm, src->k_norm, c->head_dim)) ||
            load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
            load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
-           load_gate_up_matrix(&dst->gate_up_proj, src, c) ||
-           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size);
+           load_gate_up_matrix(&dst->gate_up_proj, src, c, weights_bf16) ||
+           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size,
+                       weights_bf16);
 }
 
 /* BERT layer: attention reuses the fused qkv matrix and qkv_bias (q_dim ==
  * kv_dim == hidden); the two block LayerNorm weights load into input_norm
  * (post-attention) and post_attn_norm (post-FFN); gate_up_proj holds the single
  * up_proj. The added fields carry the biases the Qwen slots lack. */
-static int load_bert_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c) {
-    return load_qkv_matrix(&dst->qkv, src, c) ||
-           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim) ||
+static int
+load_bert_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
+    return load_qkv_matrix(&dst->qkv, src, c, weights_bf16) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weights_bf16) ||
            load_qkv_bias(&dst->qkv_bias, src, c) ||
            load_vector(&dst->o_bias, src->o_bias, c->hidden_size) ||
            load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
            load_vector(&dst->attn_ln_bias, src->attn_ln_bias, c->hidden_size) ||
            load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
            load_vector(&dst->ffn_ln_bias, src->ffn_ln_bias, c->hidden_size) ||
-           load_matrix(&dst->gate_up_proj, &src->up_proj, c->intermediate_size, c->hidden_size) ||
+           load_matrix(&dst->gate_up_proj, &src->up_proj, c->intermediate_size, c->hidden_size,
+                       weights_bf16) ||
            load_vector(&dst->ffn_inter_bias, src->ffn_inter_bias, c->intermediate_size) ||
-           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size) ||
+           load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size,
+                       weights_bf16) ||
            load_vector(&dst->ffn_out_bias, src->ffn_out_bias, c->hidden_size);
 }
 
@@ -1997,16 +2005,16 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
     ctx->cpu = cpu;
     ctx->own_cpu = own_cpu;
     ctx->config = cpu->config;
+    ctx->weights_bf16 = g_weights_bf16_override >= 0
+                            ? g_weights_bf16_override
+                            : cpu->weights.embed_tokens.dtype == DTYPE_BF16;
 
     /* Without an explicit --gpu-weight-dtype, store weights in the model
      * file's dtype: BF16 snapshots load as BF16 (bit-exact pass-through),
      * F32 snapshots keep the exact F32 default. */
-    if (!g_weights_bf16_set) {
-        g_weights_bf16 = cpu->weights.embed_tokens.dtype == DTYPE_BF16;
-        if (g_weights_bf16)
-            fprintf(stderr, "cuda: BF16 model file; storing weights as BF16 "
-                            "(use --gpu-weight-dtype f32 to override)\n");
-    }
+    if (g_weights_bf16_override < 0 && ctx->weights_bf16)
+        fprintf(stderr, "cuda: BF16 model file; storing weights as BF16 "
+                        "(use --gpu-weight-dtype f32 to override)\n");
 
     if (cudaStreamCreate(&ctx->stream) != cudaSuccess ||
         cublasCreate(&ctx->blas) != CUBLAS_STATUS_SUCCESS ||
@@ -2021,8 +2029,8 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
-    if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size, c->hidden_size) !=
-        0) {
+    if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size, c->hidden_size,
+                    ctx->weights_bf16) != 0) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
@@ -2045,8 +2053,9 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
     }
     for (int i = 0; i < c->n_layers; i++) {
         int rc = c->family == FFWD_FAMILY_BERT
-                     ? load_bert_layer(&ctx->layers[i], &cpu->weights.layers[i], c)
-                     : load_layer(&ctx->layers[i], &cpu->weights.layers[i], c);
+                     ? load_bert_layer(&ctx->layers[i], &cpu->weights.layers[i], c,
+                                       ctx->weights_bf16)
+                     : load_layer(&ctx->layers[i], &cpu->weights.layers[i], c, ctx->weights_bf16);
         if (rc != 0) {
             fprintf(stderr, "cuda: failed to load layer %d\n", i);
             ffwd_cuda_free(ctx);
@@ -2369,7 +2378,7 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
     // BF16-weight layers run attention in BF16 (cuda_attention_gemm gets `act`);
     // the batched layout must match. Weight dtype is uniform across layers.
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, g_weights_bf16) != 0)
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, ctx->weights_bf16) != 0)
         return -1;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
@@ -2652,7 +2661,8 @@ ffwd_cuda_late_ctx_t *ffwd_cuda_late_load(const char *model_dir) {
     // Upload the 1_Dense projection [token_dim, hidden].
     const ffwd_weight_ref_t *proj = ffwd_late_model_projection(cpu_late);
     if (!proj || ctx->token_dim <= 0 ||
-        load_matrix(&ctx->projection, proj, ctx->token_dim, ctx->base->config.hidden_size) != 0) {
+        load_matrix(&ctx->projection, proj, ctx->token_dim, ctx->base->config.hidden_size,
+                    ctx->base->weights_bf16) != 0) {
         ffwd_cuda_late_free(ctx);
         return NULL;
     }

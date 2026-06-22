@@ -23,8 +23,8 @@ void ffwd_cli_help(FILE *f) {
     fputs("  --gpu-gemm-mode MODE\n"
           "               GPU GEMM compute mode: f32, tf32, bf16, or 16f (default: f32)\n"
           "  --gpu-weight-dtype DTYPE\n"
-          "               GPU weight storage: f32 or bf16 (default: f32). bf16 halves\n"
-          "               weight memory and uses BF16 tensor cores\n",
+          "               GPU weight storage: f32 or bf16 (default: model dtype).\n"
+          "               bf16 halves weight memory and uses BF16 tensor cores\n",
           f);
 }
 
@@ -32,7 +32,7 @@ void ffwd_server_help(FILE *f) {
     fputs("  --gpu-gemm-mode MODE      GPU GEMM compute: f32, tf32, bf16, or 16f\n"
           "                            (default: f32, exact)\n"
           "  --gpu-weight-dtype DTYPE  GPU weight storage: f32 or bf16 (default:\n"
-          "                            f32); bf16 halves weight memory\n",
+          "                            model dtype); bf16 halves weight memory\n",
           f);
 }
 
