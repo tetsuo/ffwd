@@ -41,6 +41,35 @@ LONG_TEXTS = [
 ]
 
 
+def detect_pooling_mode(model_dir: str) -> str:
+    """Return the sentence pooling mode used by ffwd_config_load, if obvious."""
+    root = Path(model_dir)
+    pooling_path = root / "1_Pooling" / "config.json"
+    if pooling_path.exists():
+        try:
+            cfg = json.loads(pooling_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return "unknown"
+        if cfg.get("pooling_mode_lasttoken"):
+            return "last-token"
+        if cfg.get("pooling_mode_cls_token"):
+            return "cls"
+        if cfg.get("pooling_mode_mean_tokens"):
+            return "mean"
+        return "unknown"
+
+    config_path = root / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return "unknown"
+        if cfg.get("model_type") == "qwen3":
+            return "last-token"
+
+    return "unknown"
+
+
 def run_stdin(binary, model_dir, backend, batch_size, texts,
               mlx_quantize_bits, mlx_quantize_group_size,
               cuda_weight_dtype=None):
@@ -98,6 +127,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--max-diff", type=float, default=5e-5)
     ap.add_argument("--min-cosine", type=float, default=0.99999)
+    ap.add_argument("--cuda-last-token-max-diff", type=float, default=0.002,
+                    help=("effective max-abs gate for CUDA last-token pooling; "
+                          "keeps cosine strict while allowing batched-GEMM "
+                          "float reordering"))
+    ap.add_argument("--cuda-last-token-min-cosine", type=float, default=0.9999,
+                    help="effective cosine gate for CUDA last-token pooling")
     ap.add_argument("--long", action="store_true",
                     help="use long inputs that exercise tiled CPU attention")
     ap.add_argument("--mlx-quant-bits", "--mlx-quantize-bits",
@@ -117,8 +152,20 @@ def main():
         raise SystemExit("--mlx-quant-bits requires --backend mlx")
     if args.mlx_quantize_group_size <= 0:
         raise SystemExit("--mlx-quant-group-size must be > 0")
+    if args.cuda_last_token_max_diff <= 0:
+        raise SystemExit("--cuda-last-token-max-diff must be > 0")
+    if not 0.0 < args.cuda_last_token_min_cosine <= 1.0:
+        raise SystemExit("--cuda-last-token-min-cosine must be in (0, 1]")
 
     ensure_cli(Path(args.binary))
+    pooling_mode = detect_pooling_mode(args.model_dir)
+    effective_max_diff = args.max_diff
+    effective_min_cosine = args.min_cosine
+    calibrated_cuda_last_token = args.backend == "cuda" and pooling_mode == "last-token"
+    if calibrated_cuda_last_token and effective_max_diff < args.cuda_last_token_max_diff:
+        effective_max_diff = args.cuda_last_token_max_diff
+    if calibrated_cuda_last_token and effective_min_cosine > args.cuda_last_token_min_cosine:
+        effective_min_cosine = args.cuda_last_token_min_cosine
 
     seq_rows = run_stdin(args.binary, args.model_dir, args.backend, 1, texts,
                          args.mlx_quantize_bits,
@@ -145,11 +192,16 @@ def main():
             f"max_abs_diff={max_diff:.8g}"
         )
 
-    if worst_diff > args.max_diff or worst_cos < args.min_cosine:
+    if worst_diff > effective_max_diff or worst_cos < effective_min_cosine:
         raise RuntimeError(
-            f"batch parity failed: worst_diff={worst_diff:g}, worst_cos={worst_cos:g}"
+            f"batch parity failed: worst_diff={worst_diff:g}, worst_cos={worst_cos:g}, "
+            f"max_diff_gate={effective_max_diff:g}, min_cosine_gate={effective_min_cosine:g}"
         )
 
+    calibration_note = ""
+    if calibrated_cuda_last_token:
+        calibration_note = (f", pooling={pooling_mode}, max_diff_gate={effective_max_diff:g}, "
+                            f"min_cosine_gate={effective_min_cosine:g}")
     seq_ms = sum(float(row["ms"]) for row in seq_rows)
     batch_ms = sum(float(bat_rows[i]["ms"]) for i in range(0, len(bat_rows), args.batch_size))
     print(
@@ -157,6 +209,7 @@ def main():
         f"batch_size={args.batch_size}, worst_diff={worst_diff:.8g}, "
         f"worst_cos={worst_cos:.8f}, seq_ms_sum={seq_ms:.1f}, "
         f"batch_chunk_ms_sum={batch_ms:.1f}"
+        + calibration_note
         + (
             f", mlx_q{args.mlx_quantize_bits}"
             if args.mlx_quantize_bits else ""

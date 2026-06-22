@@ -6,11 +6,12 @@ the synthetic fixture. Given a MODEL_DIR it loads real weights from that
 directory instead and exercises the workspace and batch APIs. Needs only
 python3 and a model directory (with vocab.json), no reference stack.
 
-The model must be mean-pooled: the test checks that a whole-sequence span pools
-to the embedding, which holds for mean pooling (pplx-embed, BERT/BGE) but not
-for last-token pooling (Qwen3). Use a pplx-embed model.
+For mean-pooled models, the test additionally checks that a whole-sequence span
+pools to the embedding and that half-spans recombine by token-count weighting.
+For last-token/CLS models, those mean-span identities are skipped because the
+sentence embedding and contextual span APIs intentionally pool different rows.
 
-  tests/check_workspace_api.py --model-dir DIR   # DIR = a pplx-embed model
+  tests/check_workspace_api.py --model-dir DIR
 """
 
 import argparse

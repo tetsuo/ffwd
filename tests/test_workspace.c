@@ -59,8 +59,10 @@ static int check_vector_helpers(void) {
     return 0;
 }
 
-/* The allocating and pooling API variants must agree with the *_into
- * results validated in main. reference is the batched row for ids0. */
+/* The allocating and model-pooling API variants must agree with the *_into
+ * results validated in main. reference is the batched row for ids0. Contextual
+ * spans are always mean-pooled ranges, so only mean-pooling models can require
+ * a whole-sequence span to equal the sentence embedding. */
 static int check_alloc_and_pooling_variants(const ffwd_model_t *model,
                                             ffwd_workspace_t *ws,
                                             const int *ids0,
@@ -98,32 +100,34 @@ static int check_alloc_and_pooling_variants(const ffwd_model_t *model,
         goto done;
     }
 
-    /* Mean-pooling the final states reproduces the embedding. */
     if (ffwd_pool_batch(cfg, states, &n0, 1, pooled) != 0 ||
         max_abs_diff(pooled, reference, dim) > 0.00005f) {
         fprintf(stderr, "ffwd_pool_batch disagrees with embedding\n");
         goto done;
     }
 
-    /* One span covering the whole sequence pools to the embedding, and
-     * two halves recombine into it by token-count weighting. */
-    ffwd_span_t whole = {0, n0};
-    if (ffwd_model_encode_spans(model, ws, ids0, n0, &whole, 1, span_out) != 0 ||
-        max_abs_diff(span_out, reference, dim) > 0.00005f) {
-        fprintf(stderr, "whole-sequence span disagrees with embedding\n");
-        goto done;
-    }
-    int h = n0 / 2;
-    ffwd_span_t halves[2] = {{0, h}, {h, n0 - h}};
-    if (ffwd_model_encode_spans(model, ws, ids0, n0, halves, 2, span_out) != 0) {
-        fprintf(stderr, "ffwd_model_encode_spans failed for two spans\n");
-        goto done;
-    }
-    for (int d = 0; d < dim; d++) {
-        float combined = ((float)h * span_out[d] + (float)(n0 - h) * span_out[dim + d]) / (float)n0;
-        if (fabsf(combined - reference[d]) > 0.00005f) {
-            fprintf(stderr, "half spans do not recombine into embedding\n");
+    if (cfg->pooling_mode == FFWD_POOL_MEAN) {
+        /* One span covering the whole sequence pools to the embedding, and
+         * two halves recombine into it by token-count weighting. */
+        ffwd_span_t whole = {0, n0};
+        if (ffwd_model_encode_spans(model, ws, ids0, n0, &whole, 1, span_out) != 0 ||
+            max_abs_diff(span_out, reference, dim) > 0.00005f) {
+            fprintf(stderr, "whole-sequence span disagrees with embedding\n");
             goto done;
+        }
+        int h = n0 / 2;
+        ffwd_span_t halves[2] = {{0, h}, {h, n0 - h}};
+        if (ffwd_model_encode_spans(model, ws, ids0, n0, halves, 2, span_out) != 0) {
+            fprintf(stderr, "ffwd_model_encode_spans failed for two spans\n");
+            goto done;
+        }
+        for (int d = 0; d < dim; d++) {
+            float combined =
+                ((float)h * span_out[d] + (float)(n0 - h) * span_out[dim + d]) / (float)n0;
+            if (fabsf(combined - reference[d]) > 0.00005f) {
+                fprintf(stderr, "half spans do not recombine into embedding\n");
+                goto done;
+            }
         }
     }
 
