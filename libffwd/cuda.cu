@@ -3262,17 +3262,25 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // F32 activations: BERT checkpoints are F32, so the linear/linear_accum F32
 // entry points are used throughout (they still handle bf16 weights via an
 // internal cast, which keeps a future bf16 BERT correct if not yet optimized).
-// Opt-in bf16-activation BERT path (FFWD_CUDA_BERT_BF16_ACT=1). It only engages
-// when weights are bf16 and the GEMM compute mode is 16-bit, i.e. the existing
-// bf16w-bf16 path; otherwise it is a no-op.
-static int bert_bf16_act_enabled(void) {
-    static int init = 0, on = 0;
+// bf16-activation BERT path: the norm/GELU producers emit bf16 GEMM inputs (no
+// per-GEMM F32->bf16 cast) on the bf16w-bf16 path. Bit-identical to the cast
+// path, +11-13% at batch 32, but a fixed per-norm overhead makes it lose on tiny
+// inputs (single short requests). So it is auto-enabled only above a measured
+// token-count crossover (~512 tokens; 1024 leaves margin). FFWD_CUDA_BERT_BF16_ACT
+// overrides: 1/on forces it on at any size, 0/off forces it off (for A/B).
+enum { BERT_BF16_ACT_MIN_TOKENS = 1024 };
+// Returns 1 (force on), -1 (force off), or 0 (auto: gate on token count).
+static int bert_bf16_act_mode(void) {
+    static int init = 0, mode = 0;
     if (!init) {
         const char *e = getenv("FFWD_CUDA_BERT_BF16_ACT");
-        on = (e && (!strcmp(e, "1") || !strcmp(e, "on")));
+        if (e && (!strcmp(e, "1") || !strcmp(e, "on")))
+            mode = 1;
+        else if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
         init = 1;
     }
-    return on;
+    return mode;
 }
 
 static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
@@ -3300,8 +3308,9 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     // has consumed it and before the post-attention norm rewrites it.
     cublasComputeType_t gc = gemm_compute();
     int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
-    int bf16_act =
-        compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && bert_bf16_act_enabled();
+    int act_mode = bert_bf16_act_mode();
+    int bf16_act = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && act_mode >= 0 &&
+                   (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS);
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
 
     bert_embed_layer_norm_kernel<<<total, 256, ln_smem, ctx->stream>>>(
