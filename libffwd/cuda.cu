@@ -978,8 +978,7 @@ __device__ static __forceinline__ void tc_ldmatrix_x4_trans_b16(uint32_t out[4],
 #endif
 }
 
-template <int STRIDE>
-__device__ static __forceinline__ int tc_swz_idx(int row, int col) {
+template <int STRIDE> __device__ static __forceinline__ int tc_swz_idx(int row, int col) {
     int grain = col >> 3; // one ldmatrix row address names 8 contiguous bf16 values
     int in_grain = col & 7;
     int mask = (STRIDE == 16) ? ((row >> 2) & 1) : (row & 7);
@@ -987,10 +986,8 @@ __device__ static __forceinline__ int tc_swz_idx(int row, int col) {
 }
 
 template <int STRIDE>
-__device__ static __forceinline__ void tc_store_swz_bf16(__nv_bfloat16 *sh,
-                                                         int row,
-                                                         int col,
-                                                         __nv_bfloat16 v) {
+__device__ static __forceinline__ void
+tc_store_swz_bf16(__nv_bfloat16 *sh, int row, int col, __nv_bfloat16 v) {
     sh[tc_swz_idx<STRIDE>(row, col)] = v;
 }
 
@@ -2181,16 +2178,20 @@ static cublasComputeType_t gemm_compute(void) {
     return g_gemm_compute;
 }
 
-// Experimental streaming attention selector. Off by default; use
-// FFWD_CUDA_STREAMING_ATTN=tc for the BF16 tensor-core Qwen tile, =tc1 for the
-// one-warp BF16 tensor-core fallback, =tc2 for the K/V-sharing multi-warp tile,
-// =tc3 for the tc2 ldmatrix/swizzled-load variant, =tc4 for the PV-parallel
-// K/V-sharing experiment, =reg for the F32 register-resident tile, =bert for the
-// scalar BERT tile, or =wmma for the shared-memory WMMA prototype. =1/=all
-// forces the generic row kernel for every head_dim<=128 call.
+// Streaming attention selector. The DEFAULT (no env) runs the tc3 tensor-core
+// flash kernel for the Qwen BF16 HD=128 path (promoted; see use_streaming_attention)
+// and the materialized cuBLAS path for everything else. Overrides via
+// FFWD_CUDA_STREAMING_ATTN: =mat/=off forces the materialized path even for Qwen
+// BF16 (escape hatch for debug / A-B); =tc the PV-parallel BF16 tile, =tc1 the
+// one-warp fallback, =tc2 the K/V-sharing multi-warp tile, =tc3 the tc2
+// ldmatrix/swizzled-load variant (same kernel the default uses), =tc4 the
+// PV-parallel K/V-sharing experiment, =reg the F32 register-resident tile, =bert
+// the scalar BERT tile, =wmma the shared-memory WMMA prototype, =1/=all the
+// generic row kernel for every head_dim<=128 call.
 static int streaming_attention_mode(void) {
     static int init = 0;
-    static int mode = 0; // 0 off,1 all,2 BERT,3 WMMA,4 reg,5 TC,6 TC1,7 TC2,8 TC3,9 TC4
+    static int mode =
+        0; // -1 force-mat, 0 default, 1 all,2 BERT,3 WMMA,4 reg,5 TC,6 TC1,7 TC2,8 TC3,9 TC4
     if (!init) {
         const char *e = getenv("FFWD_CUDA_STREAMING_ATTN");
         if (e && (!strcmp(e, "1") || !strcmp(e, "all")))
@@ -2211,6 +2212,8 @@ static int streaming_attention_mode(void) {
             mode = 8;
         else if (e && (!strcmp(e, "tc4") || !strcmp(e, "tc_pv_kv") || !strcmp(e, "mma_pv_kv")))
             mode = 9;
+        else if (e && (!strcmp(e, "mat") || !strcmp(e, "off") || !strcmp(e, "materialized")))
+            mode = -1; // escape hatch: force the materialized path (debug / A-B vs the tc3 default)
         init = 1;
     }
     return mode;
@@ -2239,8 +2242,17 @@ static int tc_kv_warps_or(int default_w) {
 
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
-    if (!mode || head_dim > 128)
+    if (head_dim > 128)
         return 0;
+    if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
+        return 0;
+    // Promoted default (no FFWD_CUDA_STREAMING_ATTN set): the Qwen BF16 HD=128
+    // path runs the tc3 tensor-core flash kernel - faster than materialized BF16
+    // attention (1.2-2.4x, growing with length) at parity cosine ~0.99997. Every
+    // other default case (F32, BERT, non-128 head_dim) keeps the materialized
+    // path. An explicit mode overrides this below.
+    if (!mode)
+        return c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
     if (mode == 2)
         return c->family == FFWD_FAMILY_BERT && !out_bf16;
     if (mode == 3)
@@ -2601,7 +2613,11 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
 #undef TC2_LAUNCH
             return launch_check();
         }
-        if (stream_mode == 8 && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && hd == 128) {
+        // stream_mode 0 is the promoted default (use_streaming_attention only
+        // returns true for mode 0 on this Qwen BF16 HD=128 case); mode 8 is the
+        // explicit `tc3` override. Both run the same kernel.
+        if ((stream_mode == 8 || stream_mode == 0) && c->family == FFWD_FAMILY_QWEN3 && out_bf16 &&
+            hd == 128) {
             // tc2 plus ldmatrix/swizzled QK fragment loads. Uses the same WARPS
             // knob so it can be compared directly with tc2.
             int w = tc_kv_warps_or(8);
