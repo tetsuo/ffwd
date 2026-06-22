@@ -2738,15 +2738,18 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
     return 0;
 }
 
-// Opt-in BF16 tensor-core flash attention for the BERT shape (head_dim 64,
-// bidirectional), replacing the materialized N×N scores/probs path. Enabled by
-// FFWD_CUDA_BERT_FLASH=1; gated further on bf16 output + head_dim 64 at the call
-// site. FFWD_TC_WARPS (2/4/8) tunes the query tiles per block (default 8).
+// BF16 tensor-core flash attention for the BERT shape (head_dim 64,
+// bidirectional), replacing the materialized N×N scores/probs path. It is bit-
+// accurate (cosine vs F32 >= the materialized bf16 path) and faster at every
+// length (the win grows with length as it removes the O(n^2) scores HBM), so it
+// is the DEFAULT on the bf16w-bf16 head_dim-64 path. FFWD_CUDA_BERT_FLASH=0
+// forces the materialized path back for A/B. FFWD_TC_WARPS (2/4/8) tunes the
+// query tiles per block (default 8).
 static int bert_flash_enabled(void) {
-    static int init = 0, on = 0;
+    static int init = 0, on = 1;
     if (!init) {
         const char *e = getenv("FFWD_CUDA_BERT_FLASH");
-        on = (e && (!strcmp(e, "1") || !strcmp(e, "on")));
+        on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
         init = 1;
     }
     return on;
