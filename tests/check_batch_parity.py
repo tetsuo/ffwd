@@ -140,7 +140,7 @@ def main():
                     choices=(0, 8))
     ap.add_argument("--mlx-quant-group-size", "--mlx-quantize-group-size",
                     dest="mlx_quantize_group_size", type=int, default=64)
-    ap.add_argument("--cuda-weight-dtype", choices=("f32", "bf16"), default=None,
+    ap.add_argument("--cuda-weight-dtype", choices=("f32", "bf16", "f16"), default=None,
                     help="force CUDA weight storage dtype (default: snapshot dtype)")
     ap.add_argument("texts", nargs="*")
     args = ap.parse_args()

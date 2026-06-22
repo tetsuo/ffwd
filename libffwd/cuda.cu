@@ -15,11 +15,19 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+    CUDA_DTYPE_F32 = 0,
+    CUDA_DTYPE_BF16 = 1,
+    CUDA_DTYPE_F16 = 2,
+} cuda_dtype_t;
+
 typedef struct {
-    float *d; // device buffer; holds __nv_bfloat16 elements when bf16
+    void *d; // device buffer; element type is described by dtype
     int rows;
     int cols;
-    int bf16; // 1 if d holds __nv_bfloat16, 0 if F32
+    cuda_dtype_t dtype;
+    int bf16; // compatibility shorthand for dtype == CUDA_DTYPE_BF16
+    int f16;  // compatibility shorthand for dtype == CUDA_DTYPE_F16
 } cuda_matrix_t;
 
 typedef struct {
@@ -44,7 +52,9 @@ struct ffwd_cuda_ctx {
     ffwd_model_t *cpu;
     int own_cpu; // free ctx->cpu in ffwd_cuda_free only when this context owns it
     ffwd_config_t config;
+    cuda_dtype_t weight_dtype;
     int weights_bf16;
+    int weights_f16;
     cudaStream_t stream;
     cublasHandle_t blas;
     cuda_matrix_t embed_tokens;
@@ -66,8 +76,11 @@ struct ffwd_cuda_ctx {
     float *qkv;
     float *attn_out;
     float *ffn_gate_up;
+    void *ffn_gate_up_16; // BERT reduced-precision FFN intermediate
     void *x_bf16;      // Persistent BERT BF16 residual stream (gated)
+    void *x_f16;       // Persistent BERT FP16 residual stream (explicit f16 path)
     void *act_bf16;    // BF16 cast of a GEMM activation operand (bf16 weights)
+    void *act_f16;     // FP16 cast of a GEMM activation operand (f16 weights)
     float *weight_f32; // F32 widen scratch for one BF16 weight (memory-only bf16)
     size_t weight_f32_elems;
     float *pooled_out;
@@ -79,6 +92,7 @@ struct ffwd_cuda_ctx {
     int *positions;
     float *kexp;
     void *kexp_bf16; // BF16 K expansion for tensor-core streaming attention
+    void *kexp_f16;  // FP16 K expansion for tensor-core streaming attention
     float *vexp;
     float *attn_scores;
     void *attn_probs; // BF16 softmax output (bf16 weights)
@@ -181,14 +195,26 @@ static uint16_t f32_to_bf16(float f) {
     return (uint16_t)(x >> 16);
 }
 
+static uint16_t f32_to_f16(float f) {
+    __half h = __float2half_rn(f);
+    uint16_t out;
+    memcpy(&out, &h, sizeof(out));
+    return out;
+}
+
 // Explicit GPU weight-storage override. -1 means "follow the model file dtype"
 // at context creation time, matching the CPU and MLX backends. The resolved
 // choice is stored on ffwd_cuda_ctx_t; inference code must not read this global,
 // or mixed-dtype multi-model servers inherit whichever model loaded last.
-static int g_weights_bf16_override = -1;
+static int g_weight_dtype_override = -1;
 
 int ffwd_cuda_set_weights_bf16(int on) {
-    g_weights_bf16_override = on ? 1 : 0;
+    g_weight_dtype_override = on ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32;
+    return 0;
+}
+
+int ffwd_cuda_set_weights_f16(int on) {
+    g_weight_dtype_override = on ? CUDA_DTYPE_F16 : CUDA_DTYPE_F32;
     return 0;
 }
 
@@ -208,34 +234,33 @@ static int copy_weight_host_f32(float *dst, const ffwd_weight_ref_t *w, size_t c
     return -1;
 }
 
-// Upload a host F32 weight buffer to the device, as BF16 when weights_bf16 is
-// set (rounding each value) or as F32 otherwise. Sets m->d, rows, cols, bf16.
+// Upload a host F32 weight buffer to the device, rounding to the requested
+// storage dtype when reduced precision is selected. Sets m->d, rows, cols, dtype.
 static int
-upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int cols, int weights_bf16) {
+upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int cols, cuda_dtype_t dtype) {
     cudaError_t e;
-    if (weights_bf16) {
+    if (dtype == CUDA_DTYPE_BF16 || dtype == CUDA_DTYPE_F16) {
         uint16_t *tmp16 = (uint16_t *)malloc(count * sizeof(uint16_t));
         if (!tmp16)
             return -1;
-        for (size_t i = 0; i < count; i++)
-            tmp16[i] = f32_to_bf16(src[i]);
-        e = cudaMalloc((void **)&m->d, count * sizeof(__nv_bfloat16));
+        for (size_t i = 0; i < count; i++) {
+            tmp16[i] = dtype == CUDA_DTYPE_BF16 ? f32_to_bf16(src[i]) : f32_to_f16(src[i]);
+        }
+        e = cudaMalloc(&m->d, count * sizeof(uint16_t));
         if (e != cudaSuccess) {
             fprintf(stderr, "cudaMalloc weight failed: %s\n", cudaGetErrorString(e));
             free(tmp16);
             return -1;
         }
-        e = cudaMemcpy(m->d, tmp16, count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+        e = cudaMemcpy(m->d, tmp16, count * sizeof(uint16_t), cudaMemcpyHostToDevice);
         free(tmp16);
-        m->bf16 = 1;
     } else {
-        e = cudaMalloc((void **)&m->d, count * sizeof(float));
+        e = cudaMalloc(&m->d, count * sizeof(float));
         if (e != cudaSuccess) {
             fprintf(stderr, "cudaMalloc weight failed: %s\n", cudaGetErrorString(e));
             return -1;
         }
         e = cudaMemcpy(m->d, src, count * sizeof(float), cudaMemcpyHostToDevice);
-        m->bf16 = 0;
     }
     if (e != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy weight failed: %s\n", cudaGetErrorString(e));
@@ -244,11 +269,14 @@ upload_weight(cuda_matrix_t *m, const float *src, size_t count, int rows, int co
     }
     m->rows = rows;
     m->cols = cols;
+    m->dtype = dtype;
+    m->bf16 = dtype == CUDA_DTYPE_BF16;
+    m->f16 = dtype == CUDA_DTYPE_F16;
     return 0;
 }
 
 static int load_matrix(
-    cuda_matrix_t *m, const ffwd_weight_ref_t *w, int rows, int cols, int weights_bf16) {
+    cuda_matrix_t *m, const ffwd_weight_ref_t *w, int rows, int cols, cuda_dtype_t weight_dtype) {
     if (!m || !w || rows <= 0 || cols <= 0)
         return -1;
     size_t count = (size_t)rows * (size_t)cols;
@@ -259,13 +287,13 @@ static int load_matrix(
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, count, rows, cols, weights_bf16);
+    int r = upload_weight(m, tmp, count, rows, cols, weight_dtype);
     free(tmp);
     return r;
 }
 
 static int
-load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
+load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, cuda_dtype_t weight_dtype) {
     if (!m || !src || !c)
         return -1;
     int rows = c->q_dim + 2 * c->kv_dim;
@@ -282,13 +310,13 @@ load_qkv_matrix(cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, total, rows, cols, weights_bf16);
+    int r = upload_weight(m, tmp, total, rows, cols, weight_dtype);
     free(tmp);
     return r;
 }
 
 static int load_gate_up_matrix(
-    cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
+    cuda_matrix_t *m, const ffwd_layer_t *src, const ffwd_config_t *c, cuda_dtype_t weight_dtype) {
     if (!m || !src || !c)
         return -1;
     int rows = 2 * c->intermediate_size;
@@ -303,7 +331,7 @@ static int load_gate_up_matrix(
         free(tmp);
         return -1;
     }
-    int r = upload_weight(m, tmp, total, rows, cols, weights_bf16);
+    int r = upload_weight(m, tmp, total, rows, cols, weight_dtype);
     free(tmp);
     return r;
 }
@@ -347,7 +375,7 @@ __global__ static void add_row_bias_kernel(float *x, const float *bias, int rows
 }
 
 __global__ static void ffwd_lookup_kernel(
-    float *x, const int *ids, const void *emb, int emb_bf16, int total, int hidden, int vocab) {
+    float *x, const int *ids, const void *emb, int emb_dtype, int total, int hidden, int vocab) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int count = total * hidden;
     if (idx >= count)
@@ -360,8 +388,12 @@ __global__ static void ffwd_lookup_kernel(
         return;
     }
     size_t off = (size_t)id * hidden + d;
-    x[idx] =
-        emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[off]) : ((const float *)emb)[off];
+    if (emb_dtype == CUDA_DTYPE_BF16)
+        x[idx] = __bfloat162float(((const __nv_bfloat16 *)emb)[off]);
+    else if (emb_dtype == CUDA_DTYPE_F16)
+        x[idx] = __half2float(((const __half *)emb)[off]);
+    else
+        x[idx] = ((const float *)emb)[off];
 }
 
 // Cast n F32 values to BF16 (used to feed BF16-weight projection GEMMs).
@@ -377,6 +409,21 @@ __global__ static void cast_bf16_to_f32_kernel(float *out, const __nv_bfloat16 *
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
         out[i] = __bfloat162float(in[i]);
+}
+
+// Cast n F32 values to FP16 (used to feed FP16-weight projection GEMMs).
+__global__ static void cast_f32_to_f16_kernel(__half *out, const float *in, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        out[i] = __float2half(in[i]);
+}
+
+// Widen n FP16 values to F32 (used by exact/TF32 compute with FP16-stored
+// weights, and to expose the final residual stream to existing F32 pooling).
+__global__ static void cast_f16_to_f32_kernel(float *out, const __half *in, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        out[i] = __half2float(in[i]);
 }
 
 __device__ static float block_sum(float v) {
@@ -415,8 +462,22 @@ __device__ static inline void store_act(__nv_bfloat16 *out, size_t i, float v) {
     out[i] = __float2bfloat16(v);
 }
 
-__device__ static inline float load_embedding_value(const void *emb, int emb_bf16, size_t i) {
-    return emb_bf16 ? __bfloat162float(((const __nv_bfloat16 *)emb)[i]) : ((const float *)emb)[i];
+__device__ static inline void store_act(__half *out, size_t i, float v) {
+    out[i] = __float2half(v);
+}
+
+__device__ static inline float load_act(const __nv_bfloat16 *p, size_t i) {
+    return __bfloat162float(p[i]);
+}
+
+__device__ static inline float load_act(const __half *p, size_t i) { return __half2float(p[i]); }
+
+__device__ static inline float load_embedding_value(const void *emb, int emb_dtype, size_t i) {
+    if (emb_dtype == CUDA_DTYPE_BF16)
+        return __bfloat162float(((const __nv_bfloat16 *)emb)[i]);
+    if (emb_dtype == CUDA_DTYPE_F16)
+        return __half2float(((const __half *)emb)[i]);
+    return ((const float *)emb)[i];
 }
 
 // OUT_T is float, or __nv_bfloat16 when the result feeds a BF16-weight
@@ -642,6 +703,14 @@ __device__ static __forceinline__ uint32_t bf16_pair_bits(float lo, float hi) {
     return bf16_pair_bits(__float2bfloat16(lo), __float2bfloat16(hi));
 }
 
+__device__ static __forceinline__ uint32_t f16_pair_bits(__half lo, __half hi) {
+    return (uint32_t)__half_as_ushort(lo) | ((uint32_t)__half_as_ushort(hi) << 16);
+}
+
+__device__ static __forceinline__ uint32_t f16_pair_bits(float lo, float hi) {
+    return f16_pair_bits(__float2half(lo), __float2half(hi));
+}
+
 __device__ static __forceinline__ float warp_group4_sum(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 1);
     v += __shfl_xor_sync(0xffffffffu, v, 2);
@@ -663,6 +732,26 @@ mma_m16n16k16_bf16(float c[8], const uint32_t a[4], const uint32_t b[4]) {
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]),
                    "f"(c[1]), "f"(c[2]), "f"(c[3]));
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "f"(c[4]),
+                   "f"(c[5]), "f"(c[6]), "f"(c[7]));
+#else
+    (void)c;
+    (void)a;
+    (void)b;
+#endif
+}
+
+__device__ static __forceinline__ void
+mma_m16n16k16_f16(float c[8], const uint32_t a[4], const uint32_t b[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]),
+                   "f"(c[1]), "f"(c[2]), "f"(c[3]));
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                  : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "f"(c[4]),
@@ -713,6 +802,11 @@ tc_store_swz_bf16(__nv_bfloat16 *sh, int row, int col, __nv_bfloat16 v) {
     sh[tc_swz_idx<STRIDE>(row, col)] = v;
 }
 
+template <int STRIDE>
+__device__ static __forceinline__ void tc_store_swz_f16(__half *sh, int row, int col, __half v) {
+    sh[tc_swz_idx<STRIDE>(row, col)] = v;
+}
+
 __device__ static __forceinline__ void
 tc_load_a_q_ldmatrix_swz_bf16(uint32_t a[4], const __nv_bfloat16 *qsh, int d0) {
     int lane = threadIdx.x & 31;
@@ -724,6 +818,15 @@ tc_load_a_q_ldmatrix_swz_bf16(uint32_t a[4], const __nv_bfloat16 *qsh, int d0) {
 
 __device__ static __forceinline__ void
 tc_load_b_qk_ldmatrix_swz_bf16(uint32_t b[4], const __nv_bfloat16 *ktsh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int row = d0 + ((mat & 1) << 3) + (lane & 7);
+    int col = (mat >> 1) << 3;
+    tc_ldmatrix_x4_trans_b16(b, ktsh + tc_swz_idx<16>(row, col));
+}
+
+__device__ static __forceinline__ void
+tc_load_b_qk_ldmatrix_swz_f16(uint32_t b[4], const __half *ktsh, int d0) {
     int lane = threadIdx.x & 31;
     int mat = lane >> 3;
     int row = d0 + ((mat & 1) << 3) + (lane & 7);
@@ -748,6 +851,12 @@ __device__ static __forceinline__ void tc_probs_to_a_bf16(uint32_t a[4], const f
         a[r] = bf16_pair_bits(s[2 * r], s[2 * r + 1]);
 }
 
+__device__ static __forceinline__ void tc_probs_to_a_f16(uint32_t a[4], const float s[8]) {
+#pragma unroll
+    for (int r = 0; r < 4; r++)
+        a[r] = f16_pair_bits(s[2 * r], s[2 * r + 1]);
+}
+
 // Head-dim-parametric Q and V fragment loaders for the flash kernels. The QK S
 // tile and the PV O tile are 16x16 regardless of head_dim, so only the Q-tile
 // swizzle stride (HD) and the V row stride (HD) depend on it; these are the
@@ -766,6 +875,16 @@ tc_load_a_q_ldmatrix_swz_hd(uint32_t a[4], const __nv_bfloat16 *qsh, int d0) {
 
 template <int HD>
 __device__ static __forceinline__ void
+tc_load_a_q_ldmatrix_swz_hd_f16(uint32_t a[4], const __half *qsh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int row = ((mat & 1) << 3) + (lane & 7);
+    int col = d0 + ((mat >> 1) << 3);
+    tc_ldmatrix_x4_b16(a, qsh + tc_swz_idx<HD>(row, col));
+}
+
+template <int HD>
+__device__ static __forceinline__ void
 tc_load_b_pv_hd(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
     int lane = threadIdx.x & 31;
 #pragma unroll
@@ -773,6 +892,17 @@ tc_load_b_pv_hd(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
         int col = d0 + ((r >> 1) << 3) + (lane >> 2);
         int key = ((r & 1) << 3) + ((lane & 3) << 1);
         b[r] = bf16_pair_bits(vsh[key * HD + col], vsh[(key + 1) * HD + col]);
+    }
+}
+
+template <int HD>
+__device__ static __forceinline__ void tc_load_b_pv_hd_f16(uint32_t b[4], const __half *vsh, int d0) {
+    int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int col = d0 + ((r >> 1) << 3) + (lane >> 2);
+        int key = ((r & 1) << 3) + ((lane & 3) << 1);
+        b[r] = f16_pair_bits(vsh[key * HD + col], vsh[(key + 1) * HD + col]);
     }
 }
 
@@ -1075,6 +1205,149 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
     }
 }
 
+// FP16 sibling of the BERT flash kernel. The tiling, online softmax, and
+// register layout intentionally match the BF16 kernel above; only the staged
+// operand type and MMA instruction change.
+template <int HD, int WARPS>
+__global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
+                                                         const float *qkv,
+                                                         const __half *kexp,
+                                                         const __half *vexp,
+                                                         const int *offsets,
+                                                         int q_dim,
+                                                         int qkv_dim,
+                                                         int q_offset,
+                                                         float scale) {
+    enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
+    __shared__ __align__(16) __half qsh[WARPS * QT * HD];
+    __shared__ __align__(16) __half ksh[KT * HD];
+    __shared__ __align__(16) __half vsh[KT * HD];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.y;
+    int tid = warp * 32 + lane;
+    int nthreads = WARPS * 32;
+    int block_q0 = blockIdx.x * (WARPS * QT);
+    int head = blockIdx.y;
+    int b = blockIdx.z;
+    int start = offsets[b];
+    int L = offsets[b + 1] - start;
+    if (block_q0 >= L)
+        return;
+    int q0 = block_q0 + warp * QT;
+    size_t hv = (size_t)head * HD;
+    __half *myq = qsh + warp * QT * HD;
+
+    for (int idx = lane; idx < QT * HD; idx += 32) {
+        int qr = idx / HD;
+        int d = idx - qr * HD;
+        int row = q0 + qr;
+        float qv = row < L ? qkv[(size_t)(start + row) * qkv_dim + q_offset + hv + d] : 0.0f;
+        tc_store_swz_f16<HD>(myq, qr, d, __float2half(qv));
+    }
+
+    float o[DCHUNKS][8];
+#pragma unroll
+    for (int dc = 0; dc < DCHUNKS; dc++)
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            o[dc][r] = 0.0f;
+    float m[2] = {-3.402823466e+38F, -3.402823466e+38F};
+    float denom[2] = {0.0f, 0.0f};
+
+    for (int k0 = 0; k0 < L; k0 += KT) {
+        for (int idx = tid; idx < KT * HD; idx += nthreads) {
+            int kk = idx / HD;
+            int d = idx - kk * HD;
+            int key = k0 + kk;
+            size_t kb = (size_t)(start + key) * q_dim + hv + d;
+            __half kval = key < L ? kexp[kb] : __float2half(0.0f);
+            __half vval = key < L ? vexp[kb] : __float2half(0.0f);
+            tc_store_swz_f16<16>(ksh, d, kk, kval);
+            vsh[idx] = vval;
+        }
+        __syncthreads();
+
+        float s[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++)
+            s[r] = 0.0f;
+#pragma unroll
+        for (int d0 = 0; d0 < HD; d0 += 16) {
+            uint32_t a[4], bb[4];
+            tc_load_a_q_ldmatrix_swz_hd_f16<HD>(a, myq, d0);
+            tc_load_b_qk_ldmatrix_swz_f16(bb, ksh, d0);
+            mma_m16n16k16_f16(s, a, bb);
+        }
+
+        const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+            int qrow = q0 + qr;
+            int key = k0 + kc;
+            if (qrow < L && key < L)
+                s[r] *= scale;
+            else
+                s[r] = neg_inf;
+        }
+
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int r0 = j * 2;
+            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+            denom[j] *= corr;
+#pragma unroll
+            for (int dc = 0; dc < DCHUNKS; dc++) {
+                o[dc][r0 + 0] *= corr;
+                o[dc][r0 + 1] *= corr;
+                o[dc][r0 + 4] *= corr;
+                o[dc][r0 + 5] *= corr;
+            }
+            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+            s[r0 + 0] = p0;
+            s[r0 + 1] = p1;
+            s[r0 + 4] = p4;
+            s[r0 + 5] = p5;
+            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+            m[j] = m_new;
+        }
+
+        uint32_t pfrag[4];
+        tc_probs_to_a_f16(pfrag, s);
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            uint32_t vb[4];
+            tc_load_b_pv_hd_f16<HD>(vb, vsh, dc * 16);
+            mma_m16n16k16_f16(o[dc], pfrag, vb);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        int qrow = q0 + (lane >> 2) + j * 8;
+        if (qrow >= L)
+            continue;
+        float inv = denom[j] > 0.0f ? 1.0f / denom[j] : 0.0f;
+        size_t ob = (size_t)(start + qrow) * q_dim + hv;
+#pragma unroll
+        for (int dc = 0; dc < DCHUNKS; dc++) {
+            int col = dc * 16 + ((lane & 3) << 1);
+            store_act(out, ob + col + 0, o[dc][j * 2 + 0] * inv);
+            store_act(out, ob + col + 1, o[dc][j * 2 + 1] * inv);
+            store_act(out, ob + col + 8, o[dc][j * 2 + 4] * inv);
+            store_act(out, ob + col + 9, o[dc][j * 2 + 5] * inv);
+        }
+    }
+}
+
 __global__ static void
 mean_pool_kernel(float *out, const float *x, const int *offsets, int batch, int hidden) {
     int b = blockIdx.x;
@@ -1218,6 +1491,98 @@ __global__ static void bert_embed_layer_norm_bf16_kernel(__nv_bfloat16 *out,
     }
 }
 
+__global__ static void bert_embed_layer_norm_f16_act_kernel(float *out,
+                                                            __half *out_f16,
+                                                            const int *ids,
+                                                            const int *positions,
+                                                            const void *emb,
+                                                            int emb_dtype,
+                                                            const float *pos_emb,
+                                                            const float *token_type,
+                                                            const float *gamma,
+                                                            const float *beta,
+                                                            int total,
+                                                            int hidden,
+                                                            int vocab,
+                                                            float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= total)
+        return;
+    int id = ids[row];
+    int pos = positions[row];
+
+    float s = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float tok = 0.0f;
+        if (id >= 0 && id < vocab)
+            tok = load_embedding_value(emb, emb_dtype, (size_t)id * hidden + d);
+        float v = tok + (pos_emb[(size_t)pos * hidden + d] + token_type[d]);
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)hidden;
+    float vs = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)hidden + eps);
+    float *o = out + (size_t)row * hidden;
+    __half *oh = out_f16 ? out_f16 + (size_t)row * hidden : nullptr;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = nv;
+        if (oh)
+            oh[d] = __float2half(nv);
+    }
+}
+
+__global__ static void bert_embed_layer_norm_f16_kernel(__half *out,
+                                                        const int *ids,
+                                                        const int *positions,
+                                                        const void *emb,
+                                                        int emb_dtype,
+                                                        const float *pos_emb,
+                                                        const float *token_type,
+                                                        const float *gamma,
+                                                        const float *beta,
+                                                        int total,
+                                                        int hidden,
+                                                        int vocab,
+                                                        float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= total)
+        return;
+    int id = ids[row];
+    int pos = positions[row];
+
+    float s = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float tok = 0.0f;
+        if (id >= 0 && id < vocab)
+            tok = load_embedding_value(emb, emb_dtype, (size_t)id * hidden + d);
+        float v = tok + (pos_emb[(size_t)pos * hidden + d] + token_type[d]);
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)hidden;
+    float vs = 0.0f;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)hidden + eps);
+    __half *o = out + (size_t)row * hidden;
+    for (int d = tid; d < hidden; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = __float2half(nv);
+    }
+}
+
 // BERT SkipLayerNorm variant for the common post-GEMM shape. The residual has
 // already been accumulated by cuBLAS beta=1, so this fuses the remaining row
 // bias with LayerNorm and keeps the pre-normalized row in shared memory.
@@ -1302,6 +1667,80 @@ __global__ static void layer_norm_bias_resid_bf16_kernel(__nv_bfloat16 *out,
     }
 }
 
+__global__ static void layer_norm_bias_f16_kernel(float *out,
+                                                  __half *out_f16,
+                                                  const float *x,
+                                                  const float *bias,
+                                                  const float *gamma,
+                                                  const float *beta,
+                                                  int rows,
+                                                  int dim,
+                                                  float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows)
+        return;
+    const float *xr = x + (size_t)row * dim;
+    float s = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float v = xr[d] + bias[d];
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)dim;
+    float vs = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
+    float *o = out + (size_t)row * dim;
+    __half *oh = out_f16 ? out_f16 + (size_t)row * dim : nullptr;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = nv;
+        if (oh)
+            oh[d] = __float2half(nv);
+    }
+}
+
+__global__ static void layer_norm_bias_resid_f16_kernel(__half *out,
+                                                        const __half *resid,
+                                                        const float *x,
+                                                        const float *bias,
+                                                        const float *gamma,
+                                                        const float *beta,
+                                                        int rows,
+                                                        int dim,
+                                                        float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows)
+        return;
+    const float *xr = x + (size_t)row * dim;
+    const __half *rr = resid + (size_t)row * dim;
+    float s = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float v = xr[d] + __half2float(rr[d]) + bias[d];
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)dim;
+    float vs = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
+    __half *o = out + (size_t)row * dim;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = __float2half(nv);
+    }
+}
+
 __global__ static void bias_gelu_kernel(float *x, const float *bias, int rows, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t n = (size_t)rows * dim;
@@ -1325,6 +1764,29 @@ bias_gelu_to_bf16_kernel(__nv_bfloat16 *out, const float *x, const float *bias, 
     }
 }
 
+__global__ static void
+bias_gelu_to_f16_kernel(__half *out, const float *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        out[idx] = __float2half(0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+    }
+}
+
+template <typename IN_T, typename OUT_T>
+__global__ static void
+bias_gelu_16_to_16_kernel(OUT_T *out, const IN_T *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = load_act(x, idx) + bias[d];
+        store_act(out, idx, 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+    }
+}
+
 __global__ static void bias_gelu_tanh_kernel(float *x, const float *bias, int rows, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t n = (size_t)rows * dim;
@@ -1345,6 +1807,31 @@ __global__ static void bias_gelu_tanh_to_bf16_kernel(
         float v = x[idx] + bias[d];
         float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
         out[idx] = __float2bfloat16(0.5f * v * (1.0f + tanhf(inner)));
+    }
+}
+
+__global__ static void
+bias_gelu_tanh_to_f16_kernel(__half *out, const float *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = x[idx] + bias[d];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        out[idx] = __float2half(0.5f * v * (1.0f + tanhf(inner)));
+    }
+}
+
+template <typename IN_T, typename OUT_T>
+__global__ static void
+bias_gelu_tanh_16_to_16_kernel(OUT_T *out, const IN_T *x, const float *bias, int rows, int dim) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)rows * dim;
+    if (idx < n) {
+        int d = (int)(idx % dim);
+        float v = load_act(x, idx) + bias[d];
+        float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        store_act(out, idx, 0.5f * v * (1.0f + tanhf(inner)));
     }
 }
 
@@ -1438,20 +1925,17 @@ static int ensure_weight_f32(ffwd_cuda_ctx_t *ctx, size_t elems) {
     return 0;
 }
 
-// y = w @ x (+ beta*y). With BF16 weights and an already-BF16 activation
-// (x_is_bf16 - the Qwen fused path) both inputs are BF16 with F32 accumulation.
-// For the BERT family in an exact-or-TF32 compute mode the activation stays F32
-// and the BF16 weight is widened back to F32 here, so the GEMM is exact (or
-// TF32, which needs F32 operands): BF16 is then a storage choice that costs no
-// quality, which the mean-subtracting post-attention LayerNorm needs. When the
-// caller opts into 16-bit float compute (gemm mode bf16/16f) exactness is
-// already given up, so BERT takes the direct BF16xBF16 path too: widening to F32
-// would only read full F32 weight bandwidth for a result the tensor core rounds
-// to BF16 anyway. With F32 weights this is the exact path.
+// y = w @ x (+ beta*y). With 16-bit weights and already-16-bit activations, both
+// inputs are read in that storage dtype with F32 accumulation. For BERT in an
+// exact-or-TF32 compute mode, a F32 activation with reduced-precision weights is
+// handled by widening the weight back to F32 first: reduced precision is then a
+// storage choice only. In explicit reduced-compute modes (bf16/16f), exactness is
+// already given up, so we cast F32 activations to the matching 16-bit operand and
+// let tensor cores do the GEMM.
 static int linear_ex(ffwd_cuda_ctx_t *ctx,
                      const cuda_matrix_t *w,
                      const void *x,
-                     int x_is_bf16,
+                     cuda_dtype_t x_dtype,
                      float *y,
                      int rows,
                      int in_dim,
@@ -1459,18 +1943,23 @@ static int linear_ex(ffwd_cuda_ctx_t *ctx,
                      int x_stride,
                      float beta) {
     const float alpha = 1.0f;
-    if (w->bf16) {
+    if (w->dtype == CUDA_DTYPE_BF16 || w->dtype == CUDA_DTYPE_F16) {
+        cudaDataType input_type = w->dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
         // 16-bit float compute (bf16/16f) reads bf16 weights directly; exact F32
         // and TF32 need F32 weight operands, so BERT widens its bf16 weight then.
         cublasComputeType_t gc = gemm_compute();
         int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
-        if (!x_is_bf16 && ctx->config.family == FFWD_FAMILY_BERT && !compute_16bit) {
+        if (x_dtype == CUDA_DTYPE_F32 && ctx->config.family == FFWD_FAMILY_BERT && !compute_16bit) {
             size_t welems = (size_t)out_dim * (size_t)in_dim;
             if (ensure_weight_f32(ctx, welems) != 0)
                 return -1;
             int wt = 256;
-            cast_bf16_to_f32_kernel<<<(welems + wt - 1) / wt, wt, 0, ctx->stream>>>(
-                ctx->weight_f32, (const __nv_bfloat16 *)w->d, welems);
+            if (w->dtype == CUDA_DTYPE_BF16)
+                cast_bf16_to_f32_kernel<<<(welems + wt - 1) / wt, wt, 0, ctx->stream>>>(
+                    ctx->weight_f32, (const __nv_bfloat16 *)w->d, welems);
+            else
+                cast_f16_to_f32_kernel<<<(welems + wt - 1) / wt, wt, 0, ctx->stream>>>(
+                    ctx->weight_f32, (const __half *)w->d, welems);
             if (launch_check() != 0)
                 return -1;
             CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim,
@@ -1480,17 +1969,26 @@ static int linear_ex(ffwd_cuda_ctx_t *ctx,
             return 0;
         }
         const void *xb = x;
-        if (!x_is_bf16) {
+        if (x_dtype == CUDA_DTYPE_F32) {
             size_t n = (size_t)rows * (size_t)x_stride;
             int threads = 256;
-            cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(
-                (__nv_bfloat16 *)ctx->act_bf16, (const float *)x, n);
+            if (w->dtype == CUDA_DTYPE_BF16) {
+                cast_f32_to_bf16_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                    (__nv_bfloat16 *)ctx->act_bf16, (const float *)x, n);
+                xb = ctx->act_bf16;
+            } else {
+                cast_f32_to_f16_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                    (__half *)ctx->act_f16, (const float *)x, n);
+                xb = ctx->act_f16;
+            }
             if (launch_check() != 0)
                 return -1;
-            xb = ctx->act_bf16;
+        } else if (x_dtype != w->dtype) {
+            fprintf(stderr, "cuda: mixed 16-bit GEMM operand dtypes are unsupported\n");
+            return -1;
         }
         CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim, &alpha,
-                                  w->d, CUDA_R_16BF, in_dim, xb, CUDA_R_16BF, x_stride, &beta, y,
+                                  w->d, input_type, in_dim, xb, input_type, x_stride, &beta, y,
                                   CUDA_R_32F, out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         return 0;
     }
@@ -1504,10 +2002,10 @@ static int linear(ffwd_cuda_ctx_t *ctx,
                   const cuda_matrix_t *w,
                   const float *x,
                   float *y,
-                  int rows,
-                  int in_dim,
-                  int out_dim) {
-    return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 0.0f);
+    int rows,
+    int in_dim,
+    int out_dim) {
+    return linear_ex(ctx, w, x, CUDA_DTYPE_F32, y, rows, in_dim, out_dim, in_dim, 0.0f);
 }
 
 // x points at activations already stored as BF16 (e.g. ctx->act_bf16).
@@ -1520,17 +2018,53 @@ static int linear_bf16x(ffwd_cuda_ctx_t *ctx,
                         int out_dim,
                         int x_stride,
                         float beta) {
-    return linear_ex(ctx, w, x, 1, y, rows, in_dim, out_dim, x_stride, beta);
+    return linear_ex(ctx, w, x, CUDA_DTYPE_BF16, y, rows, in_dim, out_dim, x_stride, beta);
+}
+
+// x points at activations already stored as FP16 (e.g. ctx->act_f16).
+static int linear_f16x(ffwd_cuda_ctx_t *ctx,
+                       const cuda_matrix_t *w,
+                       const void *x,
+                       float *y,
+                       int rows,
+                       int in_dim,
+                       int out_dim,
+                       int x_stride,
+                       float beta) {
+    return linear_ex(ctx, w, x, CUDA_DTYPE_F16, y, rows, in_dim, out_dim, x_stride, beta);
+}
+
+static int linear_16x_to_16(ffwd_cuda_ctx_t *ctx,
+                            const cuda_matrix_t *w,
+                            const void *x,
+                            cuda_dtype_t x_dtype,
+                            void *y,
+                            cuda_dtype_t y_dtype,
+                            int rows,
+                            int in_dim,
+                            int out_dim,
+                            int x_stride) {
+    if ((y_dtype != CUDA_DTYPE_BF16 && y_dtype != CUDA_DTYPE_F16) || x_dtype != y_dtype ||
+        w->dtype != y_dtype) {
+        fprintf(stderr, "cuda: linear_16x_to_16 requires matching 16-bit operand dtypes\n");
+        return -1;
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    cudaDataType t = y_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
+    CUBLAS_CHECK(cublasGemmEx(ctx->blas, CUBLAS_OP_T, CUBLAS_OP_N, out_dim, rows, in_dim, &alpha,
+                              w->d, t, in_dim, x, t, x_stride, &beta, y, t, out_dim,
+                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    return 0;
 }
 
 static int linear_accum(ffwd_cuda_ctx_t *ctx,
                         const cuda_matrix_t *w,
                         const float *x,
                         float *y,
-                        int rows,
-                        int in_dim,
-                        int out_dim) {
-    return linear_ex(ctx, w, x, 0, y, rows, in_dim, out_dim, in_dim, 1.0f);
+    int rows,
+    int in_dim,
+    int out_dim) {
+    return linear_ex(ctx, w, x, CUDA_DTYPE_F32, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
 static int gemm_strided_batched(cublasHandle_t blas,
@@ -1583,7 +2117,7 @@ static int gemm_strided_batched(cublasHandle_t blas,
 // previously mismatched the BERT path (BF16 layout, F32 GEMM) and corrupted
 // equal-length batches.
 static int
-attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, int use_bf16) {
+attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, cuda_dtype_t attn_dtype) {
     const ffwd_config_t *c = &ctx->config;
     ctx->attn_G = 0;
     if (batch < 2)
@@ -1604,7 +2138,7 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
     if (G < 2)
         return 0;
 
-    int bf16 = use_bf16;
+    int use_16 = attn_dtype == CUDA_DTYPE_BF16 || attn_dtype == CUDA_DTYPE_F16;
     long long want = (long long)G * per;
     if (want > ctx->attn_scores_elems) {
         cudaFree(ctx->attn_scores);
@@ -1613,11 +2147,11 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
         CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)want * sizeof(float)));
         ctx->attn_scores_elems = want;
     }
-    if (bf16 && want > ctx->attn_probs_elems) {
+    if (use_16 && want > ctx->attn_probs_elems) {
         cudaFree(ctx->attn_probs);
         ctx->attn_probs = NULL;
         ctx->attn_probs_elems = 0;
-        CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)want * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)want * sizeof(uint16_t)));
         ctx->attn_probs_elems = want;
     }
 
@@ -1643,6 +2177,9 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
     const __nv_bfloat16 *vb = (const __nv_bfloat16 *)ctx->vexp;
     const __nv_bfloat16 *pb = (const __nv_bfloat16 *)ctx->attn_probs;
     const __nv_bfloat16 *ab = (const __nv_bfloat16 *)ctx->act_bf16;
+    const __half *vh = (const __half *)ctx->vexp;
+    const __half *ph = (const __half *)ctx->attn_probs;
+    const __half *ah = (const __half *)ctx->act_f16;
     for (int b = 0; b < batch; b++) {
         // Score/probability rows cycle every G sequences (chunked reuse).
         long long srow = (long long)(b % G) * per;
@@ -1652,10 +2189,14 @@ attn_batched_setup(ffwd_cuda_ctx_t *ctx, int batch, int q_offset, int qkv_dim, i
             K[i] = ctx->kexp + tok * q_dim + (size_t)h * hd;
             Q[i] = ctx->qkv + tok * qkv_dim + q_offset + (size_t)h * hd;
             S[i] = ctx->attn_scores + srow + (long long)h * L * L;
-            if (bf16) {
+            if (attn_dtype == CUDA_DTYPE_BF16) {
                 V[i] = vb + tok * q_dim + (size_t)h * hd;
                 P[i] = pb + srow + (long long)h * L * L;
                 O[i] = ab + tok * q_dim + (size_t)h * hd;
+            } else if (attn_dtype == CUDA_DTYPE_F16) {
+                V[i] = vh + tok * q_dim + (size_t)h * hd;
+                P[i] = ph + srow + (long long)h * L * L;
+                O[i] = ah + tok * q_dim + (size_t)h * hd;
             } else {
                 V[i] = ctx->vexp + tok * q_dim + (size_t)h * hd;
                 P[i] = S[i];
@@ -1692,9 +2233,9 @@ static int bert_flash_mode(void) {
     return mode;
 }
 
-// out_bf16 != NULL selects the BF16-weight layout: V and the softmax
-// probabilities are stored BF16 and the @V GEMM emits BF16 attention output
-// at out_bf16 (stride q_dim), ready for the wo projection without a cast.
+// out_16 != NULL selects a reduced-precision attention layout: V and the softmax
+// probabilities are stored in out_dtype, and the @V stage emits attention output
+// in the same dtype, ready for the output projection without a cast.
 static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                                const int *h_offsets,
                                int batch,
@@ -1703,7 +2244,8 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                                int v_offset,
                                int qkv_dim,
                                float scale,
-                               __nv_bfloat16 *out_bf16) {
+                               void *out_16,
+                               cuda_dtype_t out_dtype) {
     const ffwd_config_t *c = &ctx->config;
     int q_dim = c->q_dim;
     int hd = c->head_dim;
@@ -1718,26 +2260,39 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     int causal = c->attention_mode == FFWD_ATTENTION_CAUSAL;
     const float alpha = scale, beta = 0.0f, one = 1.0f;
     int stream_mode = streaming_attention_mode();
-    int use_stream = use_streaming_attention(c, out_bf16 != NULL, hd);
-    int use_tc_kexp_bf16 = use_stream && out_bf16 && c->family == FFWD_FAMILY_QWEN3 && hd == 128 &&
+    int use_stream = use_streaming_attention(c, out_dtype == CUDA_DTYPE_BF16, hd);
+    int use_tc_kexp_bf16 = use_stream && out_dtype == CUDA_DTYPE_BF16 &&
+                           c->family == FFWD_FAMILY_QWEN3 && hd == 128 &&
                            (stream_mode == 0 || stream_mode == 8);
-    // BERT bf16 flash attention: head_dim 32/64, bidirectional, K/V expanded BF16.
+    // BERT flash attention: head_dim 32/64, bidirectional, K/V expanded in the
+    // requested reduced dtype.
     int bert_flash = bert_flash_mode();
-    int use_bert_flash = out_bf16 && c->family == FFWD_FAMILY_BERT &&
+    int use_bert_flash = out_16 && c->family == FFWD_FAMILY_BERT &&
+                         (out_dtype == CUDA_DTYPE_BF16 || out_dtype == CUDA_DTYPE_F16) &&
                          ((hd == 64 && bert_flash >= 0) || (hd == 32 && bert_flash > 0));
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
-    if (use_tc_kexp_bf16 || use_bert_flash) {
+    if (use_tc_kexp_bf16 || (use_bert_flash && out_dtype == CUDA_DTYPE_BF16)) {
         if (!ctx->kexp_bf16)
             return -1;
         attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
             (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H,
             c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
-    } else if (out_bf16) {
+    } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16) {
+        if (!ctx->kexp_f16)
+            return -1;
+        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            (__half *)ctx->kexp_f16, (__half *)ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd,
+            qkv_dim, k_offset, v_offset);
+    } else if (out_dtype == CUDA_DTYPE_BF16) {
         attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
             ctx->kexp, (__nv_bfloat16 *)ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim,
             k_offset, v_offset);
+    } else if (out_dtype == CUDA_DTYPE_F16) {
+        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            ctx->kexp, (__half *)ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim, k_offset,
+            v_offset);
     } else {
         attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
             ctx->kexp, ctx->vexp, ctx->qkv, total, H, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
@@ -1747,13 +2302,19 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
 
     if (use_bert_flash) {
         int w = tc_kv_warps_or(8);
-#define BERT_FLASH_LAUNCH(HDV, W)                                                             \
-    do {                                                                                      \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                             \
-        dim3 block(32, (W));                                                                  \
-        attn_stream_bert_flash_kernel<(HDV), (W)><<<grid, block, 0, ctx->stream>>>(           \
-            out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
-            (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+#define BERT_FLASH_LAUNCH(HDV, W)                                                               \
+    do {                                                                                        \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                               \
+        dim3 block(32, (W));                                                                    \
+        if (out_dtype == CUDA_DTYPE_F16)                                                        \
+            attn_stream_bert_flash_f16_kernel<(HDV), (W)><<<grid, block, 0, ctx->stream>>>(     \
+                (__half *)out_16, ctx->qkv, (const __half *)ctx->kexp_f16,                      \
+                (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale);      \
+        else                                                                                    \
+            attn_stream_bert_flash_kernel<(HDV), (W)><<<grid, block, 0, ctx->stream>>>(         \
+                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,       \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset,       \
+                scale);                                                                         \
     } while (0)
         if (hd == 32) {
             if (w == 2)
@@ -1778,8 +2339,8 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         // stream_mode 0 is the promoted default (use_streaming_attention only
         // returns true for mode 0 on this Qwen BF16 HD=128 case); mode 8 is the
         // explicit `tc3` override. Both run the same kernel.
-        if ((stream_mode == 8 || stream_mode == 0) && c->family == FFWD_FAMILY_QWEN3 && out_bf16 &&
-            hd == 128) {
+        if ((stream_mode == 8 || stream_mode == 0) && c->family == FFWD_FAMILY_QWEN3 &&
+            out_dtype == CUDA_DTYPE_BF16 && out_16 && hd == 128) {
             // Promoted Qwen BF16 tensor-core flash attention.
             int w = tc_kv_warps_or(8);
 #define TC3_LAUNCH(W)                                                                             \
@@ -1788,11 +2349,11 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         dim3 block(32, (W));                                                                      \
         if (causal)                                                                               \
             attn_stream_tc128_bf16_kv_ldm_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(        \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
         else                                                                                      \
             attn_stream_tc128_bf16_kv_ldm_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(        \
-                out_bf16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,                        \
+                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
     } while (0)
             if (w == 2)
@@ -1814,8 +2375,11 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         const void *const *V = (const void *const *)S + (size_t)batch * H;
         const void *const *P = V + (size_t)batch * H;
         void *const *O = (void *const *)(P + (size_t)batch * H);
-        cudaDataType pv = out_bf16 ? CUDA_R_16BF : CUDA_R_32F;
-        cublasComputeType_t av_ct = out_bf16 ? CUBLAS_COMPUTE_32F : gemm_compute();
+        int use_16 = out_dtype == CUDA_DTYPE_BF16 || out_dtype == CUDA_DTYPE_F16;
+        cudaDataType pv = out_dtype == CUDA_DTYPE_BF16
+                              ? CUDA_R_16BF
+                              : (out_dtype == CUDA_DTYPE_F16 ? CUDA_R_16F : CUDA_R_32F);
+        cublasComputeType_t av_ct = use_16 ? CUBLAS_COMPUTE_32F : gemm_compute();
         for (int s = 0; s < batch; s += G) {
             int g = batch - s < G ? batch - s : G;
             int n = g * H;
@@ -1825,13 +2389,20 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                                              K + off, CUDA_R_32F, q_dim, Q + off, CUDA_R_32F, qkv_dim,
                                              &beta, S + off, CUDA_R_32F, L, n, gemm_compute(),
                                              CUBLAS_GEMM_DEFAULT));
-            if (out_bf16) {
+            if (out_dtype == CUDA_DTYPE_BF16) {
                 if (causal)
                     attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
                         ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
                 else
                     attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
                         ctx->attn_scores, (__nv_bfloat16 *)ctx->attn_probs, L);
+            } else if (out_dtype == CUDA_DTYPE_F16) {
+                if (causal)
+                    attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__half *)ctx->attn_probs, L);
+                else
+                    attn_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__half *)ctx->attn_probs, L);
             } else {
                 if (causal)
                     attn_causal_softmax_kernel<<<n * L, 256, 0, ctx->stream>>>(ctx->attn_scores,
@@ -1860,20 +2431,32 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                                  Q, qkv_dim, hd, &beta, ctx->attn_scores, L, (long long)L * L,
                                  H) != 0)
             return -1;
-        if (out_bf16) {
-            __nv_bfloat16 *P = (__nv_bfloat16 *)ctx->attn_probs;
-            const __nv_bfloat16 *V = (const __nv_bfloat16 *)ctx->vexp + (size_t)start * q_dim;
-            __nv_bfloat16 *O = out_bf16 + (size_t)start * q_dim;
-            if (causal)
-                attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores, P, L);
-            else
-                attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(ctx->attn_scores, P, L);
+        if (out_dtype == CUDA_DTYPE_BF16 || out_dtype == CUDA_DTYPE_F16) {
+            cudaDataType pv = out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
+            void *P = (uint16_t *)ctx->attn_probs;
+            const void *V = (const uint16_t *)ctx->vexp + (size_t)start * q_dim;
+            void *O = (uint16_t *)out_16 + (size_t)start * q_dim;
+            if (causal) {
+                if (out_dtype == CUDA_DTYPE_BF16)
+                    attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__nv_bfloat16 *)P, L);
+                else
+                    attn_causal_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__half *)P, L);
+            } else {
+                if (out_dtype == CUDA_DTYPE_BF16)
+                    attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__nv_bfloat16 *)P, L);
+                else
+                    attn_softmax_kernel<<<H * L, 256, 0, ctx->stream>>>(
+                        ctx->attn_scores, (__half *)P, L);
+            }
             if (launch_check() != 0)
                 return -1;
             /* O[h] = P[h] @ V[h]  (row-major C = A @ B) */
             CUBLAS_CHECK(cublasGemmStridedBatchedEx(ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L,
-                                                    &one, V, CUDA_R_16BF, q_dim, hd, P, CUDA_R_16BF,
-                                                    L, (long long)L * L, &beta, O, CUDA_R_16BF, q_dim,
+                                                    &one, V, pv, q_dim, hd, P, pv,
+                                                    L, (long long)L * L, &beta, O, pv, q_dim,
                                                     hd, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         } else {
             const float *V = ctx->vexp + (size_t)start * q_dim;
@@ -1904,20 +2487,28 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->qkv);
         cudaFree(ctx->attn_out);
         cudaFree(ctx->ffn_gate_up);
+        cudaFree(ctx->ffn_gate_up_16);
         cudaFree(ctx->x_bf16);
+        cudaFree(ctx->x_f16);
         cudaFree(ctx->token_ids);
         cudaFree(ctx->positions);
         cudaFree(ctx->kexp);
         cudaFree(ctx->kexp_bf16);
+        cudaFree(ctx->kexp_f16);
         cudaFree(ctx->vexp);
         cudaFree(ctx->act_bf16);
+        cudaFree(ctx->act_f16);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
+        ctx->ffn_gate_up_16 = NULL;
         ctx->x_bf16 = NULL;
+        ctx->x_f16 = NULL;
         ctx->token_ids = ctx->positions = NULL;
         ctx->kexp = ctx->vexp = NULL;
         ctx->kexp_bf16 = NULL;
+        ctx->kexp_f16 = NULL;
         ctx->act_bf16 = NULL;
+        ctx->act_f16 = NULL;
         CUDA_CHECK(cudaMalloc((void **)&ctx->x, (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm, (size_t)total * c->hidden_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,
@@ -1928,15 +2519,25 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         if (ctx->weights_bf16 && c->family == FFWD_FAMILY_BERT)
             CUDA_CHECK(cudaMalloc(&ctx->x_bf16,
                                   (size_t)total * c->hidden_size * sizeof(__nv_bfloat16)));
+        if (ctx->weights_f16 && c->family == FFWD_FAMILY_BERT)
+            CUDA_CHECK(cudaMalloc(&ctx->x_f16, (size_t)total * c->hidden_size * sizeof(__half)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
         if (ctx->weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16, (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
+        if (ctx->weights_f16)
+            CUDA_CHECK(cudaMalloc(&ctx->kexp_f16, (size_t)total * c->q_dim * sizeof(__half)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
         if (ctx->weights_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
                                   (size_t)total * 2 * c->intermediate_size * sizeof(__nv_bfloat16)));
+        if (ctx->weights_f16)
+            CUDA_CHECK(cudaMalloc(&ctx->act_f16,
+                                  (size_t)total * 2 * c->intermediate_size * sizeof(__half)));
+        if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
+            CUDA_CHECK(cudaMalloc(&ctx->ffn_gate_up_16,
+                                  (size_t)total * c->intermediate_size * sizeof(uint16_t)));
         ctx->seq_cap = total;
     }
     if (batch + 1 > ctx->batch_cap) {
@@ -1959,11 +2560,11 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
             CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)score_elems * sizeof(float)));
             ctx->attn_scores_elems = score_elems;
         }
-        if (ctx->weights_bf16 && score_elems > ctx->attn_probs_elems) {
+        if ((ctx->weights_bf16 || ctx->weights_f16) && score_elems > ctx->attn_probs_elems) {
             cudaFree(ctx->attn_probs);
             ctx->attn_probs = NULL;
             ctx->attn_probs_elems = 0;
-            CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)score_elems * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)score_elems * sizeof(uint16_t)));
             ctx->attn_probs_elems = score_elems;
         }
         float *hcos = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
@@ -2026,17 +2627,17 @@ static int ensure_span_buffers(ffwd_cuda_ctx_t *ctx, int n_spans) {
 }
 
 static int
-load_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
-    return load_qkv_matrix(&dst->qkv, src, c, weights_bf16) ||
-           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weights_bf16) ||
+load_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, cuda_dtype_t weight_dtype) {
+    return load_qkv_matrix(&dst->qkv, src, c, weight_dtype) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weight_dtype) ||
            (c->qkv_bias && load_qkv_bias(&dst->qkv_bias, src, c)) ||
            (c->qk_norm && load_vector(&dst->q_norm, src->q_norm, c->head_dim)) ||
            (c->qk_norm && load_vector(&dst->k_norm, src->k_norm, c->head_dim)) ||
            load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
            load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
-           load_gate_up_matrix(&dst->gate_up_proj, src, c, weights_bf16) ||
+           load_gate_up_matrix(&dst->gate_up_proj, src, c, weight_dtype) ||
            load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size,
-                       weights_bf16);
+                       weight_dtype);
 }
 
 /* BERT layer: attention reuses the fused qkv matrix and qkv_bias (q_dim ==
@@ -2044,9 +2645,9 @@ load_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, i
  * (post-attention) and post_attn_norm (post-FFN); gate_up_proj holds the single
  * up_proj. The added fields carry the biases the Qwen slots lack. */
 static int
-load_bert_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, int weights_bf16) {
-    return load_qkv_matrix(&dst->qkv, src, c, weights_bf16) ||
-           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weights_bf16) ||
+load_bert_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t *c, cuda_dtype_t weight_dtype) {
+    return load_qkv_matrix(&dst->qkv, src, c, weight_dtype) ||
+           load_matrix(&dst->wo, &src->wo, c->hidden_size, c->q_dim, weight_dtype) ||
            load_qkv_bias(&dst->qkv_bias, src, c) ||
            load_vector(&dst->o_bias, src->o_bias, c->hidden_size) ||
            load_vector(&dst->input_norm, src->input_norm, c->hidden_size) ||
@@ -2054,10 +2655,10 @@ load_bert_layer(cuda_layer_t *dst, const ffwd_layer_t *src, const ffwd_config_t 
            load_vector(&dst->post_attn_norm, src->post_attn_norm, c->hidden_size) ||
            load_vector(&dst->ffn_ln_bias, src->ffn_ln_bias, c->hidden_size) ||
            load_matrix(&dst->gate_up_proj, &src->up_proj, c->intermediate_size, c->hidden_size,
-                       weights_bf16) ||
+                       weight_dtype) ||
            load_vector(&dst->ffn_inter_bias, src->ffn_inter_bias, c->intermediate_size) ||
            load_matrix(&dst->down_proj, &src->down_proj, c->hidden_size, c->intermediate_size,
-                       weights_bf16) ||
+                       weight_dtype) ||
            load_vector(&dst->ffn_out_bias, src->ffn_out_bias, c->hidden_size);
 }
 
@@ -2095,14 +2696,17 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
     ctx->cpu = cpu;
     ctx->own_cpu = own_cpu;
     ctx->config = cpu->config;
-    ctx->weights_bf16 = g_weights_bf16_override >= 0
-                            ? g_weights_bf16_override
-                            : cpu->weights.embed_tokens.dtype == DTYPE_BF16;
+    ctx->weight_dtype = g_weight_dtype_override >= 0
+                            ? (cuda_dtype_t)g_weight_dtype_override
+                            : (cpu->weights.embed_tokens.dtype == DTYPE_BF16 ? CUDA_DTYPE_BF16
+                                                                              : CUDA_DTYPE_F32);
+    ctx->weights_bf16 = ctx->weight_dtype == CUDA_DTYPE_BF16;
+    ctx->weights_f16 = ctx->weight_dtype == CUDA_DTYPE_F16;
 
     /* Without an explicit --gpu-weight-dtype, store weights in the model
      * file's dtype: BF16 snapshots load as BF16 (bit-exact pass-through),
      * F32 snapshots keep the exact F32 default. */
-    if (g_weights_bf16_override < 0 && ctx->weights_bf16)
+    if (g_weight_dtype_override < 0 && ctx->weights_bf16)
         fprintf(stderr, "cuda: BF16 model file; storing weights as BF16 "
                         "(use --gpu-weight-dtype f32 to override)\n");
 
@@ -2120,7 +2724,7 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         return NULL;
     }
     if (load_matrix(&ctx->embed_tokens, &cpu->weights.embed_tokens, c->vocab_size, c->hidden_size,
-                    ctx->weights_bf16) != 0) {
+                    ctx->weight_dtype) != 0) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
@@ -2144,8 +2748,8 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
     for (int i = 0; i < c->n_layers; i++) {
         int rc = c->family == FFWD_FAMILY_BERT
                      ? load_bert_layer(&ctx->layers[i], &cpu->weights.layers[i], c,
-                                       ctx->weights_bf16)
-                     : load_layer(&ctx->layers[i], &cpu->weights.layers[i], c, ctx->weights_bf16);
+                                       ctx->weight_dtype)
+                     : load_layer(&ctx->layers[i], &cpu->weights.layers[i], c, ctx->weight_dtype);
         if (rc != 0) {
             fprintf(stderr, "cuda: failed to load layer %d\n", i);
             ffwd_cuda_free(ctx);
@@ -2179,7 +2783,9 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     cudaFree(ctx->qkv);
     cudaFree(ctx->attn_out);
     cudaFree(ctx->ffn_gate_up);
+    cudaFree(ctx->ffn_gate_up_16);
     cudaFree(ctx->x_bf16);
+    cudaFree(ctx->x_f16);
     cudaFree(ctx->pooled_out);
     cudaFree(ctx->rope_cos);
     cudaFree(ctx->rope_sin);
@@ -2189,8 +2795,10 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     cudaFree(ctx->positions);
     cudaFree(ctx->kexp);
     cudaFree(ctx->kexp_bf16);
+    cudaFree(ctx->kexp_f16);
     cudaFree(ctx->vexp);
     cudaFree(ctx->act_bf16);
+    cudaFree(ctx->act_f16);
     cudaFree(ctx->weight_f32);
     cudaFree(ctx->attn_scores);
     cudaFree(ctx->attn_probs);
@@ -2296,6 +2904,7 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // remains for A/B.
 enum { BERT_BF16_ACT_MIN_TOKENS = 1024 };
 enum { BERT_RESIDUAL16_MIN_TOKENS = 16384 };
+enum { BERT_FFN16_MIN_TOKENS = 1024 };
 // Returns 1 (force on), -1 (force off), or 0 (auto: gate on token count).
 static int bert_bf16_act_mode(void) {
     static int init = 0, mode = 0;
@@ -2326,6 +2935,22 @@ static int bert_residual16_mode(void) {
     return mode;
 }
 
+// BERT FFN intermediate storage. 0/default gates on total tokens; 1/on forces
+// the gate-up GEMM to write the intermediate as the active 16-bit dtype; 0/off
+// keeps the previous F32 intermediate for A/B.
+static int bert_ffn16_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_BERT_FFN16");
+        if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
+        else if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        init = 1;
+    }
+    return mode;
+}
+
 static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
     const ffwd_config_t *c = &ctx->config;
     int total = 0;
@@ -2341,39 +2966,63 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     int threads = 256;
     size_t ln_smem = (size_t)hidden * sizeof(float);
 
-    // bf16-activation path: the default reduced-precision path keeps ctx->x as
-    // the F32 residual stream, but each norm/GELU producer also emits a BF16
-    // GEMM input into `act`. The experimental residual16 branch swaps that
-    // persistent stream to `resid` (ctx->x_bf16) and uses ctx->x only as a F32
-    // projection-output temporary plus final pooling input.
+    // Reduced-precision activation path: BF16 keeps the validated conservative
+    // gates; explicit FP16 storage uses the same F32-reduction LayerNorm kernels
+    // but stores the persistent BERT residual stream as FP16 unless the residual
+    // override forces it off.
     cublasComputeType_t gc = gemm_compute();
     int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
     int act_mode = bert_bf16_act_mode();
-    // bf16 flash attention: the attention output is written bf16 to `act` for wo
-    // to read with no cast. It implies the bf16-act norm path so the whole layer
-    // is one bf16 activation pipeline.
     int bert_flash = bert_flash_mode();
-    int flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
+    int bf16_flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
                 ((c->head_dim == 64 && bert_flash >= 0) ||
                  (c->head_dim == 32 && bert_flash > 0));
-    int bf16_act = flash || (compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
-                             act_mode >= 0 && (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
-    __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
-    __nv_bfloat16 *resid = (__nv_bfloat16 *)ctx->x_bf16;
+    int f16_flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.f16 &&
+                    ((c->head_dim == 64 && bert_flash >= 0) ||
+                     (c->head_dim == 32 && bert_flash > 0));
+    int flash = bf16_flash || f16_flash;
+    int bf16_act = bf16_flash ||
+                   (compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
+                    act_mode >= 0 && (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
+    int f16_act = f16_flash;
+    cuda_dtype_t act_dtype = f16_act ? CUDA_DTYPE_F16 : (bf16_act ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32);
+    void *act16 = act_dtype == CUDA_DTYPE_F16 ? ctx->act_f16
+                                              : (act_dtype == CUDA_DTYPE_BF16 ? ctx->act_bf16 : NULL);
+    void *resid16 = act_dtype == CUDA_DTYPE_F16 ? ctx->x_f16
+                                                : (act_dtype == CUDA_DTYPE_BF16 ? ctx->x_bf16 : NULL);
+    __nv_bfloat16 *act_bf16 = (__nv_bfloat16 *)ctx->act_bf16;
+    __nv_bfloat16 *resid_bf16 = (__nv_bfloat16 *)ctx->x_bf16;
+    __half *act_f16 = (__half *)ctx->act_f16;
+    __half *resid_f16 = (__half *)ctx->x_f16;
     int resid_mode = bert_residual16_mode();
     int bf16_resid =
-        bf16_act && flash && resid && resid_mode >= 0 &&
+        bf16_act && flash && resid_bf16 && resid_mode >= 0 &&
         (resid_mode > 0 || total >= BERT_RESIDUAL16_MIN_TOKENS);
+    int f16_resid = f16_act && flash && resid_f16 && resid_mode >= 0;
+    int use_resid16 = bf16_resid || f16_resid;
+    int ffn16_mode = bert_ffn16_mode();
+    int ffn16 = act_dtype != CUDA_DTYPE_F32 && ctx->ffn_gate_up_16 && ffn16_mode >= 0 &&
+                (ffn16_mode > 0 || total >= BERT_FFN16_MIN_TOKENS);
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-            resid, ctx->token_ids, ctx->positions, ctx->embed_tokens.d, ctx->embed_tokens.bf16,
+            resid_bf16, ctx->token_ids, ctx->positions, ctx->embed_tokens.d, ctx->embed_tokens.dtype,
             ctx->position_embeddings, ctx->token_type_embedding, ctx->ffwd_ln_w, ctx->ffwd_ln_b,
             total, hidden, c->vocab_size, eps);
+    } else if (f16_resid) {
+        bert_embed_layer_norm_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+            resid_f16, ctx->token_ids, ctx->positions, ctx->embed_tokens.d, ctx->embed_tokens.dtype,
+            ctx->position_embeddings, ctx->token_type_embedding, ctx->ffwd_ln_w, ctx->ffwd_ln_b,
+            total, hidden, c->vocab_size, eps);
+    } else if (act_dtype == CUDA_DTYPE_F16) {
+        bert_embed_layer_norm_f16_act_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+            ctx->x, act_f16, ctx->token_ids, ctx->positions, ctx->embed_tokens.d,
+            ctx->embed_tokens.dtype, ctx->position_embeddings, ctx->token_type_embedding,
+            ctx->ffwd_ln_w, ctx->ffwd_ln_b, total, hidden, c->vocab_size, eps);
     } else {
         bert_embed_layer_norm_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-            ctx->x, bf16_act ? act : nullptr, ctx->token_ids, ctx->positions, ctx->embed_tokens.d,
-            ctx->embed_tokens.bf16, ctx->position_embeddings, ctx->token_type_embedding,
+            ctx->x, bf16_act ? act_bf16 : nullptr, ctx->token_ids, ctx->positions, ctx->embed_tokens.d,
+            ctx->embed_tokens.dtype, ctx->position_embeddings, ctx->token_type_embedding,
             ctx->ffwd_ln_w, ctx->ffwd_ln_b, total, hidden, c->vocab_size, eps);
     }
     if (launch_check() != 0)
@@ -2381,17 +3030,21 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
 
     // The materialized BERT fallback uses F32 attention here; BERT flash ignores
     // this pointer layout and writes BF16 output directly to `act`.
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, 0) != 0)
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, CUDA_DTYPE_F32) != 0)
         return -1;
 
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
-        const __nv_bfloat16 *norm_act = bf16_resid ? resid : act;
+        const void *norm_act = use_resid16 ? resid16 : act16;
 
         // Self-attention (post-norm): QKV read x directly, then +bias.
-        if (bf16_act) {
+        if (act_dtype == CUDA_DTYPE_BF16) {
             if (linear_bf16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden,
                              0.0f) != 0)
+                return -1;
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            if (linear_f16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden,
+                            0.0f) != 0)
                 return -1;
         } else {
             if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
@@ -2402,55 +3055,115 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
                                                                               total, qkv_dim);
         if (launch_check() != 0)
             return -1;
-        // flash writes the bf16 attention output into `act`; the materialized path
-        // (NULL) writes F32 attn_out (computed on bf16 tensor cores via FAST_16BF).
+        // Flash writes reduced-precision attention output into act16; the
+        // materialized path writes F32 attn_out.
         if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset, qkv_dim,
-                                scale, flash ? act : NULL) != 0)
+                                scale, flash ? act16 : NULL, flash ? act_dtype : CUDA_DTYPE_F32) != 0)
             return -1;
 
         // Output dense(+bias), residual into x (F32), then post-attention LayerNorm
         // (also emitting bf16 act for the FFN gate-up GEMM in the bf16 path). With
         // flash the attn output is already bf16 in `act`, so wo reads it directly.
-        if (flash) {
-            if (linear_bf16x(ctx, &l->wo, act, ctx->x, total, c->q_dim, hidden, c->q_dim,
-                             bf16_resid ? 0.0f : 1.0f) != 0)
+        if (flash && act_dtype == CUDA_DTYPE_BF16) {
+            if (linear_bf16x(ctx, &l->wo, act_bf16, ctx->x, total, c->q_dim, hidden, c->q_dim,
+                             use_resid16 ? 0.0f : 1.0f) != 0)
+                return -1;
+        } else if (flash && act_dtype == CUDA_DTYPE_F16) {
+            if (linear_f16x(ctx, &l->wo, act_f16, ctx->x, total, c->q_dim, hidden, c->q_dim,
+                            use_resid16 ? 0.0f : 1.0f) != 0)
                 return -1;
         } else if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0) {
             return -1;
         }
         if (bf16_resid) {
             layer_norm_bias_resid_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-                resid, resid, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total, hidden,
+                resid_bf16, resid_bf16, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total,
+                hidden, eps);
+        } else if (f16_resid) {
+            layer_norm_bias_resid_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_f16, resid_f16, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total,
+                hidden, eps);
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            layer_norm_bias_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                ctx->x, act_f16, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total, hidden,
                 eps);
         } else {
             layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-                ctx->x, bf16_act ? act : nullptr, ctx->x, l->o_bias, l->input_norm,
+                ctx->x, bf16_act ? act_bf16 : nullptr, ctx->x, l->o_bias, l->input_norm,
                 l->attn_ln_bias, total, hidden, eps);
         }
         if (launch_check() != 0)
             return -1;
-        norm_act = bf16_resid ? resid : act;
+        norm_act = use_resid16 ? resid16 : act16;
 
         // Feed-forward (post-norm): dense(+bias) -> GeLU -> dense(+bias).
-        if (bf16_act) {
-            if (linear_bf16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total, hidden,
-                             inter, hidden, 0.0f) != 0)
+        if (act_dtype == CUDA_DTYPE_BF16) {
+            if (ffn16) {
+                if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_BF16,
+                                     ctx->ffn_gate_up_16, CUDA_DTYPE_BF16, total, hidden, inter,
+                                     hidden) != 0)
+                    return -1;
+            } else if (linear_bf16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total, hidden,
+                                    inter, hidden, 0.0f) != 0) {
                 return -1;
+            }
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            if (ffn16) {
+                if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_F16,
+                                     ctx->ffn_gate_up_16, CUDA_DTYPE_F16, total, hidden, inter,
+                                     hidden) != 0)
+                    return -1;
+            } else if (linear_f16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total, hidden,
+                                   inter, hidden, 0.0f) != 0) {
+                return -1;
+            }
         } else {
             if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
                 return -1;
         }
         int inter_count = total * inter;
-        if (bf16_act) {
-            // GELU reads the F32 gate-up result and writes bf16 act for down_proj.
-            if (c->ffn_act == FFWD_ACT_GELU_TANH)
+        if (act_dtype == CUDA_DTYPE_BF16) {
+            if (ffn16) {
+                const __nv_bfloat16 *gate = (const __nv_bfloat16 *)ctx->ffn_gate_up_16;
+                if (c->ffn_act == FFWD_ACT_GELU_TANH)
+                    bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads,
+                                                     0, ctx->stream>>>(act_bf16, gate,
+                                                                       l->ffn_inter_bias, total,
+                                                                       inter);
+                else
+                    bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                ctx->stream>>>(act_bf16, gate, l->ffn_inter_bias,
+                                                               total, inter);
+            } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
                 bias_gelu_tanh_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                                ctx->stream>>>(act, ctx->ffn_gate_up,
+                                                ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
                                                                l->ffn_inter_bias, total, inter);
-            else
+            } else {
                 bias_gelu_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                           ctx->stream>>>(act, ctx->ffn_gate_up, l->ffn_inter_bias,
-                                                          total, inter);
+                                           ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
+                                                          l->ffn_inter_bias, total, inter);
+            }
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            if (ffn16) {
+                const __half *gate = (const __half *)ctx->ffn_gate_up_16;
+                if (c->ffn_act == FFWD_ACT_GELU_TANH)
+                    bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads,
+                                                     0, ctx->stream>>>(act_f16, gate,
+                                                                       l->ffn_inter_bias, total,
+                                                                       inter);
+                else
+                    bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                ctx->stream>>>(act_f16, gate, l->ffn_inter_bias,
+                                                               total, inter);
+            } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
+                bias_gelu_tanh_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                               ctx->stream>>>(act_f16, ctx->ffn_gate_up,
+                                                              l->ffn_inter_bias, total, inter);
+            } else {
+                bias_gelu_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                          ctx->stream>>>(act_f16, ctx->ffn_gate_up,
+                                                         l->ffn_inter_bias, total, inter);
+            }
         } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
             bias_gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
                 ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
@@ -2460,9 +3173,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         }
         if (launch_check() != 0)
             return -1;
-        if (bf16_act) {
-            if (linear_bf16x(ctx, &l->down_proj, act, ctx->x, total, inter, hidden, inter,
-                             bf16_resid ? 0.0f : 1.0f) != 0)
+        if (act_dtype == CUDA_DTYPE_BF16) {
+            if (linear_bf16x(ctx, &l->down_proj, act_bf16, ctx->x, total, inter, hidden, inter,
+                             use_resid16 ? 0.0f : 1.0f) != 0)
+                return -1;
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            if (linear_f16x(ctx, &l->down_proj, act_f16, ctx->x, total, inter, hidden, inter,
+                            use_resid16 ? 0.0f : 1.0f) != 0)
                 return -1;
         } else {
             if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
@@ -2470,11 +3187,19 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         }
         if (bf16_resid) {
             layer_norm_bias_resid_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-                resid, resid, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias, total,
+                resid_bf16, resid_bf16, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias,
+                total, hidden, eps);
+        } else if (f16_resid) {
+            layer_norm_bias_resid_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_f16, resid_f16, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias,
+                total, hidden, eps);
+        } else if (act_dtype == CUDA_DTYPE_F16) {
+            layer_norm_bias_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                ctx->x, act_f16, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias, total,
                 hidden, eps);
         } else {
             layer_norm_bias_kernel<<<total, 256, ln_smem, ctx->stream>>>(
-                ctx->x, bf16_act ? act : nullptr, ctx->x, l->ffn_out_bias, l->post_attn_norm,
+                ctx->x, bf16_act ? act_bf16 : nullptr, ctx->x, l->ffn_out_bias, l->post_attn_norm,
                 l->ffn_ln_bias, total, hidden, eps);
         }
         if (launch_check() != 0)
@@ -2483,7 +3208,14 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     if (bf16_resid) {
         size_t n = (size_t)total * (size_t)hidden;
         cast_bf16_to_f32_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(ctx->x,
-                                                                                         resid, n);
+                                                                                         resid_bf16,
+                                                                                         n);
+        if (launch_check() != 0)
+            return -1;
+    } else if (f16_resid) {
+        size_t n = (size_t)total * (size_t)hidden;
+        cast_f16_to_f32_kernel<<<(n + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            ctx->x, resid_f16, n);
         if (launch_check() != 0)
             return -1;
     }
@@ -2504,7 +3236,7 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     int threads = 256;
     int blocks_hidden = (total * c->hidden_size + threads - 1) / threads;
     ffwd_lookup_kernel<<<blocks_hidden, threads, 0, ctx->stream>>>(
-        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.bf16, total, c->hidden_size,
+        ctx->x, ctx->token_ids, ctx->embed_tokens.d, ctx->embed_tokens.dtype, total, c->hidden_size,
         c->vocab_size);
     if (launch_check() != 0)
         return -1;
@@ -2521,7 +3253,8 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
     __nv_bfloat16 *act = (__nv_bfloat16 *)ctx->act_bf16;
     // BF16-weight layers run attention in BF16 (cuda_attention_gemm gets `act`);
     // the batched layout must match. Weight dtype is uniform across layers.
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, ctx->weights_bf16) != 0)
+    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim,
+                           ctx->weights_bf16 ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32) != 0)
         return -1;
     for (int layer = 0; layer < c->n_layers; layer++) {
         cuda_layer_t *l = &ctx->layers[layer];
@@ -2559,7 +3292,8 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
             return -1;
 
         if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset, qkv_dim,
-                                scale, wbf16 ? act : NULL) != 0)
+                                scale, wbf16 ? act : NULL,
+                                wbf16 ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32) != 0)
             return -1;
 
         if (wbf16) {
@@ -2602,7 +3336,7 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
                                                     ctx->ffn_gate_up, total, c->intermediate_size);
             if (launch_check() != 0)
                 return -1;
-            if (linear_ex(ctx, &l->down_proj, ctx->ffn_gate_up, 0, ctx->x, total,
+            if (linear_ex(ctx, &l->down_proj, ctx->ffn_gate_up, CUDA_DTYPE_F32, ctx->x, total,
                           c->intermediate_size, c->hidden_size, 2 * c->intermediate_size, 1.0f) != 0)
                 return -1;
         }
@@ -2805,7 +3539,7 @@ ffwd_cuda_late_ctx_t *ffwd_cuda_late_load(const char *model_dir) {
     const ffwd_weight_ref_t *proj = ffwd_late_model_projection(cpu_late);
     if (!proj || ctx->token_dim <= 0 ||
         load_matrix(&ctx->projection, proj, ctx->token_dim, ctx->base->config.hidden_size,
-                    ctx->base->weights_bf16) != 0) {
+                    ctx->base->weight_dtype) != 0) {
         ffwd_cuda_late_free(ctx);
         return NULL;
     }

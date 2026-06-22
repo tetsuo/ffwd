@@ -23,16 +23,16 @@ void ffwd_cli_help(FILE *f) {
     fputs("  --gpu-gemm-mode MODE\n"
           "               GPU GEMM compute mode: f32, tf32, bf16, or 16f (default: f32)\n"
           "  --gpu-weight-dtype DTYPE\n"
-          "               GPU weight storage: f32 or bf16 (default: model dtype).\n"
-          "               bf16 halves weight memory and uses BF16 tensor cores\n",
+          "               GPU weight storage: f32, bf16, or f16 (default: model dtype).\n"
+          "               bf16/f16 halve weight memory and use 16-bit tensor cores\n",
           f);
 }
 
 void ffwd_server_help(FILE *f) {
     fputs("  --gpu-gemm-mode MODE      GPU GEMM compute: f32, tf32, bf16, or 16f\n"
           "                            (default: f32, exact)\n"
-          "  --gpu-weight-dtype DTYPE  GPU weight storage: f32 or bf16 (default:\n"
-          "                            model dtype); bf16 halves weight memory\n",
+          "  --gpu-weight-dtype DTYPE  GPU weight storage: f32, bf16, or f16\n"
+          "                            (default: model dtype); 16-bit halves memory\n",
           f);
 }
 
@@ -44,10 +44,12 @@ int ffwd_init(const ffwd_options_t *opts, char *err, size_t errlen) {
     if (opts->gpu_weight_dtype) {
         if (!strcmp(opts->gpu_weight_dtype, "bf16"))
             ffwd_cuda_set_weights_bf16(1);
+        else if (!strcmp(opts->gpu_weight_dtype, "f16") || !strcmp(opts->gpu_weight_dtype, "fp16"))
+            ffwd_cuda_set_weights_f16(1);
         else if (!strcmp(opts->gpu_weight_dtype, "f32"))
             ffwd_cuda_set_weights_bf16(0);
         else {
-            snprintf(err, errlen, "--gpu-weight-dtype must be f32 or bf16");
+            snprintf(err, errlen, "--gpu-weight-dtype must be f32, bf16, or f16");
             return -1;
         }
     }

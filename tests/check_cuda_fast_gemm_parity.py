@@ -131,7 +131,7 @@ def main() -> int:
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--mode", choices=("f32", "tf32", "bf16", "16f"),
                     default="tf32")
-    ap.add_argument("--weights", choices=("f32", "bf16"), default="f32")
+    ap.add_argument("--weights", choices=("f32", "bf16", "f16"), default="f32")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-diff", type=float, default=None)
     ap.add_argument("--min-cosine", type=float, default=0.999)

@@ -23,6 +23,7 @@ typedef struct ffwd_cuda_late_ctx ffwd_cuda_late_ctx_t;
 
 FFWD_API int ffwd_cuda_set_fast_gemm(const char *mode);
 FFWD_API int ffwd_cuda_set_weights_bf16(int on);
+FFWD_API int ffwd_cuda_set_weights_f16(int on);
 
 FFWD_API ffwd_cuda_ctx_t *ffwd_cuda_load(const char *model_dir);
 FFWD_API void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx);
