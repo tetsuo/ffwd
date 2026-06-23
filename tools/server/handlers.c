@@ -27,15 +27,32 @@ typedef struct {
     int output_index;
 } embedding_batch_item;
 
-static int async_embedding_render_enabled(void) {
-    static int init = 0, enabled = 1;
+/* Render placement (auto by default). JSON serialization is deferred to the
+ * renderer thread only when another batch is already queued for the worker, so
+ * the worker can start the next GPU launch while results serialize; when the
+ * queue is empty (single-stream), the worker renders inline and skips the
+ * thread handoff, which otherwise costs ~1-2% with nothing to overlap.
+ * FFWD_SERVER_ASYNC_RENDER=0 forces inline, =1 forces always-deferred (A/B). */
+static int async_render_mode(void) {
+    static int init = 0, mode = -1; /* -1 auto, 0 inline, 1 deferred */
     if (!init) {
         const char *e = getenv("FFWD_SERVER_ASYNC_RENDER");
-        if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
-            enabled = 0;
+        if (e) {
+            if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false"))
+                mode = 0;
+            else if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "true"))
+                mode = 1;
+        }
         init = 1;
     }
-    return enabled;
+    return mode;
+}
+
+static int render_should_defer(http_server *s) {
+    int mode = async_render_mode();
+    if (mode >= 0)
+        return mode;
+    return worker_has_pending_jobs(s);
 }
 
 static int embedding_batch_item_cmp(const void *a, const void *b) {
@@ -114,12 +131,13 @@ void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
         start += cur;
     }
 
+    int defer_render = render_should_defer(reqs[0]->j->srv);
     pos = 0;
     for (int i = 0; i < n_reqs; i++) {
         reqs[i]->j->infer_ns += infer_ns;
         if (failed) {
             job_set_error(reqs[i]->j, 500, "embedding failed", "server_error");
-        } else if (!async_embedding_render_enabled()) {
+        } else if (!defer_render) {
             uint64_t t0 = nstime();
             if (render_embedding_response(reqs[i], embs + (size_t)pos * dim) != 0)
                 job_set_error(reqs[i]->j, 500, "embedding normalization failed", "server_error");

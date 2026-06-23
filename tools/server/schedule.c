@@ -144,6 +144,16 @@ int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
     return n;
 }
 
+/* True when more jobs are already waiting for the worker. The render placement
+ * decision (handlers.c) uses this so it only hands a finished batch to the
+ * renderer thread when the worker has another batch to run. */
+int worker_has_pending_jobs(http_server *s) {
+    pthread_mutex_lock(&s->mu);
+    int pending = s->job_head != NULL;
+    pthread_mutex_unlock(&s->mu);
+    return pending;
+}
+
 void enqueue_job(job *j) {
     http_server *s = j->srv;
     pthread_mutex_lock(&s->mu);

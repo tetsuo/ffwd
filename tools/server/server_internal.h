@@ -324,6 +324,7 @@ void execute_rerank_request(rerank_request *r);
 
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */
 void enqueue_job(job *j);
+int worker_has_pending_jobs(http_server *s);
 void enqueue_render_job(job *j);
 job *dequeue_render_job(http_server *s);
 void finish_job(job *j);
