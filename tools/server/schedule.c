@@ -182,6 +182,17 @@ int worker_has_pending_jobs(http_server *s) {
     return pending;
 }
 
+/* True when work is already queued anywhere ahead of the worker (untokenized or
+ * tokenized). dispatch routes a new request to the tokenizer thread when this
+ * holds, so tokenization overlaps in-flight work; an otherwise idle pipeline
+ * tokenizes the request inline on the worker and skips the queue hand-off. */
+int server_has_backlog(http_server *s) {
+    pthread_mutex_lock(&s->mu);
+    int busy = s->raw_head != NULL || s->job_head != NULL;
+    pthread_mutex_unlock(&s->mu);
+    return busy;
+}
+
 void enqueue_job(job *j) {
     http_server *s = j->srv;
     pthread_mutex_lock(&s->mu);
@@ -309,11 +320,12 @@ static void process_unknown_job(job *j) {
     cJSON_Delete(root);
 }
 
-/* Parse and tokenize one job into a heap request attached to j->prep. Runs on
- * the tokenizer thread when tokenize-off-worker is on, or inline on the worker
- * otherwise; the worker moves *prep into its request array. An unknown endpoint
- * leaves prep_kind 0 (process_unknown_job handles it); a parse failure leaves
- * prep NULL with the 422 already set, so the worker finishes it as not-ready. */
+/* Parse and tokenize one job into a heap request attached to j->prep, which the
+ * worker then moves into its request array. Runs on the tokenizer thread, or on
+ * the worker itself for a request that reached the job queue untokenized. An
+ * unknown endpoint leaves prep_kind 0 (process_unknown_job handles it); a parse
+ * failure leaves prep NULL with the 422 already set, so the worker finishes it
+ * as not-ready. The tokenized flag guards against tokenizing twice. */
 void tokenize_job(http_server *s, job *j) {
     j->tokenized = 1;
     if (!j->started_ns)
@@ -349,25 +361,7 @@ void tokenize_job(http_server *s, job *j) {
     }
 }
 
-/* Cross-request batch merging (default on). When enabled, every compatible
- * ready request in the arrival window is flattened into one pool and re-packed
- * into token-budget batches by execute_*_request_list, so mixed client batch
- * shapes fill the GPU batch instead of each whole request running on its own
- * partly-empty launch. FFWD_SERVER_MERGE_BATCHES=0 restores whole-request
- * grouping for an A/B comparison. Read once on the worker thread, so no race. */
-static int server_merge_batches_enabled(void) {
-    static int init = 0, enabled = 1;
-    if (!init) {
-        const char *e = getenv("FFWD_SERVER_MERGE_BATCHES");
-        if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
-            enabled = 0;
-        init = 1;
-    }
-    return enabled;
-}
-
 void process_job_group(http_server *s, job **jobs, int n_jobs) {
-    int merge_batches = server_merge_batches_enabled();
     embedding_request *std_reqs = xcalloc((size_t)n_jobs, sizeof(*std_reqs));
     contextual_request *ctx_reqs = xcalloc((size_t)n_jobs, sizeof(*ctx_reqs));
     rerank_request *rerank_reqs = xcalloc((size_t)n_jobs, sizeof(*rerank_reqs));
@@ -376,11 +370,11 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
     embedding_request **std_group = xmalloc((size_t)n_jobs * sizeof(*std_group));
     contextual_request **ctx_group = xmalloc((size_t)n_jobs * sizeof(*ctx_group));
 
-    /* Tokenize on the worker only for jobs the tokenizer stage did not already
-     * prepare (tokenize-off-worker disabled), then move each prepared request
-     * out of its job into the contiguous array the grouping below indexes. The
-     * move transfers the heap pointers; freeing the wrapper leaves the array
-     * slot owning them, freed once at the end. */
+    /* Tokenize any job that reached the queue untokenized (dispatched inline
+     * past the tokenizer thread), then move each prepared request out of its job
+     * into the contiguous array the grouping below indexes. The move transfers
+     * the heap pointers; freeing the wrapper leaves the array slot owning them,
+     * freed once at the end. */
     for (int i = 0; i < n_jobs; i++) {
         if (!jobs[i]->tokenized)
             tokenize_job(s, jobs[i]);
@@ -420,24 +414,17 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
             finish_job(jobs[i]);
             done[i] = 1;
         } else if (kind[i] == 1) {
+            /* Pool every compatible ready request in this window into one list.
+             * execute_embedding_request_list length-sorts the inputs and packs
+             * them into token-budget batches, so mixed client batch shapes fill
+             * the GPU batch instead of each request running on a partly-empty
+             * launch of its own. */
             int group_n = 1;
-            int group_inputs = std_reqs[i].n_inputs;
-            int group_tokens = std_reqs[i].total_tokens;
             std_group[0] = &std_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
-                if (done[k] || kind[k] != 1 || !std_reqs[k].ready ||
-                    !embedding_request_compatible(&std_reqs[i], &std_reqs[k]))
-                    continue;
-                /* Merge mode pools every compatible request and lets the executor
-                 * pack token-budget batches; the off path keeps only requests
-                 * that wholly fit one batch (the pre-merge grouping). */
-                if (!merge_batches &&
-                    !embedding_request_fits_group(&std_reqs[k], group_inputs, group_tokens,
-                                                  s->batch_size, s->max_batch_tokens))
-                    continue;
-                std_group[group_n++] = &std_reqs[k];
-                group_inputs += std_reqs[k].n_inputs;
-                group_tokens += std_reqs[k].total_tokens;
+                if (!done[k] && kind[k] == 1 && std_reqs[k].ready &&
+                    embedding_request_compatible(&std_reqs[i], &std_reqs[k]))
+                    std_group[group_n++] = &std_reqs[k];
             }
             execute_embedding_request_list(std_group, group_n);
             for (int k = 0; k < group_n; k++) {
@@ -450,20 +437,11 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
             }
         } else {
             int group_n = 1;
-            int group_docs = ctx_reqs[i].n_docs;
-            int group_tokens = ctx_reqs[i].total_tokens;
             ctx_group[0] = &ctx_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
-                if (done[k] || kind[k] != 2 || !ctx_reqs[k].ready ||
-                    !contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]))
-                    continue;
-                if (!merge_batches &&
-                    !contextual_request_fits_group(&ctx_reqs[k], group_docs, group_tokens,
-                                                   s->batch_size, s->max_batch_tokens))
-                    continue;
-                ctx_group[group_n++] = &ctx_reqs[k];
-                group_docs += ctx_reqs[k].n_docs;
-                group_tokens += ctx_reqs[k].total_tokens;
+                if (!done[k] && kind[k] == 2 && ctx_reqs[k].ready &&
+                    contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]))
+                    ctx_group[group_n++] = &ctx_reqs[k];
             }
             execute_contextual_request_list(ctx_group, group_n);
             for (int k = 0; k < group_n; k++) {

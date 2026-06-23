@@ -27,33 +27,11 @@ typedef struct {
     int output_index;
 } embedding_batch_item;
 
-/* Render placement (auto by default). JSON serialization is deferred to the
- * renderer thread only when another batch is already queued for the worker, so
- * the worker can start the next GPU launch while results serialize; when the
- * queue is empty (single-stream), the worker renders inline and skips the
- * thread handoff, which otherwise costs ~1-2% with nothing to overlap.
- * FFWD_SERVER_ASYNC_RENDER=0 forces inline, =1 forces always-deferred (A/B). */
-static int async_render_mode(void) {
-    static int init = 0, mode = -1; /* -1 auto, 0 inline, 1 deferred */
-    if (!init) {
-        const char *e = getenv("FFWD_SERVER_ASYNC_RENDER");
-        if (e) {
-            if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false"))
-                mode = 0;
-            else if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "true"))
-                mode = 1;
-        }
-        init = 1;
-    }
-    return mode;
-}
-
-static int render_should_defer(http_server *s) {
-    int mode = async_render_mode();
-    if (mode >= 0)
-        return mode;
-    return worker_has_pending_jobs(s);
-}
+/* Hand JSON serialization to the renderer thread only when another batch is
+ * already queued, so the worker can start that GPU launch while these results
+ * serialize. With nothing else queued the worker renders inline, which avoids a
+ * thread hand-off that buys no overlap and adds latency to the reply. */
+static int render_should_defer(http_server *s) { return worker_has_pending_jobs(s); }
 
 static int embedding_batch_item_cmp(const void *a, const void *b) {
     const embedding_batch_item *ia = a;
@@ -63,17 +41,6 @@ static int embedding_batch_item_cmp(const void *a, const void *b) {
     if (ia->input.n_tokens > ib->input.n_tokens)
         return 1;
     return ia->output_index - ib->output_index;
-}
-
-int embedding_request_fits_group(const embedding_request *r,
-                                 int group_inputs,
-                                 int group_tokens,
-                                 int max_batch,
-                                 int max_batch_tokens) {
-    if (group_inputs == 0)
-        return 1;
-    return r->n_inputs <= max_batch - group_inputs &&
-           r->total_tokens <= max_batch_tokens - group_tokens;
 }
 
 void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
@@ -157,16 +124,6 @@ void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
 int contextual_request_compatible(const contextual_request *a, const contextual_request *b) {
     return a->ready && b->ready && a->model == b->model && a->dims == b->dims &&
            !strcmp(a->encoding, b->encoding);
-}
-
-int contextual_request_fits_group(const contextual_request *r,
-                                  int group_docs,
-                                  int group_tokens,
-                                  int max_batch,
-                                  int max_batch_tokens) {
-    if (group_docs == 0)
-        return 1;
-    return r->n_docs <= max_batch - group_docs && r->total_tokens <= max_batch_tokens - group_tokens;
 }
 
 typedef struct {

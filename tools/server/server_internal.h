@@ -51,18 +51,6 @@
 #define FFWD_MLX_MEMORY_BUDGET_PERCENT  90
 #define FFWD_MLX_RESIDENT_MULTIPLIER    2
 
-/* Runtime diagnostic switches. All are optional: the default is always the
- * tuned release path, so nothing has to be set to get full performance. Each is
- * read once at startup and exists only to isolate one pipeline stage for an A/B
- * comparison.
- *   FFWD_SERVER_TOKENIZE_OFF_WORKER  default on   - 0 tokenizes on the worker
- *                                                   instead of a separate thread
- *   FFWD_SERVER_MERGE_BATCHES        default on   - 0 groups only requests that
- *                                                   wholly fit one batch
- *   FFWD_SERVER_ASYNC_RENDER         default auto - 0 always inline, 1 always
- *                                                   defer; auto overlaps on load
- * Backend kernel switches (FFWD_CUDA_*) are separate and live in libffwd. */
-
 typedef enum { MODEL_KIND_STANDARD, MODEL_KIND_CONTEXTUAL, MODEL_KIND_LATE } model_kind;
 
 typedef enum {
@@ -117,10 +105,9 @@ typedef struct {
     int worker_init_rc;
     job *job_head;
     job *job_tail;
-    /* Tokenizer stage: when tokenize_off_worker is set, dispatch enqueues raw
-     * jobs here and a dedicated thread parses + tokenizes them off the worker so
+    /* Tokenizer stage: dispatch enqueues a raw job here when the pipeline is
+     * busy, and a dedicated thread parses + tokenizes it off the worker so
      * tokenization overlaps the GPU instead of serializing in front of it. */
-    int tokenize_off_worker;
     pthread_t tokenizer;
     pthread_cond_t raw_cv;
     int raw_stopping;
@@ -179,10 +166,10 @@ struct job {
     char *extra_headers;
     char *response;
     size_t response_len;
-    /* Filled by the tokenizer stage (tokenize_job): prep points at a heap
-     * request of type prep_kind (1 embedding, 2 contextual, 3 rerank), which the
-     * worker moves into its request array. tokenized guards re-tokenizing when
-     * the worker runs tokenize_job inline (tokenize-off-worker disabled). */
+    /* Filled by tokenize_job (on the tokenizer thread, or on the worker for a
+     * request dispatched inline): prep points at a heap request of type
+     * prep_kind (1 embedding, 2 contextual, 3 rerank), which the worker moves
+     * into its request array. tokenized guards against tokenizing twice. */
     int tokenized;
     int prep_kind;
     void *prep;
@@ -333,19 +320,9 @@ void free_models(http_server *s);
 /* ---- server_handlers.c: per-endpoint prepare / batch-group / execute ---- */
 void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_request *out);
 int embedding_request_compatible(const embedding_request *a, const embedding_request *b);
-int embedding_request_fits_group(const embedding_request *r,
-                                 int group_inputs,
-                                 int group_tokens,
-                                 int max_batch,
-                                 int max_batch_tokens);
 void execute_embedding_request_list(embedding_request **reqs, int n_reqs);
 void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_request *out);
 int contextual_request_compatible(const contextual_request *a, const contextual_request *b);
-int contextual_request_fits_group(const contextual_request *r,
-                                  int group_docs,
-                                  int group_tokens,
-                                  int max_batch,
-                                  int max_batch_tokens);
 void execute_contextual_request_list(contextual_request **reqs, int n_reqs);
 void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out);
 void execute_rerank_request(rerank_request *r);
@@ -353,6 +330,7 @@ void execute_rerank_request(rerank_request *r);
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */
 void enqueue_job(job *j);
 int worker_has_pending_jobs(http_server *s);
+int server_has_backlog(http_server *s);
 void enqueue_raw_job(job *j);
 job *dequeue_raw_job(http_server *s);
 void tokenize_job(http_server *s, job *j);

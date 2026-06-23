@@ -66,17 +66,6 @@ static bool auth_ok(http_server *s, const char *auth) {
            !strcmp(auth + sizeof(prefix) - 1, s->api_key);
 }
 
-/* Tokenize-off-worker (default on). When set, dispatch hands raw jobs to the
- * tokenizer thread so parsing and tokenization overlap the GPU instead of
- * running in front of it on the worker. FFWD_SERVER_TOKENIZE_OFF_WORKER=0
- * keeps tokenization on the worker for an A/B comparison. */
-static int tokenize_off_worker_default(void) {
-    const char *e = getenv("FFWD_SERVER_TOKENIZE_OFF_WORKER");
-    if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
-        return 0;
-    return 1;
-}
-
 void dispatch_request(client *c) {
     aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
 
@@ -117,7 +106,10 @@ void dispatch_request(client *c) {
     j->auth = c->req.auth ? xstrdup(c->req.auth) : NULL;
     j->created_ns = nstime();
     client_incref(c);
-    if (c->srv->tokenize_off_worker)
+    /* Tokenize off the worker when the pipeline is already busy so it overlaps
+     * in-flight work; tokenize inline on the worker when idle to avoid a
+     * queue hand-off that single-stream requests gain nothing from. */
+    if (server_has_backlog(c->srv))
         enqueue_raw_job(j);
     else
         enqueue_job(j);
@@ -232,7 +224,7 @@ static void *worker_main(void *arg) {
 /* Tokenizer stage: parse + tokenize raw jobs off the worker, then feed the
  * worker's job queue. Waits for the worker to finish model init first, because
  * a GPU build finalizes the model config (dims, pooling) on the worker and
- * request validation reads it. Idle when tokenize-off-worker is disabled. */
+ * request validation reads it. Idle while no request is routed through it. */
 static void *tokenizer_main(void *arg) {
     http_server *s = arg;
     pthread_mutex_lock(&s->mu);
@@ -354,7 +346,6 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     s.max_batch_tokens =
         cfg->max_batch_tokens > 0 ? cfg->max_batch_tokens : FFWD_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0 ? cfg->batch_wait_us : ffwd_default_batch_wait_us();
-    s.tokenize_off_worker = tokenize_off_worker_default();
     s.backend_opts = backend_opts;
     if (cfg->api_key && cfg->api_key[0])
         s.api_key = xstrdup(cfg->api_key);
