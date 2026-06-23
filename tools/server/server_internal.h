@@ -51,6 +51,18 @@
 #define FFWD_MLX_MEMORY_BUDGET_PERCENT  90
 #define FFWD_MLX_RESIDENT_MULTIPLIER    2
 
+/* Runtime diagnostic switches. All are optional: the default is always the
+ * tuned release path, so nothing has to be set to get full performance. Each is
+ * read once at startup and exists only to isolate one pipeline stage for an A/B
+ * comparison.
+ *   FFWD_SERVER_TOKENIZE_OFF_WORKER  default on   - 0 tokenizes on the worker
+ *                                                   instead of a separate thread
+ *   FFWD_SERVER_MERGE_BATCHES        default on   - 0 groups only requests that
+ *                                                   wholly fit one batch
+ *   FFWD_SERVER_ASYNC_RENDER         default auto - 0 always inline, 1 always
+ *                                                   defer; auto overlaps on load
+ * Backend kernel switches (FFWD_CUDA_*) are separate and live in libffwd. */
+
 typedef enum { MODEL_KIND_STANDARD, MODEL_KIND_CONTEXTUAL, MODEL_KIND_LATE } model_kind;
 
 typedef enum {
