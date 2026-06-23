@@ -129,6 +129,48 @@ int render_embedding_response(embedding_request *r, const float *embs) {
     return 0;
 }
 
+void job_render_free(job *j) {
+    if (!j)
+        return;
+    free(j->embedding_render.encoding);
+    free(j->embedding_render.embs);
+    memset(&j->embedding_render, 0, sizeof(j->embedding_render));
+    j->render_kind = 0;
+}
+
+void job_set_embedding_render(job *j, const embedding_request *r, const float *embs) {
+    if (!j || !r || !r->model || !embs)
+        return;
+    job_render_free(j);
+    size_t count = (size_t)r->n_inputs * (size_t)r->model->info->dim;
+    j->embedding_render.model = r->model;
+    j->embedding_render.encoding = xstrdup(r->encoding);
+    j->embedding_render.embs = xmalloc(count * sizeof(*j->embedding_render.embs));
+    memcpy(j->embedding_render.embs, embs, count * sizeof(*j->embedding_render.embs));
+    j->embedding_render.dims = r->dims;
+    j->embedding_render.n_inputs = r->n_inputs;
+    j->embedding_render.total_tokens = r->total_tokens;
+    j->render_kind = 1;
+}
+
+int render_job_response(job *j) {
+    if (!j || j->render_kind == 0)
+        return 0;
+    if (j->render_kind != 1 || !j->embedding_render.model || !j->embedding_render.encoding ||
+        !j->embedding_render.embs)
+        return -1;
+
+    embedding_request r;
+    memset(&r, 0, sizeof(r));
+    r.j = j;
+    r.model = j->embedding_render.model;
+    r.dims = j->embedding_render.dims;
+    r.encoding = j->embedding_render.encoding;
+    r.n_inputs = j->embedding_render.n_inputs;
+    r.total_tokens = j->embedding_render.total_tokens;
+    return render_embedding_response(&r, j->embedding_render.embs);
+}
+
 void render_contextual_response(contextual_request *r, const float *embs) {
     sbuf b = {0};
     sbuf_puts(&b, "{\"object\":\"list\",\"data\":[");

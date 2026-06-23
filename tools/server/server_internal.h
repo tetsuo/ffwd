@@ -74,8 +74,8 @@ typedef struct {
 typedef struct {
     model_info *info;
     char *path;
-    ffwd_tok_t *tok;        /* tokenizer: text -> ids + the model's special tokens */
-    ffwd_t *backend;        /* compute handle */
+    ffwd_tok_t *tok;           /* tokenizer: text -> ids + the model's special tokens */
+    ffwd_t *backend;           /* compute handle */
     int renormalize_truncated; /* serving policy: re-normalize a Matryoshka cut */
 } loaded_model;
 
@@ -105,6 +105,11 @@ typedef struct {
     int worker_init_rc;
     job *job_head;
     job *job_tail;
+    pthread_t renderer;
+    pthread_cond_t render_cv;
+    int render_stopping;
+    job *render_head;
+    job *render_tail;
     job *done_head;
     job *done_tail;
 
@@ -159,6 +164,15 @@ struct job {
     uint64_t tokenize_ns;
     uint64_t infer_ns;
     uint64_t encode_ns;
+    int render_kind;
+    struct {
+        loaded_model *model;
+        char *encoding;
+        float *embs;
+        int dims;
+        int n_inputs;
+        int total_tokens;
+    } embedding_render;
     job *next;
 };
 
@@ -260,6 +274,9 @@ void append_embedding_value(
 void set_response_from_buf(job *j, sbuf *b);
 int render_embedding_response(embedding_request *r, const float *embs);
 void render_contextual_response(contextual_request *r, const float *embs);
+void job_render_free(job *j);
+void job_set_embedding_render(job *j, const embedding_request *r, const float *embs);
+int render_job_response(job *j);
 
 /* ---- server_models.c: model load/lifecycle, tokenize/inference dispatch ---- */
 loaded_model *loaded_model_for_label(http_server *s, const char *label);
@@ -275,9 +292,9 @@ int tokenize_input(
 int tokenize_late_text(loaded_model *m, job *j, const char *text, int is_query, late_tokens *out);
 int model_ffwd_batch(loaded_model *m, const ffwd_input_t *inputs, int batch, float *out);
 int model_ffwd_spans_batch(loaded_model *m,
-                              const ffwd_context_input_t *inputs,
-                              int batch,
-                              float *out);
+                           const ffwd_context_input_t *inputs,
+                           int batch,
+                           float *out);
 int inference_batch_accepts_input(
     const loaded_model *m, int batch, int packed_tokens, int next_tokens, int max_batch_tokens);
 int configure_loaded_model(loaded_model *m, const ffwd_config_t *config, int token_dim);
@@ -307,6 +324,9 @@ void execute_rerank_request(rerank_request *r);
 
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */
 void enqueue_job(job *j);
+void enqueue_render_job(job *j);
+job *dequeue_render_job(http_server *s);
+void finish_job(job *j);
 int collect_job_batch(http_server *s, job **jobs, int max_jobs);
 void process_job_group(http_server *s, job **jobs, int n_jobs);
 void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask);

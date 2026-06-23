@@ -27,6 +27,17 @@ typedef struct {
     int output_index;
 } embedding_batch_item;
 
+static int async_embedding_render_enabled(void) {
+    static int init = 0, enabled = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_SERVER_ASYNC_RENDER");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
+            enabled = 0;
+        init = 1;
+    }
+    return enabled;
+}
+
 static int embedding_batch_item_cmp(const void *a, const void *b) {
     const embedding_batch_item *ia = a;
     const embedding_batch_item *ib = b;
@@ -108,11 +119,13 @@ void execute_embedding_request_list(embedding_request **reqs, int n_reqs) {
         reqs[i]->j->infer_ns += infer_ns;
         if (failed) {
             job_set_error(reqs[i]->j, 500, "embedding failed", "server_error");
-        } else {
+        } else if (!async_embedding_render_enabled()) {
             uint64_t t0 = nstime();
             if (render_embedding_response(reqs[i], embs + (size_t)pos * dim) != 0)
                 job_set_error(reqs[i]->j, 500, "embedding normalization failed", "server_error");
             reqs[i]->j->encode_ns += nstime() - t0;
+        } else {
+            job_set_embedding_render(reqs[i]->j, reqs[i], embs + (size_t)pos * dim);
         }
         pos += reqs[i]->n_inputs;
     }

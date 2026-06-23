@@ -215,6 +215,23 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+static void *renderer_main(void *arg) {
+    http_server *s = arg;
+    for (;;) {
+        job *j = dequeue_render_job(s);
+        if (!j)
+            break;
+
+        uint64_t t0 = nstime();
+        if (render_job_response(j) != 0)
+            job_set_error(j, 500, "embedding normalization failed", "server_error");
+        j->encode_ns += nstime() - t0;
+        job_render_free(j);
+        finish_job(j);
+    }
+    return NULL;
+}
+
 static int listen_on(const char *host, int port) {
     char portbuf[32];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
@@ -310,10 +327,15 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
 
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.render_cv, NULL);
 
     for (int i = 0; i < cfg->n_models; i++) {
         if (load_one_model(&s, &cfg->models[i]) != 0) {
             free_models(&s);
+            free(s.api_key);
+            pthread_cond_destroy(&s.render_cv);
+            pthread_cond_destroy(&s.cv);
+            pthread_mutex_destroy(&s.mu);
             return 1;
         }
     }
@@ -321,6 +343,10 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     if (pipe(s.completion_pipe) != 0 || pipe(s.signal_pipe) != 0) {
         perror("pipe");
         free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
         return 1;
     }
     set_nonblock(s.completion_pipe[0]);
@@ -341,13 +367,37 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     if (!s.loop) {
         fprintf(stderr, "ffwd-server: failed to create event loop\n");
         free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+
+    if (pthread_create(&s.renderer, NULL, renderer_main, &s) != 0) {
+        fprintf(stderr, "ffwd-server: failed to start renderer\n");
+        aeDeleteEventLoop(s.loop);
+        free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
         return 1;
     }
 
     if (pthread_create(&s.worker, NULL, worker_main, &s) != 0) {
         fprintf(stderr, "ffwd-server: failed to start worker\n");
+        pthread_mutex_lock(&s.mu);
+        s.render_stopping = 1;
+        pthread_cond_signal(&s.render_cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.renderer, NULL);
         aeDeleteEventLoop(s.loop);
         free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
         return 1;
     }
     pthread_mutex_lock(&s.mu);
@@ -356,10 +406,20 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     int worker_init_rc = s.worker_init_rc;
     pthread_mutex_unlock(&s.mu);
     if (worker_init_rc) {
+        pthread_mutex_lock(&s.mu);
+        s.stopping = 1;
+        pthread_cond_signal(&s.cv);
+        pthread_mutex_unlock(&s.mu);
         pthread_join(s.worker, NULL);
+        pthread_mutex_lock(&s.mu);
+        s.render_stopping = 1;
+        pthread_cond_signal(&s.render_cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.renderer, NULL);
         aeDeleteEventLoop(s.loop);
         free_models(&s);
         free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -372,8 +432,17 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         pthread_cond_signal(&s.cv);
         pthread_mutex_unlock(&s.mu);
         pthread_join(s.worker, NULL);
+        pthread_mutex_lock(&s.mu);
+        s.render_stopping = 1;
+        pthread_cond_signal(&s.render_cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.renderer, NULL);
         aeDeleteEventLoop(s.loop);
         free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
         return 1;
     }
 
@@ -400,6 +469,11 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     pthread_cond_signal(&s.cv);
     pthread_mutex_unlock(&s.mu);
     pthread_join(s.worker, NULL);
+    pthread_mutex_lock(&s.mu);
+    s.render_stopping = 1;
+    pthread_cond_signal(&s.render_cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(s.renderer, NULL);
 
     aeDeleteEventLoop(s.loop);
     close(s.completion_pipe[0]);
@@ -408,6 +482,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     close(s.signal_pipe[1]);
     free_models(&s);
     free(s.api_key);
+    pthread_cond_destroy(&s.render_cv);
     pthread_cond_destroy(&s.cv);
     pthread_mutex_destroy(&s.mu);
     return 0;
