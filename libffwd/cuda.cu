@@ -62,6 +62,12 @@ struct ffwd_cuda_ctx {
     void *lt_workspace;  // device workspace for cublasLtMatmul
     size_t lt_ws_bytes;
     void *lt_bias16; // 16-bit cast of an epilogue bias (cuBLASLt rejects F32 bias on 16-bit out)
+    // Cached cuBLASLt plan for the repeated gate-up shape (rebuilt only when the
+    // shape changes, e.g. a new total-token count); skips per-layer heuristics.
+    cublasLtMatmulDesc_t lt_desc;
+    cublasLtMatrixLayout_t lt_A, lt_B, lt_D;
+    cublasLtMatmulHeuristicResult_t lt_heur;
+    int lt_have, lt_k_rows, lt_k_in, lt_k_out, lt_k_xs, lt_k_epi, lt_k_io, lt_k_od;
     cuda_matrix_t embed_tokens;
     cuda_layer_t *layers;
     float *norm;
@@ -2153,12 +2159,26 @@ static int linear_accum(ffwd_cuda_ctx_t *ctx,
     return linear_ex(ctx, w, x, CUDA_DTYPE_F32, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
+static void linear_lt_plan_free(ffwd_cuda_ctx_t *ctx) {
+    if (!ctx->lt_have)
+        return;
+    cublasLtMatrixLayoutDestroy(ctx->lt_D);
+    cublasLtMatrixLayoutDestroy(ctx->lt_B);
+    cublasLtMatrixLayoutDestroy(ctx->lt_A);
+    cublasLtMatmulDescDestroy(ctx->lt_desc);
+    ctx->lt_have = 0;
+}
+
 // Fused projection via cuBLASLt: y = epilogue(W^T @ x). The epilogue applies the
 // row bias and, for CUBLASLT_EPILOGUE_GELU_BIAS, the exact erf GeLU inside the
 // GEMM, so a separate bias/activation kernel and its [out_dim x rows] HBM
-// round-trip are removed. Operands are the weight's 16-bit dtype (also x's), the
-// output is `out_dtype`, accumulation is F32. The bias is F32. Layouts mirror the
-// cublasGemmEx call (OP_T on the [in_dim x out_dim] weight, OP_N on x).
+// round-trip are removed. Operands and output are 16-bit (bf16/f16), accumulation
+// is F32, the F32 bias is cast to the output dtype (cuBLASLt rejects an F32 bias
+// on 16-bit output). The matmul plan (descriptor + layouts + algo) is cached on
+// the context keyed by shape: the BERT gate-up shape repeats across every layer
+// and across same-size requests, so the heuristic runs ~once per request rather
+// than once per layer. The cached descriptor points its bias at lt_bias16, so the
+// per-call cast refreshes the values the matmul reads.
 static int linear_lt(ffwd_cuda_ctx_t *ctx,
                      const cuda_matrix_t *w,
                      const void *x,
@@ -2174,88 +2194,104 @@ static int linear_lt(ffwd_cuda_ctx_t *ctx,
         fprintf(stderr, "cuda: linear_lt requires 16-bit weights\n");
         return -1;
     }
+    if (out_dtype != CUDA_DTYPE_BF16 && out_dtype != CUDA_DTYPE_F16) {
+        fprintf(stderr, "cuda: linear_lt requires 16-bit output\n");
+        return -1;
+    }
     cudaDataType io = w->dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
-    cudaDataType od = out_dtype == CUDA_DTYPE_F16
-                          ? CUDA_R_16F
-                          : (out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_32F);
+    cudaDataType od = out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
     const float alpha = 1.0f, beta = 0.0f;
-    // cuBLASLt's heuristic rejects an F32 bias when the output is 16-bit
-    // (INVALID_VALUE), so for a 16-bit output cast the F32 bias to the output
-    // dtype into the small lt_bias16 scratch and declare that dtype.
-    const void *bias_dev = bias;
-    cudaDataType bias_t = CUDA_R_32F;
-    if (od == CUDA_R_16BF) {
+
+    // Refresh the bias each call: cast the F32 bias to the output dtype into the
+    // fixed lt_bias16 scratch that the cached descriptor's BIAS_POINTER targets.
+    if (od == CUDA_R_16BF)
         cast_f32_to_bf16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
             (__nv_bfloat16 *)ctx->lt_bias16, bias, out_dim);
-        bias_dev = ctx->lt_bias16;
-        bias_t = CUDA_R_16BF;
-    } else if (od == CUDA_R_16F) {
+    else
         cast_f32_to_f16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
             (__half *)ctx->lt_bias16, bias, out_dim);
-        bias_dev = ctx->lt_bias16;
-        bias_t = CUDA_R_16F;
-    }
 
-    cublasLtMatmulDesc_t op = NULL;
-    cublasLtMatrixLayout_t A = NULL, B = NULL, D = NULL;
-    cublasLtMatmulPreference_t pref = NULL;
-    int rc = -1;
-    do {
-        if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS)
-            break;
-        cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
-                                       sizeof(epilogue));
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
-                                       sizeof(bias_dev));
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_t,
-                                       sizeof(bias_t));
-        // A = weight stored [in_dim x out_dim] col-major (ld in_dim), transposed by op;
-        // B = x stored [in_dim x rows] (ld x_stride); D = y stored [out_dim x rows].
-        if (cublasLtMatrixLayoutCreate(&A, io, in_dim, out_dim, in_dim) != CUBLAS_STATUS_SUCCESS)
-            break;
-        if (cublasLtMatrixLayoutCreate(&B, io, in_dim, rows, x_stride) != CUBLAS_STATUS_SUCCESS)
-            break;
-        if (cublasLtMatrixLayoutCreate(&D, od, out_dim, rows, out_dim) != CUBLAS_STATUS_SUCCESS)
-            break;
-        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS)
-            break;
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                             &ctx->lt_ws_bytes, sizeof(ctx->lt_ws_bytes));
-        cublasLtMatmulHeuristicResult_t heur;
-        int got = 0;
-        cublasStatus_t hst =
-            cublasLtMatmulAlgoGetHeuristic(ctx->lt, op, A, B, D, D, pref, 1, &heur, &got);
-        if (hst != CUBLAS_STATUS_SUCCESS || got == 0) {
-            fprintf(stderr,
-                    "cuda: linear_lt heuristic st=%d got=%d (m=%d n=%d k=%d epi=%d io=%d od=%d)\n",
-                    (int)hst, got, out_dim, rows, in_dim, (int)epilogue, (int)io, (int)od);
-            break;
+    int key_ok = ctx->lt_have && ctx->lt_k_rows == rows && ctx->lt_k_in == in_dim &&
+                 ctx->lt_k_out == out_dim && ctx->lt_k_xs == x_stride &&
+                 ctx->lt_k_epi == (int)epilogue && ctx->lt_k_io == (int)io && ctx->lt_k_od == (int)od;
+    if (!key_ok) {
+        linear_lt_plan_free(ctx);
+        cublasLtMatmulDesc_t op = NULL;
+        cublasLtMatrixLayout_t A = NULL, B = NULL, D = NULL;
+        cublasLtMatmulPreference_t pref = NULL;
+        const void *bias_dev = ctx->lt_bias16;
+        cudaDataType bias_t = od;
+        int ok = 0;
+        do {
+            if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+                CUBLAS_STATUS_SUCCESS)
+                break;
+            cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                           sizeof(epilogue));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
+                                           sizeof(bias_dev));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_t,
+                                           sizeof(bias_t));
+            // A = weight stored [in_dim x out_dim] col-major (ld in_dim), op transposes it;
+            // B = x stored [in_dim x rows] (ld x_stride); D = y stored [out_dim x rows].
+            if (cublasLtMatrixLayoutCreate(&A, io, in_dim, out_dim, in_dim) != CUBLAS_STATUS_SUCCESS)
+                break;
+            if (cublasLtMatrixLayoutCreate(&B, io, in_dim, rows, x_stride) != CUBLAS_STATUS_SUCCESS)
+                break;
+            if (cublasLtMatrixLayoutCreate(&D, od, out_dim, rows, out_dim) != CUBLAS_STATUS_SUCCESS)
+                break;
+            if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS)
+                break;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                 &ctx->lt_ws_bytes, sizeof(ctx->lt_ws_bytes));
+            int got = 0;
+            cublasStatus_t hst =
+                cublasLtMatmulAlgoGetHeuristic(ctx->lt, op, A, B, D, D, pref, 1, &ctx->lt_heur, &got);
+            if (hst != CUBLAS_STATUS_SUCCESS || got == 0) {
+                fprintf(stderr, "cuda: linear_lt heuristic st=%d got=%d (m=%d n=%d k=%d epi=%d)\n",
+                        (int)hst, got, out_dim, rows, in_dim, (int)epilogue);
+                break;
+            }
+            ok = 1;
+        } while (0);
+        if (pref)
+            cublasLtMatmulPreferenceDestroy(pref);
+        if (!ok) {
+            if (D)
+                cublasLtMatrixLayoutDestroy(D);
+            if (B)
+                cublasLtMatrixLayoutDestroy(B);
+            if (A)
+                cublasLtMatrixLayoutDestroy(A);
+            if (op)
+                cublasLtMatmulDescDestroy(op);
+            fprintf(stderr, "cuda: linear_lt plan build failed\n");
+            return -1;
         }
-        cublasStatus_t mst =
-            cublasLtMatmul(ctx->lt, op, &alpha, w->d, A, x, B, &beta, y, D, y, D, &heur.algo,
-                           ctx->lt_workspace, ctx->lt_ws_bytes, ctx->stream);
-        if (mst != CUBLAS_STATUS_SUCCESS) {
-            fprintf(stderr, "cuda: linear_lt matmul st=%d\n", (int)mst);
-            break;
-        }
-        rc = 0;
-    } while (0);
-    if (pref)
-        cublasLtMatmulPreferenceDestroy(pref);
-    if (D)
-        cublasLtMatrixLayoutDestroy(D);
-    if (B)
-        cublasLtMatrixLayoutDestroy(B);
-    if (A)
-        cublasLtMatrixLayoutDestroy(A);
-    if (op)
-        cublasLtMatmulDescDestroy(op);
-    if (rc != 0)
-        fprintf(stderr, "cuda: linear_lt fused matmul failed\n");
-    return rc;
+        ctx->lt_desc = op;
+        ctx->lt_A = A;
+        ctx->lt_B = B;
+        ctx->lt_D = D;
+        ctx->lt_have = 1;
+        ctx->lt_k_rows = rows;
+        ctx->lt_k_in = in_dim;
+        ctx->lt_k_out = out_dim;
+        ctx->lt_k_xs = x_stride;
+        ctx->lt_k_epi = (int)epilogue;
+        ctx->lt_k_io = (int)io;
+        ctx->lt_k_od = (int)od;
+    }
+    cublasStatus_t mst = cublasLtMatmul(ctx->lt, ctx->lt_desc, &alpha, w->d, ctx->lt_A, x, ctx->lt_B,
+                                        &beta, y, ctx->lt_D, y, ctx->lt_D, &ctx->lt_heur.algo,
+                                        ctx->lt_workspace, ctx->lt_ws_bytes, ctx->stream);
+    if (mst != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cuda: linear_lt matmul st=%d\n", (int)mst);
+        return -1;
+    }
+    return 0;
 }
 
 static int gemm_strided_batched(cublasHandle_t blas,
@@ -3017,6 +3053,7 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     cudaFree(ctx->span_lens);
     cudaFree(ctx->lt_workspace);
     cudaFree(ctx->lt_bias16);
+    linear_lt_plan_free(ctx);
     if (ctx->lt)
         cublasLtDestroy(ctx->lt);
     if (ctx->blas)
