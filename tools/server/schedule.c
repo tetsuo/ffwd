@@ -12,13 +12,14 @@
 /* ========================================================================
  * Job queue, micro-batching, and completion
  *
- * dispatch_request (http.c) enqueues one job per framed request; the
+ * dispatch_request (server.c) enqueues one job per framed request; the
  * inference worker thread (worker_main, server.c) drains them with
  * collect_job_batch (a short first-arrival wait groups concurrent arrivals) and
  * runs process_job_group, which routes each job to its endpoint handler and
- * batches compatible ones. Finished jobs go on the done queue and wake the event
- * loop through the completion pipe; completion_cb writes each response back on
- * the loop thread, so sockets are only ever touched there.
+ * merges all compatible requests into one pool that execute_*_request_list
+ * re-packs into token-budget batches. Finished jobs go on the done queue and
+ * wake the event loop through the completion pipe; completion_cb writes each
+ * response back on the loop thread, so sockets are only ever touched there.
  * ======================================================================== */
 
 static void enqueue_done(job *j) {
@@ -253,7 +254,25 @@ static void process_unknown_job(job *j) {
     cJSON_Delete(root);
 }
 
+/* Cross-request batch merging (default on). When enabled, every compatible
+ * ready request in the arrival window is flattened into one pool and re-packed
+ * into token-budget batches by execute_*_request_list, so mixed client batch
+ * shapes fill the GPU batch instead of each whole request running on its own
+ * partly-empty launch. FFWD_SERVER_MERGE_BATCHES=0 restores whole-request
+ * grouping for an A/B comparison. Read once on the worker thread, so no race. */
+static int server_merge_batches_enabled(void) {
+    static int init = 0, enabled = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_SERVER_MERGE_BATCHES");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
+            enabled = 0;
+        init = 1;
+    }
+    return enabled;
+}
+
 void process_job_group(http_server *s, job **jobs, int n_jobs) {
+    int merge_batches = server_merge_batches_enabled();
     embedding_request *std_reqs = xcalloc((size_t)n_jobs, sizeof(*std_reqs));
     contextual_request *ctx_reqs = xcalloc((size_t)n_jobs, sizeof(*ctx_reqs));
     rerank_request *rerank_reqs = xcalloc((size_t)n_jobs, sizeof(*rerank_reqs));
@@ -316,14 +335,19 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
             int group_tokens = std_reqs[i].total_tokens;
             std_group[0] = &std_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
-                if (!done[k] && kind[k] == 1 && std_reqs[k].ready &&
-                    embedding_request_compatible(&std_reqs[i], &std_reqs[k]) &&
-                    embedding_request_fits_group(&std_reqs[k], group_inputs, group_tokens,
-                                                 s->batch_size, s->max_batch_tokens)) {
-                    std_group[group_n++] = &std_reqs[k];
-                    group_inputs += std_reqs[k].n_inputs;
-                    group_tokens += std_reqs[k].total_tokens;
-                }
+                if (done[k] || kind[k] != 1 || !std_reqs[k].ready ||
+                    !embedding_request_compatible(&std_reqs[i], &std_reqs[k]))
+                    continue;
+                /* Merge mode pools every compatible request and lets the executor
+                 * pack token-budget batches; the off path keeps only requests
+                 * that wholly fit one batch (the pre-merge grouping). */
+                if (!merge_batches &&
+                    !embedding_request_fits_group(&std_reqs[k], group_inputs, group_tokens,
+                                                  s->batch_size, s->max_batch_tokens))
+                    continue;
+                std_group[group_n++] = &std_reqs[k];
+                group_inputs += std_reqs[k].n_inputs;
+                group_tokens += std_reqs[k].total_tokens;
             }
             execute_embedding_request_list(std_group, group_n);
             for (int k = 0; k < group_n; k++) {
@@ -340,14 +364,16 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
             int group_tokens = ctx_reqs[i].total_tokens;
             ctx_group[0] = &ctx_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
-                if (!done[k] && kind[k] == 2 && ctx_reqs[k].ready &&
-                    contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]) &&
-                    contextual_request_fits_group(&ctx_reqs[k], group_docs, group_tokens,
-                                                  s->batch_size, s->max_batch_tokens)) {
-                    ctx_group[group_n++] = &ctx_reqs[k];
-                    group_docs += ctx_reqs[k].n_docs;
-                    group_tokens += ctx_reqs[k].total_tokens;
-                }
+                if (done[k] || kind[k] != 2 || !ctx_reqs[k].ready ||
+                    !contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]))
+                    continue;
+                if (!merge_batches &&
+                    !contextual_request_fits_group(&ctx_reqs[k], group_docs, group_tokens,
+                                                   s->batch_size, s->max_batch_tokens))
+                    continue;
+                ctx_group[group_n++] = &ctx_reqs[k];
+                group_docs += ctx_reqs[k].n_docs;
+                group_tokens += ctx_reqs[k].total_tokens;
             }
             execute_contextual_request_list(ctx_group, group_n);
             for (int k = 0; k < group_n; k++) {
