@@ -1082,7 +1082,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
 // scores live in registers and never reach global memory, removing the O(n^2)
 // HBM that dominates BERT attention at batch 32. One block = WARPS query tiles
 // sharing one K/V staging tile; the math is otherwise identical to tc3.
-template <int HD, int WARPS, typename QKV_T>
+template <int HD, int WARPS, typename QKV_T, int DIRECT_KV>
 __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                                                      const QKV_T *qkv,
                                                      const __nv_bfloat16 *kexp,
@@ -1091,6 +1091,10 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                                                      int q_dim,
                                                      int qkv_dim,
                                                      int q_offset,
+                                                     int k_offset,
+                                                     int v_offset,
+                                                     int n_heads,
+                                                     int n_kv_heads,
                                                      float scale) {
     enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
     __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
@@ -1110,6 +1114,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
         return;
     int q0 = block_q0 + warp * QT;
     size_t hv = (size_t)head * HD;
+    int kv_head = head / (n_heads / n_kv_heads);
     __nv_bfloat16 *myq = qsh + warp * QT * HD;
 
     for (int idx = lane; idx < QT * HD; idx += 32) {
@@ -1135,9 +1140,19 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
             int kk = idx / HD;
             int d = idx - kk * HD;
             int key = k0 + kk;
-            size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
-            __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
+            __nv_bfloat16 kval = __float2bfloat16(0.0f);
+            __nv_bfloat16 vval = __float2bfloat16(0.0f);
+            if (key < L) {
+                if (DIRECT_KV) {
+                    size_t base = (size_t)(start + key) * qkv_dim + (size_t)kv_head * HD + d;
+                    kval = __float2bfloat16(load_act(qkv, base + k_offset));
+                    vval = __float2bfloat16(load_act(qkv, base + v_offset));
+                } else {
+                    size_t kb = (size_t)(start + key) * q_dim + hv + d;
+                    kval = kexp[kb];
+                    vval = vexp[kb];
+                }
+            }
             tc_store_swz_bf16<16>(ksh, d, kk, kval);
             vsh[idx] = vval;
         }
@@ -1226,7 +1241,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 // FP16 sibling of the BERT flash kernel. The tiling, online softmax, and
 // register layout intentionally match the BF16 kernel above; only the staged
 // operand type and MMA instruction change.
-template <int HD, int WARPS, typename QKV_T>
+template <int HD, int WARPS, typename QKV_T, int DIRECT_KV>
 __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
                                                          const QKV_T *qkv,
                                                          const __half *kexp,
@@ -1235,6 +1250,10 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
                                                          int q_dim,
                                                          int qkv_dim,
                                                          int q_offset,
+                                                         int k_offset,
+                                                         int v_offset,
+                                                         int n_heads,
+                                                         int n_kv_heads,
                                                          float scale) {
     enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
     __shared__ __align__(16) __half qsh[WARPS * QT * HD];
@@ -1254,6 +1273,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
         return;
     int q0 = block_q0 + warp * QT;
     size_t hv = (size_t)head * HD;
+    int kv_head = head / (n_heads / n_kv_heads);
     __half *myq = qsh + warp * QT * HD;
 
     for (int idx = lane; idx < QT * HD; idx += 32) {
@@ -1279,9 +1299,19 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
             int kk = idx / HD;
             int d = idx - kk * HD;
             int key = k0 + kk;
-            size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            __half kval = key < L ? kexp[kb] : __float2half(0.0f);
-            __half vval = key < L ? vexp[kb] : __float2half(0.0f);
+            __half kval = __float2half(0.0f);
+            __half vval = __float2half(0.0f);
+            if (key < L) {
+                if (DIRECT_KV) {
+                    size_t base = (size_t)(start + key) * qkv_dim + (size_t)kv_head * HD + d;
+                    kval = __float2half(load_act(qkv, base + k_offset));
+                    vval = __float2half(load_act(qkv, base + v_offset));
+                } else {
+                    size_t kb = (size_t)(start + key) * q_dim + hv + d;
+                    kval = kexp[kb];
+                    vval = vexp[kb];
+                }
+            }
             tc_store_swz_f16<16>(ksh, d, kk, kval);
             vsh[idx] = vval;
         }
@@ -2474,6 +2504,22 @@ static int bert_flash_mode(void) {
     return mode;
 }
 
+// BERT flash K/V staging. Unset/default uses direct packed-QKV K/V loads whenever
+// QKV16 is active; 1/on keeps that direct path enabled; 0/off keeps the separate
+// K/V expansion for A/B. This rides QKV16 and never applies to F32 qkv.
+static int bert_direct_kv_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_BERT_DIRECT_KV");
+        if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
+        else if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        init = 1;
+    }
+    return mode;
+}
+
 // out_16 != NULL selects a reduced-precision attention layout: V and the softmax
 // probabilities are stored in out_dtype, and the @V stage emits attention output
 // in the same dtype, ready for the output projection without a cast.
@@ -2519,79 +2565,103 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         fprintf(stderr, "cuda: reduced-precision qkv is only supported by matching BERT flash\n");
         return -1;
     }
+    int direct_kv_mode = bert_direct_kv_mode();
+    int use_bert_direct_kv = use_bert_flash && qkv_dtype != CUDA_DTYPE_F32 &&
+                             qkv_dtype == out_dtype && direct_kv_mode >= 0;
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
-    if (use_bert_flash && out_dtype == CUDA_DTYPE_BF16 && qkv_dtype == CUDA_DTYPE_BF16) {
-        if (!ctx->kexp_bf16)
+    if (!use_bert_direct_kv) {
+        if (use_bert_flash && out_dtype == CUDA_DTYPE_BF16 && qkv_dtype == CUDA_DTYPE_BF16) {
+            if (!ctx->kexp_bf16)
+                return -1;
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp,
+                (const __nv_bfloat16 *)qkv_src, total, H, c->n_kv_heads, hd, qkv_dim, k_offset,
+                v_offset);
+        } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16 && qkv_dtype == CUDA_DTYPE_F16) {
+            if (!ctx->kexp_f16)
+                return -1;
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                (__half *)ctx->kexp_f16, (__half *)ctx->vexp, (const __half *)qkv_src, total, H,
+                c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+        } else if (use_tc_kexp_bf16 || (use_bert_flash && out_dtype == CUDA_DTYPE_BF16)) {
+            if (!ctx->kexp_bf16)
+                return -1;
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp, (const float *)qkv_src,
+                total, H, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+        } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16) {
+            if (!ctx->kexp_f16)
+                return -1;
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                (__half *)ctx->kexp_f16, (__half *)ctx->vexp, (const float *)qkv_src, total, H,
+                c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+        } else if (out_dtype == CUDA_DTYPE_BF16) {
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->kexp, (__nv_bfloat16 *)ctx->vexp, (const float *)qkv_src, total, H,
+                c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+        } else if (out_dtype == CUDA_DTYPE_F16) {
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->kexp, (__half *)ctx->vexp, (const float *)qkv_src, total, H, c->n_kv_heads, hd,
+                qkv_dim, k_offset, v_offset);
+        } else {
+            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                ctx->kexp, ctx->vexp, (const float *)qkv_src, total, H, c->n_kv_heads, hd, qkv_dim,
+                k_offset, v_offset);
+        }
+        if (launch_check() != 0)
             return -1;
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp,
-            (const __nv_bfloat16 *)qkv_src, total, H, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
-    } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16 && qkv_dtype == CUDA_DTYPE_F16) {
-        if (!ctx->kexp_f16)
-            return -1;
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            (__half *)ctx->kexp_f16, (__half *)ctx->vexp, (const __half *)qkv_src, total, H,
-            c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
-    } else if (use_tc_kexp_bf16 || (use_bert_flash && out_dtype == CUDA_DTYPE_BF16)) {
-        if (!ctx->kexp_bf16)
-            return -1;
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp, (const float *)qkv_src,
-            total, H, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
-    } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16) {
-        if (!ctx->kexp_f16)
-            return -1;
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            (__half *)ctx->kexp_f16, (__half *)ctx->vexp, (const float *)qkv_src, total, H,
-            c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
-    } else if (out_dtype == CUDA_DTYPE_BF16) {
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            ctx->kexp, (__nv_bfloat16 *)ctx->vexp, (const float *)qkv_src, total, H, c->n_kv_heads,
-            hd, qkv_dim, k_offset, v_offset);
-    } else if (out_dtype == CUDA_DTYPE_F16) {
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            ctx->kexp, (__half *)ctx->vexp, (const float *)qkv_src, total, H, c->n_kv_heads, hd,
-            qkv_dim, k_offset, v_offset);
-    } else {
-        attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-            ctx->kexp, ctx->vexp, (const float *)qkv_src, total, H, c->n_kv_heads, hd, qkv_dim,
-            k_offset, v_offset);
     }
-    if (launch_check() != 0)
-        return -1;
 
     if (use_bert_flash) {
         int w = tc_kv_warps_or(8);
-#define BERT_FLASH_LAUNCH(HDV, W)                                                                  \
-    do {                                                                                           \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                  \
-        dim3 block(32, (W));                                                                       \
-        if (out_dtype == CUDA_DTYPE_F16) {                                                         \
-            if (qkv_dtype == CUDA_DTYPE_F16)                                                       \
-                attn_stream_bert_flash_f16_kernel<(HDV), (W), __half>                              \
-                    <<<grid, block, 0, ctx->stream>>>(                                             \
-                        (__half *)out_16, (const __half *)qkv_src, (const __half *)ctx->kexp_f16,  \
-                        (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
-            else                                                                                   \
-                attn_stream_bert_flash_f16_kernel<(HDV), (W), float>                               \
-                    <<<grid, block, 0, ctx->stream>>>(                                             \
-                        (__half *)out_16, (const float *)qkv_src, (const __half *)ctx->kexp_f16,   \
-                        (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
-        } else {                                                                                   \
-            if (qkv_dtype == CUDA_DTYPE_BF16)                                                      \
-                attn_stream_bert_flash_kernel<(HDV), (W), __nv_bfloat16>                           \
-                    <<<grid, block, 0, ctx->stream>>>(                                             \
-                        (__nv_bfloat16 *)out_16, (const __nv_bfloat16 *)qkv_src,                   \
-                        (const __nv_bfloat16 *)ctx->kexp_bf16, (const __nv_bfloat16 *)ctx->vexp,   \
-                        ctx->offsets, q_dim, qkv_dim, q_offset, scale);                            \
-            else                                                                                   \
-                attn_stream_bert_flash_kernel<(HDV), (W), float><<<grid, block, 0, ctx->stream>>>( \
-                    (__nv_bfloat16 *)out_16, (const float *)qkv_src,                               \
-                    (const __nv_bfloat16 *)ctx->kexp_bf16, (const __nv_bfloat16 *)ctx->vexp,       \
-                    ctx->offsets, q_dim, qkv_dim, q_offset, scale);                                \
-        }                                                                                          \
+#define BERT_FLASH_LAUNCH(HDV, W)                                                                    \
+    do {                                                                                             \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                    \
+        dim3 block(32, (W));                                                                         \
+        if (out_dtype == CUDA_DTYPE_F16) {                                                           \
+            if (qkv_dtype == CUDA_DTYPE_F16 && use_bert_direct_kv)                                   \
+                attn_stream_bert_flash_f16_kernel<(HDV), (W), __half, 1>                             \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__half *)out_16, (const __half *)qkv_src, (const __half *)ctx->kexp_f16,    \
+                        (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, \
+                        v_offset, H, c->n_kv_heads, scale);                                          \
+            else if (qkv_dtype == CUDA_DTYPE_F16)                                                    \
+                attn_stream_bert_flash_f16_kernel<(HDV), (W), __half, 0>                             \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__half *)out_16, (const __half *)qkv_src, (const __half *)ctx->kexp_f16,    \
+                        (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, \
+                        v_offset, H, c->n_kv_heads, scale);                                          \
+            else                                                                                     \
+                attn_stream_bert_flash_f16_kernel<(HDV), (W), float, 0>                              \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__half *)out_16, (const float *)qkv_src, (const __half *)ctx->kexp_f16,     \
+                        (const __half *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, \
+                        v_offset, H, c->n_kv_heads, scale);                                          \
+        } else {                                                                                     \
+            if (qkv_dtype == CUDA_DTYPE_BF16 && use_bert_direct_kv)                                  \
+                attn_stream_bert_flash_kernel<(HDV), (W), __nv_bfloat16, 1>                          \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__nv_bfloat16 *)out_16, (const __nv_bfloat16 *)qkv_src,                     \
+                        (const __nv_bfloat16 *)ctx->kexp_bf16, (const __nv_bfloat16 *)ctx->vexp,     \
+                        ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, v_offset, H,               \
+                        c->n_kv_heads, scale);                                                       \
+            else if (qkv_dtype == CUDA_DTYPE_BF16)                                                   \
+                attn_stream_bert_flash_kernel<(HDV), (W), __nv_bfloat16, 0>                          \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__nv_bfloat16 *)out_16, (const __nv_bfloat16 *)qkv_src,                     \
+                        (const __nv_bfloat16 *)ctx->kexp_bf16, (const __nv_bfloat16 *)ctx->vexp,     \
+                        ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, v_offset, H,               \
+                        c->n_kv_heads, scale);                                                       \
+            else                                                                                     \
+                attn_stream_bert_flash_kernel<(HDV), (W), float, 0>                                  \
+                    <<<grid, block, 0, ctx->stream>>>(                                               \
+                        (__nv_bfloat16 *)out_16, (const float *)qkv_src,                             \
+                        (const __nv_bfloat16 *)ctx->kexp_bf16, (const __nv_bfloat16 *)ctx->vexp,     \
+                        ctx->offsets, q_dim, qkv_dim, q_offset, k_offset, v_offset, H,               \
+                        c->n_kv_heads, scale);                                                       \
+        }                                                                                            \
     } while (0)
         if (hd == 32) {
             if (w == 2)
