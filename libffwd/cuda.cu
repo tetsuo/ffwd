@@ -2172,13 +2172,11 @@ static void linear_lt_plan_free(ffwd_cuda_ctx_t *ctx) {
 // Fused projection via cuBLASLt: y = epilogue(W^T @ x). The epilogue applies the
 // row bias and, for CUBLASLT_EPILOGUE_GELU_BIAS, the exact erf GeLU inside the
 // GEMM, so a separate bias/activation kernel and its [out_dim x rows] HBM
-// round-trip are removed. Operands and output are 16-bit (bf16/f16), accumulation
-// is F32, the F32 bias is cast to the output dtype (cuBLASLt rejects an F32 bias
-// on 16-bit output). The matmul plan (descriptor + layouts + algo) is cached on
-// the context keyed by shape: the BERT gate-up shape repeats across every layer
-// and across same-size requests, so the heuristic runs ~once per request rather
-// than once per layer. The cached descriptor points its bias at lt_bias16, so the
-// per-call cast refreshes the values the matmul reads.
+// round-trip are removed. Operands are 16-bit (bf16/f16); the output is bf16/f16
+// (FFN gate-up) or F32 (qkv projection), accumulation is F32. The matmul plan
+// (descriptor + layouts + algo) is cached on the context keyed by shape, so the
+// heuristic runs ~once per request rather than once per layer (a single slot, so
+// the qkv and gate-up shapes alternate-evict, which is still correct and cheap).
 static int linear_lt(ffwd_cuda_ctx_t *ctx,
                      const cuda_matrix_t *w,
                      const void *x,
@@ -2194,22 +2192,33 @@ static int linear_lt(ffwd_cuda_ctx_t *ctx,
         fprintf(stderr, "cuda: linear_lt requires 16-bit weights\n");
         return -1;
     }
-    if (out_dtype != CUDA_DTYPE_BF16 && out_dtype != CUDA_DTYPE_F16) {
-        fprintf(stderr, "cuda: linear_lt requires 16-bit output\n");
-        return -1;
-    }
     cudaDataType io = w->dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
-    cudaDataType od = out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
+    cudaDataType od = out_dtype == CUDA_DTYPE_F16
+                          ? CUDA_R_16F
+                          : (out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_32F);
     const float alpha = 1.0f, beta = 0.0f;
 
-    // Refresh the bias each call: cast the F32 bias to the output dtype into the
-    // fixed lt_bias16 scratch that the cached descriptor's BIAS_POINTER targets.
-    if (od == CUDA_R_16BF)
+    // The bias dtype must match the output (cuBLASLt rejects an F32 bias on a
+    // 16-bit output): for a 16-bit output cast the F32 bias into lt_bias16; for an
+    // F32 output (the qkv projection) use the F32 bias directly. The bias POINTER
+    // is set per call below (it varies per layer for the F32 path), not baked into
+    // the cached plan.
+    const void *bias_dev;
+    cudaDataType bias_t;
+    if (od == CUDA_R_16BF) {
         cast_f32_to_bf16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
             (__nv_bfloat16 *)ctx->lt_bias16, bias, out_dim);
-    else
+        bias_dev = ctx->lt_bias16;
+        bias_t = CUDA_R_16BF;
+    } else if (od == CUDA_R_16F) {
         cast_f32_to_f16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
             (__half *)ctx->lt_bias16, bias, out_dim);
+        bias_dev = ctx->lt_bias16;
+        bias_t = CUDA_R_16F;
+    } else {
+        bias_dev = bias;
+        bias_t = CUDA_R_32F;
+    }
 
     int key_ok = ctx->lt_have && ctx->lt_k_rows == rows && ctx->lt_k_in == in_dim &&
                  ctx->lt_k_out == out_dim && ctx->lt_k_xs == x_stride &&
@@ -2219,8 +2228,6 @@ static int linear_lt(ffwd_cuda_ctx_t *ctx,
         cublasLtMatmulDesc_t op = NULL;
         cublasLtMatrixLayout_t A = NULL, B = NULL, D = NULL;
         cublasLtMatmulPreference_t pref = NULL;
-        const void *bias_dev = ctx->lt_bias16;
-        cudaDataType bias_t = od;
         int ok = 0;
         do {
             if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
@@ -2231,8 +2238,6 @@ static int linear_lt(ffwd_cuda_ctx_t *ctx,
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
                                            sizeof(epilogue));
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
-                                           sizeof(bias_dev));
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_t,
                                            sizeof(bias_t));
             // A = weight stored [in_dim x out_dim] col-major (ld in_dim), op transposes it;
@@ -2284,6 +2289,10 @@ static int linear_lt(ffwd_cuda_ctx_t *ctx,
         ctx->lt_k_io = (int)io;
         ctx->lt_k_od = (int)od;
     }
+    // The bias pointer is not baked into the cached plan (it varies per layer for
+    // the F32 qkv path), so set it on the descriptor every call.
+    cublasLtMatmulDescSetAttribute(ctx->lt_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
+                                   sizeof(bias_dev));
     cublasStatus_t mst = cublasLtMatmul(ctx->lt, ctx->lt_desc, &alpha, w->d, ctx->lt_A, x, ctx->lt_B,
                                         &beta, y, ctx->lt_D, y, ctx->lt_D, &ctx->lt_heur.algo,
                                         ctx->lt_workspace, ctx->lt_ws_bytes, ctx->stream);
@@ -3291,12 +3300,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     // replaces the F32 projection delta the *_resid_* LayerNorm kernels read), so
     // it rides residual16's gate: on whenever residual16 is, unless forced off.
     int delta16 = use_resid16 && ctx->resid_delta_16 && bert_delta16_mode() >= 0;
-    // cuBLASLt fuses bias + erf-GeLU into the gate-up GEMM epilogue. Default on
-    // for the exact-GeLU 16-bit BERT path (the GELU epilogue is erf-only); it
-    // wins at every measured batch/length incl. batch 1, so it is not token-gated.
-    // FFWD_CUDA_CUBLASLT=0 forces the GEMM + separate kernel back for A/B.
-    int cublaslt = bert_cublaslt_mode() >= 0 && act_dtype != CUDA_DTYPE_F32 &&
-                   c->ffn_act == FFWD_ACT_GELU_ERF && ctx->lt != NULL;
+    // cuBLASLt fused epilogues, default on for the 16-bit BERT path (wins at every
+    // measured batch/length incl. batch 1, so not token-gated; FFWD_CUDA_CUBLASLT=0
+    // forces the GEMM + separate kernels back for A/B). `cublaslt_avail` gates the
+    // qkv BIAS epilogue (any activation); the gate-up GELU_BIAS epilogue also needs
+    // exact erf-GeLU (the cuBLASLt GELU epilogue is erf-only).
+    int cublaslt_avail = bert_cublaslt_mode() >= 0 && act_dtype != CUDA_DTYPE_F32 && ctx->lt != NULL;
+    int cublaslt = cublaslt_avail && c->ffn_act == FFWD_ACT_GELU_ERF;
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
@@ -3332,24 +3342,33 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         cuda_layer_t *l = &ctx->layers[layer];
         const void *norm_act = use_resid16 ? resid16 : act16;
 
-        // Self-attention (post-norm): QKV read x directly, then +bias.
-        if (act_dtype == CUDA_DTYPE_BF16) {
-            if (linear_bf16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden,
-                             0.0f) != 0)
-                return -1;
-        } else if (act_dtype == CUDA_DTYPE_F16) {
-            if (linear_f16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden, 0.0f) !=
-                0)
+        // Self-attention (post-norm): QKV read x directly, then +bias. cuBLASLt
+        // fuses the qkv bias into the GEMM epilogue (F32 output), removing the
+        // separate add_row_bias_kernel's full read+write of the qkv tensor; the
+        // else path keeps the GEMM + bias kernel.
+        if (cublaslt_avail) {
+            if (linear_lt(ctx, &l->qkv, norm_act, ctx->qkv, CUDA_DTYPE_F32, l->qkv_bias,
+                          CUBLASLT_EPILOGUE_BIAS, total, hidden, qkv_dim, hidden) != 0)
                 return -1;
         } else {
-            if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
+            if (act_dtype == CUDA_DTYPE_BF16) {
+                if (linear_bf16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden,
+                                 0.0f) != 0)
+                    return -1;
+            } else if (act_dtype == CUDA_DTYPE_F16) {
+                if (linear_f16x(ctx, &l->qkv, norm_act, ctx->qkv, total, hidden, qkv_dim, hidden,
+                                0.0f) != 0)
+                    return -1;
+            } else {
+                if (linear(ctx, &l->qkv, ctx->x, ctx->qkv, total, hidden, qkv_dim) != 0)
+                    return -1;
+            }
+            int qkv_count = total * qkv_dim;
+            add_row_bias_kernel<<<(qkv_count + 255) / 256, 256, 0, ctx->stream>>>(
+                ctx->qkv, l->qkv_bias, total, qkv_dim);
+            if (launch_check() != 0)
                 return -1;
         }
-        int qkv_count = total * qkv_dim;
-        add_row_bias_kernel<<<(qkv_count + 255) / 256, 256, 0, ctx->stream>>>(ctx->qkv, l->qkv_bias,
-                                                                              total, qkv_dim);
-        if (launch_check() != 0)
-            return -1;
         // Flash writes reduced-precision attention output into act16; the
         // materialized path writes F32 attn_out.
         if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset, qkv_dim,
