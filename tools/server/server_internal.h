@@ -105,6 +105,15 @@ typedef struct {
     int worker_init_rc;
     job *job_head;
     job *job_tail;
+    /* Tokenizer stage: when tokenize_off_worker is set, dispatch enqueues raw
+     * jobs here and a dedicated thread parses + tokenizes them off the worker so
+     * tokenization overlaps the GPU instead of serializing in front of it. */
+    int tokenize_off_worker;
+    pthread_t tokenizer;
+    pthread_cond_t raw_cv;
+    int raw_stopping;
+    job *raw_head;
+    job *raw_tail;
     pthread_t renderer;
     pthread_cond_t render_cv;
     int render_stopping;
@@ -158,6 +167,13 @@ struct job {
     char *extra_headers;
     char *response;
     size_t response_len;
+    /* Filled by the tokenizer stage (tokenize_job): prep points at a heap
+     * request of type prep_kind (1 embedding, 2 contextual, 3 rerank), which the
+     * worker moves into its request array. tokenized guards re-tokenizing when
+     * the worker runs tokenize_job inline (tokenize-off-worker disabled). */
+    int tokenized;
+    int prep_kind;
+    void *prep;
     uint64_t created_ns;
     uint64_t started_ns;
     uint64_t parse_ns;
@@ -325,6 +341,9 @@ void execute_rerank_request(rerank_request *r);
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */
 void enqueue_job(job *j);
 int worker_has_pending_jobs(http_server *s);
+void enqueue_raw_job(job *j);
+job *dequeue_raw_job(http_server *s);
+void tokenize_job(http_server *s, job *j);
 void enqueue_render_job(job *j);
 job *dequeue_render_job(http_server *s);
 void finish_job(job *j);

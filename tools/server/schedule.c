@@ -65,6 +65,34 @@ job *dequeue_render_job(http_server *s) {
     return j;
 }
 
+void enqueue_raw_job(job *j) {
+    http_server *s = j->srv;
+    pthread_mutex_lock(&s->mu);
+    if (s->raw_tail)
+        s->raw_tail->next = j;
+    else
+        s->raw_head = j;
+    s->raw_tail = j;
+    pthread_cond_signal(&s->raw_cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+job *dequeue_raw_job(http_server *s) {
+    pthread_mutex_lock(&s->mu);
+    while (!s->raw_head && !s->raw_stopping)
+        pthread_cond_wait(&s->raw_cv, &s->mu);
+
+    job *j = s->raw_head;
+    if (j) {
+        s->raw_head = j->next;
+        if (!s->raw_head)
+            s->raw_tail = NULL;
+        j->next = NULL;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return j;
+}
+
 static job *pop_job_locked(http_server *s) {
     job *j = s->job_head;
     if (j) {
@@ -179,9 +207,26 @@ static job *pop_done(http_server *s) {
     return j;
 }
 
+/* Free a tokenizer-stage request still attached to a job. In the normal flow
+ * the worker moves *prep out and clears it before the job is freed; this only
+ * fires if a tokenized job is discarded without being processed. */
+static void job_prep_free(job *j) {
+    if (!j->prep)
+        return;
+    if (j->prep_kind == 1)
+        embedding_request_free(j->prep);
+    else if (j->prep_kind == 2)
+        contextual_request_free(j->prep);
+    else if (j->prep_kind == 3)
+        rerank_request_free(j->prep);
+    free(j->prep);
+    j->prep = NULL;
+}
+
 static void job_free(job *j) {
     if (!j)
         return;
+    job_prep_free(j);
     job_render_free(j);
     free(j->body);
     free(j->auth);
@@ -264,6 +309,46 @@ static void process_unknown_job(job *j) {
     cJSON_Delete(root);
 }
 
+/* Parse and tokenize one job into a heap request attached to j->prep. Runs on
+ * the tokenizer thread when tokenize-off-worker is on, or inline on the worker
+ * otherwise; the worker moves *prep into its request array. An unknown endpoint
+ * leaves prep_kind 0 (process_unknown_job handles it); a parse failure leaves
+ * prep NULL with the 422 already set, so the worker finishes it as not-ready. */
+void tokenize_job(http_server *s, job *j) {
+    j->tokenized = 1;
+    if (!j->started_ns)
+        j->started_ns = nstime();
+    if (!strcmp(j->path, "/v1/embeddings"))
+        j->prep_kind = 1;
+    else if (!strcmp(j->path, "/v1/contextualizedembeddings"))
+        j->prep_kind = 2;
+    else if (!strcmp(j->path, "/v1/rerank"))
+        j->prep_kind = 3;
+    else
+        return;
+
+    cJSON *root = NULL;
+    uint64_t t0 = nstime();
+    int parse_rc = parse_job_root(j, &root);
+    j->parse_ns += nstime() - t0;
+    if (parse_rc != 0)
+        return;
+
+    if (j->prep_kind == 1) {
+        embedding_request *r = xcalloc(1, sizeof(*r));
+        prepare_embedding_request(j, root, s, r);
+        j->prep = r;
+    } else if (j->prep_kind == 2) {
+        contextual_request *r = xcalloc(1, sizeof(*r));
+        prepare_contextual_request(j, root, s, r);
+        j->prep = r;
+    } else {
+        rerank_request *r = xcalloc(1, sizeof(*r));
+        prepare_rerank_request(j, root, s, r);
+        j->prep = r;
+    }
+}
+
 /* Cross-request batch merging (default on). When enabled, every compatible
  * ready request in the arrival window is flattened into one pool and re-packed
  * into token-budget batches by execute_*_request_list, so mixed client batch
@@ -291,30 +376,25 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
     embedding_request **std_group = xmalloc((size_t)n_jobs * sizeof(*std_group));
     contextual_request **ctx_group = xmalloc((size_t)n_jobs * sizeof(*ctx_group));
 
+    /* Tokenize on the worker only for jobs the tokenizer stage did not already
+     * prepare (tokenize-off-worker disabled), then move each prepared request
+     * out of its job into the contiguous array the grouping below indexes. The
+     * move transfers the heap pointers; freeing the wrapper leaves the array
+     * slot owning them, freed once at the end. */
     for (int i = 0; i < n_jobs; i++) {
-        cJSON *root = NULL;
-        if (!jobs[i]->started_ns)
-            jobs[i]->started_ns = nstime();
-        if (!strcmp(jobs[i]->path, "/v1/embeddings")) {
-            kind[i] = 1;
-        } else if (!strcmp(jobs[i]->path, "/v1/contextualizedembeddings")) {
-            kind[i] = 2;
-        } else if (!strcmp(jobs[i]->path, "/v1/rerank")) {
-            kind[i] = 3;
-        } else {
-            continue;
+        if (!jobs[i]->tokenized)
+            tokenize_job(s, jobs[i]);
+        kind[i] = jobs[i]->prep_kind;
+        if (jobs[i]->prep) {
+            if (kind[i] == 1)
+                std_reqs[i] = *(embedding_request *)jobs[i]->prep;
+            else if (kind[i] == 2)
+                ctx_reqs[i] = *(contextual_request *)jobs[i]->prep;
+            else if (kind[i] == 3)
+                rerank_reqs[i] = *(rerank_request *)jobs[i]->prep;
+            free(jobs[i]->prep);
+            jobs[i]->prep = NULL;
         }
-        uint64_t t0 = nstime();
-        int parse_rc = parse_job_root(jobs[i], &root);
-        jobs[i]->parse_ns += nstime() - t0;
-        if (parse_rc != 0)
-            continue;
-        if (kind[i] == 1)
-            prepare_embedding_request(jobs[i], root, s, &std_reqs[i]);
-        else if (kind[i] == 2)
-            prepare_contextual_request(jobs[i], root, s, &ctx_reqs[i]);
-        else
-            prepare_rerank_request(jobs[i], root, s, &rerank_reqs[i]);
     }
 
     for (int i = 0; i < n_jobs; i++) {

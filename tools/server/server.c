@@ -66,6 +66,17 @@ static bool auth_ok(http_server *s, const char *auth) {
            !strcmp(auth + sizeof(prefix) - 1, s->api_key);
 }
 
+/* Tokenize-off-worker (default on). When set, dispatch hands raw jobs to the
+ * tokenizer thread so parsing and tokenization overlap the GPU instead of
+ * running in front of it on the worker. FFWD_SERVER_TOKENIZE_OFF_WORKER=0
+ * keeps tokenization on the worker for an A/B comparison. */
+static int tokenize_off_worker_default(void) {
+    const char *e = getenv("FFWD_SERVER_TOKENIZE_OFF_WORKER");
+    if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
+        return 0;
+    return 1;
+}
+
 void dispatch_request(client *c) {
     aeDeleteFileEvent(c->srv->loop, c->fd, AE_READABLE);
 
@@ -106,7 +117,10 @@ void dispatch_request(client *c) {
     j->auth = c->req.auth ? xstrdup(c->req.auth) : NULL;
     j->created_ns = nstime();
     client_incref(c);
-    enqueue_job(j);
+    if (c->srv->tokenize_off_worker)
+        enqueue_raw_job(j);
+    else
+        enqueue_job(j);
 }
 
 static void accept_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
@@ -215,6 +229,30 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+/* Tokenizer stage: parse + tokenize raw jobs off the worker, then feed the
+ * worker's job queue. Waits for the worker to finish model init first, because
+ * a GPU build finalizes the model config (dims, pooling) on the worker and
+ * request validation reads it. Idle when tokenize-off-worker is disabled. */
+static void *tokenizer_main(void *arg) {
+    http_server *s = arg;
+    pthread_mutex_lock(&s->mu);
+    while (!s->worker_ready)
+        pthread_cond_wait(&s->cv, &s->mu);
+    int rc = s->worker_init_rc;
+    pthread_mutex_unlock(&s->mu);
+    if (rc)
+        return NULL;
+
+    for (;;) {
+        job *j = dequeue_raw_job(s);
+        if (!j)
+            break;
+        tokenize_job(s, j);
+        enqueue_job(j);
+    }
+    return NULL;
+}
+
 static void *renderer_main(void *arg) {
     http_server *s = arg;
     for (;;) {
@@ -316,6 +354,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     s.max_batch_tokens =
         cfg->max_batch_tokens > 0 ? cfg->max_batch_tokens : FFWD_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0 ? cfg->batch_wait_us : ffwd_default_batch_wait_us();
+    s.tokenize_off_worker = tokenize_off_worker_default();
     s.backend_opts = backend_opts;
     if (cfg->api_key && cfg->api_key[0])
         s.api_key = xstrdup(cfg->api_key);
@@ -327,6 +366,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
 
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.raw_cv, NULL);
     pthread_cond_init(&s.render_cv, NULL);
 
     for (int i = 0; i < cfg->n_models; i++) {
@@ -334,6 +374,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
             free_models(&s);
             free(s.api_key);
             pthread_cond_destroy(&s.render_cv);
+            pthread_cond_destroy(&s.raw_cv);
             pthread_cond_destroy(&s.cv);
             pthread_mutex_destroy(&s.mu);
             return 1;
@@ -345,6 +386,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -369,6 +411,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -380,6 +423,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -396,6 +440,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -420,13 +465,18 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
     }
 
-    s.listen_fd = listen_on(s.host, s.port);
-    if (s.listen_fd < 0) {
+    /* Started after worker init so the tokenizer sees a finalized model config
+     * (a GPU build sets dims/pooling on the worker, and request validation reads
+     * them). Joined before the worker at shutdown so it drains raw jobs into the
+     * job queue first. */
+    if (pthread_create(&s.tokenizer, NULL, tokenizer_main, &s) != 0) {
+        fprintf(stderr, "ffwd-server: failed to start tokenizer\n");
         pthread_mutex_lock(&s.mu);
         s.stopping = 1;
         pthread_cond_signal(&s.cv);
@@ -441,6 +491,34 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         free_models(&s);
         free(s.api_key);
         pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+
+    s.listen_fd = listen_on(s.host, s.port);
+    if (s.listen_fd < 0) {
+        pthread_mutex_lock(&s.mu);
+        s.raw_stopping = 1;
+        pthread_cond_signal(&s.raw_cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.tokenizer, NULL);
+        pthread_mutex_lock(&s.mu);
+        s.stopping = 1;
+        pthread_cond_signal(&s.cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.worker, NULL);
+        pthread_mutex_lock(&s.mu);
+        s.render_stopping = 1;
+        pthread_cond_signal(&s.render_cv);
+        pthread_mutex_unlock(&s.mu);
+        pthread_join(s.renderer, NULL);
+        aeDeleteEventLoop(s.loop);
+        free_models(&s);
+        free(s.api_key);
+        pthread_cond_destroy(&s.render_cv);
+        pthread_cond_destroy(&s.raw_cv);
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
@@ -464,6 +542,14 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         c = next;
     }
 
+    /* Drain stages front to back: the tokenizer flushes raw jobs into the job
+     * queue, then the worker drains that, then the renderer drains finished
+     * jobs, so nothing is stranded mid-pipeline. */
+    pthread_mutex_lock(&s.mu);
+    s.raw_stopping = 1;
+    pthread_cond_signal(&s.raw_cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(s.tokenizer, NULL);
     pthread_mutex_lock(&s.mu);
     s.stopping = 1;
     pthread_cond_signal(&s.cv);
@@ -483,6 +569,7 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     free_models(&s);
     free(s.api_key);
     pthread_cond_destroy(&s.render_cv);
+    pthread_cond_destroy(&s.raw_cv);
     pthread_cond_destroy(&s.cv);
     pthread_mutex_destroy(&s.mu);
     return 0;
