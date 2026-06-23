@@ -77,6 +77,7 @@ struct ffwd_cuda_ctx {
     float *attn_out;
     float *ffn_gate_up;
     void *ffn_gate_up_16; // BERT reduced-precision FFN intermediate
+    void *resid_delta_16; // BERT reduced-precision residual delta (wo/down output)
     void *x_bf16;         // Persistent BERT BF16 residual stream (gated)
     void *x_f16;          // Persistent BERT FP16 residual stream (explicit f16 path)
     void *act_bf16;       // BF16 cast of a GEMM activation operand (bf16 weights)
@@ -1743,6 +1744,85 @@ __global__ static void layer_norm_bias_resid_f16_kernel(__half *out,
     }
 }
 
+// Reduced-precision residual delta: identical reductions to the *_resid_*
+// kernels above, but the freshly-projected delta (wo / down output) is read as
+// the active 16-bit dtype instead of F32. The residual add and the LayerNorm
+// mean/variance stay in F32; only the projection output is rounded, which
+// removes one F32 [rows x dim] write+reread per attention/FFN block. Active with
+// the 16-bit residual stream (FFWD_CUDA_BERT_DELTA16=0 forces the F32 delta back
+// for A/B); validated at parity, cosine vs F32 ~0.99998 on bge-base.
+__global__ static void layer_norm_bias_resid_bf16_delta16_kernel(__nv_bfloat16 *out,
+                                                                 const __nv_bfloat16 *resid,
+                                                                 const __nv_bfloat16 *delta,
+                                                                 const float *bias,
+                                                                 const float *gamma,
+                                                                 const float *beta,
+                                                                 int rows,
+                                                                 int dim,
+                                                                 float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows)
+        return;
+    const __nv_bfloat16 *dr = delta + (size_t)row * dim;
+    const __nv_bfloat16 *rr = resid + (size_t)row * dim;
+    float s = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float v = __bfloat162float(dr[d]) + __bfloat162float(rr[d]) + bias[d];
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)dim;
+    float vs = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
+    __nv_bfloat16 *o = out + (size_t)row * dim;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = __float2bfloat16(nv);
+    }
+}
+
+__global__ static void layer_norm_bias_resid_f16_delta16_kernel(__half *out,
+                                                                const __half *resid,
+                                                                const __half *delta,
+                                                                const float *bias,
+                                                                const float *gamma,
+                                                                const float *beta,
+                                                                int rows,
+                                                                int dim,
+                                                                float eps) {
+    extern __shared__ float rowbuf[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows)
+        return;
+    const __half *dr = delta + (size_t)row * dim;
+    const __half *rr = resid + (size_t)row * dim;
+    float s = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float v = __half2float(dr[d]) + __half2float(rr[d]) + bias[d];
+        rowbuf[d] = v;
+        s += v;
+    }
+    float mean = block_sum(s) / (float)dim;
+    float vs = 0.0f;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float c = rowbuf[d] - mean;
+        vs += c * c;
+    }
+    float inv = rsqrtf(block_sum(vs) / (float)dim + eps);
+    __half *o = out + (size_t)row * dim;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float nv = (rowbuf[d] - mean) * inv * gamma[d] + beta[d];
+        o[d] = __float2half(nv);
+    }
+}
+
 __global__ static void bias_gelu_kernel(float *x, const float *bias, int rows, int dim) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t n = (size_t)rows * dim;
@@ -2488,6 +2568,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->attn_out);
         cudaFree(ctx->ffn_gate_up);
         cudaFree(ctx->ffn_gate_up_16);
+        cudaFree(ctx->resid_delta_16);
         cudaFree(ctx->x_bf16);
         cudaFree(ctx->x_f16);
         cudaFree(ctx->token_ids);
@@ -2501,6 +2582,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
         ctx->ffn_gate_up_16 = NULL;
+        ctx->resid_delta_16 = NULL;
         ctx->x_bf16 = NULL;
         ctx->x_f16 = NULL;
         ctx->token_ids = ctx->positions = NULL;
@@ -2538,6 +2620,9 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
             CUDA_CHECK(cudaMalloc(&ctx->ffn_gate_up_16,
                                   (size_t)total * c->intermediate_size * sizeof(uint16_t)));
+        if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
+            CUDA_CHECK(
+                cudaMalloc(&ctx->resid_delta_16, (size_t)total * c->hidden_size * sizeof(uint16_t)));
         ctx->seq_cap = total;
     }
     if (batch + 1 > ctx->batch_cap) {
@@ -2787,6 +2872,7 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     cudaFree(ctx->attn_out);
     cudaFree(ctx->ffn_gate_up);
     cudaFree(ctx->ffn_gate_up_16);
+    cudaFree(ctx->resid_delta_16);
     cudaFree(ctx->x_bf16);
     cudaFree(ctx->x_f16);
     cudaFree(ctx->pooled_out);
@@ -2954,6 +3040,24 @@ static int bert_ffn16_mode(void) {
     return mode;
 }
 
+// BERT reduced-precision residual delta. Rides the residual16 gate (on whenever
+// the 16-bit residual stream is active); 0/off forces the F32 projection delta
+// back for A/B, 1/on is explicit-on. It writes the wo/down projection output as
+// the active 16-bit dtype (read back by the *_delta16 LayerNorm kernels) instead
+// of an F32 delta.
+static int bert_delta16_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_BERT_DELTA16");
+        if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
+        else if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        init = 1;
+    }
+    return mode;
+}
+
 static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
     const ffwd_config_t *c = &ctx->config;
     int total = 0;
@@ -3004,6 +3108,10 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     int ffn16_mode = bert_ffn16_mode();
     int ffn16 = act_dtype != CUDA_DTYPE_F32 && ctx->ffn_gate_up_16 && ffn16_mode >= 0 &&
                 (ffn16_mode > 0 || total >= BERT_FFN16_MIN_TOKENS);
+    // The delta path only exists when the residual stream is already 16-bit (it
+    // replaces the F32 projection delta the *_resid_* LayerNorm kernels read), so
+    // it rides residual16's gate: on whenever residual16 is, unless forced off.
+    int delta16 = use_resid16 && ctx->resid_delta_16 && bert_delta16_mode() >= 0;
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
@@ -3067,20 +3175,38 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         // (also emitting bf16 act for the FFN gate-up GEMM in the bf16 path). With
         // flash the attn output is already bf16 in `act`, so wo reads it directly.
         if (flash && act_dtype == CUDA_DTYPE_BF16) {
-            if (linear_bf16x(ctx, &l->wo, act_bf16, ctx->x, total, c->q_dim, hidden, c->q_dim,
-                             use_resid16 ? 0.0f : 1.0f) != 0)
+            if (delta16) {
+                if (linear_16x_to_16(ctx, &l->wo, act_bf16, CUDA_DTYPE_BF16, ctx->resid_delta_16,
+                                     CUDA_DTYPE_BF16, total, c->q_dim, hidden, c->q_dim) != 0)
+                    return -1;
+            } else if (linear_bf16x(ctx, &l->wo, act_bf16, ctx->x, total, c->q_dim, hidden, c->q_dim,
+                                    use_resid16 ? 0.0f : 1.0f) != 0) {
                 return -1;
+            }
         } else if (flash && act_dtype == CUDA_DTYPE_F16) {
-            if (linear_f16x(ctx, &l->wo, act_f16, ctx->x, total, c->q_dim, hidden, c->q_dim,
-                            use_resid16 ? 0.0f : 1.0f) != 0)
+            if (delta16) {
+                if (linear_16x_to_16(ctx, &l->wo, act_f16, CUDA_DTYPE_F16, ctx->resid_delta_16,
+                                     CUDA_DTYPE_F16, total, c->q_dim, hidden, c->q_dim) != 0)
+                    return -1;
+            } else if (linear_f16x(ctx, &l->wo, act_f16, ctx->x, total, c->q_dim, hidden, c->q_dim,
+                                   use_resid16 ? 0.0f : 1.0f) != 0) {
                 return -1;
+            }
         } else if (linear_accum(ctx, &l->wo, ctx->attn_out, ctx->x, total, c->q_dim, hidden) != 0) {
             return -1;
         }
-        if (bf16_resid) {
+        if (bf16_resid && delta16) {
+            layer_norm_bias_resid_bf16_delta16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_bf16, resid_bf16, (const __nv_bfloat16 *)ctx->resid_delta_16, l->o_bias,
+                l->input_norm, l->attn_ln_bias, total, hidden, eps);
+        } else if (bf16_resid) {
             layer_norm_bias_resid_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
                 resid_bf16, resid_bf16, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total,
                 hidden, eps);
+        } else if (f16_resid && delta16) {
+            layer_norm_bias_resid_f16_delta16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_f16, resid_f16, (const __half *)ctx->resid_delta_16, l->o_bias, l->input_norm,
+                l->attn_ln_bias, total, hidden, eps);
         } else if (f16_resid) {
             layer_norm_bias_resid_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
                 resid_f16, resid_f16, ctx->x, l->o_bias, l->input_norm, l->attn_ln_bias, total,
@@ -3174,21 +3300,40 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
         if (launch_check() != 0)
             return -1;
         if (act_dtype == CUDA_DTYPE_BF16) {
-            if (linear_bf16x(ctx, &l->down_proj, act_bf16, ctx->x, total, inter, hidden, inter,
-                             use_resid16 ? 0.0f : 1.0f) != 0)
+            if (delta16) {
+                if (linear_16x_to_16(ctx, &l->down_proj, act_bf16, CUDA_DTYPE_BF16,
+                                     ctx->resid_delta_16, CUDA_DTYPE_BF16, total, inter, hidden,
+                                     inter) != 0)
+                    return -1;
+            } else if (linear_bf16x(ctx, &l->down_proj, act_bf16, ctx->x, total, inter, hidden, inter,
+                                    use_resid16 ? 0.0f : 1.0f) != 0) {
                 return -1;
+            }
         } else if (act_dtype == CUDA_DTYPE_F16) {
-            if (linear_f16x(ctx, &l->down_proj, act_f16, ctx->x, total, inter, hidden, inter,
-                            use_resid16 ? 0.0f : 1.0f) != 0)
+            if (delta16) {
+                if (linear_16x_to_16(ctx, &l->down_proj, act_f16, CUDA_DTYPE_F16, ctx->resid_delta_16,
+                                     CUDA_DTYPE_F16, total, inter, hidden, inter) != 0)
+                    return -1;
+            } else if (linear_f16x(ctx, &l->down_proj, act_f16, ctx->x, total, inter, hidden, inter,
+                                   use_resid16 ? 0.0f : 1.0f) != 0) {
                 return -1;
+            }
         } else {
             if (linear_accum(ctx, &l->down_proj, ctx->ffn_gate_up, ctx->x, total, inter, hidden) != 0)
                 return -1;
         }
-        if (bf16_resid) {
+        if (bf16_resid && delta16) {
+            layer_norm_bias_resid_bf16_delta16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_bf16, resid_bf16, (const __nv_bfloat16 *)ctx->resid_delta_16, l->ffn_out_bias,
+                l->post_attn_norm, l->ffn_ln_bias, total, hidden, eps);
+        } else if (bf16_resid) {
             layer_norm_bias_resid_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
                 resid_bf16, resid_bf16, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias,
                 total, hidden, eps);
+        } else if (f16_resid && delta16) {
+            layer_norm_bias_resid_f16_delta16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
+                resid_f16, resid_f16, (const __half *)ctx->resid_delta_16, l->ffn_out_bias,
+                l->post_attn_norm, l->ffn_ln_bias, total, hidden, eps);
         } else if (f16_resid) {
             layer_norm_bias_resid_f16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
                 resid_f16, resid_f16, ctx->x, l->ffn_out_bias, l->post_attn_norm, l->ffn_ln_bias,
