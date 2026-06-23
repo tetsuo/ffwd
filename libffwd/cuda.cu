@@ -7,6 +7,7 @@ extern "C" {
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <limits.h>
 #include <math.h>
@@ -57,6 +58,10 @@ struct ffwd_cuda_ctx {
     int weights_f16;
     cudaStream_t stream;
     cublasHandle_t blas;
+    cublasLtHandle_t lt; // cuBLASLt handle for fused bias/GeLU epilogue GEMMs
+    void *lt_workspace;  // device workspace for cublasLtMatmul
+    size_t lt_ws_bytes;
+    void *lt_bias16; // 16-bit cast of an epilogue bias (cuBLASLt rejects F32 bias on 16-bit out)
     cuda_matrix_t embed_tokens;
     cuda_layer_t *layers;
     float *norm;
@@ -2148,6 +2153,111 @@ static int linear_accum(ffwd_cuda_ctx_t *ctx,
     return linear_ex(ctx, w, x, CUDA_DTYPE_F32, y, rows, in_dim, out_dim, in_dim, 1.0f);
 }
 
+// Fused projection via cuBLASLt: y = epilogue(W^T @ x). The epilogue applies the
+// row bias and, for CUBLASLT_EPILOGUE_GELU_BIAS, the exact erf GeLU inside the
+// GEMM, so a separate bias/activation kernel and its [out_dim x rows] HBM
+// round-trip are removed. Operands are the weight's 16-bit dtype (also x's), the
+// output is `out_dtype`, accumulation is F32. The bias is F32. Layouts mirror the
+// cublasGemmEx call (OP_T on the [in_dim x out_dim] weight, OP_N on x).
+static int linear_lt(ffwd_cuda_ctx_t *ctx,
+                     const cuda_matrix_t *w,
+                     const void *x,
+                     void *y,
+                     cuda_dtype_t out_dtype,
+                     const float *bias,
+                     cublasLtEpilogue_t epilogue,
+                     int rows,
+                     int in_dim,
+                     int out_dim,
+                     int x_stride) {
+    if (w->dtype != CUDA_DTYPE_BF16 && w->dtype != CUDA_DTYPE_F16) {
+        fprintf(stderr, "cuda: linear_lt requires 16-bit weights\n");
+        return -1;
+    }
+    cudaDataType io = w->dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_16F;
+    cudaDataType od = out_dtype == CUDA_DTYPE_F16
+                          ? CUDA_R_16F
+                          : (out_dtype == CUDA_DTYPE_BF16 ? CUDA_R_16BF : CUDA_R_32F);
+    const float alpha = 1.0f, beta = 0.0f;
+    // cuBLASLt's heuristic rejects an F32 bias when the output is 16-bit
+    // (INVALID_VALUE), so for a 16-bit output cast the F32 bias to the output
+    // dtype into the small lt_bias16 scratch and declare that dtype.
+    const void *bias_dev = bias;
+    cudaDataType bias_t = CUDA_R_32F;
+    if (od == CUDA_R_16BF) {
+        cast_f32_to_bf16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
+            (__nv_bfloat16 *)ctx->lt_bias16, bias, out_dim);
+        bias_dev = ctx->lt_bias16;
+        bias_t = CUDA_R_16BF;
+    } else if (od == CUDA_R_16F) {
+        cast_f32_to_f16_kernel<<<(out_dim + 255) / 256, 256, 0, ctx->stream>>>(
+            (__half *)ctx->lt_bias16, bias, out_dim);
+        bias_dev = ctx->lt_bias16;
+        bias_t = CUDA_R_16F;
+    }
+
+    cublasLtMatmulDesc_t op = NULL;
+    cublasLtMatrixLayout_t A = NULL, B = NULL, D = NULL;
+    cublasLtMatmulPreference_t pref = NULL;
+    int rc = -1;
+    do {
+        if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS)
+            break;
+        cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                       sizeof(epilogue));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
+                                       sizeof(bias_dev));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_t,
+                                       sizeof(bias_t));
+        // A = weight stored [in_dim x out_dim] col-major (ld in_dim), transposed by op;
+        // B = x stored [in_dim x rows] (ld x_stride); D = y stored [out_dim x rows].
+        if (cublasLtMatrixLayoutCreate(&A, io, in_dim, out_dim, in_dim) != CUBLAS_STATUS_SUCCESS)
+            break;
+        if (cublasLtMatrixLayoutCreate(&B, io, in_dim, rows, x_stride) != CUBLAS_STATUS_SUCCESS)
+            break;
+        if (cublasLtMatrixLayoutCreate(&D, od, out_dim, rows, out_dim) != CUBLAS_STATUS_SUCCESS)
+            break;
+        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS)
+            break;
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                             &ctx->lt_ws_bytes, sizeof(ctx->lt_ws_bytes));
+        cublasLtMatmulHeuristicResult_t heur;
+        int got = 0;
+        cublasStatus_t hst =
+            cublasLtMatmulAlgoGetHeuristic(ctx->lt, op, A, B, D, D, pref, 1, &heur, &got);
+        if (hst != CUBLAS_STATUS_SUCCESS || got == 0) {
+            fprintf(stderr,
+                    "cuda: linear_lt heuristic st=%d got=%d (m=%d n=%d k=%d epi=%d io=%d od=%d)\n",
+                    (int)hst, got, out_dim, rows, in_dim, (int)epilogue, (int)io, (int)od);
+            break;
+        }
+        cublasStatus_t mst =
+            cublasLtMatmul(ctx->lt, op, &alpha, w->d, A, x, B, &beta, y, D, y, D, &heur.algo,
+                           ctx->lt_workspace, ctx->lt_ws_bytes, ctx->stream);
+        if (mst != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda: linear_lt matmul st=%d\n", (int)mst);
+            break;
+        }
+        rc = 0;
+    } while (0);
+    if (pref)
+        cublasLtMatmulPreferenceDestroy(pref);
+    if (D)
+        cublasLtMatrixLayoutDestroy(D);
+    if (B)
+        cublasLtMatrixLayoutDestroy(B);
+    if (A)
+        cublasLtMatrixLayoutDestroy(A);
+    if (op)
+        cublasLtMatmulDescDestroy(op);
+    if (rc != 0)
+        fprintf(stderr, "cuda: linear_lt fused matmul failed\n");
+    return rc;
+}
+
 static int gemm_strided_batched(cublasHandle_t blas,
                                 cublasOperation_t transa,
                                 cublasOperation_t transb,
@@ -2805,6 +2915,16 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
+    // cuBLASLt handle + workspace + a small 16-bit bias scratch for the fused
+    // bias/GeLU epilogue GEMMs (the bias is cast to the output dtype per call).
+    ctx->lt_ws_bytes = (size_t)32 << 20;
+    if (cublasLtCreate(&ctx->lt) != CUBLAS_STATUS_SUCCESS ||
+        cudaMalloc(&ctx->lt_workspace, ctx->lt_ws_bytes) != cudaSuccess ||
+        cudaMalloc(&ctx->lt_bias16, (size_t)ctx->config.intermediate_size * sizeof(uint16_t)) !=
+            cudaSuccess) {
+        ffwd_cuda_free(ctx);
+        return NULL;
+    }
 
     const ffwd_config_t *c = &ctx->config;
     ctx->layers = (cuda_layer_t *)calloc((size_t)c->n_layers, sizeof(*ctx->layers));
@@ -2895,6 +3015,10 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     free((void *)ctx->attn_ptrs_host);
     cudaFree(ctx->span_starts);
     cudaFree(ctx->span_lens);
+    cudaFree(ctx->lt_workspace);
+    cudaFree(ctx->lt_bias16);
+    if (ctx->lt)
+        cublasLtDestroy(ctx->lt);
     if (ctx->blas)
         cublasDestroy(ctx->blas);
     if (ctx->stream)
@@ -3058,6 +3182,24 @@ static int bert_delta16_mode(void) {
     return mode;
 }
 
+// cuBLASLt fused bias/GeLU epilogue for the BERT FFN gate-up GEMM. Default on
+// for the exact-GeLU bf16/f16 BERT path; 0/off forces the GEMM + separate
+// bias-GeLU kernel back for A/B. It routes the gate-up projection through
+// cublasLtMatmul with a fused bias + erf-GeLU epilogue, replacing the separate
+// bias-GeLU kernel and removing the FFN intermediate HBM round-trip.
+static int bert_cublaslt_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_CUBLASLT");
+        if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
+        else if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        init = 1;
+    }
+    return mode;
+}
+
 static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, int batch) {
     const ffwd_config_t *c = &ctx->config;
     int total = 0;
@@ -3112,6 +3254,12 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     // replaces the F32 projection delta the *_resid_* LayerNorm kernels read), so
     // it rides residual16's gate: on whenever residual16 is, unless forced off.
     int delta16 = use_resid16 && ctx->resid_delta_16 && bert_delta16_mode() >= 0;
+    // cuBLASLt fuses bias + erf-GeLU into the gate-up GEMM epilogue. Default on
+    // for the exact-GeLU 16-bit BERT path (the GELU epilogue is erf-only); it
+    // wins at every measured batch/length incl. batch 1, so it is not token-gated.
+    // FFWD_CUDA_CUBLASLT=0 forces the GEMM + separate kernel back for A/B.
+    int cublaslt = bert_cublaslt_mode() >= 0 && act_dtype != CUDA_DTYPE_F32 &&
+                   c->ffn_act == FFWD_ACT_GELU_ERF && ctx->lt != NULL;
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
@@ -3224,78 +3372,90 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
             return -1;
         norm_act = use_resid16 ? resid16 : act16;
 
-        // Feed-forward (post-norm): dense(+bias) -> GeLU -> dense(+bias).
-        if (act_dtype == CUDA_DTYPE_BF16) {
-            if (ffn16) {
-                if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_BF16,
-                                     ctx->ffn_gate_up_16, CUDA_DTYPE_BF16, total, hidden, inter,
-                                     hidden) != 0)
-                    return -1;
-            } else if (linear_bf16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total, hidden,
-                                    inter, hidden, 0.0f) != 0) {
+        // Feed-forward (post-norm): dense(+bias) -> GeLU -> dense(+bias). cuBLASLt
+        // fuses bias + erf-GeLU into the gate-up GEMM epilogue and writes the
+        // activation straight into act16, so the FFN intermediate never lands in
+        // HBM for a separate kernel; the else path keeps the GEMM + fused kernel.
+        if (cublaslt) {
+            void *ffn_act_out = act_dtype == CUDA_DTYPE_F16 ? (void *)act_f16 : (void *)act_bf16;
+            if (linear_lt(ctx, &l->gate_up_proj, norm_act, ffn_act_out, act_dtype, l->ffn_inter_bias,
+                          CUBLASLT_EPILOGUE_GELU_BIAS, total, hidden, inter, hidden) != 0)
                 return -1;
-            }
-        } else if (act_dtype == CUDA_DTYPE_F16) {
-            if (ffn16) {
-                if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_F16,
-                                     ctx->ffn_gate_up_16, CUDA_DTYPE_F16, total, hidden, inter,
-                                     hidden) != 0)
-                    return -1;
-            } else if (linear_f16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total, hidden,
-                                   inter, hidden, 0.0f) != 0) {
-                return -1;
-            }
         } else {
-            if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) != 0)
-                return -1;
-        }
-        int inter_count = total * inter;
-        if (act_dtype == CUDA_DTYPE_BF16) {
-            if (ffn16) {
-                const __nv_bfloat16 *gate = (const __nv_bfloat16 *)ctx->ffn_gate_up_16;
-                if (c->ffn_act == FFWD_ACT_GELU_TANH)
-                    bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads,
-                                                     0, ctx->stream>>>(
-                        act_bf16, gate, l->ffn_inter_bias, total, inter);
-                else
-                    bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                                ctx->stream>>>(act_bf16, gate, l->ffn_inter_bias,
-                                                               total, inter);
-            } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
-                bias_gelu_tanh_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                                ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
-                                                               l->ffn_inter_bias, total, inter);
+            if (act_dtype == CUDA_DTYPE_BF16) {
+                if (ffn16) {
+                    if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_BF16,
+                                         ctx->ffn_gate_up_16, CUDA_DTYPE_BF16, total, hidden, inter,
+                                         hidden) != 0)
+                        return -1;
+                } else if (linear_bf16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total,
+                                        hidden, inter, hidden, 0.0f) != 0) {
+                    return -1;
+                }
+            } else if (act_dtype == CUDA_DTYPE_F16) {
+                if (ffn16) {
+                    if (linear_16x_to_16(ctx, &l->gate_up_proj, norm_act, CUDA_DTYPE_F16,
+                                         ctx->ffn_gate_up_16, CUDA_DTYPE_F16, total, hidden, inter,
+                                         hidden) != 0)
+                        return -1;
+                } else if (linear_f16x(ctx, &l->gate_up_proj, norm_act, ctx->ffn_gate_up, total,
+                                       hidden, inter, hidden, 0.0f) != 0) {
+                    return -1;
+                }
             } else {
-                bias_gelu_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                           ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
-                                                          l->ffn_inter_bias, total, inter);
+                if (linear(ctx, &l->gate_up_proj, ctx->x, ctx->ffn_gate_up, total, hidden, inter) !=
+                    0)
+                    return -1;
             }
-        } else if (act_dtype == CUDA_DTYPE_F16) {
-            if (ffn16) {
-                const __half *gate = (const __half *)ctx->ffn_gate_up_16;
-                if (c->ffn_act == FFWD_ACT_GELU_TANH)
-                    bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads,
-                                                     0, ctx->stream>>>(
-                        act_f16, gate, l->ffn_inter_bias, total, inter);
-                else
-                    bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                                ctx->stream>>>(act_f16, gate, l->ffn_inter_bias,
-                                                               total, inter);
-            } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
-                bias_gelu_tanh_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                               ctx->stream>>>(act_f16, ctx->ffn_gate_up,
+            int inter_count = total * inter;
+            if (act_dtype == CUDA_DTYPE_BF16) {
+                if (ffn16) {
+                    const __nv_bfloat16 *gate = (const __nv_bfloat16 *)ctx->ffn_gate_up_16;
+                    if (c->ffn_act == FFWD_ACT_GELU_TANH)
+                        bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads,
+                                                         threads, 0, ctx->stream>>>(
+                            act_bf16, gate, l->ffn_inter_bias, total, inter);
+                    else
+                        bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                    ctx->stream>>>(act_bf16, gate, l->ffn_inter_bias,
+                                                                   total, inter);
+                } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
+                    bias_gelu_tanh_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                    ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
+                                                                   l->ffn_inter_bias, total, inter);
+                } else {
+                    bias_gelu_to_bf16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                               ctx->stream>>>(act_bf16, ctx->ffn_gate_up,
                                                               l->ffn_inter_bias, total, inter);
+                }
+            } else if (act_dtype == CUDA_DTYPE_F16) {
+                if (ffn16) {
+                    const __half *gate = (const __half *)ctx->ffn_gate_up_16;
+                    if (c->ffn_act == FFWD_ACT_GELU_TANH)
+                        bias_gelu_tanh_16_to_16_kernel<<<(inter_count + threads - 1) / threads,
+                                                         threads, 0, ctx->stream>>>(
+                            act_f16, gate, l->ffn_inter_bias, total, inter);
+                    else
+                        bias_gelu_16_to_16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                    ctx->stream>>>(act_f16, gate, l->ffn_inter_bias,
+                                                                   total, inter);
+                } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
+                    bias_gelu_tanh_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                                   ctx->stream>>>(act_f16, ctx->ffn_gate_up,
+                                                                  l->ffn_inter_bias, total, inter);
+                } else {
+                    bias_gelu_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                              ctx->stream>>>(act_f16, ctx->ffn_gate_up,
+                                                             l->ffn_inter_bias, total, inter);
+                }
+            } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
+                bias_gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
+                                        ctx->stream>>>(ctx->ffn_gate_up, l->ffn_inter_bias, total,
+                                                       inter);
             } else {
-                bias_gelu_to_f16_kernel<<<(inter_count + threads - 1) / threads, threads, 0,
-                                          ctx->stream>>>(act_f16, ctx->ffn_gate_up, l->ffn_inter_bias,
-                                                         total, inter);
+                bias_gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+                    ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
             }
-        } else if (c->ffn_act == FFWD_ACT_GELU_TANH) {
-            bias_gelu_tanh_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-                ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
-        } else {
-            bias_gelu_kernel<<<(inter_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
-                ctx->ffn_gate_up, l->ffn_inter_bias, total, inter);
         }
         if (launch_check() != 0)
             return -1;

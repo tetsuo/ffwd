@@ -121,7 +121,7 @@ MLX_BACKEND_LDFLAGS  = -framework Metal -framework Foundation \
                        -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
 CUDA_BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_GPU $(OPENBLAS_CFLAGS) \
                        -I$(CUDA_HOME)/include
-CUDA_BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 $(OPENBLAS_LDFLAGS) -lcudart -lcublas
+CUDA_BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 $(OPENBLAS_LDFLAGS) -lcudart -lcublas -lcublasLt
 
 ifeq ($(BACKEND),blas)
     BACKEND_CFLAGS  = $(BLAS_BACKEND_CFLAGS)
