@@ -80,6 +80,7 @@ struct ffwd_cuda_ctx {
     float *ffwd_ln_b;
 
     int seq_cap;
+    int scratch_key;
     int batch_cap;
     int max_seq_cap;
     float *x;
@@ -2826,9 +2827,150 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     return 0;
 }
 
+enum { BERT_BF16_ACT_MIN_TOKENS = 1024 };
+enum { BERT_RESIDUAL16_MIN_TOKENS = 16384 };
+enum { BERT_FFN16_MIN_TOKENS = 1024 };
+enum { BERT_QKV16_MIN_TOKENS = 1024 };
+
+typedef struct {
+    int compute_16bit;
+    int bf16_flash;
+    int f16_flash;
+    int flash;
+    int bf16_act;
+    int f16_act;
+    cuda_dtype_t act_dtype;
+    int bf16_resid;
+    int f16_resid;
+    int use_resid16;
+    int ffn16;
+    int delta16;
+    int cublaslt_avail;
+    int cublaslt;
+    int qkv16;
+    int direct_kv;
+} bert_cuda_plan_t;
+
+static int bert_flash_mode(void);
+static int bert_direct_kv_mode(void);
+static int bert_bf16_act_mode(void);
+static int bert_residual16_mode(void);
+static int bert_ffn16_mode(void);
+static int bert_delta16_mode(void);
+static int bert_cublaslt_mode(void);
+static int bert_qkv16_mode(void);
+
+static void bert_cuda_plan(ffwd_cuda_ctx_t *ctx, int total, bert_cuda_plan_t *p) {
+    memset(p, 0, sizeof(*p));
+    p->act_dtype = CUDA_DTYPE_F32;
+    if (!ctx || ctx->config.family != FFWD_FAMILY_BERT || ctx->config.n_layers <= 0)
+        return;
+
+    const ffwd_config_t *c = &ctx->config;
+    cublasComputeType_t gc = gemm_compute();
+    p->compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
+
+    int bert_flash = bert_flash_mode();
+    p->bf16_flash = p->compute_16bit && ctx->layers[0].qkv.bf16 &&
+                    ((c->head_dim == 64 && bert_flash >= 0) || (c->head_dim == 32 && bert_flash > 0));
+    p->f16_flash = p->compute_16bit && ctx->layers[0].qkv.f16 &&
+                   ((c->head_dim == 64 && bert_flash >= 0) || (c->head_dim == 32 && bert_flash > 0));
+    p->flash = p->bf16_flash || p->f16_flash;
+
+    int act_mode = bert_bf16_act_mode();
+    p->bf16_act = p->bf16_flash || (p->compute_16bit && ctx->layers[0].qkv.bf16 && act_mode >= 0 &&
+                                    (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
+    p->f16_act = p->f16_flash;
+    p->act_dtype = p->f16_act ? CUDA_DTYPE_F16 : (p->bf16_act ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32);
+
+    int resid_mode = bert_residual16_mode();
+    p->bf16_resid = p->bf16_act && p->flash && resid_mode >= 0 &&
+                    (resid_mode > 0 || total >= BERT_RESIDUAL16_MIN_TOKENS);
+    p->f16_resid = p->f16_act && p->flash && resid_mode >= 0;
+    p->use_resid16 = p->bf16_resid || p->f16_resid;
+
+    int ffn16_mode = bert_ffn16_mode();
+    p->ffn16 = p->act_dtype != CUDA_DTYPE_F32 && ffn16_mode >= 0 &&
+               (ffn16_mode > 0 || total >= BERT_FFN16_MIN_TOKENS);
+    p->delta16 = p->use_resid16 && bert_delta16_mode() >= 0;
+
+    p->cublaslt_avail =
+        bert_cublaslt_mode() >= 0 && p->act_dtype != CUDA_DTYPE_F32 && ctx->lt != NULL;
+    p->cublaslt = p->cublaslt_avail && c->ffn_act == FFWD_ACT_GELU_ERF;
+
+    int qkv16_mode = bert_qkv16_mode();
+    p->qkv16 = p->flash && p->cublaslt_avail && qkv16_mode >= 0 &&
+               (qkv16_mode > 0 || total >= BERT_QKV16_MIN_TOKENS);
+    p->direct_kv = p->flash && p->qkv16 && bert_direct_kv_mode() >= 0;
+}
+
 static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_seq) {
     const ffwd_config_t *c = &ctx->config;
-    if (total > ctx->seq_cap) {
+    bert_cuda_plan_t bp;
+    bert_cuda_plan(ctx, total, &bp);
+
+    int is_bert = c->family == FFWD_FAMILY_BERT;
+    int need_x = 1;
+    int need_x_norm = !is_bert;
+    int need_qkv = !is_bert || !bp.qkv16;
+    int need_qkv_16 = is_bert && bp.qkv16;
+    int need_attn_out = !is_bert || !bp.flash;
+    int need_ffn_gate_up = 1;
+    int need_ffn_gate_up_16 = 0;
+    int need_resid_delta_16 = is_bert && bp.delta16;
+    int need_x_bf16 = is_bert && bp.bf16_resid;
+    int need_x_f16 = is_bert && bp.f16_resid;
+    int need_kexp = 1;
+    int need_kexp_bf16 = ctx->weights_bf16;
+    int need_kexp_f16 = ctx->weights_f16;
+    int need_vexp = 1;
+    int vexp_elem_bytes = (int)sizeof(float);
+    int need_act_bf16 = ctx->weights_bf16;
+    int need_act_f16 = ctx->weights_f16;
+    int act_cols = 2 * c->intermediate_size;
+    int ffn_gate_up_cols = 2 * c->intermediate_size;
+
+    if (is_bert) {
+        need_x_norm = 0;
+        need_ffn_gate_up = !bp.cublaslt && (bp.act_dtype == CUDA_DTYPE_F32 || !bp.ffn16);
+        need_ffn_gate_up_16 = bp.act_dtype != CUDA_DTYPE_F32 && bp.ffn16 && !bp.cublaslt;
+        ffn_gate_up_cols = c->intermediate_size;
+        need_kexp = !bp.flash || !bp.direct_kv;
+        need_kexp_bf16 = bp.flash && !bp.direct_kv && bp.act_dtype == CUDA_DTYPE_BF16;
+        need_kexp_f16 = bp.flash && !bp.direct_kv && bp.act_dtype == CUDA_DTYPE_F16;
+        need_vexp = !bp.flash || !bp.direct_kv;
+        vexp_elem_bytes =
+            bp.flash && bp.act_dtype != CUDA_DTYPE_F32 ? (int)sizeof(uint16_t) : (int)sizeof(float);
+        need_act_bf16 = bp.act_dtype == CUDA_DTYPE_BF16;
+        need_act_f16 = bp.act_dtype == CUDA_DTYPE_F16;
+        act_cols = c->intermediate_size;
+        if (act_cols < c->hidden_size)
+            act_cols = c->hidden_size;
+        if (act_cols < c->q_dim)
+            act_cols = c->q_dim;
+    }
+
+    int scratch_key = 1;
+    scratch_key |= need_x_norm << 1;
+    scratch_key |= need_qkv << 2;
+    scratch_key |= need_qkv_16 << 3;
+    scratch_key |= need_attn_out << 4;
+    scratch_key |= need_ffn_gate_up << 5;
+    scratch_key |= need_ffn_gate_up_16 << 6;
+    scratch_key |= need_resid_delta_16 << 7;
+    scratch_key |= need_x_bf16 << 8;
+    scratch_key |= need_x_f16 << 9;
+    scratch_key |= need_kexp << 10;
+    scratch_key |= need_kexp_bf16 << 11;
+    scratch_key |= need_kexp_f16 << 12;
+    scratch_key |= need_vexp << 13;
+    scratch_key |= (vexp_elem_bytes == (int)sizeof(uint16_t)) << 14;
+    scratch_key |= need_act_bf16 << 15;
+    scratch_key |= need_act_f16 << 16;
+    scratch_key |= is_bert << 17;
+    scratch_key |= (bp.flash ? 1 : 0) << 18;
+
+    if (total > ctx->seq_cap || scratch_key != ctx->scratch_key) {
         cudaFree(ctx->x);
         cudaFree(ctx->x_norm);
         cudaFree(ctx->qkv);
@@ -2847,6 +2989,10 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->vexp);
         cudaFree(ctx->act_bf16);
         cudaFree(ctx->act_f16);
+        cudaFree(ctx->rope_cos);
+        cudaFree(ctx->rope_sin);
+        cudaFree(ctx->attn_scores);
+        cudaFree(ctx->attn_probs);
         ctx->x = ctx->x_norm = ctx->qkv = NULL;
         ctx->qkv_16 = NULL;
         ctx->attn_out = ctx->ffn_gate_up = NULL;
@@ -2860,42 +3006,57 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         ctx->kexp_f16 = NULL;
         ctx->act_bf16 = NULL;
         ctx->act_f16 = NULL;
-        CUDA_CHECK(cudaMalloc((void **)&ctx->x, (size_t)total * c->hidden_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->x_norm, (size_t)total * c->hidden_size * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,
-                              (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
-        if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
+        ctx->rope_cos = NULL;
+        ctx->rope_sin = NULL;
+        ctx->attn_scores = NULL;
+        ctx->attn_probs = NULL;
+        ctx->attn_scores_elems = 0;
+        ctx->attn_probs_elems = 0;
+        ctx->max_seq_cap = 0;
+        ctx->scratch_key = 0;
+        if (need_x)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->x, (size_t)total * c->hidden_size * sizeof(float)));
+        if (need_x_norm)
+            CUDA_CHECK(
+                cudaMalloc((void **)&ctx->x_norm, (size_t)total * c->hidden_size * sizeof(float)));
+        if (need_qkv)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->qkv,
+                                  (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(float)));
+        if (need_qkv_16)
             CUDA_CHECK(cudaMalloc(&ctx->qkv_16,
                                   (size_t)total * (c->q_dim + 2 * c->kv_dim) * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate_up,
-                              (size_t)total * 2 * c->intermediate_size * sizeof(float)));
-        if (ctx->weights_bf16 && c->family == FFWD_FAMILY_BERT)
+        if (need_attn_out)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->attn_out, (size_t)total * c->q_dim * sizeof(float)));
+        if (need_ffn_gate_up)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->ffn_gate_up,
+                                  (size_t)total * ffn_gate_up_cols * sizeof(float)));
+        if (need_x_bf16)
             CUDA_CHECK(
                 cudaMalloc(&ctx->x_bf16, (size_t)total * c->hidden_size * sizeof(__nv_bfloat16)));
-        if (ctx->weights_f16 && c->family == FFWD_FAMILY_BERT)
+        if (need_x_f16)
             CUDA_CHECK(cudaMalloc(&ctx->x_f16, (size_t)total * c->hidden_size * sizeof(__half)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->token_ids, (size_t)total * sizeof(int)));
         CUDA_CHECK(cudaMalloc((void **)&ctx->positions, (size_t)total * sizeof(int)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
-        if (ctx->weights_bf16)
+        if (need_kexp)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->kexp, (size_t)total * c->q_dim * sizeof(float)));
+        if (need_kexp_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->kexp_bf16, (size_t)total * c->q_dim * sizeof(__nv_bfloat16)));
-        if (ctx->weights_f16)
+        if (need_kexp_f16)
             CUDA_CHECK(cudaMalloc(&ctx->kexp_f16, (size_t)total * c->q_dim * sizeof(__half)));
-        CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * sizeof(float)));
-        if (ctx->weights_bf16)
-            CUDA_CHECK(cudaMalloc(&ctx->act_bf16,
-                                  (size_t)total * 2 * c->intermediate_size * sizeof(__nv_bfloat16)));
-        if (ctx->weights_f16)
-            CUDA_CHECK(
-                cudaMalloc(&ctx->act_f16, (size_t)total * 2 * c->intermediate_size * sizeof(__half)));
-        if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
+        if (need_vexp)
+            CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * vexp_elem_bytes));
+        if (need_act_bf16)
+            CUDA_CHECK(cudaMalloc(&ctx->act_bf16, (size_t)total * act_cols * sizeof(__nv_bfloat16)));
+        if (need_act_f16)
+            CUDA_CHECK(cudaMalloc(&ctx->act_f16, (size_t)total * act_cols * sizeof(__half)));
+        if (need_ffn_gate_up_16)
             CUDA_CHECK(cudaMalloc(&ctx->ffn_gate_up_16,
                                   (size_t)total * c->intermediate_size * sizeof(uint16_t)));
-        if ((ctx->weights_bf16 || ctx->weights_f16) && c->family == FFWD_FAMILY_BERT)
+        if (need_resid_delta_16)
             CUDA_CHECK(
                 cudaMalloc(&ctx->resid_delta_16, (size_t)total * c->hidden_size * sizeof(uint16_t)));
         ctx->seq_cap = total;
+        ctx->scratch_key = scratch_key;
     }
     if (batch + 1 > ctx->batch_cap) {
         cudaFree(ctx->offsets);
@@ -2909,20 +3070,28 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
     if (max_seq > ctx->max_seq_cap) {
         cudaFree(ctx->rope_cos);
         cudaFree(ctx->rope_sin);
+        ctx->rope_cos = NULL;
+        ctx->rope_sin = NULL;
         long long score_elems = (long long)c->n_heads * max_seq * max_seq;
-        if (score_elems > ctx->attn_scores_elems) {
+        int need_materialized_scores = !is_bert || !bp.flash;
+        if (need_materialized_scores && score_elems > ctx->attn_scores_elems) {
             cudaFree(ctx->attn_scores);
             ctx->attn_scores = NULL;
             ctx->attn_scores_elems = 0;
             CUDA_CHECK(cudaMalloc((void **)&ctx->attn_scores, (size_t)score_elems * sizeof(float)));
             ctx->attn_scores_elems = score_elems;
         }
-        if ((ctx->weights_bf16 || ctx->weights_f16) && score_elems > ctx->attn_probs_elems) {
+        if (need_materialized_scores && (ctx->weights_bf16 || ctx->weights_f16) &&
+            score_elems > ctx->attn_probs_elems) {
             cudaFree(ctx->attn_probs);
             ctx->attn_probs = NULL;
             ctx->attn_probs_elems = 0;
             CUDA_CHECK(cudaMalloc(&ctx->attn_probs, (size_t)score_elems * sizeof(uint16_t)));
             ctx->attn_probs_elems = score_elems;
+        }
+        if (is_bert) {
+            ctx->max_seq_cap = max_seq;
+            return 0;
         }
         float *hcos = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
         float *hsin = (float *)malloc((size_t)max_seq * c->head_dim * sizeof(float));
@@ -3282,10 +3451,6 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
 // LayerNorm reductions in F32. It is auto-enabled only for large packed BERT
 // batches where L4 validation showed a stable long-sequence win; the env override
 // remains for A/B.
-enum { BERT_BF16_ACT_MIN_TOKENS = 1024 };
-enum { BERT_RESIDUAL16_MIN_TOKENS = 16384 };
-enum { BERT_FFN16_MIN_TOKENS = 1024 };
-enum { BERT_QKV16_MIN_TOKENS = 1024 };
 // Returns 1 (force on), -1 (force off), or 0 (auto: gate on token count).
 static int bert_bf16_act_mode(void) {
     static int init = 0, mode = 0;
@@ -3399,25 +3564,14 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     int threads = 256;
     size_t ln_smem = (size_t)hidden * sizeof(float);
 
-    // Reduced-precision activation path: BF16 keeps the validated conservative
-    // gates; explicit FP16 storage uses the same F32-reduction LayerNorm kernels
-    // but stores the persistent BERT residual stream as FP16 unless the residual
-    // override forces it off.
-    cublasComputeType_t gc = gemm_compute();
-    int compute_16bit = (gc == CUBLAS_COMPUTE_32F_FAST_16BF || gc == CUBLAS_COMPUTE_32F_FAST_16F);
-    int act_mode = bert_bf16_act_mode();
-    int bert_flash = bert_flash_mode();
-    int bf16_flash =
-        compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 &&
-        ((c->head_dim == 64 && bert_flash >= 0) || (c->head_dim == 32 && bert_flash > 0));
-    int f16_flash = compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.f16 &&
-                    ((c->head_dim == 64 && bert_flash >= 0) || (c->head_dim == 32 && bert_flash > 0));
-    int flash = bf16_flash || f16_flash;
-    int bf16_act =
-        bf16_flash || (compute_16bit && c->n_layers > 0 && ctx->layers[0].qkv.bf16 && act_mode >= 0 &&
-                       (act_mode == 1 || total >= BERT_BF16_ACT_MIN_TOKENS));
-    int f16_act = f16_flash;
-    cuda_dtype_t act_dtype = f16_act ? CUDA_DTYPE_F16 : (bf16_act ? CUDA_DTYPE_BF16 : CUDA_DTYPE_F32);
+    // Reduced-precision activation path. The same plan is used by
+    // ensure_buffers, so the forward loop only references scratch that was
+    // allocated for this exact path.
+    bert_cuda_plan_t bp;
+    bert_cuda_plan(ctx, total, &bp);
+    int flash = bp.flash;
+    int bf16_act = bp.bf16_act;
+    cuda_dtype_t act_dtype = bp.act_dtype;
     void *act16 = act_dtype == CUDA_DTYPE_F16 ? ctx->act_f16
                                               : (act_dtype == CUDA_DTYPE_BF16 ? ctx->act_bf16 : NULL);
     void *resid16 = act_dtype == CUDA_DTYPE_F16 ? ctx->x_f16
@@ -3426,28 +3580,14 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     __nv_bfloat16 *resid_bf16 = (__nv_bfloat16 *)ctx->x_bf16;
     __half *act_f16 = (__half *)ctx->act_f16;
     __half *resid_f16 = (__half *)ctx->x_f16;
-    int resid_mode = bert_residual16_mode();
-    int bf16_resid = bf16_act && flash && resid_bf16 && resid_mode >= 0 &&
-                     (resid_mode > 0 || total >= BERT_RESIDUAL16_MIN_TOKENS);
-    int f16_resid = f16_act && flash && resid_f16 && resid_mode >= 0;
-    int use_resid16 = bf16_resid || f16_resid;
-    int ffn16_mode = bert_ffn16_mode();
-    int ffn16 = act_dtype != CUDA_DTYPE_F32 && ctx->ffn_gate_up_16 && ffn16_mode >= 0 &&
-                (ffn16_mode > 0 || total >= BERT_FFN16_MIN_TOKENS);
-    // The delta path only exists when the residual stream is already 16-bit (it
-    // replaces the F32 projection delta the *_resid_* LayerNorm kernels read), so
-    // it rides residual16's gate: on whenever residual16 is, unless forced off.
-    int delta16 = use_resid16 && ctx->resid_delta_16 && bert_delta16_mode() >= 0;
-    // cuBLASLt fused epilogues, default on for the 16-bit BERT path (wins at every
-    // measured batch/length incl. batch 1, so not token-gated; FFWD_CUDA_CUBLASLT=0
-    // forces the GEMM + separate kernels back for A/B). `cublaslt_avail` gates the
-    // qkv BIAS epilogue (any activation); the gate-up GELU_BIAS epilogue also needs
-    // exact erf-GeLU (the cuBLASLt GELU epilogue is erf-only).
-    int cublaslt_avail = bert_cublaslt_mode() >= 0 && act_dtype != CUDA_DTYPE_F32 && ctx->lt != NULL;
-    int cublaslt = cublaslt_avail && c->ffn_act == FFWD_ACT_GELU_ERF;
-    int qkv16_mode = bert_qkv16_mode();
-    int qkv16 = flash && cublaslt_avail && ctx->qkv_16 && qkv16_mode >= 0 &&
-                (qkv16_mode > 0 || total >= BERT_QKV16_MIN_TOKENS);
+    int bf16_resid = bp.bf16_resid;
+    int f16_resid = bp.f16_resid;
+    int use_resid16 = bp.use_resid16;
+    int ffn16 = bp.ffn16;
+    int delta16 = bp.delta16;
+    int cublaslt_avail = bp.cublaslt_avail;
+    int cublaslt = bp.cublaslt;
+    int qkv16 = bp.qkv16;
 
     if (bf16_resid) {
         bert_embed_layer_norm_bf16_kernel<<<total, 256, ln_smem, ctx->stream>>>(
@@ -3474,9 +3614,9 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
     if (launch_check() != 0)
         return -1;
 
-    // The materialized BERT fallback uses F32 attention here; BERT flash ignores
-    // this pointer layout and writes BF16 output directly to `act`.
-    if (attn_batched_setup(ctx, batch, q_offset, qkv_dim, CUDA_DTYPE_F32) != 0)
+    // The materialized BERT fallback uses F32 attention here. BERT flash keeps
+    // scores in registers and does not use the pointer-array batched GEMM setup.
+    if (!flash && attn_batched_setup(ctx, batch, q_offset, qkv_dim, CUDA_DTYPE_F32) != 0)
         return -1;
 
     for (int layer = 0; layer < c->n_layers; layer++) {
