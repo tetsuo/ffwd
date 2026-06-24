@@ -21,33 +21,34 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "ffwd-cli"
 
 
+_PASSAGE = (
+    "document: Embedding models turn text into dense vectors for semantic "
+    "retrieval. Long document inference stresses bidirectional attention "
+    "because every token attends to every other token in the same packed "
+    "sequence. "
+)
+
 DEFAULT_TEXTS = [
     "query: what is the capital of France?",
     "document: Paris is the capital of France.",
     "document: Berlin is the capital of Germany.",
-    (
-        "document: Embedding models turn text into dense vectors for semantic "
-        "retrieval. Long document inference stresses bidirectional attention "
-        "because every token attends to every other token in the same packed "
-        "sequence. "
-    ) * 3,
-    (
-        "document: Embedding models turn text into dense vectors for semantic "
-        "retrieval. Long document inference stresses bidirectional attention "
-        "because every token attends to every other token in the same packed "
-        "sequence. "
-    ) * 6,
+    _PASSAGE * 4,
+    _PASSAGE * 5,
+    _PASSAGE * 6,
+    _PASSAGE * 7,
+    _PASSAGE * 8,
 ]
-# The longest passage stays under ~512 tokens so short-context encoders
-# (BERT/MiniLM/BGE max_position 512, XLM-R 514) accept it; larger 8x/14x inputs
-# overflowed their position tables and were (correctly) rejected, which looked
-# like a CUDA failure. Still long enough to stress packed-sequence attention.
-#
-# NOTE on coverage: these defaults are all DIFFERENT lengths, so they exercise
-# only the per-sequence (ragged) attention path. The CUDA batched-attention path
-# (cublasGemmBatchedEx) engages only when every sequence in the batch is the SAME
-# length (see attn_batched_setup). To exercise it, pass >=2 identical texts as
-# positional args, e.g. the same sentence four times with --batch-size 4.
+# COVERAGE: the batch total here clears ~1300 tokens, ABOVE the 1024-token
+# threshold that gates the CUDA reduced-precision stack (bf16 activations,
+# cuBLASLt fused FFN epilogue, QKV16, direct-K/V). That threshold matters: a
+# cuBLASLt FFN gate-up aliasing bug shipped undetected precisely because the old
+# defaults summed to <1024 tokens, so the reduced path never engaged here. Keep
+# the batch >=1024 tokens. Each entry still stays under the 512-token position
+# limit of short-context encoders (BERT/MiniLM/BGE max_position 512, XLM-R 514);
+# larger single inputs overflow their position tables and are (correctly)
+# rejected. The entries are deliberately ragged (different lengths) to exercise
+# the per-sequence attention path; to also hit the equal-length batched-attention
+# path (cublasGemmBatchedEx), pass >=2 identical texts as positional args.
 
 
 def run_cuda(binary: str, model_dir: str, mode: str, weights: str,
@@ -136,6 +137,13 @@ def main() -> int:
     ap.add_argument("--max-diff", type=float, default=None)
     ap.add_argument("--min-cosine", type=float, default=0.999)
     ap.add_argument("--max-int8-change-rate", type=float, default=None)
+    # The reduced-precision path must be DETERMINISTIC: re-run the fast batch and
+    # require the runs to agree. A self-aliasing or unsynchronized GPU kernel
+    # produces correct-looking averages but different output per run; that is
+    # invisible to a single quality-vs-f32 comparison, so it gets its own gate.
+    ap.add_argument("--determinism-runs", type=int, default=3,
+                    help="repeat the fast batch this many times and require agreement")
+    ap.add_argument("--determinism-min-cosine", type=float, default=0.99999)
     ap.add_argument("texts", nargs="*")
     args = ap.parse_args()
 
@@ -159,6 +167,15 @@ def main() -> int:
     qdiff, qcos, qchanges = compare("quality", ref_batch, fast_batch)
     sdiff, scos, schanges = compare("shape", fast_single, fast_batch)
 
+    # Determinism: re-run the fast batch and compare each repeat to the first.
+    # The min cosine across all repeats and rows must stay essentially 1.0.
+    det_cos = 1.0
+    for r in range(1, max(args.determinism_runs, 1)):
+        repeat = run_cuda(args.binary, args.model_dir, args.mode, args.weights,
+                          args.batch_size, texts)
+        _, rcos, _ = compare(f"determinism[{r}]", fast_batch, repeat)
+        det_cos = min(det_cos, rcos)
+
     total_values = len(texts) * len(ref_batch[0])
     qrate = qchanges / total_values
     srate = schanges / total_values
@@ -168,20 +185,23 @@ def main() -> int:
         f"quality_diff={qdiff:.8g} quality_cos={qcos:.8f} "
         f"quality_int8_change_rate={qrate:.6f} "
         f"shape_diff={sdiff:.8g} shape_cos={scos:.8f} "
-        f"shape_int8_change_rate={srate:.6f}"
+        f"shape_int8_change_rate={srate:.6f} "
+        f"determinism_runs={args.determinism_runs} determinism_cos={det_cos:.8f}"
     )
 
     failed = (
         qdiff > args.max_diff or qcos < args.min_cosine or
         sdiff > args.max_diff or scos < args.min_cosine or
         qrate > args.max_int8_change_rate or
-        srate > args.max_int8_change_rate
+        srate > args.max_int8_change_rate or
+        det_cos < args.determinism_min_cosine
     )
     if failed:
         raise SystemExit(
             f"cuda parity failed (mode={args.mode} weights={args.weights}): "
             f"quality diff={qdiff:g} cos={qcos:g} int8_rate={qrate:g}; "
-            f"shape diff={sdiff:g} cos={scos:g} int8_rate={srate:g}"
+            f"shape diff={sdiff:g} cos={scos:g} int8_rate={srate:g}; "
+            f"determinism cos={det_cos:g} (min {args.determinism_min_cosine:g})"
         )
     return 0
 
