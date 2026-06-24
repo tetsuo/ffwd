@@ -982,7 +982,7 @@ template <int N> __device__ static __forceinline__ void tc_cp_async_wait_group()
 #endif
 }
 
-template <int HD, typename QKV_T, int DIRECT_KV>
+template <int HD, int KT, typename QKV_T, int DIRECT_KV>
 __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh,
                                                               __nv_bfloat16 *vsh,
                                                               const QKV_T *qkv,
@@ -999,7 +999,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
                                                               int kv_head,
                                                               int tid,
                                                               int nthreads) {
-    enum { KT = 64, VEC = 8, SEGS = KT * HD / VEC };
+    enum { VEC = 8, SEGS = KT * HD / VEC };
     bool full_tile = k0 + KT <= L;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (full_tile) {
@@ -1052,7 +1052,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
     return 0;
 }
 
-template <int HD, typename QKV_T, int DIRECT_KV>
+template <int HD, int KT, typename QKV_T, int DIRECT_KV>
 __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
                                                              __half *vsh,
                                                              const QKV_T *qkv,
@@ -1069,7 +1069,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
                                                              int kv_head,
                                                              int tid,
                                                              int nthreads) {
-    enum { KT = 64, VEC = 8, SEGS = KT * HD / VEC };
+    enum { VEC = 8, SEGS = KT * HD / VEC };
     bool full_tile = k0 + KT <= L;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (full_tile) {
@@ -1122,9 +1122,13 @@ __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
 
 // Qwen BF16 tensor-core flash attention. One block owns WARPS 16-query tiles
 // that share a 16-key K/V staging tile. Q is stored with a grain-level XOR
-// swizzle and K is staged transposed+swizzled so ldmatrix.x4.trans feeds the QK
-// MMA fragments directly; P*V uses the validated BF16 pair loader.
-template <int CAUSAL, int WARPS>
+// swizzle; P*V uses the validated BF16 pair loader. PIPELINED double-buffers the
+// K/V staging with cp.async (the same scheme the BERT flash kernel uses) so the
+// next key tile streams from global memory while the current tile feeds the
+// QK/softmax/PV recurrence; the legacy single-buffer path (PIPELINED=0) stages K
+// transposed+swizzled for ldmatrix.x4.trans and is kept only as a same-binary
+// A/B baseline. Both paths are numerically identical.
+template <int CAUSAL, int WARPS, int PIPELINED>
 __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             const float *qkv,
                                                             const __nv_bfloat16 *kexp,
@@ -1135,9 +1139,10 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             int q_offset,
                                                             float scale) {
     enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
-    __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
-    __shared__ __align__(16) __nv_bfloat16 ksh[KT * HD];
-    __shared__ __align__(16) __nv_bfloat16 vsh[KT * HD];
+    // Q stays resident; the K/V region is a single double-buffer when PIPELINED
+    // (two K stages + two V stages) and a single K+V tile otherwise.
+    enum { Q_ELEMS = WARPS * QT * HD, KV_ELEMS = (PIPELINED ? 4 : 2) * KT * HD };
+    __shared__ __align__(16) __nv_bfloat16 shmem[Q_ELEMS + KV_ELEMS];
 
     int lane = threadIdx.x & 31;
     int warp = threadIdx.y;
@@ -1152,6 +1157,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         return;
     int q0 = block_q0 + warp * QT;
     size_t hv = (size_t)head * HD;
+    __nv_bfloat16 *qsh = shmem;
     __nv_bfloat16 *myq = qsh + warp * QT * HD;
 
     for (int idx = lane; idx < QT * HD; idx += 32) {
@@ -1178,79 +1184,192 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
             key_hi = lim;
     }
 
-    for (int k0 = 0; k0 < key_hi; k0 += KT) {
-        for (int idx = tid; idx < KT * HD; idx += nthreads) {
-            int kk = idx / HD;
-            int d = idx - kk * HD;
-            int key = k0 + kk;
-            size_t kb = (size_t)(start + key) * q_dim + hv + d;
-            __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
-            __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
-            tc_store_swz_bf16<16>(ksh, d, kk, kval);
-            vsh[idx] = vval;
-        }
-        __syncthreads();
+    if constexpr (PIPELINED) {
+        // Double-buffered K/V: while one 16-key tile feeds QK/softmax/PV, the next
+        // tile streams from global into the other stage via cp.async, so per-tile
+        // global-load latency overlaps compute instead of stalling the loop (the
+        // cost that grows with sequence length). K lands in the (key, d) row-major
+        // swizzle the QK ldmatrix reads directly; V stays plain for the PV gather;
+        // the single barrier per tile publishes the freshly staged tile. Qwen
+        // reads K/V from the GQA-expanded kexp/vexp (DIRECT_KV=0), so the stager's
+        // k_offset/v_offset/kv_head/qkv_dim args are unused. Q is kept resident
+        // (not aliased for KV) so a_q need not be preloaded into 32 registers,
+        // which would drop the block below the 2-per-SM occupancy HD=128 needs.
+        __nv_bfloat16 *kstage0 = shmem + Q_ELEMS;
+        __nv_bfloat16 *kstage1 = kstage0 + KT * HD;
+        __nv_bfloat16 *vstage0 = kstage1 + KT * HD;
+        __nv_bfloat16 *vstage1 = vstage0 + KT * HD;
 
-        float s[8];
-#pragma unroll
-        for (int r = 0; r < 8; r++)
-            s[r] = 0.0f;
-#pragma unroll
-        for (int d0 = 0; d0 < HD; d0 += 16) {
-            uint32_t a[4], bb[4];
-            tc_load_a_q_ldmatrix_swz_bf16(a, myq, d0);
-            tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh, d0);
-            mma_m16n16k16_bf16(s, a, bb);
-        }
+        int stage = 0;
+        int async_stage =
+            bert_stage_kv_tile_bf16<HD, KT, float, 0>(kstage0, vstage0, qkv, kexp, vexp, start, L, 0,
+                                                      q_dim, qkv_dim, 0, 0, hv, 0, tid, nthreads);
 
-        const float neg_inf = -3.402823466e+38F;
+        for (int k0 = 0; k0 < key_hi; k0 += KT) {
+            if (async_stage)
+                tc_cp_async_wait_group<0>();
+            __syncthreads();
+
+            __nv_bfloat16 *krow = stage ? kstage1 : kstage0;
+            __nv_bfloat16 *vsh = stage ? vstage1 : vstage0;
+
+            int next_k0 = k0 + KT;
+            int next_stage = stage ^ 1;
+            int async_next = 0;
+            if (next_k0 < key_hi) {
+                async_next = bert_stage_kv_tile_bf16<HD, KT, float, 0>(
+                    next_stage ? kstage1 : kstage0, next_stage ? vstage1 : vstage0, qkv, kexp, vexp,
+                    start, L, next_k0, q_dim, qkv_dim, 0, 0, hv, 0, tid, nthreads);
+            }
+
+            float s[8];
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-            int qrow = q0 + qr;
-            int key = k0 + kc;
-            if (qrow < L && key < L && (!CAUSAL || key <= qrow))
-                s[r] *= scale;
-            else
-                s[r] = neg_inf;
-        }
+            for (int r = 0; r < 8; r++)
+                s[r] = 0.0f;
+#pragma unroll
+            for (int d0 = 0; d0 < HD; d0 += 16) {
+                uint32_t a[4], bb[4];
+                tc_load_a_q_ldmatrix_swz_hd<HD>(a, myq, d0);
+                tc_load_b_qk_keyd_swz_bf16<HD>(bb, krow, d0);
+                mma_m16n16k16_bf16(s, a, bb);
+            }
+
+            const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+                int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+                int qrow = q0 + qr;
+                int key = k0 + kc;
+                if (qrow < L && key < L && (!CAUSAL || key <= qrow))
+                    s[r] *= scale;
+                else
+                    s[r] = neg_inf;
+            }
 
 #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            int r0 = j * 2;
-            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
-            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
-            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
-            denom[j] *= corr;
+            for (int j = 0; j < 2; j++) {
+                int r0 = j * 2;
+                float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+                float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+                float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+                denom[j] *= corr;
+#pragma unroll
+                for (int dc = 0; dc < DCHUNKS; dc++) {
+                    o[dc][r0 + 0] *= corr;
+                    o[dc][r0 + 1] *= corr;
+                    o[dc][r0 + 4] *= corr;
+                    o[dc][r0 + 5] *= corr;
+                }
+                float p0 =
+                    (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+                float p1 =
+                    (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+                float p4 =
+                    (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+                float p5 =
+                    (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+                s[r0 + 0] = p0;
+                s[r0 + 1] = p1;
+                s[r0 + 4] = p4;
+                s[r0 + 5] = p5;
+                denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+                m[j] = m_new;
+            }
+
+            uint32_t pfrag[4];
+            tc_probs_to_a_bf16(pfrag, s);
 #pragma unroll
             for (int dc = 0; dc < DCHUNKS; dc++) {
-                o[dc][r0 + 0] *= corr;
-                o[dc][r0 + 1] *= corr;
-                o[dc][r0 + 4] *= corr;
-                o[dc][r0 + 5] *= corr;
+                uint32_t vb[4];
+                tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
+                mma_m16n16k16_bf16(o[dc], pfrag, vb);
             }
-            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
-            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
-            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
-            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
-            s[r0 + 0] = p0;
-            s[r0 + 1] = p1;
-            s[r0 + 4] = p4;
-            s[r0 + 5] = p5;
-            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
-            m[j] = m_new;
+            stage = next_stage;
+            async_stage = async_next;
         }
+    } else {
+        __nv_bfloat16 *ksh = shmem + Q_ELEMS;
+        __nv_bfloat16 *vsh = ksh + KT * HD;
 
-        uint32_t pfrag[4];
-        tc_probs_to_a_bf16(pfrag, s);
+        for (int k0 = 0; k0 < key_hi; k0 += KT) {
+            for (int idx = tid; idx < KT * HD; idx += nthreads) {
+                int kk = idx / HD;
+                int d = idx - kk * HD;
+                int key = k0 + kk;
+                size_t kb = (size_t)(start + key) * q_dim + hv + d;
+                __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
+                __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
+                tc_store_swz_bf16<16>(ksh, d, kk, kval);
+                vsh[idx] = vval;
+            }
+            __syncthreads();
+
+            float s[8];
 #pragma unroll
-        for (int dc = 0; dc < DCHUNKS; dc++) {
-            uint32_t vb[4];
-            tc_load_b_pv_bf16(vb, vsh, dc * 16);
-            mma_m16n16k16_bf16(o[dc], pfrag, vb);
+            for (int r = 0; r < 8; r++)
+                s[r] = 0.0f;
+#pragma unroll
+            for (int d0 = 0; d0 < HD; d0 += 16) {
+                uint32_t a[4], bb[4];
+                tc_load_a_q_ldmatrix_swz_bf16(a, myq, d0);
+                tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh, d0);
+                mma_m16n16k16_bf16(s, a, bb);
+            }
+
+            const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+                int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+                int qrow = q0 + qr;
+                int key = k0 + kc;
+                if (qrow < L && key < L && (!CAUSAL || key <= qrow))
+                    s[r] *= scale;
+                else
+                    s[r] = neg_inf;
+            }
+
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                int r0 = j * 2;
+                float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+                float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+                float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+                denom[j] *= corr;
+#pragma unroll
+                for (int dc = 0; dc < DCHUNKS; dc++) {
+                    o[dc][r0 + 0] *= corr;
+                    o[dc][r0 + 1] *= corr;
+                    o[dc][r0 + 4] *= corr;
+                    o[dc][r0 + 5] *= corr;
+                }
+                float p0 =
+                    (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+                float p1 =
+                    (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+                float p4 =
+                    (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+                float p5 =
+                    (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+                s[r0 + 0] = p0;
+                s[r0 + 1] = p1;
+                s[r0 + 4] = p4;
+                s[r0 + 5] = p5;
+                denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+                m[j] = m_new;
+            }
+
+            uint32_t pfrag[4];
+            tc_probs_to_a_bf16(pfrag, s);
+#pragma unroll
+            for (int dc = 0; dc < DCHUNKS; dc++) {
+                uint32_t vb[4];
+                tc_load_b_pv_bf16(vb, vsh, dc * 16);
+                mma_m16n16k16_bf16(o[dc], pfrag, vb);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -1438,7 +1557,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
         __nv_bfloat16 *vstage1 = vstage0 + KT * HD;
 
         int stage = 0;
-        int async_stage = bert_stage_kv_tile_bf16<HD, QKV_T, DIRECT_KV>(
+        int async_stage = bert_stage_kv_tile_bf16<HD, 64, QKV_T, DIRECT_KV>(
             kstage0, vstage0, qkv, kexp, vexp, start, L, 0, q_dim, qkv_dim, k_offset, v_offset, hv,
             kv_head, tid, nthreads);
 
@@ -1459,7 +1578,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
             int next_stage = stage ^ 1;
             int async_next = 0;
             if (next_k0 < L) {
-                async_next = bert_stage_kv_tile_bf16<HD, QKV_T, DIRECT_KV>(
+                async_next = bert_stage_kv_tile_bf16<HD, 64, QKV_T, DIRECT_KV>(
                     next_stage ? kstage1 : kstage0, next_stage ? vstage1 : vstage0, qkv, kexp, vexp,
                     start, L, next_k0, q_dim, qkv_dim, k_offset, v_offset, hv, kv_head, tid,
                     nthreads);
@@ -1728,7 +1847,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
         __half *vstage1 = vstage0 + KT * HD;
 
         int stage = 0;
-        int async_stage = bert_stage_kv_tile_f16<HD, QKV_T, DIRECT_KV>(
+        int async_stage = bert_stage_kv_tile_f16<HD, 64, QKV_T, DIRECT_KV>(
             kstage0, vstage0, qkv, kexp, vexp, start, L, 0, q_dim, qkv_dim, k_offset, v_offset, hv,
             kv_head, tid, nthreads);
 
@@ -1749,7 +1868,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
             int next_stage = stage ^ 1;
             int async_next = 0;
             if (next_k0 < L) {
-                async_next = bert_stage_kv_tile_f16<HD, QKV_T, DIRECT_KV>(
+                async_next = bert_stage_kv_tile_f16<HD, 64, QKV_T, DIRECT_KV>(
                     next_stage ? kstage1 : kstage0, next_stage ? vstage1 : vstage0, qkv, kexp, vexp,
                     start, L, next_k0, q_dim, qkv_dim, k_offset, v_offset, hv, kv_head, tid,
                     nthreads);
@@ -2565,6 +2684,23 @@ static int tc_kv_warps_or(int default_w) {
     return w ? w : default_w;
 }
 
+// Qwen flash K/V-staging pipeline. Diagnostic switch over the single release
+// path: env unset/default runs the cp.async double-buffer (the shipped
+// behavior), 1/on forces it on, 0/off forces the legacy single-buffer staging.
+// Used to A/B the pipeline at one token count without rebuilding.
+static int qwen_flash_pipeline_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_QWEN_FLASH_PIPELINE");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        else if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
+        init = 1;
+    }
+    return mode;
+}
+
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
     if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
@@ -3272,25 +3408,35 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             out_dtype == CUDA_DTYPE_BF16 && out_16 && hd == 128) {
             // Promoted Qwen BF16 tensor-core flash attention.
             int w = tc_kv_warps_or(8);
-#define TC3_LAUNCH(W)                                                                             \
+            int qpipe = qwen_flash_pipeline_mode() >= 0;
+#define TC3_LAUNCH(W, P)                                                                          \
     do {                                                                                          \
         dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                 \
         dim3 block(32, (W));                                                                      \
         if (causal)                                                                               \
-            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W)><<<grid, block, 0, ctx->stream>>>(        \
+            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P)><<<grid, block, 0, ctx->stream>>>(   \
                 (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
         else                                                                                      \
-            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W)><<<grid, block, 0, ctx->stream>>>(        \
+            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P)><<<grid, block, 0, ctx->stream>>>(   \
                 (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
     } while (0)
-            if (w == 2)
-                TC3_LAUNCH(2);
-            else if (w == 8)
-                TC3_LAUNCH(8);
-            else
-                TC3_LAUNCH(4);
+            if (qpipe) {
+                if (w == 2)
+                    TC3_LAUNCH(2, 1);
+                else if (w == 8)
+                    TC3_LAUNCH(8, 1);
+                else
+                    TC3_LAUNCH(4, 1);
+            } else {
+                if (w == 2)
+                    TC3_LAUNCH(2, 0);
+                else if (w == 8)
+                    TC3_LAUNCH(8, 0);
+                else
+                    TC3_LAUNCH(4, 0);
+            }
 #undef TC3_LAUNCH
             return launch_check();
         }
