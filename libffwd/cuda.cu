@@ -4060,10 +4060,10 @@ static int bert_qkv16_mode(void) {
 }
 
 // BERT flash K/V-staging pipeline. Diagnostic switch over the single release
-// path: 0/default rides the residual16 gate (the shipped behavior), 1/on forces
-// the cp.async pipeline on, 0/off forces the legacy single-buffer staging. Used
-// to A/B the pipeline at one token count without rebuilding while the
-// non-residual16 bf16 correctness question is open.
+// path: env unset/default runs the cp.async pipeline whenever BERT flash is
+// active (the shipped behavior), 1/on forces it on, 0/off forces the legacy
+// single-buffer staging. Used to A/B the pipeline at one token count without
+// rebuilding.
 static int bert_flash_pipeline_mode(void) {
     static int init = 0, mode = 0;
     if (!init) {
@@ -4187,11 +4187,13 @@ static int cuda_forward_batch_bert(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inp
                 return -1;
         }
         // Flash writes reduced-precision attention output into act16; the
-        // materialized path writes F32 attn_out. The K/V-staging pipeline rides
-        // the residual16 gate by default; the diagnostic env knob forces it
-        // on/off to validate that single release path.
+        // materialized path writes F32 attn_out. The K/V-staging pipeline runs
+        // whenever flash is active: it is numerically identical to single-buffer
+        // staging (it only overlaps the cp.async K/V loads) and is faster across
+        // the reduced-precision batch cells. The diagnostic env knob forces it
+        // on/off for a same-host A/B.
         int pipe_mode = bert_flash_pipeline_mode();
-        int bert_pipeline = pipe_mode > 0 ? 1 : (pipe_mode < 0 ? 0 : use_resid16);
+        int bert_pipeline = pipe_mode > 0 ? 1 : (pipe_mode < 0 ? 0 : flash);
         if (cuda_attention_gemm(ctx, ctx->offsets_host, batch, q_offset, k_offset, v_offset, qkv_dim,
                                 qkv_src, qkv_dtype, scale, flash ? act16 : NULL,
                                 flash ? act_dtype : CUDA_DTYPE_F32, bert_pipeline) != 0)
