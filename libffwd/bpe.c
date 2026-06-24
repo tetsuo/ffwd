@@ -1,4 +1,7 @@
 #include "bpe.h"
+
+#include "yyjson.h"
+
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -119,88 +122,6 @@ static char *decode_gpt2_token(const char *token_str) {
     }
     bytes[byte_count] = '\0';
     return (char *)bytes;
-}
-
-/* ========================================================================
- * Simple JSON parser for vocab.json
- * ======================================================================== */
-
-static void skip_ws(const char **p) {
-    while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t')
-        (*p)++;
-}
-
-static int parse_json_string(const char **p, char *out, size_t max_len) {
-    skip_ws(p);
-    if (**p != '"')
-        return -1;
-    (*p)++;
-    size_t i = 0;
-    while (**p && **p != '"' && i < max_len - 1) {
-        if (**p == '\\') {
-            (*p)++;
-            if (**p == 'n')
-                out[i++] = '\n';
-            else if (**p == 't')
-                out[i++] = '\t';
-            else if (**p == '"')
-                out[i++] = '"';
-            else if (**p == '\\')
-                out[i++] = '\\';
-            else if (**p == '/')
-                out[i++] = '/';
-            else if (**p == 'u') {
-                (*p)++;
-                unsigned int cp = 0;
-                for (int j = 0; j < 4 && **p; j++, (*p)++) {
-                    cp <<= 4;
-                    char c = **p;
-                    if (c >= '0' && c <= '9')
-                        cp |= (unsigned)(c - '0');
-                    else if (c >= 'a' && c <= 'f')
-                        cp |= (unsigned)(c - 'a' + 10);
-                    else if (c >= 'A' && c <= 'F')
-                        cp |= (unsigned)(c - 'A' + 10);
-                }
-                if (cp < 0x80 && i + 1 < max_len) {
-                    out[i++] = (char)cp;
-                } else if (cp < 0x800 && i + 2 < max_len) {
-                    out[i++] = (char)(0xC0 | (cp >> 6));
-                    out[i++] = (char)(0x80 | (cp & 0x3F));
-                } else if (i + 3 < max_len) {
-                    out[i++] = (char)(0xE0 | (cp >> 12));
-                    out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                    out[i++] = (char)(0x80 | (cp & 0x3F));
-                }
-                continue;
-            } else {
-                out[i++] = **p;
-            }
-        } else {
-            out[i++] = **p;
-        }
-        (*p)++;
-    }
-    out[i] = '\0';
-    if (**p != '"')
-        return -1;
-    (*p)++;
-    return 0;
-}
-
-static int64_t parse_json_int(const char **p) {
-    skip_ws(p);
-    int neg = 0;
-    if (**p == '-') {
-        neg = 1;
-        (*p)++;
-    }
-    int64_t val = 0;
-    while (**p >= '0' && **p <= '9') {
-        val = val * 10 + (**p - '0');
-        (*p)++;
-    }
-    return neg ? -val : val;
 }
 
 /* ========================================================================
@@ -1759,33 +1680,23 @@ tok_bpe_t *tok_bpe_load(const char *vocab_json_path) {
     fclose(f);
     json[file_size] = '\0';
 
-    int max_id = 0;
-    const char *p = json;
-    skip_ws(&p);
-    if (*p != '{') {
+    yyjson_doc *doc = yyjson_read(json, (size_t)file_size, 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
         free(json);
         return NULL;
     }
-    p++;
 
-    const char *saved = p;
-    while (*p && *p != '}') {
-        skip_ws(&p);
-        if (*p == ',') {
-            p++;
-            continue;
-        }
-        if (*p == '}')
-            break;
-
-        char key[4096] = {0};
-        if (parse_json_string(&p, key, sizeof(key)) != 0)
-            break;
-        skip_ws(&p);
-        if (*p != ':')
-            break;
-        p++;
-        int64_t id = parse_json_int(&p);
+    /* vocab.json is a flat { token: id } object. Walk it once for the max id to
+     * size the tables, then again to fill them. yyjson unescapes each key
+     * (including \uXXXX) to the same byte-level GPT-2 form the old scanner
+     * produced; decode_gpt2_token then maps that to the raw token text. */
+    int max_id = 0;
+    size_t idx, n;
+    yyjson_val *key, *val;
+    yyjson_obj_foreach(root, idx, n, key, val) {
+        int64_t id = yyjson_get_int(val);
         if (id > max_id)
             max_id = (int)id;
     }
@@ -1793,6 +1704,7 @@ tok_bpe_t *tok_bpe_load(const char *vocab_json_path) {
     int vocab_size = max_id + 1;
     tok_bpe_t *tok = (tok_bpe_t *)calloc(1, sizeof(tok_bpe_t));
     if (!tok) {
+        yyjson_doc_free(doc);
         free(json);
         return NULL;
     }
@@ -1801,36 +1713,22 @@ tok_bpe_t *tok_bpe_load(const char *vocab_json_path) {
     tok->id_to_bpe = (char **)calloc((size_t)vocab_size, sizeof(char *));
     if (!tok->id_to_text || !tok->id_to_bpe) {
         tok_bpe_free(tok);
+        yyjson_doc_free(doc);
         free(json);
         return NULL;
     }
 
-    p = saved;
-    while (*p && *p != '}') {
-        skip_ws(&p);
-        if (*p == ',') {
-            p++;
-            continue;
-        }
-        if (*p == '}')
-            break;
-
-        char key[4096] = {0};
-        if (parse_json_string(&p, key, sizeof(key)) != 0)
-            break;
-        skip_ws(&p);
-        if (*p != ':')
-            break;
-        p++;
-        int64_t id = parse_json_int(&p);
-
-        if (id >= 0 && id < vocab_size) {
+    yyjson_obj_foreach(root, idx, n, key, val) {
+        const char *kstr = yyjson_get_str(key);
+        int64_t id = yyjson_get_int(val);
+        if (kstr && id >= 0 && id < vocab_size) {
             free(tok->id_to_bpe[id]);
             free(tok->id_to_text[id]);
-            tok->id_to_bpe[id] = strdup(key);
-            tok->id_to_text[id] = decode_gpt2_token(key);
+            tok->id_to_bpe[id] = strdup(kstr);
+            tok->id_to_text[id] = decode_gpt2_token(kstr);
         }
     }
+    yyjson_doc_free(doc);
     free(json);
 
     int n_vocab_entries = 0;
