@@ -1097,7 +1097,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                                                      int n_heads,
                                                      int n_kv_heads,
                                                      float scale) {
-    enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
+    enum { QT = 16, KT = 64, DCHUNKS = HD / 16, KSUB = KT / 16 };
     __shared__ __align__(16) __nv_bfloat16 qsh[WARPS * QT * HD];
     __shared__ __align__(16) __nv_bfloat16 ksh[KT * HD];
     __shared__ __align__(16) __nv_bfloat16 vsh[KT * HD];
@@ -1127,6 +1127,13 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
         tc_store_swz_bf16<HD>(myq, qr, d, __float2bfloat16(qv));
     }
 
+    // Q fragments do not change across keys: load them once and reuse them for
+    // every K sub-tile, instead of re-issuing ldmatrix on every K step.
+    uint32_t a_q[DCHUNKS][4];
+#pragma unroll
+    for (int dc = 0; dc < DCHUNKS; dc++)
+        tc_load_a_q_ldmatrix_swz_hd<HD>(a_q[dc], myq, dc * 16);
+
     float o[DCHUNKS][8];
 #pragma unroll
     for (int dc = 0; dc < DCHUNKS; dc++)
@@ -1136,6 +1143,10 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
     float m[2] = {-3.402823466e+38F, -3.402823466e+38F};
     float denom[2] = {0.0f, 0.0f};
 
+    // One shared-memory stage loads KT keys; the QK/softmax/PV math then runs
+    // over KSUB 16-key sub-tiles with no barrier between them, so a long
+    // sequence pays a quarter of the __syncthreads a 16-key tile would. The key
+    // order, masking, and online-softmax recurrence are unchanged.
     for (int k0 = 0; k0 < L; k0 += KT) { // bidirectional: every query attends every key
         for (int idx = tid; idx < KT * HD; idx += nthreads) {
             int kk = idx / HD;
@@ -1154,69 +1165,81 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                     vval = vexp[kb];
                 }
             }
-            tc_store_swz_bf16<16>(ksh, d, kk, kval);
+            tc_store_swz_bf16<16>(ksh + (kk >> 4) * 16 * HD, d, kk & 15, kval);
             vsh[idx] = vval;
         }
         __syncthreads();
 
-        float s[8];
 #pragma unroll
-        for (int r = 0; r < 8; r++)
-            s[r] = 0.0f;
-#pragma unroll
-        for (int d0 = 0; d0 < HD; d0 += 16) {
-            uint32_t a[4], bb[4];
-            tc_load_a_q_ldmatrix_swz_hd<HD>(a, myq, d0);
-            tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh, d0);
-            mma_m16n16k16_bf16(s, a, bb);
-        }
+        for (int sub = 0; sub < KSUB; sub++) {
+            const __nv_bfloat16 *ksh_s = ksh + sub * 16 * HD;
+            const __nv_bfloat16 *vsh_s = vsh + sub * 16 * HD;
+            int ksub0 = k0 + sub * 16;
+            if (ksub0 >= L) // remaining sub-tiles are entirely past the sequence end
+                break;
 
-        const float neg_inf = -3.402823466e+38F;
+            float s[8];
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-            int qrow = q0 + qr;
-            int key = k0 + kc;
-            if (qrow < L && key < L)
-                s[r] *= scale;
-            else
-                s[r] = neg_inf;
-        }
+            for (int r = 0; r < 8; r++)
+                s[r] = 0.0f;
+#pragma unroll
+            for (int d0 = 0; d0 < HD; d0 += 16) {
+                uint32_t bb[4];
+                tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh_s, d0);
+                mma_m16n16k16_bf16(s, a_q[d0 >> 4], bb);
+            }
+
+            const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+                int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+                int qrow = q0 + qr;
+                int key = ksub0 + kc;
+                if (qrow < L && key < L)
+                    s[r] *= scale;
+                else
+                    s[r] = neg_inf;
+            }
 
 #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            int r0 = j * 2;
-            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
-            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
-            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
-            denom[j] *= corr;
+            for (int j = 0; j < 2; j++) {
+                int r0 = j * 2;
+                float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+                float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+                float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+                denom[j] *= corr;
+#pragma unroll
+                for (int dc = 0; dc < DCHUNKS; dc++) {
+                    o[dc][r0 + 0] *= corr;
+                    o[dc][r0 + 1] *= corr;
+                    o[dc][r0 + 4] *= corr;
+                    o[dc][r0 + 5] *= corr;
+                }
+                float p0 =
+                    (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+                float p1 =
+                    (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+                float p4 =
+                    (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+                float p5 =
+                    (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+                s[r0 + 0] = p0;
+                s[r0 + 1] = p1;
+                s[r0 + 4] = p4;
+                s[r0 + 5] = p5;
+                denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+                m[j] = m_new;
+            }
+
+            uint32_t pfrag[4];
+            tc_probs_to_a_bf16(pfrag, s);
 #pragma unroll
             for (int dc = 0; dc < DCHUNKS; dc++) {
-                o[dc][r0 + 0] *= corr;
-                o[dc][r0 + 1] *= corr;
-                o[dc][r0 + 4] *= corr;
-                o[dc][r0 + 5] *= corr;
+                uint32_t vb[4];
+                tc_load_b_pv_hd<HD>(vb, vsh_s, dc * 16);
+                mma_m16n16k16_bf16(o[dc], pfrag, vb);
             }
-            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
-            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
-            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
-            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
-            s[r0 + 0] = p0;
-            s[r0 + 1] = p1;
-            s[r0 + 4] = p4;
-            s[r0 + 5] = p5;
-            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
-            m[j] = m_new;
-        }
-
-        uint32_t pfrag[4];
-        tc_probs_to_a_bf16(pfrag, s);
-#pragma unroll
-        for (int dc = 0; dc < DCHUNKS; dc++) {
-            uint32_t vb[4];
-            tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
-            mma_m16n16k16_bf16(o[dc], pfrag, vb);
         }
         __syncthreads();
     }
@@ -1256,7 +1279,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
                                                          int n_heads,
                                                          int n_kv_heads,
                                                          float scale) {
-    enum { QT = 16, KT = 16, DCHUNKS = HD / 16 };
+    enum { QT = 16, KT = 64, DCHUNKS = HD / 16, KSUB = KT / 16 };
     __shared__ __align__(16) __half qsh[WARPS * QT * HD];
     __shared__ __align__(16) __half ksh[KT * HD];
     __shared__ __align__(16) __half vsh[KT * HD];
@@ -1286,6 +1309,13 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
         tc_store_swz_f16<HD>(myq, qr, d, __float2half(qv));
     }
 
+    // Q fragments do not change across keys: load them once and reuse them for
+    // every K sub-tile, instead of re-issuing ldmatrix on every K step.
+    uint32_t a_q[DCHUNKS][4];
+#pragma unroll
+    for (int dc = 0; dc < DCHUNKS; dc++)
+        tc_load_a_q_ldmatrix_swz_hd_f16<HD>(a_q[dc], myq, dc * 16);
+
     float o[DCHUNKS][8];
 #pragma unroll
     for (int dc = 0; dc < DCHUNKS; dc++)
@@ -1295,6 +1325,10 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
     float m[2] = {-3.402823466e+38F, -3.402823466e+38F};
     float denom[2] = {0.0f, 0.0f};
 
+    // One shared-memory stage loads KT keys; the QK/softmax/PV math then runs
+    // over KSUB 16-key sub-tiles with no barrier between them, so a long
+    // sequence pays a quarter of the __syncthreads a 16-key tile would. The key
+    // order, masking, and online-softmax recurrence are unchanged.
     for (int k0 = 0; k0 < L; k0 += KT) {
         for (int idx = tid; idx < KT * HD; idx += nthreads) {
             int kk = idx / HD;
@@ -1313,69 +1347,81 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
                     vval = vexp[kb];
                 }
             }
-            tc_store_swz_f16<16>(ksh, d, kk, kval);
+            tc_store_swz_f16<16>(ksh + (kk >> 4) * 16 * HD, d, kk & 15, kval);
             vsh[idx] = vval;
         }
         __syncthreads();
 
-        float s[8];
 #pragma unroll
-        for (int r = 0; r < 8; r++)
-            s[r] = 0.0f;
-#pragma unroll
-        for (int d0 = 0; d0 < HD; d0 += 16) {
-            uint32_t a[4], bb[4];
-            tc_load_a_q_ldmatrix_swz_hd_f16<HD>(a, myq, d0);
-            tc_load_b_qk_ldmatrix_swz_f16(bb, ksh, d0);
-            mma_m16n16k16_f16(s, a, bb);
-        }
+        for (int sub = 0; sub < KSUB; sub++) {
+            const __half *ksh_s = ksh + sub * 16 * HD;
+            const __half *vsh_s = vsh + sub * 16 * HD;
+            int ksub0 = k0 + sub * 16;
+            if (ksub0 >= L) // remaining sub-tiles are entirely past the sequence end
+                break;
 
-        const float neg_inf = -3.402823466e+38F;
+            float s[8];
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-            int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-            int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-            int qrow = q0 + qr;
-            int key = k0 + kc;
-            if (qrow < L && key < L)
-                s[r] *= scale;
-            else
-                s[r] = neg_inf;
-        }
+            for (int r = 0; r < 8; r++)
+                s[r] = 0.0f;
+#pragma unroll
+            for (int d0 = 0; d0 < HD; d0 += 16) {
+                uint32_t bb[4];
+                tc_load_b_qk_ldmatrix_swz_f16(bb, ksh_s, d0);
+                mma_m16n16k16_f16(s, a_q[d0 >> 4], bb);
+            }
+
+            const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+                int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+                int qrow = q0 + qr;
+                int key = ksub0 + kc;
+                if (qrow < L && key < L)
+                    s[r] *= scale;
+                else
+                    s[r] = neg_inf;
+            }
 
 #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            int r0 = j * 2;
-            float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
-            float m_new = fmaxf(m[j], warp_group4_max(tile_m));
-            float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
-            denom[j] *= corr;
+            for (int j = 0; j < 2; j++) {
+                int r0 = j * 2;
+                float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+                float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+                float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+                denom[j] *= corr;
+#pragma unroll
+                for (int dc = 0; dc < DCHUNKS; dc++) {
+                    o[dc][r0 + 0] *= corr;
+                    o[dc][r0 + 1] *= corr;
+                    o[dc][r0 + 4] *= corr;
+                    o[dc][r0 + 5] *= corr;
+                }
+                float p0 =
+                    (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+                float p1 =
+                    (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+                float p4 =
+                    (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+                float p5 =
+                    (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+                s[r0 + 0] = p0;
+                s[r0 + 1] = p1;
+                s[r0 + 4] = p4;
+                s[r0 + 5] = p5;
+                denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+                m[j] = m_new;
+            }
+
+            uint32_t pfrag[4];
+            tc_probs_to_a_f16(pfrag, s);
 #pragma unroll
             for (int dc = 0; dc < DCHUNKS; dc++) {
-                o[dc][r0 + 0] *= corr;
-                o[dc][r0 + 1] *= corr;
-                o[dc][r0 + 4] *= corr;
-                o[dc][r0 + 5] *= corr;
+                uint32_t vb[4];
+                tc_load_b_pv_hd_f16<HD>(vb, vsh_s, dc * 16);
+                mma_m16n16k16_f16(o[dc], pfrag, vb);
             }
-            float p0 = (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
-            float p1 = (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
-            float p4 = (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
-            float p5 = (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
-            s[r0 + 0] = p0;
-            s[r0 + 1] = p1;
-            s[r0 + 4] = p4;
-            s[r0 + 5] = p5;
-            denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
-            m[j] = m_new;
-        }
-
-        uint32_t pfrag[4];
-        tc_probs_to_a_f16(pfrag, s);
-#pragma unroll
-        for (int dc = 0; dc < DCHUNKS; dc++) {
-            uint32_t vb[4];
-            tc_load_b_pv_hd_f16<HD>(vb, vsh, dc * 16);
-            mma_m16n16k16_f16(o[dc], pfrag, vb);
         }
         __syncthreads();
     }
