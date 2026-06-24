@@ -1271,6 +1271,82 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
     }
 }
 
+// QK^T for one 16-key sub-tile into the per-row score fragment s[8], including
+// the scale and the length mask. Factored out so the BERT flash main loop can
+// issue the NEXT sub-tile's QK before the CURRENT sub-tile's softmax: QK is pure
+// (it reads K/Q and writes only its own s[8]), so its HMMAs can run on the
+// tensor cores while the softmax (exp/shuffle/rescale) runs on the SFU/FP units.
+// The scheduled SASS shows that without this, the tensor cores sit idle through
+// the entire softmax block, because QK->softmax->PV is a serial dependency chain
+// per sub-tile and the compiler cannot hoist QK across it on its own.
+template <int HD>
+__device__ static __forceinline__ void bert_qk_subtile_bf16(float s[8],
+                                                            const __nv_bfloat16 *krow,
+                                                            const uint32_t (*a_q)[4],
+                                                            int sub,
+                                                            int k0,
+                                                            int q0,
+                                                            int L,
+                                                            float scale) {
+    int lane = threadIdx.x & 31;
+    const __nv_bfloat16 *ksh_s = krow + sub * 16 * HD;
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+        s[r] = 0.0f;
+#pragma unroll
+    for (int d0 = 0; d0 < HD; d0 += 16) {
+        uint32_t bb[4];
+        tc_load_b_qk_keyd_swz_bf16<HD>(bb, ksh_s, d0);
+        mma_m16n16k16_bf16(s, a_q[d0 >> 4], bb);
+    }
+    const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+        int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+        int qrow = q0 + qr;
+        int key = k0 + sub * 16 + kc;
+        if (qrow < L && key < L)
+            s[r] *= scale;
+        else
+            s[r] = neg_inf;
+    }
+}
+
+template <int HD>
+__device__ static __forceinline__ void bert_qk_subtile_f16(float s[8],
+                                                           const __half *krow,
+                                                           const uint32_t (*a_q)[4],
+                                                           int sub,
+                                                           int k0,
+                                                           int q0,
+                                                           int L,
+                                                           float scale) {
+    int lane = threadIdx.x & 31;
+    const __half *ksh_s = krow + sub * 16 * HD;
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+        s[r] = 0.0f;
+#pragma unroll
+    for (int d0 = 0; d0 < HD; d0 += 16) {
+        uint32_t bb[4];
+        tc_load_b_qk_keyd_swz_f16<HD>(bb, ksh_s, d0);
+        mma_m16n16k16_f16(s, a_q[d0 >> 4], bb);
+    }
+    const float neg_inf = -3.402823466e+38F;
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+        int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+        int qrow = q0 + qr;
+        int key = k0 + sub * 16 + kc;
+        if (qrow < L && key < L)
+            s[r] *= scale;
+        else
+            s[r] = neg_inf;
+    }
+}
+
 // BF16 tensor-core flash attention for the BERT shape: head_dim 32/64, BIDIRECTIONAL
 // (no causal mask). The tc3 kernel for the Qwen shape (head_dim 128, K/V-sharing,
 // ldmatrix QK, online softmax) generalized to smaller BERT head sizes: fewer
@@ -1389,38 +1465,24 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                     nthreads);
             }
 
+            // Software-pipelined sub-tiles: hold two score buffers and issue the
+            // next sub-tile's QK (pure, writes only its s[8]) before the current
+            // sub-tile's softmax, so the QK HMMAs overlap the softmax's exp/
+            // shuffle/rescale instead of leaving the tensor cores idle. Output is
+            // bit-identical to the serial order; only the schedule changes.
+            float sA[8], sB[8];
+            bert_qk_subtile_bf16<HD>(sA, krow, a_q, 0, k0, q0, L, scale);
 #pragma unroll
             for (int sub = 0; sub < KSUB; sub++) {
-                const __nv_bfloat16 *ksh_s = krow + sub * 16 * HD;
-                const __nv_bfloat16 *vsh_s = vsh + sub * 16 * HD;
                 int ksub0 = k0 + sub * 16;
                 if (ksub0 >= L)
                     break;
-
-                float s[8];
-#pragma unroll
-                for (int r = 0; r < 8; r++)
-                    s[r] = 0.0f;
-#pragma unroll
-                for (int d0 = 0; d0 < HD; d0 += 16) {
-                    uint32_t bb[4];
-                    tc_load_b_qk_keyd_swz_bf16<HD>(bb, ksh_s, d0);
-                    mma_m16n16k16_bf16(s, a_q[d0 >> 4], bb);
-                }
+                float (&s)[8] = (sub & 1) ? sB : sA;
+                if (sub + 1 < KSUB && k0 + (sub + 1) * 16 < L)
+                    bert_qk_subtile_bf16<HD>((sub & 1) ? sA : sB, krow, a_q, sub + 1, k0, q0, L,
+                                             scale);
 
                 const float neg_inf = -3.402823466e+38F;
-#pragma unroll
-                for (int r = 0; r < 8; r++) {
-                    int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-                    int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-                    int qrow = q0 + qr;
-                    int key = ksub0 + kc;
-                    if (qrow < L && key < L)
-                        s[r] *= scale;
-                    else
-                        s[r] = neg_inf;
-                }
-
 #pragma unroll
                 for (int j = 0; j < 2; j++) {
                     int r0 = j * 2;
@@ -1453,6 +1515,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 
                 uint32_t pfrag[4];
                 tc_probs_to_a_bf16(pfrag, s);
+                const __nv_bfloat16 *vsh_s = vsh + sub * 16 * HD;
 #pragma unroll
                 for (int dc = 0; dc < DCHUNKS; dc++) {
                     uint32_t vb[4];
@@ -1693,37 +1756,22 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
             }
 
 #pragma unroll
+            // See the bf16 sibling: prefetch the next sub-tile's QK before this
+            // sub-tile's softmax so the QK HMMAs overlap the softmax. Output is
+            // bit-identical to the serial order.
+            float sA[8], sB[8];
+            bert_qk_subtile_f16<HD>(sA, krow, a_q, 0, k0, q0, L, scale);
+#pragma unroll
             for (int sub = 0; sub < KSUB; sub++) {
-                const __half *ksh_s = krow + sub * 16 * HD;
-                const __half *vsh_s = vsh + sub * 16 * HD;
                 int ksub0 = k0 + sub * 16;
                 if (ksub0 >= L)
                     break;
-
-                float s[8];
-#pragma unroll
-                for (int r = 0; r < 8; r++)
-                    s[r] = 0.0f;
-#pragma unroll
-                for (int d0 = 0; d0 < HD; d0 += 16) {
-                    uint32_t bb[4];
-                    tc_load_b_qk_keyd_swz_f16<HD>(bb, ksh_s, d0);
-                    mma_m16n16k16_f16(s, a_q[d0 >> 4], bb);
-                }
+                float (&s)[8] = (sub & 1) ? sB : sA;
+                if (sub + 1 < KSUB && k0 + (sub + 1) * 16 < L)
+                    bert_qk_subtile_f16<HD>((sub & 1) ? sA : sB, krow, a_q, sub + 1, k0, q0, L,
+                                            scale);
 
                 const float neg_inf = -3.402823466e+38F;
-#pragma unroll
-                for (int r = 0; r < 8; r++) {
-                    int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-                    int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-                    int qrow = q0 + qr;
-                    int key = ksub0 + kc;
-                    if (qrow < L && key < L)
-                        s[r] *= scale;
-                    else
-                        s[r] = neg_inf;
-                }
-
 #pragma unroll
                 for (int j = 0; j < 2; j++) {
                     int r0 = j * 2;
@@ -1756,6 +1804,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
 
                 uint32_t pfrag[4];
                 tc_probs_to_a_f16(pfrag, s);
+                const __half *vsh_s = vsh + sub * 16 * HD;
 #pragma unroll
                 for (int dc = 0; dc < DCHUNKS; dc++) {
                     uint32_t vb[4];
