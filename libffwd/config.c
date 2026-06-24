@@ -1,6 +1,7 @@
 #include "config.h"
 
-#include <ctype.h>
+#include "yyjson.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -19,56 +20,36 @@ typedef enum {
     JSON_BOOL_INVALID = -1,
 } json_bool_t;
 
-static const char *skip_ws(const char *p) {
-    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
-        p++;
-    return p;
+/* Field readers over a parsed JSON object. yyjson getters are NULL-tolerant, so
+ * a missing key or wrong-typed value falls back cleanly. These replace a
+ * substring scanner that could match a key nested anywhere in the document
+ * (e.g. a field inside a nested sub-config), which is exactly the failure mode
+ * a real parser removes. */
+static int json_get_int(yyjson_val *obj, const char *key, int fallback) {
+    yyjson_val *v = yyjson_obj_get(obj, key);
+    if (yyjson_is_int(v))
+        return (int)yyjson_get_int(v);
+    if (yyjson_is_real(v))
+        return (int)yyjson_get_real(v);
+    return fallback;
 }
 
-static const char *json_find_key(const char *json, const char *key) {
-    size_t klen = strlen(key);
-    const char *p = json;
-    while ((p = strstr(p, key)) != NULL) {
-        if (p > json && p[-1] == '"') {
-            const char *after = p + klen;
-            if (*after == '"') {
-                after = skip_ws(after + 1);
-                if (*after == ':')
-                    return skip_ws(after + 1);
-            }
-        }
-        p += klen;
-    }
-    return NULL;
+static double json_get_double(yyjson_val *obj, const char *key, double fallback) {
+    yyjson_val *v = yyjson_obj_get(obj, key);
+    return yyjson_is_num(v) ? yyjson_get_num(v) : fallback;
 }
 
-static int json_get_int(const char *json, const char *key, int fallback) {
-    const char *v = json_find_key(json, key);
-    return v ? atoi(v) : fallback;
+static int json_string_equals(yyjson_val *obj, const char *key, const char *expected) {
+    const char *s = yyjson_get_str(yyjson_obj_get(obj, key));
+    return s && strcmp(s, expected) == 0;
 }
 
-static double json_get_double(const char *json, const char *key, double fallback) {
-    const char *v = json_find_key(json, key);
-    return v ? atof(v) : fallback;
-}
-
-static int json_string_equals(const char *json, const char *key, const char *expected) {
-    const char *v = json_find_key(json, key);
-    if (!v || *v != '"')
-        return 0;
-    v++;
-    size_t len = strlen(expected);
-    return strncmp(v, expected, len) == 0 && v[len] == '"';
-}
-
-static json_bool_t json_get_bool(const char *json, const char *key) {
-    const char *v = json_find_key(json, key);
+static json_bool_t json_get_bool(yyjson_val *obj, const char *key) {
+    yyjson_val *v = yyjson_obj_get(obj, key);
     if (!v)
         return JSON_BOOL_MISSING;
-    if (strncmp(v, "true", 4) == 0 && !isalnum((unsigned char)v[4]) && v[4] != '_')
-        return JSON_BOOL_TRUE;
-    if (strncmp(v, "false", 5) == 0 && !isalnum((unsigned char)v[5]) && v[5] != '_')
-        return JSON_BOOL_FALSE;
+    if (yyjson_is_bool(v))
+        return yyjson_get_bool(v) ? JSON_BOOL_TRUE : JSON_BOOL_FALSE;
     return JSON_BOOL_INVALID;
 }
 
@@ -116,14 +97,17 @@ static int parse_sentence_transformers_metadata(ffwd_config_t *cfg, const char *
     if (rc < 0)
         return -1;
     if (rc > 0) {
-        json_bool_t mean = json_get_bool(buf, "pooling_mode_mean_tokens");
-        json_bool_t last = json_get_bool(buf, "pooling_mode_lasttoken");
-        json_bool_t cls = json_get_bool(buf, "pooling_mode_cls_token");
-        json_bool_t max = json_get_bool(buf, "pooling_mode_max_tokens");
-        json_bool_t sqrt_len = json_get_bool(buf, "pooling_mode_mean_sqrt_len_tokens");
-        json_bool_t weighted = json_get_bool(buf, "pooling_mode_weightedmean_tokens");
+        yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        json_bool_t mean = json_get_bool(root, "pooling_mode_mean_tokens");
+        json_bool_t last = json_get_bool(root, "pooling_mode_lasttoken");
+        json_bool_t cls = json_get_bool(root, "pooling_mode_cls_token");
+        json_bool_t max = json_get_bool(root, "pooling_mode_max_tokens");
+        json_bool_t sqrt_len = json_get_bool(root, "pooling_mode_mean_sqrt_len_tokens");
+        json_bool_t weighted = json_get_bool(root, "pooling_mode_weightedmean_tokens");
         if (mean < 0 || last < 0 || cls < 0 || max < 0 || sqrt_len < 0 || weighted < 0) {
             fprintf(stderr, "ffwd_config: invalid pooling metadata\n");
+            yyjson_doc_free(doc);
             free(buf);
             return -1;
         }
@@ -132,12 +116,14 @@ static int parse_sentence_transformers_metadata(ffwd_config_t *cfg, const char *
             max == JSON_BOOL_TRUE || sqrt_len == JSON_BOOL_TRUE || weighted == JSON_BOOL_TRUE;
         if (supported != 1 || unsupported) {
             fprintf(stderr, "ffwd_config: unsupported Sentence Transformers pooling mode\n");
+            yyjson_doc_free(doc);
             free(buf);
             return -1;
         }
         cfg->pooling_mode = cls == JSON_BOOL_TRUE    ? FFWD_POOL_CLS
                             : last == JSON_BOOL_TRUE ? FFWD_POOL_LAST_TOKEN
                                                      : FFWD_POOL_MEAN;
+        yyjson_doc_free(doc);
         free(buf);
         buf = NULL;
     }
@@ -146,7 +132,22 @@ static int parse_sentence_transformers_metadata(ffwd_config_t *cfg, const char *
     if (rc < 0)
         return -1;
     if (rc > 0) {
-        cfg->normalize_embeddings = strstr(buf, "\"sentence_transformers.models.Normalize\"") != NULL;
+        /* modules.json is an array of module objects; the embeddings are
+         * normalized iff one module's "type" is the Normalize class. Walking the
+         * array is exact, unlike a substring match that any field could trip. */
+        yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        int normalize = 0;
+        size_t idx, n;
+        yyjson_val *mod;
+        yyjson_arr_foreach(root, idx, n, mod) {
+            if (json_string_equals(mod, "type", "sentence_transformers.models.Normalize")) {
+                normalize = 1;
+                break;
+            }
+        }
+        cfg->normalize_embeddings = normalize;
+        yyjson_doc_free(doc);
         free(buf);
         buf = NULL;
     }
@@ -155,14 +156,18 @@ static int parse_sentence_transformers_metadata(ffwd_config_t *cfg, const char *
     if (rc < 0)
         return -1;
     if (rc > 0) {
-        json_bool_t add_eos = json_get_bool(buf, "add_eos_token");
+        yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        json_bool_t add_eos = json_get_bool(root, "add_eos_token");
         if (add_eos < 0) {
             fprintf(stderr, "ffwd_config: invalid add_eos_token metadata\n");
+            yyjson_doc_free(doc);
             free(buf);
             return -1;
         }
         if (add_eos != JSON_BOOL_MISSING)
             cfg->append_terminal_token = add_eos == JSON_BOOL_TRUE;
+        yyjson_doc_free(doc);
         free(buf);
     }
     return 0;
@@ -200,19 +205,28 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
     fclose(f);
     buf[sz] = '\0';
 
-    cfg->hidden_size = json_get_int(buf, "hidden_size", 0);
-    cfg->n_layers = json_get_int(buf, "num_hidden_layers", 0);
-    cfg->n_heads = json_get_int(buf, "num_attention_heads", 0);
-    cfg->n_kv_heads = json_get_int(buf, "num_key_value_heads", 0);
-    cfg->head_dim = json_get_int(buf, "head_dim", FFWD_HEAD_DIM);
-    cfg->intermediate_size = json_get_int(buf, "intermediate_size", 0);
-    cfg->vocab_size = json_get_int(buf, "vocab_size", FFWD_VOCAB_SIZE);
-    cfg->rms_norm_eps = (float)json_get_double(buf, "rms_norm_eps", 1e-6);
-    cfg->layer_norm_eps = (float)json_get_double(buf, "layer_norm_eps", 1e-12);
-    cfg->rope_theta = (float)json_get_double(buf, "rope_theta", 1000000.0);
-    cfg->max_position_embeddings = json_get_int(buf, "max_position_embeddings", 0);
+    yyjson_doc *doc = yyjson_read(buf, (size_t)sz, 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        fprintf(stderr, "ffwd_config: invalid JSON in %s\n", path);
+        yyjson_doc_free(doc);
+        free(buf);
+        return -1;
+    }
+
+    cfg->hidden_size = json_get_int(root, "hidden_size", 0);
+    cfg->n_layers = json_get_int(root, "num_hidden_layers", 0);
+    cfg->n_heads = json_get_int(root, "num_attention_heads", 0);
+    cfg->n_kv_heads = json_get_int(root, "num_key_value_heads", 0);
+    cfg->head_dim = json_get_int(root, "head_dim", FFWD_HEAD_DIM);
+    cfg->intermediate_size = json_get_int(root, "intermediate_size", 0);
+    cfg->vocab_size = json_get_int(root, "vocab_size", FFWD_VOCAB_SIZE);
+    cfg->rms_norm_eps = (float)json_get_double(root, "rms_norm_eps", 1e-6);
+    cfg->layer_norm_eps = (float)json_get_double(root, "layer_norm_eps", 1e-12);
+    cfg->rope_theta = (float)json_get_double(root, "rope_theta", 1000000.0);
+    cfg->max_position_embeddings = json_get_int(root, "max_position_embeddings", 0);
     cfg->position_id_offset = 0;
-    cfg->type_vocab_size = json_get_int(buf, "type_vocab_size", 2);
+    cfg->type_vocab_size = json_get_int(root, "type_vocab_size", 2);
     cfg->family = FFWD_FAMILY_QWEN3;
     cfg->qk_norm = 1;
     cfg->qkv_bias = 0;
@@ -221,29 +235,30 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
     cfg->normalize_embeddings = 0;
     cfg->append_terminal_token = 0;
 
-    if (json_string_equals(buf, "model_type", "qwen3")) {
+    if (json_string_equals(root, "model_type", "qwen3")) {
         cfg->attention_mode = FFWD_ATTENTION_CAUSAL;
         cfg->pooling_mode = FFWD_POOL_LAST_TOKEN;
         cfg->normalize_embeddings = 1;
         cfg->append_terminal_token = 1;
-    } else if (json_string_equals(buf, "model_type", "qwen2")) {
+    } else if (json_string_equals(root, "model_type", "qwen2")) {
         cfg->qk_norm = 0;
         cfg->qkv_bias = 1;
         cfg->attention_mode = FFWD_ATTENTION_CAUSAL;
-    } else if (json_string_equals(buf, "model_type", "bert") ||
-               json_string_equals(buf, "model_type", "roberta") ||
-               json_string_equals(buf, "model_type", "xlm-roberta")) {
+    } else if (json_string_equals(root, "model_type", "bert") ||
+               json_string_equals(root, "model_type", "roberta") ||
+               json_string_equals(root, "model_type", "xlm-roberta")) {
         cfg->family = FFWD_FAMILY_BERT;
         cfg->qk_norm = 0;
         cfg->qkv_bias = 1; /* q/k/v/o and both dense layers carry bias */
         cfg->attention_mode = FFWD_ATTENTION_BIDIRECTIONAL;
         cfg->n_kv_heads = cfg->n_heads; /* full multi-head attention, no GQA */
         cfg->head_dim = cfg->n_heads > 0 ? cfg->hidden_size / cfg->n_heads : 0;
-        if (json_string_equals(buf, "model_type", "roberta") ||
-            json_string_equals(buf, "model_type", "xlm-roberta")) {
-            int pad_id = json_get_int(buf, "pad_token_id", 1);
+        if (json_string_equals(root, "model_type", "roberta") ||
+            json_string_equals(root, "model_type", "xlm-roberta")) {
+            int pad_id = json_get_int(root, "pad_token_id", 1);
             if (pad_id < 0 || pad_id == INT_MAX) {
                 fprintf(stderr, "ffwd_config: invalid RoBERTa pad_token_id\n");
+                yyjson_doc_free(doc);
                 free(buf);
                 return -1;
             }
@@ -252,22 +267,24 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
         /* hidden_act selects the feed-forward GeLU curve. gelu_new and
          * gelu_pytorch_tanh are the same tanh approximation; everything else
          * (gelu, absent) is the exact erf GeLU the released encoders use. */
-        if (json_string_equals(buf, "hidden_act", "gelu_new") ||
-            json_string_equals(buf, "hidden_act", "gelu_pytorch_tanh")) {
+        if (json_string_equals(root, "hidden_act", "gelu_new") ||
+            json_string_equals(root, "hidden_act", "gelu_pytorch_tanh")) {
             cfg->ffn_act = FFWD_ACT_GELU_TANH;
         }
         if (cfg->max_position_embeddings <= 0 ||
             cfg->position_id_offset >= cfg->max_position_embeddings || cfg->type_vocab_size <= 0 ||
             !isfinite(cfg->layer_norm_eps) || cfg->layer_norm_eps <= 0.0f) {
             fprintf(stderr, "ffwd_config: invalid BERT layer_norm_eps/max_position_embeddings\n");
+            yyjson_doc_free(doc);
             free(buf);
             return -1;
         }
     }
 
-    json_bool_t is_causal = json_get_bool(buf, "is_causal");
+    json_bool_t is_causal = json_get_bool(root, "is_causal");
     if (is_causal < 0) {
         fprintf(stderr, "ffwd_config: invalid is_causal in %s\n", path);
+        yyjson_doc_free(doc);
         free(buf);
         return -1;
     }
@@ -283,6 +300,7 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
     if (cfg->n_kv_heads > 0 && cfg->head_dim > 0 && cfg->n_kv_heads <= INT_MAX / cfg->head_dim)
         cfg->kv_dim = cfg->n_kv_heads * cfg->head_dim;
 
+    yyjson_doc_free(doc);
     free(buf);
 
     if (parse_sentence_transformers_metadata(cfg, model_dir) != 0)
@@ -301,8 +319,7 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
         return -1;
     }
     if (cfg->n_layers > FFWD_MAX_LAYERS) {
-        fprintf(stderr, "ffwd_config: too many layers (%d > %d)\n", cfg->n_layers,
-                FFWD_MAX_LAYERS);
+        fprintf(stderr, "ffwd_config: too many layers (%d > %d)\n", cfg->n_layers, FFWD_MAX_LAYERS);
         return -1;
     }
 
@@ -315,7 +332,7 @@ int ffwd_config_parse(ffwd_config_t *cfg, const char *model_dir) {
                 cfg->attention_mode == FFWD_ATTENTION_CAUSAL ? "causal" : "bidirectional",
                 cfg->pooling_mode == FFWD_POOL_LAST_TOKEN ? "last-token"
                 : cfg->pooling_mode == FFWD_POOL_CLS      ? "cls"
-                                                             : "mean",
+                                                          : "mean",
                 cfg->qk_norm ? "yes" : "no", cfg->qkv_bias ? "yes" : "no");
 
     return 0;
