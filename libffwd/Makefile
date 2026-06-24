@@ -14,6 +14,9 @@ SHARED_LDFLAGS += $(EXPORT_FLAGS)
 
 # Tokenizer, config, safetensors reader, and L2/cosine helpers: every backend.
 COMMON_SRCS := config.c vec.c tokenize.c bpe.c sentencepiece.c wordpiece.c safetensors.c
+# Vendored JSON library, compiled into libffwd so config/tokenizer loading and
+# every consumer (CLI, server) share one parser instead of hand-rolled scanners.
+COMMON_SRCS += ../deps/yyjson/yyjson.c
 
 # CPU math kernels and SIMD dispatch. generic.c is always built; avx.c and
 # neon.c each guard their entire body by arch (__AVX2__ / __ARM_NEON), so the

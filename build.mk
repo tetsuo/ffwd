@@ -154,6 +154,9 @@ else
 CFLAGS = $(OPT)
 endif
 CPPFLAGS ?=
+# Vendored yyjson (deps/yyjson) is the one JSON parser/writer for the whole
+# tree; every component includes its header from here.
+CPPFLAGS += -I$(ROOT)/deps/yyjson
 LDLIBS ?=
 SHARED_LDLIBS ?=
 
