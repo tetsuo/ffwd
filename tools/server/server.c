@@ -106,13 +106,10 @@ void dispatch_request(client *c) {
     j->auth = c->req.auth ? xstrdup(c->req.auth) : NULL;
     j->created_ns = nstime();
     client_incref(c);
-    /* Tokenize off the worker when the pipeline is already busy so it overlaps
-     * in-flight work; tokenize inline on the worker when idle to avoid a
-     * queue hand-off that single-stream requests gain nothing from. */
-    if (server_has_backlog(c->srv))
-        enqueue_raw_job(j);
-    else
-        enqueue_job(j);
+    /* All requests go through the tokenizer thread. Tokenization must run on a
+     * single thread because the model tokenizer is shared mutable state; letting
+     * the worker also tokenize would race it. */
+    enqueue_raw_job(j);
 }
 
 static void accept_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {

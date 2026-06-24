@@ -182,17 +182,6 @@ int worker_has_pending_jobs(http_server *s) {
     return pending;
 }
 
-/* True when work is already queued anywhere ahead of the worker (untokenized or
- * tokenized). dispatch routes a new request to the tokenizer thread when this
- * holds, so tokenization overlaps in-flight work; an otherwise idle pipeline
- * tokenizes the request inline on the worker and skips the queue hand-off. */
-int server_has_backlog(http_server *s) {
-    pthread_mutex_lock(&s->mu);
-    int busy = s->raw_head != NULL || s->job_head != NULL;
-    pthread_mutex_unlock(&s->mu);
-    return busy;
-}
-
 void enqueue_job(job *j) {
     http_server *s = j->srv;
     pthread_mutex_lock(&s->mu);

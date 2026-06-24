@@ -105,9 +105,10 @@ typedef struct {
     int worker_init_rc;
     job *job_head;
     job *job_tail;
-    /* Tokenizer stage: dispatch enqueues a raw job here when the pipeline is
-     * busy, and a dedicated thread parses + tokenizes it off the worker so
-     * tokenization overlaps the GPU instead of serializing in front of it. */
+    /* Tokenizer stage: dispatch enqueues every raw job here, and a single
+     * dedicated thread parses + tokenizes it off the worker so tokenization
+     * overlaps the GPU. One thread, so the shared model tokenizer is never
+     * touched concurrently. */
     pthread_t tokenizer;
     pthread_cond_t raw_cv;
     int raw_stopping;
@@ -330,7 +331,6 @@ void execute_rerank_request(rerank_request *r);
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */
 void enqueue_job(job *j);
 int worker_has_pending_jobs(http_server *s);
-int server_has_backlog(http_server *s);
 void enqueue_raw_job(job *j);
 job *dequeue_raw_job(http_server *s);
 void tokenize_job(http_server *s, job *j);
