@@ -172,10 +172,12 @@ int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
     return n;
 }
 
-/* True when more jobs are already waiting for the worker. The render placement
+/* True when more work is already waiting for the worker. The render placement
  * decision (handlers.c) uses this so it only hands a finished batch to the
  * renderer thread when the worker has another batch to run. */
 int worker_has_pending_jobs(http_server *s) {
+    if (s->worker_local_backlog)
+        return 1;
     pthread_mutex_lock(&s->mu);
     int pending = s->job_head != NULL;
     pthread_mutex_unlock(&s->mu);
@@ -280,6 +282,20 @@ static void job_set_timing_header(job *j) {
 void finish_job(job *j) {
     job_set_timing_header(j);
     enqueue_done(j);
+}
+
+static int merge_token_budget_accepts(int64_t used_tokens, int next_tokens, int budget) {
+    if (budget <= 0 || used_tokens <= 0 || next_tokens <= 0)
+        return 1;
+    return used_tokens <= (int64_t)budget - next_tokens;
+}
+
+static int has_unfinished_jobs(const int *done, int n_jobs) {
+    for (int i = 0; i < n_jobs; i++) {
+        if (!done[i])
+            return 1;
+    }
+    return 0;
 }
 
 static int parse_job_root(job *j, cJSON **out_root) {
@@ -407,14 +423,26 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
              * execute_embedding_request_list length-sorts the inputs and packs
              * them into token-budget batches, so mixed client batch shapes fill
              * the GPU batch instead of each request running on a partly-empty
-             * launch of its own. */
+             * launch of its own. The merged execution unit is also capped by
+             * the configured token budget so one arrival window cannot become
+             * an unbounded host/output buffer before any response can finish. */
             int group_n = 1;
+            int64_t group_tokens = std_reqs[i].total_tokens;
             std_group[0] = &std_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
                 if (!done[k] && kind[k] == 1 && std_reqs[k].ready &&
-                    embedding_request_compatible(&std_reqs[i], &std_reqs[k]))
+                    embedding_request_compatible(&std_reqs[i], &std_reqs[k]) &&
+                    merge_token_budget_accepts(group_tokens, std_reqs[k].total_tokens,
+                                               s->max_batch_tokens)) {
                     std_group[group_n++] = &std_reqs[k];
+                    group_tokens += std_reqs[k].total_tokens;
+                }
             }
+            for (int k = 0; k < group_n; k++) {
+                int idx = (int)(std_group[k] - std_reqs);
+                done[idx] = 1;
+            }
+            s->worker_local_backlog = has_unfinished_jobs(done, n_jobs);
             execute_embedding_request_list(std_group, group_n);
             for (int k = 0; k < group_n; k++) {
                 int idx = (int)(std_group[k] - std_reqs);
@@ -422,21 +450,29 @@ void process_job_group(http_server *s, job **jobs, int n_jobs) {
                     enqueue_render_job(jobs[idx]);
                 else
                     finish_job(jobs[idx]);
-                done[idx] = 1;
             }
+            s->worker_local_backlog = 0;
         } else {
             int group_n = 1;
+            int64_t group_tokens = ctx_reqs[i].total_tokens;
             ctx_group[0] = &ctx_reqs[i];
             for (int k = i + 1; k < n_jobs; k++) {
                 if (!done[k] && kind[k] == 2 && ctx_reqs[k].ready &&
-                    contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]))
+                    contextual_request_compatible(&ctx_reqs[i], &ctx_reqs[k]) &&
+                    merge_token_budget_accepts(group_tokens, ctx_reqs[k].total_tokens,
+                                               s->max_batch_tokens)) {
                     ctx_group[group_n++] = &ctx_reqs[k];
+                    group_tokens += ctx_reqs[k].total_tokens;
+                }
+            }
+            for (int k = 0; k < group_n; k++) {
+                int idx = (int)(ctx_group[k] - ctx_reqs);
+                done[idx] = 1;
             }
             execute_contextual_request_list(ctx_group, group_n);
             for (int k = 0; k < group_n; k++) {
                 int idx = (int)(ctx_group[k] - ctx_reqs);
                 finish_job(jobs[idx]);
-                done[idx] = 1;
             }
         }
     }

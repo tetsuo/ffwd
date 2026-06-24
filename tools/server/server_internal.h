@@ -103,6 +103,10 @@ typedef struct {
     int stopping;
     int worker_ready;
     int worker_init_rc;
+    /* Worker-only hint: current collected window still has unprocessed jobs, so
+     * response rendering can overlap that local work even if the shared queue
+     * is empty. */
+    int worker_local_backlog;
     job *job_head;
     job *job_tail;
     /* Tokenizer stage: dispatch enqueues every raw job here, and a single
