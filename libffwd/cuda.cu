@@ -852,6 +852,42 @@ tc_load_b_qk_ldmatrix_swz_f16(uint32_t b[4], const __half *ktsh, int d0) {
     tc_ldmatrix_x4_trans_b16(b, ktsh + tc_swz_idx<16>(row, col));
 }
 
+// Direct-read QK B-operand loaders for the BERT flash kernels. Unlike the
+// transposed loaders above, these read K straight from the cp.async-staged
+// ROW-MAJOR (key, d) shared tile (stride HD, grain XOR-swizzled), so the kernel
+// pays no shared->shared K transpose and no extra barrier per key tile.
+//
+// The QK MMA is m16n8k16.row.col, so its B operand is column-major (d, key). A
+// plain (non-transposing) ldmatrix.x4 over a (key, d) row-major source produces
+// exactly that fragment: thread t ends up with the pair
+// {K[key=t/4][d=2*(t%4)], K[key=t/4][d=2*(t%4)+1]}, which is {k=2*(t%4),
+// n=t/4} = the B operand the mma expects (k = head-dim, n = key). So QK^T is
+// bit-for-bit identical to the transposed-staging loader; only the shared layout
+// it reads from differs. The four ldmatrix sub-tiles map to (key block, d half):
+// mat&2 selects keys 0..7 vs 8..15, mat&1 selects the low vs high 8 of the
+// 16-wide head-dim chunk. `ksh` points at the current 16-key sub-tile base
+// (krow + sub*16*HD); since the 16-key offset is a multiple of 8 the grain
+// swizzle is the same whether computed on the local or the absolute key.
+template <int HD>
+__device__ static __forceinline__ void
+tc_load_b_qk_keyd_swz_bf16(uint32_t b[4], const __nv_bfloat16 *ksh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int key = ((mat >> 1) << 3) + (lane & 7);
+    int d = d0 + ((mat & 1) << 3);
+    tc_ldmatrix_x4_b16(b, ksh + tc_swz_idx<HD>(key, d));
+}
+
+template <int HD>
+__device__ static __forceinline__ void
+tc_load_b_qk_keyd_swz_f16(uint32_t b[4], const __half *ksh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int key = ((mat >> 1) << 3) + (lane & 7);
+    int d = d0 + ((mat & 1) << 3);
+    tc_ldmatrix_x4_b16(b, ksh + tc_swz_idx<HD>(key, d));
+}
+
 __device__ static __forceinline__ void
 tc_load_b_pv_bf16(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
     int lane = threadIdx.x & 31;
@@ -924,28 +960,6 @@ __device__ static __forceinline__ void tc_load_b_pv_hd_f16(uint32_t b[4], const 
     }
 }
 
-template <int HD>
-__device__ static __forceinline__ void
-bert_transpose_k_tile_bf16(__nv_bfloat16 *ktsh, const __nv_bfloat16 *krow, int tid, int nthreads) {
-    enum { KT = 64 };
-    for (int idx = tid; idx < KT * HD; idx += nthreads) {
-        int kk = idx / HD;
-        int d = idx - kk * HD;
-        tc_store_swz_bf16<16>(ktsh + (kk >> 4) * 16 * HD, d, kk & 15, krow[idx]);
-    }
-}
-
-template <int HD>
-__device__ static __forceinline__ void
-bert_transpose_k_tile_f16(__half *ktsh, const __half *krow, int tid, int nthreads) {
-    enum { KT = 64 };
-    for (int idx = tid; idx < KT * HD; idx += nthreads) {
-        int kk = idx / HD;
-        int d = idx - kk * HD;
-        tc_store_swz_f16<16>(ktsh + (kk >> 4) * 16 * HD, d, kk & 15, krow[idx]);
-    }
-}
-
 __device__ static __forceinline__ void tc_cp_async_cg_16(void *dst, const void *src) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     uint32_t smem = (uint32_t)__cvta_generic_to_shared(dst);
@@ -1004,7 +1018,11 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
                 ksrc = kexp + base;
                 vsrc = vexp + base;
             }
-            tc_cp_async_cg_16(ksh + kk * HD + d, ksrc);
+            // K lands grain-swizzled in (key, d) so the QK ldmatrix reads it
+            // directly with no transpose; V stays plain row-major for the PV
+            // gather. The 16-byte cp.async grain (8 head-dims) stays contiguous
+            // under the swizzle, which only permutes the 16-byte slot.
+            tc_cp_async_cg_16(ksh + tc_swz_idx<HD>(kk, d), ksrc);
             tc_cp_async_cg_16(vsh + kk * HD + d, vsrc);
         }
         tc_cp_async_commit_group();
@@ -1028,7 +1046,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
                 vval = vexp[base];
             }
         }
-        ksh[idx] = kval;
+        ksh[tc_swz_idx<HD>(kk, d)] = kval; // (key, d) swizzled, matches the fast path
         vsh[idx] = vval;
     }
     return 0;
@@ -1070,7 +1088,9 @@ __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
                 ksrc = kexp + base;
                 vsrc = vexp + base;
             }
-            tc_cp_async_cg_16(ksh + kk * HD + d, ksrc);
+            // K grain-swizzled in (key, d) for the direct QK ldmatrix read; V
+            // stays plain row-major (see the bf16 sibling for the rationale).
+            tc_cp_async_cg_16(ksh + tc_swz_idx<HD>(kk, d), ksrc);
             tc_cp_async_cg_16(vsh + kk * HD + d, vsrc);
         }
         tc_cp_async_commit_group();
@@ -1094,7 +1114,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
                 vval = vexp[base];
             }
         }
-        ksh[idx] = kval;
+        ksh[tc_swz_idx<HD>(kk, d)] = kval; // (key, d) swizzled, matches the fast path
         vsh[idx] = vval;
     }
     return 0;
@@ -1275,7 +1295,11 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
                                                      float scale) {
     enum { QT = 16, KT = 64, DCHUNKS = HD / 16, KSUB = KT / 16 };
     enum { Q_ELEMS = WARPS * QT * HD, KV_LEGACY_ELEMS = Q_ELEMS + 2 * KT * HD };
-    enum { KV_PIPE_ELEMS = 5 * KT * HD };
+    // Pipelined K/V double-buffer: two K stages + two V stages. K is staged in
+    // (key, d) row-major and read by the QK ldmatrix directly, so there is no
+    // separate transposed-K buffer; dropping that 5th KT*HD tile frees ~8 KB of
+    // shared memory (helping occupancy) and one barrier per key tile.
+    enum { KV_PIPE_ELEMS = 4 * KT * HD };
     enum {
         SH_ELEMS = PIPELINED ? ((Q_ELEMS > KV_PIPE_ELEMS) ? Q_ELEMS : KV_PIPE_ELEMS) : KV_LEGACY_ELEMS
     };
@@ -1336,7 +1360,6 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
         __nv_bfloat16 *kstage1 = kstage0 + KT * HD;
         __nv_bfloat16 *vstage0 = kstage1 + KT * HD;
         __nv_bfloat16 *vstage1 = vstage0 + KT * HD;
-        __nv_bfloat16 *ktsh = vstage1 + KT * HD;
 
         int stage = 0;
         int async_stage = bert_stage_kv_tile_bf16<HD, QKV_T, DIRECT_KV>(
@@ -1345,7 +1368,9 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 
         // K/V staging is double-buffered. While one 64-key tile feeds the
         // unchanged QK/softmax/PV recurrence, the next tile is already moving
-        // from global to the other shared stage.
+        // from global to the other shared stage. K is staged in the (key, d)
+        // layout the QK ldmatrix reads directly, so the single barrier below
+        // (publishing the freshly staged tile) is the only one per key tile.
         for (int k0 = 0; k0 < L; k0 += KT) { // bidirectional: every query attends every key
             if (async_stage)
                 tc_cp_async_wait_group<0>();
@@ -1353,8 +1378,6 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 
             __nv_bfloat16 *krow = stage ? kstage1 : kstage0;
             __nv_bfloat16 *vsh = stage ? vstage1 : vstage0;
-            bert_transpose_k_tile_bf16<HD>(ktsh, krow, tid, nthreads);
-            __syncthreads();
 
             int next_k0 = k0 + KT;
             int next_stage = stage ^ 1;
@@ -1368,7 +1391,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 
 #pragma unroll
             for (int sub = 0; sub < KSUB; sub++) {
-                const __nv_bfloat16 *ksh_s = ktsh + sub * 16 * HD;
+                const __nv_bfloat16 *ksh_s = krow + sub * 16 * HD;
                 const __nv_bfloat16 *vsh_s = vsh + sub * 16 * HD;
                 int ksub0 = k0 + sub * 16;
                 if (ksub0 >= L)
@@ -1381,7 +1404,7 @@ __global__ static void attn_stream_bert_flash_kernel(__nv_bfloat16 *out,
 #pragma unroll
                 for (int d0 = 0; d0 < HD; d0 += 16) {
                     uint32_t bb[4];
-                    tc_load_b_qk_ldmatrix_swz_bf16(bb, ksh_s, d0);
+                    tc_load_b_qk_keyd_swz_bf16<HD>(bb, ksh_s, d0);
                     mma_m16n16k16_bf16(s, a_q[d0 >> 4], bb);
                 }
 
@@ -1579,7 +1602,10 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
                                                          float scale) {
     enum { QT = 16, KT = 64, DCHUNKS = HD / 16, KSUB = KT / 16 };
     enum { Q_ELEMS = WARPS * QT * HD, KV_LEGACY_ELEMS = Q_ELEMS + 2 * KT * HD };
-    enum { KV_PIPE_ELEMS = 5 * KT * HD };
+    // See the bf16 sibling: K is read directly from its (key, d) staged tile, so
+    // the pipeline needs only two K and two V stages, not a fifth transposed-K
+    // tile.
+    enum { KV_PIPE_ELEMS = 4 * KT * HD };
     enum {
         SH_ELEMS = PIPELINED ? ((Q_ELEMS > KV_PIPE_ELEMS) ? Q_ELEMS : KV_PIPE_ELEMS) : KV_LEGACY_ELEMS
     };
@@ -1637,7 +1663,6 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
         __half *kstage1 = kstage0 + KT * HD;
         __half *vstage0 = kstage1 + KT * HD;
         __half *vstage1 = vstage0 + KT * HD;
-        __half *ktsh = vstage1 + KT * HD;
 
         int stage = 0;
         int async_stage = bert_stage_kv_tile_f16<HD, QKV_T, DIRECT_KV>(
@@ -1646,7 +1671,9 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
 
         // K/V staging is double-buffered. While one 64-key tile feeds the
         // unchanged QK/softmax/PV recurrence, the next tile is already moving
-        // from global to the other shared stage.
+        // from global to the other shared stage. K is staged in the (key, d)
+        // layout the QK ldmatrix reads directly, so the single barrier below is
+        // the only one per key tile.
         for (int k0 = 0; k0 < L; k0 += KT) {
             if (async_stage)
                 tc_cp_async_wait_group<0>();
@@ -1654,8 +1681,6 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
 
             __half *krow = stage ? kstage1 : kstage0;
             __half *vsh = stage ? vstage1 : vstage0;
-            bert_transpose_k_tile_f16<HD>(ktsh, krow, tid, nthreads);
-            __syncthreads();
 
             int next_k0 = k0 + KT;
             int next_stage = stage ^ 1;
@@ -1669,7 +1694,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
 
 #pragma unroll
             for (int sub = 0; sub < KSUB; sub++) {
-                const __half *ksh_s = ktsh + sub * 16 * HD;
+                const __half *ksh_s = krow + sub * 16 * HD;
                 const __half *vsh_s = vsh + sub * 16 * HD;
                 int ksub0 = k0 + sub * 16;
                 if (ksub0 >= L)
@@ -1682,7 +1707,7 @@ __global__ static void attn_stream_bert_flash_f16_kernel(__half *out,
 #pragma unroll
                 for (int d0 = 0; d0 < HD; d0 += 16) {
                     uint32_t bb[4];
-                    tc_load_b_qk_ldmatrix_swz_f16(bb, ksh_s, d0);
+                    tc_load_b_qk_keyd_swz_f16<HD>(bb, ksh_s, d0);
                     mma_m16n16k16_f16(s, a_q[d0 >> 4], bb);
                 }
 
