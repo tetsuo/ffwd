@@ -1137,7 +1137,8 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             int q_dim,
                                                             int qkv_dim,
                                                             int q_offset,
-                                                            float scale) {
+                                                            float scale,
+                                                            int causal_skip) {
     enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
     // Q stays resident; the K/V region is a single double-buffer when PIPELINED
     // (two K stages + two V stages) and a single K+V tile otherwise.
@@ -1183,6 +1184,14 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         if (lim < key_hi)
             key_hi = lim;
     }
+    // Per-warp causal skip: this warp owns query rows [q0, q0+QT); the latest key
+    // any of them can attend to is q0+QT-1, so a key tile at k0 >= q0+QT is
+    // entirely future and contributes nothing -- its scores all mask to -inf, so
+    // p=0, corr=1, and the online-softmax state stays unchanged to the bit.
+    // Skipping its QK+PV MMAs removes the diagonal-band tensor-core work the
+    // shared-K/V lockstep otherwise runs for early warps. Staging stays
+    // cooperative (later warps still need the tile); only per-warp math is gated.
+    int warp_key_hi = q0 + QT;
 
     if constexpr (PIPELINED) {
         // Double-buffered K/V: while one 16-key tile feeds QK/softmax/PV, the next
@@ -1222,68 +1231,70 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                     start, L, next_k0, q_dim, qkv_dim, 0, 0, hv, 0, tid, nthreads);
             }
 
-            float s[8];
+            if (!CAUSAL || !causal_skip || k0 < warp_key_hi) {
+                float s[8];
 #pragma unroll
-            for (int r = 0; r < 8; r++)
-                s[r] = 0.0f;
+                for (int r = 0; r < 8; r++)
+                    s[r] = 0.0f;
 #pragma unroll
-            for (int d0 = 0; d0 < HD; d0 += 16) {
-                uint32_t a[4], bb[4];
-                tc_load_a_q_ldmatrix_swz_hd<HD>(a, myq, d0);
-                tc_load_b_qk_keyd_swz_bf16<HD>(bb, krow, d0);
-                mma_m16n16k16_bf16(s, a, bb);
-            }
+                for (int d0 = 0; d0 < HD; d0 += 16) {
+                    uint32_t a[4], bb[4];
+                    tc_load_a_q_ldmatrix_swz_hd<HD>(a, myq, d0);
+                    tc_load_b_qk_keyd_swz_bf16<HD>(bb, krow, d0);
+                    mma_m16n16k16_bf16(s, a, bb);
+                }
 
-            const float neg_inf = -3.402823466e+38F;
+                const float neg_inf = -3.402823466e+38F;
 #pragma unroll
-            for (int r = 0; r < 8; r++) {
-                int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
-                int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
-                int qrow = q0 + qr;
-                int key = k0 + kc;
-                if (qrow < L && key < L && (!CAUSAL || key <= qrow))
-                    s[r] *= scale;
-                else
-                    s[r] = neg_inf;
-            }
+                for (int r = 0; r < 8; r++) {
+                    int qr = (lane >> 2) + (((r % 4) >> 1) << 3);
+                    int kc = ((lane & 3) << 1) + ((r >> 2) << 3) + (r & 1);
+                    int qrow = q0 + qr;
+                    int key = k0 + kc;
+                    if (qrow < L && key < L && (!CAUSAL || key <= qrow))
+                        s[r] *= scale;
+                    else
+                        s[r] = neg_inf;
+                }
 
 #pragma unroll
-            for (int j = 0; j < 2; j++) {
-                int r0 = j * 2;
-                float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
-                float m_new = fmaxf(m[j], warp_group4_max(tile_m));
-                float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
-                denom[j] *= corr;
+                for (int j = 0; j < 2; j++) {
+                    int r0 = j * 2;
+                    float tile_m = fmaxf(fmaxf(s[r0 + 0], s[r0 + 1]), fmaxf(s[r0 + 4], s[r0 + 5]));
+                    float m_new = fmaxf(m[j], warp_group4_max(tile_m));
+                    float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
+                    denom[j] *= corr;
+#pragma unroll
+                    for (int dc = 0; dc < DCHUNKS; dc++) {
+                        o[dc][r0 + 0] *= corr;
+                        o[dc][r0 + 1] *= corr;
+                        o[dc][r0 + 4] *= corr;
+                        o[dc][r0 + 5] *= corr;
+                    }
+                    float p0 =
+                        (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
+                    float p1 =
+                        (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
+                    float p4 =
+                        (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
+                    float p5 =
+                        (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
+                    s[r0 + 0] = p0;
+                    s[r0 + 1] = p1;
+                    s[r0 + 4] = p4;
+                    s[r0 + 5] = p5;
+                    denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
+                    m[j] = m_new;
+                }
+
+                uint32_t pfrag[4];
+                tc_probs_to_a_bf16(pfrag, s);
 #pragma unroll
                 for (int dc = 0; dc < DCHUNKS; dc++) {
-                    o[dc][r0 + 0] *= corr;
-                    o[dc][r0 + 1] *= corr;
-                    o[dc][r0 + 4] *= corr;
-                    o[dc][r0 + 5] *= corr;
+                    uint32_t vb[4];
+                    tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
+                    mma_m16n16k16_bf16(o[dc], pfrag, vb);
                 }
-                float p0 =
-                    (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
-                float p1 =
-                    (s[r0 + 1] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 1] - m_new);
-                float p4 =
-                    (s[r0 + 4] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 4] - m_new);
-                float p5 =
-                    (s[r0 + 5] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 5] - m_new);
-                s[r0 + 0] = p0;
-                s[r0 + 1] = p1;
-                s[r0 + 4] = p4;
-                s[r0 + 5] = p5;
-                denom[j] += warp_group4_sum(p0 + p1 + p4 + p5);
-                m[j] = m_new;
-            }
-
-            uint32_t pfrag[4];
-            tc_probs_to_a_bf16(pfrag, s);
-#pragma unroll
-            for (int dc = 0; dc < DCHUNKS; dc++) {
-                uint32_t vb[4];
-                tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
-                mma_m16n16k16_bf16(o[dc], pfrag, vb);
             }
             stage = next_stage;
             async_stage = async_next;
@@ -2701,6 +2712,22 @@ static int qwen_flash_pipeline_mode(void) {
     return mode;
 }
 
+// Per-warp causal tile skip. Bit-identical optimization for the causal Qwen
+// kernel: a warp skips the QK+PV multiplies for key tiles entirely in its
+// queries' future, where every score masks to -inf and contributes zero. Default
+// on; env 0/off disables it to A/B the diagonal-band tensor-core work without a
+// rebuild.
+static int qwen_causal_skip(void) {
+    static int init = 0, on = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_QWEN_CSKIP");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            on = 0;
+        init = 1;
+    }
+    return on;
+}
+
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
     if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
@@ -3409,18 +3436,21 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             // Promoted Qwen BF16 tensor-core flash attention.
             int w = tc_kv_warps_or(8);
             int qpipe = qwen_flash_pipeline_mode() >= 0;
-#define TC3_LAUNCH(W, P)                                                                          \
-    do {                                                                                          \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                 \
-        dim3 block(32, (W));                                                                      \
-        if (causal)                                                                               \
-            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P)><<<grid, block, 0, ctx->stream>>>(   \
-                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
-        else                                                                                      \
-            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P)><<<grid, block, 0, ctx->stream>>>(   \
-                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,         \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale); \
+            int cskip = qwen_causal_skip();
+#define TC3_LAUNCH(W, P)                                                                         \
+    do {                                                                                         \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                \
+        dim3 block(32, (W));                                                                     \
+        if (causal)                                                                              \
+            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
+                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
+                cskip);                                                                          \
+        else                                                                                     \
+            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
+                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
+                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
+                cskip);                                                                          \
     } while (0)
             if (qpipe) {
                 if (w == 2)
