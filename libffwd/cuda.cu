@@ -949,6 +949,22 @@ tc_load_b_pv_hd(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
     }
 }
 
+// PV B-operand loaded with ldmatrix.trans instead of the scalar gather above.
+// Requires V staged in the SAME (key,d) grain-swizzle as K (SWZ_V). The PV operand
+// has k=key, n=d, so mat&1 selects the key block and mat>>1 the d block (swapped vs
+// the QK loader, whose n=key); ldmatrix.trans then yields (k=key, n=d) directly.
+// The scalar gather is ~half the kernel at long context; this is the lever that
+// lifts the tc128 path from ~48% to ~70% of bf16 peak (bit-identical V values).
+template <int HD>
+__device__ static __forceinline__ void
+tc_load_b_pv_ldm(uint32_t b[4], const __nv_bfloat16 *vsh, int d0) {
+    int lane = threadIdx.x & 31;
+    int mat = lane >> 3;
+    int key = ((mat & 1) << 3) + (lane & 7);
+    int d = d0 + ((mat >> 1) << 3);
+    tc_ldmatrix_x4_trans_b16(b, vsh + tc_swz_idx<HD>(key, d));
+}
+
 template <int HD>
 __device__ static __forceinline__ void tc_load_b_pv_hd_f16(uint32_t b[4], const __half *vsh, int d0) {
     int lane = threadIdx.x & 31;
@@ -982,7 +998,7 @@ template <int N> __device__ static __forceinline__ void tc_cp_async_wait_group()
 #endif
 }
 
-template <int HD, int KT, typename QKV_T, int DIRECT_KV>
+template <int HD, int KT, typename QKV_T, int DIRECT_KV, int SWZ_V = 0>
 __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh,
                                                               __nv_bfloat16 *vsh,
                                                               const QKV_T *qkv,
@@ -1019,11 +1035,12 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
                 vsrc = vexp + base;
             }
             // K lands grain-swizzled in (key, d) so the QK ldmatrix reads it
-            // directly with no transpose; V stays plain row-major for the PV
-            // gather. The 16-byte cp.async grain (8 head-dims) stays contiguous
-            // under the swizzle, which only permutes the 16-byte slot.
+            // directly with no transpose. V is plain row-major for the scalar PV
+            // gather, or the same (key, d) grain-swizzle when SWZ_V so the PV
+            // B-operand can be read with ldmatrix.trans. The 16-byte cp.async grain
+            // (8 head-dims) stays contiguous under the swizzle.
             tc_cp_async_cg_16(ksh + tc_swz_idx<HD>(kk, d), ksrc);
-            tc_cp_async_cg_16(vsh + kk * HD + d, vsrc);
+            tc_cp_async_cg_16(vsh + (SWZ_V ? tc_swz_idx<HD>(kk, d) : kk * HD + d), vsrc);
         }
         tc_cp_async_commit_group();
         return 1;
@@ -1047,7 +1064,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_bf16(__nv_bfloat16 *ksh
             }
         }
         ksh[tc_swz_idx<HD>(kk, d)] = kval; // (key, d) swizzled, matches the fast path
-        vsh[idx] = vval;
+        vsh[SWZ_V ? tc_swz_idx<HD>(kk, d) : idx] = vval;
     }
     return 0;
 }
@@ -1128,7 +1145,7 @@ __device__ static __forceinline__ int bert_stage_kv_tile_f16(__half *ksh,
 // QK/softmax/PV recurrence; the legacy single-buffer path (PIPELINED=0) stages K
 // transposed+swizzled for ldmatrix.x4.trans and is kept only as a same-binary
 // A/B baseline. Both paths are numerically identical.
-template <int CAUSAL, int WARPS, int PIPELINED>
+template <int CAUSAL, int WARPS, int PIPELINED, int LDMV>
 __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             const float *qkv,
                                                             const __nv_bfloat16 *kexp,
@@ -1219,9 +1236,9 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         __nv_bfloat16 *vstage1 = vstage0 + KT * HD;
 
         int stage = 0;
-        int async_stage = bert_stage_kv_tile_bf16<HD, KT, float, 0>(kstage0, vstage0, qkv, kexp, vexp,
-                                                                    start, L, 0, kv_stride, qkv_dim,
-                                                                    0, 0, kvhv, 0, tid, nthreads);
+        int async_stage = bert_stage_kv_tile_bf16<HD, KT, float, 0, LDMV>(
+            kstage0, vstage0, qkv, kexp, vexp, start, L, 0, kv_stride, qkv_dim, 0, 0, kvhv, 0, tid,
+            nthreads);
 
         for (int k0 = 0; k0 < key_hi; k0 += KT) {
             if (async_stage)
@@ -1235,7 +1252,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
             int next_stage = stage ^ 1;
             int async_next = 0;
             if (next_k0 < key_hi) {
-                async_next = bert_stage_kv_tile_bf16<HD, KT, float, 0>(
+                async_next = bert_stage_kv_tile_bf16<HD, KT, float, 0, LDMV>(
                     next_stage ? kstage1 : kstage0, next_stage ? vstage1 : vstage0, qkv, kexp, vexp,
                     start, L, next_k0, kv_stride, qkv_dim, 0, 0, kvhv, 0, tid, nthreads);
             }
@@ -1301,7 +1318,10 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
 #pragma unroll
                 for (int dc = 0; dc < DCHUNKS; dc++) {
                     uint32_t vb[4];
-                    tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
+                    if constexpr (LDMV)
+                        tc_load_b_pv_ldm<HD>(vb, vsh, dc * 16);
+                    else
+                        tc_load_b_pv_hd<HD>(vb, vsh, dc * 16);
                     mma_m16n16k16_bf16(o[dc], pfrag, vb);
                 }
             }
@@ -2752,6 +2772,22 @@ static int qwen_compact_kv(void) {
     return on;
 }
 
+// PV V-operand load mode for the Qwen tc128 flash path. Default 1 = ldmatrix.trans
+// (V staged in the same (key,d) grain-swizzle as K; reads the whole 8x8 fragment in
+// one instruction). env 0/off restores the scalar smem gather for A/B. The gather
+// costs ~half the kernel at long context; ldmatrix lifts it from ~48% to ~70% of
+// bf16 peak, bit-identical (same V values). Only affects the pipelined path.
+static int qwen_ldmv_env(void) {
+    static int init = 0, on = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_QWEN_LDMV");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            on = 0;
+        init = 1;
+    }
+    return on;
+}
+
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
     if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
@@ -3470,35 +3506,47 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             int compact_kv = qwen_compact_kv();
             int kv_stride = compact_kv ? c->n_kv_heads * hd : q_dim; // compact vs expanded row
             int kv_head_div = compact_kv ? H / c->n_kv_heads : 1;    // query heads per kv head
-#define TC3_LAUNCH(W, P)                                                                         \
-    do {                                                                                         \
-        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                \
-        dim3 block(32, (W));                                                                     \
-        if (causal)                                                                              \
-            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
-                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                cskip, kv_stride, kv_head_div);                                                  \
-        else                                                                                     \
-            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
-                (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
-                (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                cskip, kv_stride, kv_head_div);                                                  \
+#define TC3_LAUNCH(W, P, LV)                                                                         \
+    do {                                                                                             \
+        dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                    \
+        dim3 block(32, (W));                                                                         \
+        if (causal)                                                                                  \
+            attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P), (LV)>                                  \
+                <<<grid, block, 0, ctx->stream>>>(                                                   \
+                    (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
+                    cskip, kv_stride, kv_head_div);                                                  \
+        else                                                                                         \
+            attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P), (LV)>                                  \
+                <<<grid, block, 0, ctx->stream>>>(                                                   \
+                    (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
+                    (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
+                    cskip, kv_stride, kv_head_div);                                                  \
     } while (0)
+            int ldmv = qwen_ldmv_env();
             if (qpipe) {
-                if (w == 2)
-                    TC3_LAUNCH(2, 1);
-                else if (w == 8)
-                    TC3_LAUNCH(8, 1);
-                else
-                    TC3_LAUNCH(4, 1);
+                if (ldmv) {
+                    if (w == 2)
+                        TC3_LAUNCH(2, 1, 1);
+                    else if (w == 8)
+                        TC3_LAUNCH(8, 1, 1);
+                    else
+                        TC3_LAUNCH(4, 1, 1);
+                } else {
+                    if (w == 2)
+                        TC3_LAUNCH(2, 1, 0);
+                    else if (w == 8)
+                        TC3_LAUNCH(8, 1, 0);
+                    else
+                        TC3_LAUNCH(4, 1, 0);
+                }
             } else {
                 if (w == 2)
-                    TC3_LAUNCH(2, 0);
+                    TC3_LAUNCH(2, 0, 0);
                 else if (w == 8)
-                    TC3_LAUNCH(8, 0);
+                    TC3_LAUNCH(8, 0, 0);
                 else
-                    TC3_LAUNCH(4, 0);
+                    TC3_LAUNCH(4, 0, 0);
             }
 #undef TC3_LAUNCH
             return launch_check();
