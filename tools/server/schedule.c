@@ -231,7 +231,6 @@ static void job_free(job *j) {
     job_prep_free(j);
     job_render_free(j);
     free(j->body);
-    free(j->auth);
     free(j->extra_headers);
     free(j->response);
     free(j);

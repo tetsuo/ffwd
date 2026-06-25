@@ -165,7 +165,6 @@ struct job {
     char path[FFWD_HTTP_MAX_PATH + 1];
     char *body;
     size_t body_len;
-    char *auth;
     int status;
     char *content_type;
     char *extra_headers;
