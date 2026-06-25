@@ -231,7 +231,6 @@ static void job_free(job *j) {
     job_prep_free(j);
     job_render_free(j);
     free(j->body);
-    free(j->extra_headers);
     free(j->response);
     free(j);
 }
@@ -249,9 +248,9 @@ void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
         client *c = j->c;
         int refs_to_drop = 1; /* job reference */
         if (!c->cancelled) {
-            append_http_response_ex(c, j->status, j->content_type, j->extra_headers,
-                                    j->response ? j->response : "",
-                                    j->response ? j->response_len : 0);
+            append_http_response_ex(
+                c, j->status, j->content_type, j->extra_headers[0] ? j->extra_headers : NULL,
+                j->response ? j->response : "", j->response ? j->response_len : 0);
             if (queue_write(c) != AE_OK)
                 refs_to_drop += close_client_unlink(c);
         }
@@ -261,21 +260,22 @@ void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
 }
 
 static void job_set_timing_header(job *j) {
-    if (!j || j->extra_headers || !j->created_ns)
+    if (!j || j->extra_headers[0] || !j->created_ns)
         return;
     uint64_t done_ns = nstime();
     uint64_t queue_ns = j->started_ns > j->created_ns ? j->started_ns - j->created_ns : 0;
     uint64_t worker_ns = j->started_ns && done_ns > j->started_ns ? done_ns - j->started_ns : 0;
 
-    char buf[384];
-    int n = snprintf(buf, sizeof(buf),
+    /* Format into the job's inline header buffer; on overflow or error reset it
+     * to empty so no truncated header is emitted. */
+    int n = snprintf(j->extra_headers, sizeof(j->extra_headers),
                      "Server-Timing: queue;dur=%.3f, parse;dur=%.3f, "
                      "tokenize;dur=%.3f, infer;dur=%.3f, encode;dur=%.3f, "
                      "worker;dur=%.3f\r\n",
                      ns_to_ms(queue_ns), ns_to_ms(j->parse_ns), ns_to_ms(j->tokenize_ns),
                      ns_to_ms(j->infer_ns), ns_to_ms(j->encode_ns), ns_to_ms(worker_ns));
-    if (n > 0 && (size_t)n < sizeof(buf))
-        j->extra_headers = xstrdup(buf);
+    if (n <= 0 || (size_t)n >= sizeof(j->extra_headers))
+        j->extra_headers[0] = '\0';
 }
 
 void finish_job(job *j) {

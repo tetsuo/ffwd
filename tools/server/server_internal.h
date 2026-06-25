@@ -27,6 +27,7 @@
 #define FFWD_HTTP_SETSIZE           10240
 #define FFWD_HTTP_CLIENT_TIMEOUT_MS 30000
 #define FFWD_HTTP_SWEEP_MS          1000
+#define FFWD_HTTP_TIMING_HEADER_MAX 384
 
 #define FFWD_API_MAX_STANDARD_INPUTS  512
 #define FFWD_API_MAX_CONTEXT_DOCS     512
@@ -167,7 +168,7 @@ struct job {
     size_t body_len;
     int status;
     char *content_type;
-    char *extra_headers;
+    char extra_headers[FFWD_HTTP_TIMING_HEADER_MAX];
     char *response;
     size_t response_len;
     /* Filled by tokenize_job (on the tokenizer thread, or on the worker for a
