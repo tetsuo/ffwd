@@ -99,9 +99,10 @@ void dispatch_request(client *c) {
     j->c = c;
     snprintf(j->method, sizeof(j->method), "%s", c->req.method);
     snprintf(j->path, sizeof(j->path), "%s", c->req.path);
-    j->body = xstrndup(c->req.body ? c->req.body : "", c->req.body_len);
+    j->body = c->req.body;
     j->body_len = c->req.body_len;
-    j->auth = c->req.auth ? xstrdup(c->req.auth) : NULL;
+    c->req.body = NULL;
+    c->req.body_len = 0;
     j->created_ns = nstime();
     client_incref(c);
     /* All requests go through the tokenizer thread. Tokenization must run on a
