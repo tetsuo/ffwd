@@ -1,15 +1,14 @@
 # ffwd
 
-ffwd is a library and toolkit for text embedding inference.
+ffwd is a high-performance text embedding inference library and toolkit for
+transformer-based models.
 
-It works with a variety of transformer-based models and runs natively on Apple
-Silicon and NVIDIA GPUs, with CPU fallback on x86/ARM.
+It runs natively on Apple Silicon and NVIDIA GPUs, with CPU support for both x86
+and ARM architectures.
 
 ## Supported models
 
-ffwd supports models in the Hugging Face
-[safetensors](https://huggingface.co/docs/safetensors/index) format. Tested
-architectures include:
+Tested architectures include:
 
 - Qwen3: Qwen3-Embedding and pplx-embed families
 - Qwen2: GTE-Qwen2
@@ -18,13 +17,21 @@ architectures include:
 
 ## Components
 
-- [libffwd](./libffwd) is the core embedding inference library with kernels,
-  tokenizer, and model loading.
-- [ffwd-server](./tools/server) is a lightweight HTTP server with
-  OpenAI/Perplexity-compatible embedding APIs, including late-interaction and
-  contextualized embeddings.
-- [ffwd-cli](./tools/cli) is a basic command-line tool that generates embeddings
-  and computes cosine similarity.
+### libffwd
+
+[libffwd](./libffwd) is the core embedding inference library, providing
+optimized kernels, tokenization, and model loading.
+
+### ffwd-server
+
+[ffwd-server](./tools/server) is an HTTP server that provides OpenAI- and
+Perplexity-compatible embedding APIs, including support for late-interaction and
+contextualized embeddings.
+
+### ffwd-cli
+
+[ffwd-cli](./tools/cli) is a command-line tool for generating embeddings and
+computing cosine similarity.
 
 ## Building
 
