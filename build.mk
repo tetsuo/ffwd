@@ -34,19 +34,13 @@ ifeq ($(strip $(OPENBLAS_LDFLAGS)),)
     OPENBLAS_LDFLAGS = -lopenblas
 endif
 
-YYJSON_CFLAGS  ?= $(shell sh -c 'pkg-config --cflags yyjson 2>/dev/null')
-YYJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs yyjson 2>/dev/null')
-ifeq ($(OS),Darwin)
-ifeq ($(strip $(YYJSON_CFLAGS)),)
-    YYJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
-endif
-ifeq ($(strip $(YYJSON_LDFLAGS)),)
-    YYJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lyyjson
-endif
-endif
-ifeq ($(strip $(YYJSON_LDFLAGS)),)
-    YYJSON_LDFLAGS = -lyyjson
-endif
+# yyjson is vendored under deps/yyjson and built into a per-config static archive
+# (deps/yyjson/Makefile), so there is no system or pkg-config dependency.
+# YYJSON_CFLAGS resolves <yyjson.h> to the vendored header; YYJSON_LDFLAGS names
+# the archive by full path (as the server links libae.a), which links the same
+# way on macOS and Linux. Consumers build it via $(MAKE) -C deps/yyjson.
+YYJSON_CFLAGS  := -I$(ROOT)/deps/yyjson
+YYJSON_LDFLAGS := $(OUTDIR)/libyyjson.a
 
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
 MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)

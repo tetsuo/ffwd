@@ -4,6 +4,7 @@ include $(ROOT)/build.mk
 
 LIBFFWD := $(ROOT)/libffwd
 AE         := $(ROOT)/deps/ae
+YYJSON     := $(ROOT)/deps/yyjson
 
 BIN := $(OUTDIR)/ffwd-server
 SRCS := base64.c encode.c handlers.c http.c json.c main.c models.c sbuf.c \
@@ -14,8 +15,8 @@ DEPS := $(call deps,$(OBJS))
 TEST_BINS := test_base64 test_sbuf test_encode test_json test_schedule test_models
 TEST_OBJS := $(filter-out $(OBJDIR)/main.o,$(OBJS))
 
-LIBS := $(OUTDIR)/libffwd.a $(OUTDIR)/libae.a
-LDLIBS := $(YYJSON_LDFLAGS) $(BACKEND_LDFLAGS) -lm
+LIBS := $(OUTDIR)/libffwd.a $(OUTDIR)/libae.a $(OUTDIR)/libyyjson.a
+LDLIBS := $(BACKEND_LDFLAGS) -lm
 
 CFLAGS += -std=gnu11 -pthread
 CPPFLAGS += -I. -I$(LIBFFWD) -I$(AE)
@@ -40,6 +41,9 @@ $(OUTDIR)/libffwd.a:
 
 $(OUTDIR)/libae.a:
 	$(MAKE) -C $(AE)
+
+$(OUTDIR)/libyyjson.a:
+	$(MAKE) -C $(YYJSON)
 
 clean:
 	$(RM) -r $(OBJDIR) $(BIN) $(BIN).dSYM \

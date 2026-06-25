@@ -45,6 +45,12 @@ all: $(STATIC) $(SHARED)
 
 $(eval $(call static_archive,$(STATIC),$(OBJS)))
 $(eval $(call shared_library,$(SHARED),$(OBJS),,$(BACKEND_LDFLAGS) $(YYJSON_LDFLAGS) -lm))
+# yyjson is vendored under deps/yyjson; build its archive before linking the
+# shared library (the static libffwd.a does not embed it — consumers link both).
+YYJSON := $(ROOT)/deps/yyjson
+$(OUTDIR)/libyyjson.a:
+	$(MAKE) -C $(YYJSON)
+$(SHARED): $(OUTDIR)/libyyjson.a
 # The export map is generated from the public ABI (the FFWD_API declarations in
 # ffwd.h) instead of being committed, so it cannot drift from the header. It is
 # regenerated when the header or the generator changes, and the shared library
