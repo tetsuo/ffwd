@@ -3866,7 +3866,13 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         ctx->rope_cos = NULL;
         ctx->rope_sin = NULL;
         long long score_elems = (long long)c->n_heads * max_seq * max_seq;
-        int need_materialized_scores = !is_bert || !bp.flash;
+        // The Qwen BF16 HD=128 tc3 path is streaming flash attention: it writes the
+        // output directly and never materializes the N*N scores. Skip the O(L^2)
+        // attn_scores/attn_probs allocation for it (as BERT flash already does),
+        // which otherwise OOMs at long context (e.g. 32k) and caps ffwd's usable
+        // sequence length below the model's 32k. mat/f16 fallbacks still allocate.
+        int qwen_stream_flash = use_streaming_attention(c, ctx->weights_bf16, c->head_dim);
+        int need_materialized_scores = (!is_bert || !bp.flash) && !qwen_stream_flash;
         if (need_materialized_scores && score_elems > ctx->attn_scores_elems) {
             cudaFree(ctx->attn_scores);
             ctx->attn_scores = NULL;
