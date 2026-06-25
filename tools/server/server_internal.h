@@ -294,7 +294,6 @@ void dispatch_request(client *c);
 
 /* ---- server_encode.c: embedding output encoding ---- */
 signed char quantize_int8_tanh(float x);
-char *encode_embedding(const float *emb, int dims, const char *encoding);
 void append_embedding_value(
     sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api);
 void set_response_from_buf(job *j, sbuf *b);

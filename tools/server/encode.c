@@ -26,14 +26,17 @@ signed char quantize_int8_tanh(float x) {
     return (signed char)v;
 }
 
-char *encode_embedding(const float *emb, int dims, const char *encoding) {
+/* The bytes to base64 for `encoding`. "base64" aliases the float vector
+ * (*owned = 0); "base64_int8" and "base64_binary" return a freshly allocated
+ * buffer the caller frees (*owned = 1). */
+static const unsigned char *
+embedding_bytes(const float *emb, int dims, const char *encoding, size_t *n_out, int *owned) {
     if (!strcmp(encoding, "base64")) {
-        /* OpenAI/DashScope (Qwen3): base64 of the raw little-endian float32
-         * vector. x86_64 and aarch64 are little-endian, so the float bytes are
-         * already the wire format; read them directly through an unsigned char
-         * pointer. */
-        size_t nbytes = (size_t)dims * sizeof(float);
-        return base64_encode((const unsigned char *)emb, nbytes);
+        /* OpenAI/DashScope (Qwen3): raw little-endian float32. x86_64 and aarch64
+         * are little-endian, so the float bytes are the base64 wire format as-is. */
+        *owned = 0;
+        *n_out = (size_t)dims * sizeof(float);
+        return (const unsigned char *)emb;
     }
     if (!strcmp(encoding, "base64_binary")) {
         size_t bytes = (size_t)dims / 8;
@@ -42,23 +45,27 @@ char *encode_embedding(const float *emb, int dims, const char *encoding) {
             if (emb[i] >= 0.0f)
                 bits[(size_t)i >> 3] |= (unsigned char)(1u << (i & 7));
         }
-        char *out = base64_encode(bits, bytes);
-        free(bits);
-        return out;
+        *owned = 1;
+        *n_out = bytes;
+        return bits;
     }
-
+    /* base64_int8 (Perplexity default): tanh-quantized signed bytes. */
     signed char *q = xmalloc((size_t)dims);
     for (int i = 0; i < dims; i++)
         q[i] = quantize_int8_tanh(emb[i]);
-    char *out = base64_encode((const unsigned char *)q, (size_t)dims);
-    free(q);
-    return out;
+    *owned = 1;
+    *n_out = (size_t)dims;
+    return (const unsigned char *)q;
 }
 
-static void append_embedding_object(sbuf *b, int index, const char *embedding) {
-    sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":\"", index);
-    sbuf_puts(b, embedding);
-    sbuf_puts(b, "\"}");
+/* Append the base64 of src to b: reserve the exact output length and encode it
+ * in place. */
+static void sbuf_append_base64(sbuf *b, const unsigned char *src, size_t n) {
+    size_t out_len = base64_encoded_len(n);
+    sbuf_reserve(b, out_len);
+    base64_encode_to(b->ptr + b->len, src, n);
+    b->len += out_len;
+    b->ptr[b->len] = '\0';
 }
 
 void append_embedding_value(
@@ -78,9 +85,15 @@ void append_embedding_value(
         sbuf_puts(b, "]}");
         return;
     }
-    char *encoded = encode_embedding(emb, dims, encoding);
-    append_embedding_object(b, index, encoded);
-    free(encoded);
+    /* base64 family: int8, binary, or raw float32 bytes, base64-encoded. */
+    size_t n;
+    int owned;
+    const unsigned char *bytes = embedding_bytes(emb, dims, encoding, &n, &owned);
+    sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":\"", index);
+    sbuf_append_base64(b, bytes, n);
+    sbuf_puts(b, "\"}");
+    if (owned)
+        free((void *)bytes);
 }
 
 void set_response_from_buf(job *j, sbuf *b) {

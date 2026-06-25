@@ -5,6 +5,7 @@
 #include "server_internal.h"
 #include "test_util.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,37 +20,43 @@ static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.5f) == 59);
 }
 
-static void test_encode_embedding_int8(void) {
-    float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
-    signed char expect[4] = {0, 59, -59, 127};
-    char *got = encode_embedding(emb, 4, "base64_int8");
-    char *want = base64_encode((const unsigned char *)expect, 4);
-    TEST_ASSERT(strcmp(got, want) == 0);
-    free(got);
-    free(want);
+/* Assert that rendering emb under `encoding` puts the base64 of `expect` in the
+ * embedding field of the response object. */
+static void assert_base64_field(const float *emb,
+                                int dims,
+                                const char *encoding,
+                                embedding_api_t api,
+                                const unsigned char *expect,
+                                size_t expect_n) {
+    char *b64 = base64_encode(expect, expect_n);
+    char field[96];
+    snprintf(field, sizeof(field), "\"embedding\":\"%s\"", b64);
+    sbuf b = {0};
+    append_embedding_value(&b, 0, emb, dims, encoding, api);
+    TEST_ASSERT(b.ptr && strstr(b.ptr, field) != NULL);
+    sbuf_free(&b);
+    free(b64);
 }
 
-static void test_encode_embedding_binary(void) {
+static void test_append_embedding_value_int8(void) {
+    float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
+    signed char expect[4] = {0, 59, -59, 127};
+    assert_base64_field(emb, 4, "base64_int8", FFWD_API_PERPLEXITY, (const unsigned char *)expect, 4);
+}
+
+static void test_append_embedding_value_binary(void) {
     /* Sign bits pack LSB-first: bit i of byte i/8 is 1 when emb[i] >= 0. */
     float emb[8] = {1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f};
     unsigned char expect = 0x85; /* bits 0, 2, 7 set */
-    char *got = encode_embedding(emb, 8, "base64_binary");
-    char *want = base64_encode(&expect, 1);
-    TEST_ASSERT(strcmp(got, want) == 0);
-    free(got);
-    free(want);
+    assert_base64_field(emb, 8, "base64_binary", FFWD_API_PERPLEXITY, &expect, 1);
 
     /* Zero counts as non-negative (sign bit set). */
     float zeros[8] = {0};
     unsigned char all = 0xff;
-    got = encode_embedding(zeros, 8, "base64_binary");
-    want = base64_encode(&all, 1);
-    TEST_ASSERT(strcmp(got, want) == 0);
-    free(got);
-    free(want);
+    assert_base64_field(zeros, 8, "base64_binary", FFWD_API_PERPLEXITY, &all, 1);
 }
 
-static void test_encode_embedding_base64_float32(void) {
+static void test_append_embedding_value_base64(void) {
     /* OpenAI/DashScope "base64" is base64 of the raw little-endian float32
      * vector - lossless, unlike the int8 formats. */
     float emb[4] = {0.0f, 0.5f, -0.5f, 100.0f};
@@ -57,11 +64,7 @@ static void test_encode_embedding_base64_float32(void) {
      * static analyzer's uninitialized-read model. */
     unsigned char bytes[sizeof emb];
     memcpy(bytes, emb, sizeof emb);
-    char *want = base64_encode(bytes, sizeof emb);
-    char *got = encode_embedding(emb, 4, "base64");
-    TEST_ASSERT(strcmp(got, want) == 0);
-    free(got);
-    free(want);
+    assert_base64_field(emb, 4, "base64", FFWD_API_OPENAI, bytes, sizeof emb);
 }
 
 static void test_append_embedding_value_float(void) {
@@ -121,9 +124,9 @@ static void test_job_embedding_render_payload(void) {
 
 int main(void) {
     test_quantize_int8_tanh();
-    test_encode_embedding_int8();
-    test_encode_embedding_binary();
-    test_encode_embedding_base64_float32();
+    test_append_embedding_value_int8();
+    test_append_embedding_value_binary();
+    test_append_embedding_value_base64();
     test_append_embedding_value_float();
     test_job_embedding_render_payload();
     return TEST_REPORT("encode");
