@@ -62,8 +62,8 @@ int ffwd_init(const ffwd_options_t *opts, char *err, size_t errlen) {
     return 0;
 }
 
-ffwd_t *ffwd_open(
-    const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen) {
+ffwd_t *
+ffwd_open(const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen) {
     ffwd_t *b = (ffwd_t *)calloc(1, sizeof(*b));
     if (!b || !(b->dir = strdup(model_dir))) {
         snprintf(err, errlen, "out of memory");
@@ -120,9 +120,7 @@ const ffwd_config_t *ffwd_config(const ffwd_t *b) {
     return b->is_late ? ffwd_mlx_late_config(b->late_ctx) : ffwd_mlx_config(b->ctx);
 }
 
-int ffwd_token_dim(const ffwd_t *b) {
-    return b->is_late ? ffwd_mlx_late_token_dim(b->late_ctx) : 0;
-}
+int ffwd_token_dim(const ffwd_t *b) { return b->is_late ? ffwd_mlx_late_token_dim(b->late_ctx) : 0; }
 
 int ffwd_uses_dense_batches(const ffwd_t *b) { return b->ctx != NULL; }
 
@@ -130,10 +128,7 @@ int ffwd_encode_batch(ffwd_t *b, const ffwd_input_t *inputs, int batch, float *o
     return ffwd_mlx_encode_batch(b->ctx, inputs, batch, out);
 }
 
-int ffwd_encode_spans_batch(ffwd_t *b,
-                               const ffwd_context_input_t *inputs,
-                               int batch,
-                               float *out) {
+int ffwd_encode_spans_batch(ffwd_t *b, const ffwd_context_input_t *inputs, int batch, float *out) {
     return ffwd_mlx_encode_spans_batch(b->ctx, inputs, batch, out);
 }
 
@@ -144,11 +139,10 @@ int ffwd_rerank(ffwd_t *b, const ffwd_rerank_input_t *in, float *scores) {
     ffwd_mlx_late_vectors_t *packed =
         (query && offsets)
             ? ffwd_mlx_late_encode_docs_device(b->late_ctx, in->doc_ids, in->doc_n_tokens,
-                                                  in->doc_keep, in->doc_n_keep, in->n_docs, 1,
-                                                  offsets)
+                                               in->doc_keep, in->doc_n_keep, in->n_docs, 1, offsets)
             : NULL;
     int rc = packed ? ffwd_mlx_late_maxsim_batch_device(b->late_ctx, query, packed, offsets,
-                                                           in->n_docs, scores)
+                                                        in->n_docs, scores)
                     : -1;
     ffwd_mlx_late_vectors_free(packed);
     ffwd_mlx_late_vectors_free(query);

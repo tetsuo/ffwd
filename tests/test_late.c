@@ -48,7 +48,7 @@ static int check_maxsim_batch_parity(const float *query,
     }
     for (int i = 0; i < n_docs; i++) {
         float one = ffwd_late_maxsim(query, query_tokens, docs + (size_t)offsets[i] * dim,
-                                        offsets[i + 1] - offsets[i], dim);
+                                     offsets[i + 1] - offsets[i], dim);
         if (fabsf(scores[i] - one) > 0.0001f) {
             fprintf(stderr, "maxsim_batch (%s) doc %d: %g vs %g\n", what, i, scores[i], one);
             return 1;
@@ -257,7 +257,7 @@ int main(void) {
         }
         for (int i = 0; i < 3; i++) {
             if (ffwd_late_model_encode_tokens(late, ws, doc_ids[i], lens[i], 1,
-                                                 doc_vecs + (size_t)offsets[i] * TOKEN_DIM) != 0) {
+                                              doc_vecs + (size_t)offsets[i] * TOKEN_DIM) != 0) {
                 fprintf(stderr, "doc encode failed\n");
                 goto fail;
             }
@@ -269,10 +269,8 @@ int main(void) {
         float scores[3];
         int bad_first[4] = {1, 2, 3, 4};
         int empty_doc[3] = {0, 2, 2};
-        if (ffwd_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3, TOKEN_DIM, scores) ==
-                0 ||
-            ffwd_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2, TOKEN_DIM, scores) ==
-                0 ||
+        if (ffwd_late_maxsim_batch(vecs, n_tokens, doc_vecs, bad_first, 3, TOKEN_DIM, scores) == 0 ||
+            ffwd_late_maxsim_batch(vecs, n_tokens, doc_vecs, empty_doc, 2, TOKEN_DIM, scores) == 0 ||
             ffwd_late_maxsim_batch(vecs, n_tokens, doc_vecs, offsets, 3, TOKEN_DIM, NULL) == 0) {
             fprintf(stderr, "maxsim_batch accepted invalid arguments\n");
             goto fail;
@@ -297,8 +295,8 @@ int main(void) {
                 keep_arrs[i][t] = t;
         }
         if (ffwd_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
-                                           (const int *const *)keep_arrs, lens, 3, 1, batched,
-                                           batch_offsets) != 0) {
+                                        (const int *const *)keep_arrs, lens, 3, 1, batched,
+                                        batch_offsets) != 0) {
             fprintf(stderr, "encode_docs failed\n");
             goto fail;
         }
@@ -333,7 +331,7 @@ int main(void) {
             if (!filtered)
                 goto fail;
             if (ffwd_late_model_encode_docs(late, ws, one_ids, one_len, one_keep, one_nkeep, 1, 1,
-                                               filtered, one_off) != 0 ||
+                                            filtered, one_off) != 0 ||
                 one_off[1] != nk0 ||
                 max_abs_diff(filtered, doc_vecs + TOKEN_DIM, (size_t)nk0 * TOKEN_DIM) > 0.0001f) {
                 fprintf(stderr, "encode_docs keep-filter mismatch\n");
@@ -345,14 +343,14 @@ int main(void) {
 
         /* Invalid arguments must be rejected. */
         if (ffwd_late_model_encode_docs(NULL, ws, (const int *const *)doc_ids, lens,
-                                           (const int *const *)keep_arrs, lens, 3, 1, batched,
-                                           batch_offsets) == 0 ||
+                                        (const int *const *)keep_arrs, lens, 3, 1, batched,
+                                        batch_offsets) == 0 ||
             ffwd_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
-                                           (const int *const *)keep_arrs, lens, 0, 1, batched,
-                                           batch_offsets) == 0 ||
+                                        (const int *const *)keep_arrs, lens, 0, 1, batched,
+                                        batch_offsets) == 0 ||
             ffwd_late_model_encode_docs(late, ws, (const int *const *)doc_ids, lens,
-                                           (const int *const *)keep_arrs, lens, 3, 1, NULL,
-                                           batch_offsets) == 0) {
+                                        (const int *const *)keep_arrs, lens, 3, 1, NULL,
+                                        batch_offsets) == 0) {
             fprintf(stderr, "encode_docs accepted invalid arguments\n");
             goto fail;
         }

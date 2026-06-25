@@ -38,8 +38,8 @@ int ffwd_init(const ffwd_options_t *opts, char *err, size_t errlen) {
     return 0;
 }
 
-ffwd_t *ffwd_open(
-    const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen) {
+ffwd_t *
+ffwd_open(const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen) {
     (void)opts;
     ffwd_t *b = (ffwd_t *)calloc(1, sizeof(*b));
     if (!b) {
@@ -102,9 +102,7 @@ const ffwd_config_t *ffwd_config(const ffwd_t *b) {
     return b->is_late ? ffwd_late_model_config(b->late) : ffwd_model_config(b->model);
 }
 
-int ffwd_token_dim(const ffwd_t *b) {
-    return b->is_late ? ffwd_late_model_token_dim(b->late) : 0;
-}
+int ffwd_token_dim(const ffwd_t *b) { return b->is_late ? ffwd_late_model_token_dim(b->late) : 0; }
 
 int ffwd_uses_dense_batches(const ffwd_t *b) {
     (void)b;
@@ -115,10 +113,7 @@ int ffwd_encode_batch(ffwd_t *b, const ffwd_input_t *inputs, int batch, float *o
     return ffwd_model_encode_batch(b->model, b->ws, inputs, batch, out);
 }
 
-int ffwd_encode_spans_batch(ffwd_t *b,
-                               const ffwd_context_input_t *inputs,
-                               int batch,
-                               float *out) {
+int ffwd_encode_spans_batch(ffwd_t *b, const ffwd_context_input_t *inputs, int batch, float *out) {
     return ffwd_model_encode_spans_batch(b->model, b->ws, inputs, batch, out);
 }
 
@@ -136,15 +131,13 @@ int ffwd_rerank(ffwd_t *b, const ffwd_rerank_input_t *in, float *scores) {
     /* Encode every candidate in one block-diagonal forward: the encoder packs
      * each document's kept token vectors back-to-back and fills offsets. */
     if (rc == 0)
-        rc = ffwd_late_model_encode_tokens(b->late, b->late_ws, in->query_ids, in->query_n_tokens,
-                                              1, query);
+        rc = ffwd_late_model_encode_tokens(b->late, b->late_ws, in->query_ids, in->query_n_tokens, 1,
+                                           query);
     if (rc == 0)
         rc = ffwd_late_model_encode_docs(b->late, b->late_ws, in->doc_ids, in->doc_n_tokens,
-                                            in->doc_keep, in->doc_n_keep, in->n_docs, 1, docs,
-                                            offsets);
+                                         in->doc_keep, in->doc_n_keep, in->n_docs, 1, docs, offsets);
     if (rc == 0)
-        rc = ffwd_late_maxsim_batch(query, in->query_n_keep, docs, offsets, in->n_docs, dim,
-                                       scores);
+        rc = ffwd_late_maxsim_batch(query, in->query_n_keep, docs, offsets, in->n_docs, dim, scores);
     free(offsets);
     free(docs);
     free(query);

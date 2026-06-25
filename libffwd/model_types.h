@@ -26,13 +26,13 @@ typedef struct {
     ffwd_weight_ref_t wk;        /* [kv_dim,  hidden] */
     ffwd_weight_ref_t wv;        /* [kv_dim,  hidden] */
     ffwd_weight_ref_t wo;        /* [hidden,  q_dim]  */
-    const float *q_bias;          /* [q_dim], optional */
-    const float *k_bias;          /* [kv_dim], optional */
-    const float *v_bias;          /* [kv_dim], optional */
-    const float *q_norm;          /* [head_dim] */
-    const float *k_norm;          /* [head_dim] */
-    const float *input_norm;      /* [hidden] */
-    const float *post_attn_norm;  /* [hidden] */
+    const float *q_bias;         /* [q_dim], optional */
+    const float *k_bias;         /* [kv_dim], optional */
+    const float *v_bias;         /* [kv_dim], optional */
+    const float *q_norm;         /* [head_dim] */
+    const float *k_norm;         /* [head_dim] */
+    const float *input_norm;     /* [hidden] */
+    const float *post_attn_norm; /* [hidden] */
     ffwd_weight_ref_t gate_proj; /* [intermediate, hidden] */
     ffwd_weight_ref_t up_proj;   /* [intermediate, hidden] */
     ffwd_weight_ref_t down_proj; /* [hidden, intermediate] */
@@ -51,27 +51,27 @@ typedef struct {
 typedef struct {
     ffwd_weight_ref_t embed_tokens; /* [vocab_size, hidden] */
     ffwd_layer_t *layers;           /* [n_layers] heap-allocated */
-    const float *norm;               /* [hidden]; NULL for BERT (no final norm) */
+    const float *norm;              /* [hidden]; NULL for BERT (no final norm) */
     /* BERT family (NULL for Qwen3): learned absolute position embeddings,
      * token-type (segment) embeddings, and the embedding LayerNorm. */
     const float *position_embeddings;   /* [max_position_embeddings, hidden] */
     const float *token_type_embeddings; /* [type_vocab_size, hidden] */
-    const float *ffwd_ln_w;            /* embedding LayerNorm weight [hidden] */
-    const float *ffwd_ln_b;            /* embedding LayerNorm bias [hidden] */
+    const float *ffwd_ln_w;             /* embedding LayerNorm weight [hidden] */
+    const float *ffwd_ln_b;             /* embedding LayerNorm bias [hidden] */
 } ffwd_weights_t;
 
 typedef void (*ffwd_attention_fn)(float *out,
-                                   const float *Q,
-                                   const float *K,
-                                   const float *V,
-                                   const int *offsets,
-                                   int batch,
-                                   int n_heads,
-                                   int n_kv_heads,
-                                   int head_dim,
-                                   float scale,
-                                   float *scratch,
-                                   size_t scratch_bytes);
+                                  const float *Q,
+                                  const float *K,
+                                  const float *V,
+                                  const int *offsets,
+                                  int batch,
+                                  int n_heads,
+                                  int n_kv_heads,
+                                  int head_dim,
+                                  float scale,
+                                  float *scratch,
+                                  size_t scratch_bytes);
 
 struct ffwd_model {
     ffwd_config_t config;

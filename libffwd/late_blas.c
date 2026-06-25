@@ -55,11 +55,11 @@ void ffwd_late_workspace_free(ffwd_late_workspace_t *ws) {
 }
 
 int ffwd_late_model_encode_tokens(const ffwd_late_model_t *model,
-                                     ffwd_late_workspace_t *ws,
-                                     const int *token_ids,
-                                     int n_tokens,
-                                     int normalize,
-                                     float *out_vectors) {
+                                  ffwd_late_workspace_t *ws,
+                                  const int *token_ids,
+                                  int n_tokens,
+                                  int normalize,
+                                  float *out_vectors) {
     int dim = ffwd_late_model_token_dim(model);
     ffwd_model_t *base = ffwd_late_model_base(model);
     const ffwd_weight_ref_t *projection = ffwd_late_model_projection(model);
@@ -86,15 +86,15 @@ int ffwd_late_model_encode_tokens(const ffwd_late_model_t *model,
 /* Late-interaction batch encoder. Reuses the base model's packed/ragged batch
  * forward pass, then gathers kept rows and projects them in one GEMM. */
 int ffwd_late_model_encode_docs(const ffwd_late_model_t *model,
-                                   ffwd_late_workspace_t *ws,
-                                   const int *const *doc_ids,
-                                   const int *n_tokens,
-                                   const int *const *keep,
-                                   const int *n_keep,
-                                   int n_docs,
-                                   int normalize,
-                                   float *out_vectors,
-                                   int *out_offsets) {
+                                ffwd_late_workspace_t *ws,
+                                const int *const *doc_ids,
+                                const int *n_tokens,
+                                const int *const *keep,
+                                const int *n_keep,
+                                int n_docs,
+                                int normalize,
+                                float *out_vectors,
+                                int *out_offsets) {
     int dim = ffwd_late_model_token_dim(model);
     ffwd_model_t *base = ffwd_late_model_base(model);
     const ffwd_weight_ref_t *projection = ffwd_late_model_projection(model);

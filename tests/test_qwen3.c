@@ -36,9 +36,8 @@ int main(void) {
         fprintf(stderr, "model setup failed\n");
         return 1;
     }
-    if (cfg->attention_mode != FFWD_ATTENTION_CAUSAL ||
-        cfg->pooling_mode != FFWD_POOL_LAST_TOKEN || !cfg->normalize_embeddings ||
-        !cfg->append_terminal_token) {
+    if (cfg->attention_mode != FFWD_ATTENTION_CAUSAL || cfg->pooling_mode != FFWD_POOL_LAST_TOKEN ||
+        !cfg->normalize_embeddings || !cfg->append_terminal_token) {
         fprintf(stderr, "Qwen3 config semantics were not detected\n");
         return 1;
     }

@@ -225,8 +225,7 @@ static int forward_packed_slice_inplace(const ffwd_model_t *model,
             for (int i = 0; i < inputs[b].n_tokens; i++) {
                 int id = inputs[b].ids[i];
                 if (id < 0 || id >= cfg->vocab_size) {
-                    fprintf(stderr, "ffwd: invalid token id %d at input %d position %d\n", id, b,
-                            i);
+                    fprintf(stderr, "ffwd: invalid token id %d at input %d position %d\n", id, b, i);
                     return -1;
                 }
                 copy_weight_row(x + (size_t)(start + i) * hidden, &w->embed_tokens, (size_t)id,
@@ -466,10 +465,10 @@ static int pool_embeddings(const ffwd_model_t *model,
  * ======================================================================== */
 
 int ffwd_model_forward_into(const ffwd_model_t *model,
-                               ffwd_workspace_t *ws,
-                               const int *token_ids,
-                               int n_tokens,
-                               float *out_states) {
+                            ffwd_workspace_t *ws,
+                            const int *token_ids,
+                            int n_tokens,
+                            float *out_states) {
     if (!model || !ws || !token_ids || n_tokens <= 0 || !out_states)
         return -1;
 
@@ -488,11 +487,11 @@ int ffwd_model_forward_into(const ffwd_model_t *model,
 }
 
 int ffwd_pool_spans(const ffwd_config_t *cfg,
-                       const float *states,
-                       int n_tokens,
-                       const ffwd_span_t *spans,
-                       int n_spans,
-                       float *out_embeddings) {
+                    const float *states,
+                    int n_tokens,
+                    const ffwd_span_t *spans,
+                    int n_spans,
+                    float *out_embeddings) {
     if (!cfg || !states || n_tokens <= 0 || !spans || n_spans <= 0 || !out_embeddings)
         return -1;
 
@@ -524,10 +523,10 @@ int ffwd_pool_spans(const ffwd_config_t *cfg,
 }
 
 int ffwd_model_encode_spans_batch(const ffwd_model_t *model,
-                                     ffwd_workspace_t *ws,
-                                     const ffwd_context_input_t *inputs,
-                                     int batch,
-                                     float *out_embeddings) {
+                                  ffwd_workspace_t *ws,
+                                  const ffwd_context_input_t *inputs,
+                                  int batch,
+                                  float *out_embeddings) {
     if (!model || !ws || !inputs || batch <= 0 || !out_embeddings)
         return -1;
 
@@ -579,8 +578,8 @@ int ffwd_model_encode_spans_batch(const ffwd_model_t *model,
     for (int b = 0; b < batch; b++) {
         const ffwd_context_input_t *input = &inputs[b];
         if (ffwd_pool_spans(&model->config, ws->x + (size_t)offsets[b] * hidden,
-                               input->input.n_tokens, input->spans, input->n_spans,
-                               out_embeddings + (size_t)span_offset * hidden) != 0)
+                            input->input.n_tokens, input->spans, input->n_spans,
+                            out_embeddings + (size_t)span_offset * hidden) != 0)
             return -1;
         span_offset += input->n_spans;
     }
@@ -588,12 +587,12 @@ int ffwd_model_encode_spans_batch(const ffwd_model_t *model,
 }
 
 int ffwd_model_encode_spans(const ffwd_model_t *model,
-                               ffwd_workspace_t *ws,
-                               const int *token_ids,
-                               int n_tokens,
-                               const ffwd_span_t *spans,
-                               int n_spans,
-                               float *out_embeddings) {
+                            ffwd_workspace_t *ws,
+                            const int *token_ids,
+                            int n_tokens,
+                            const ffwd_span_t *spans,
+                            int n_spans,
+                            float *out_embeddings) {
     ffwd_context_input_t input = {
         .input = {token_ids, n_tokens},
         .spans = spans,
@@ -603,9 +602,9 @@ int ffwd_model_encode_spans(const ffwd_model_t *model,
 }
 
 float *ffwd_model_forward(const ffwd_model_t *model,
-                             ffwd_workspace_t *ws,
-                             const int *token_ids,
-                             int n_tokens) {
+                          ffwd_workspace_t *ws,
+                          const int *token_ids,
+                          int n_tokens) {
     if (!model || !ws || !token_ids || n_tokens <= 0)
         return NULL;
 
@@ -624,10 +623,10 @@ float *ffwd_model_forward(const ffwd_model_t *model,
 }
 
 int ffwd_model_encode_batch(const ffwd_model_t *model,
-                               ffwd_workspace_t *ws,
-                               const ffwd_input_t *inputs,
-                               int batch,
-                               float *out_embeddings) {
+                            ffwd_workspace_t *ws,
+                            const ffwd_input_t *inputs,
+                            int batch,
+                            float *out_embeddings) {
     if (!model || !ws || !inputs || batch <= 0 || !out_embeddings)
         return -1;
 
@@ -650,10 +649,10 @@ int ffwd_model_encode_batch(const ffwd_model_t *model,
 }
 
 int ffwd_pool_batch(const ffwd_config_t *cfg,
-                       const float *states,
-                       const int *seq_lengths,
-                       int batch,
-                       float *out_embeddings) {
+                    const float *states,
+                    const int *seq_lengths,
+                    int batch,
+                    float *out_embeddings) {
     if (!cfg || !states || !seq_lengths || batch <= 0 || !out_embeddings || cfg->hidden_size <= 0)
         return -1;
 
@@ -689,18 +688,18 @@ int ffwd_pool_batch(const ffwd_config_t *cfg,
 }
 
 int ffwd_model_encode_into(const ffwd_model_t *model,
-                              ffwd_workspace_t *ws,
-                              const int *token_ids,
-                              int n_tokens,
-                              float *out_embedding) {
+                           ffwd_workspace_t *ws,
+                           const int *token_ids,
+                           int n_tokens,
+                           float *out_embedding) {
     ffwd_input_t input = {token_ids, n_tokens};
     return ffwd_model_encode_batch(model, ws, &input, 1, out_embedding);
 }
 
 float *ffwd_model_encode(const ffwd_model_t *model,
-                            ffwd_workspace_t *ws,
-                            const int *token_ids,
-                            int n_tokens) {
+                         ffwd_workspace_t *ws,
+                         const int *token_ids,
+                         int n_tokens) {
     if (!model || !ws || !token_ids || n_tokens <= 0)
         return NULL;
 

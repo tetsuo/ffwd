@@ -228,9 +228,9 @@ int model_ffwd_batch(loaded_model *m, const ffwd_input_t *inputs, int batch, flo
 }
 
 int model_ffwd_spans_batch(loaded_model *m,
-                              const ffwd_context_input_t *inputs,
-                              int batch,
-                              float *out) {
+                           const ffwd_context_input_t *inputs,
+                           int batch,
+                           float *out) {
     return ffwd_encode_spans_batch(m->backend, inputs, batch, out);
 }
 

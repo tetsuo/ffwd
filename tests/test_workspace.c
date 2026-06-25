@@ -165,8 +165,8 @@ static int check_spans_batch_parity(const ffwd_model_t *model,
     ffwd_span_t spans0[2] = {{0, ntok[0]}, {ntok[0] + 1, ntok[1]}};
     ffwd_span_t span1 = {0, ntok[2]};
     if (ffwd_model_encode_spans(model, ws, doc0, n0, spans0, 2, expected) != 0 ||
-        ffwd_model_encode_spans(model, ws, ids[2], ntok[2], &span1, 1,
-                                   expected + (size_t)2 * dim) != 0) {
+        ffwd_model_encode_spans(model, ws, ids[2], ntok[2], &span1, 1, expected + (size_t)2 * dim) !=
+            0) {
         fprintf(stderr, "singleton contextual embedding failed\n");
         goto done;
     }

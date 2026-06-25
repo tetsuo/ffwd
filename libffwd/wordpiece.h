@@ -52,18 +52,18 @@ void tok_wp_workspace_free(tok_wp_workspace_t *ws);
  * on error, -2 if out_cap is too small. *out_n_tokens (when non-NULL) is set to
  * the number of tokens needed/emitted in all cases. */
 int tok_wp_encode_into(const tok_wp_t *tok,
-                               tok_wp_workspace_t *ws,
-                               const char *text,
-                               int *out_ids,
-                               int out_cap,
-                               int *out_n_tokens);
+                       tok_wp_workspace_t *ws,
+                       const char *text,
+                       int *out_ids,
+                       int out_cap,
+                       int *out_n_tokens);
 
 /* Same tokenization as tok_wp_encode(), reusing ws internally and
  * performing only the final returned int[] allocation. */
 int *tok_wp_encode_with_workspace(const tok_wp_t *tok,
-                                          tok_wp_workspace_t *ws,
-                                          const char *text,
-                                          int *out_n_tokens);
+                                  tok_wp_workspace_t *ws,
+                                  const char *text,
+                                  int *out_n_tokens);
 
 void tok_wp_free(tok_wp_t *tok);
 

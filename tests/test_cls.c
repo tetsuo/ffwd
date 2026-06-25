@@ -37,8 +37,8 @@ int main(void) {
         fprintf(stderr, "model setup failed\n");
         return 1;
     }
-    if (cfg->pooling_mode != FFWD_POOL_CLS ||
-        cfg->attention_mode != FFWD_ATTENTION_BIDIRECTIONAL || !cfg->normalize_embeddings) {
+    if (cfg->pooling_mode != FFWD_POOL_CLS || cfg->attention_mode != FFWD_ATTENTION_BIDIRECTIONAL ||
+        !cfg->normalize_embeddings) {
         fprintf(stderr, "CLS pooling metadata was not detected\n");
         return 1;
     }

@@ -39,9 +39,7 @@ typedef struct {
     void *ws;
 } bench_tok_t;
 
-static int path_exists(const char *path) {
-    return access(path, R_OK) == 0;
-}
+static int path_exists(const char *path) { return access(path, R_OK) == 0; }
 
 static int load_tokenizer(bench_tok_t *bt, const char *path) {
     char p[1024];
@@ -88,28 +86,28 @@ static int *tok_encode(bench_tok_t *bt, const char *text, int *n) {
 static int *tok_encode_ws(bench_tok_t *bt, const char *text, int *n) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        return tok_wp_encode_with_workspace((tok_wp_t *)bt->tok,
-                                            (tok_wp_workspace_t *)bt->ws, text, n);
+        return tok_wp_encode_with_workspace((tok_wp_t *)bt->tok, (tok_wp_workspace_t *)bt->ws, text,
+                                            n);
     case TOK_SENTENCEPIECE:
-        return tok_spm_encode_with_workspace(
-            (tok_spm_t *)bt->tok, (tok_spm_workspace_t *)bt->ws, text, n);
+        return tok_spm_encode_with_workspace((tok_spm_t *)bt->tok, (tok_spm_workspace_t *)bt->ws,
+                                             text, n);
     default:
-        return tok_bpe_encode_with_workspace((tok_bpe_t *)bt->tok,
-                                             (tok_bpe_workspace_t *)bt->ws, text, n);
+        return tok_bpe_encode_with_workspace((tok_bpe_t *)bt->tok, (tok_bpe_workspace_t *)bt->ws,
+                                             text, n);
     }
 }
 
 static int tok_encode_into(bench_tok_t *bt, const char *text, int *out, int cap, int *n) {
     switch (bt->kind) {
     case TOK_WORDPIECE:
-        return tok_wp_encode_into((tok_wp_t *)bt->tok,
-                                  (tok_wp_workspace_t *)bt->ws, text, out, cap, n);
+        return tok_wp_encode_into((tok_wp_t *)bt->tok, (tok_wp_workspace_t *)bt->ws, text, out, cap,
+                                  n);
     case TOK_SENTENCEPIECE:
-        return tok_spm_encode_into((tok_spm_t *)bt->tok,
-                                   (tok_spm_workspace_t *)bt->ws, text, out, cap, n);
+        return tok_spm_encode_into((tok_spm_t *)bt->tok, (tok_spm_workspace_t *)bt->ws, text, out,
+                                   cap, n);
     default:
-        return tok_bpe_encode_into((tok_bpe_t *)bt->tok,
-                                   (tok_bpe_workspace_t *)bt->ws, text, out, cap, n);
+        return tok_bpe_encode_into((tok_bpe_t *)bt->tok, (tok_bpe_workspace_t *)bt->ws, text, out,
+                                   cap, n);
     }
 }
 

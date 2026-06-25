@@ -189,9 +189,7 @@ void ffwd_tok_free(ffwd_tok_t *t) {
     free(t);
 }
 
-int ffwd_tok_context_separator_id(const ffwd_tok_t *t) {
-    return t ? t->context_separator_id : -1;
-}
+int ffwd_tok_context_separator_id(const ffwd_tok_t *t) { return t ? t->context_separator_id : -1; }
 
 void ffwd_tok_set_append_terminal(ffwd_tok_t *t, int on) {
     if (t)
@@ -289,10 +287,7 @@ static int late_id_is_skipped(const ffwd_tok_t *t, int id) {
     return 0;
 }
 
-int ffwd_tokenize_late(ffwd_tok_t *t,
-                          const char *text,
-                          int is_query,
-                          ffwd_late_tokens_t *out) {
+int ffwd_tokenize_late(ffwd_tok_t *t, const char *text, int is_query, ffwd_late_tokens_t *out) {
     memset(out, 0, sizeof(*out));
     if (!t || !text)
         return -1;

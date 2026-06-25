@@ -327,9 +327,7 @@ static mlx_array linear(mlx_array x, const mlx_linear_t *W, mlx_stream s) {
     return res;
 }
 
-const ffwd_config_t *ffwd_mlx_config(const ffwd_mlx_ctx_t *ctx) {
-    return ctx ? &ctx->config : NULL;
-}
+const ffwd_config_t *ffwd_mlx_config(const ffwd_mlx_ctx_t *ctx) { return ctx ? &ctx->config : NULL; }
 
 /* Upcast a tensor to F32 in place (no-op if already F32 or empty). Used for the
  * tiny RMSNorm vectors so non-quantized BF16 models can run norms and the
@@ -432,8 +430,7 @@ static int load_mlx_bert_weights(ffwd_mlx_ctx_t *ctx, int layer_start, int layer
         snprintf(name, sizeof(name), "%sembeddings.LayerNorm.bias", p);
         ctx->ffwd_ln_b = load_tensor(ctx->ms, name, ln_shape, 1);
         if (!arr_ok(ctx->embed_tokens) || !arr_ok(ctx->position_embeddings) ||
-            !arr_ok(ctx->token_type_embeddings) || !arr_ok(ctx->ffwd_ln_w) ||
-            !arr_ok(ctx->ffwd_ln_b))
+            !arr_ok(ctx->token_type_embeddings) || !arr_ok(ctx->ffwd_ln_w) || !arr_ok(ctx->ffwd_ln_b))
             return -1;
     }
 
@@ -483,10 +480,10 @@ static int load_mlx_bert_weights(ffwd_mlx_ctx_t *ctx, int layer_start, int layer
 }
 
 static ffwd_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
-                                            int layer_start,
-                                            int layer_end,
-                                            const ffwd_mlx_options_t *opts,
-                                            int allow_late) {
+                                         int layer_start,
+                                         int layer_end,
+                                         const ffwd_mlx_options_t *opts,
+                                         int allow_late) {
     ffwd_mlx_options_t options = normalize_mlx_options(opts);
     if (options.quantize_bits < 0)
         return NULL;
@@ -703,8 +700,7 @@ ffwd_mlx_ctx_t *ffwd_mlx_load(const char *model_dir) {
     return mlx_load_range_ex(model_dir, 0, -1, NULL, 0);
 }
 
-ffwd_mlx_ctx_t *ffwd_mlx_load_with_options(const char *model_dir,
-                                                 const ffwd_mlx_options_t *opts) {
+ffwd_mlx_ctx_t *ffwd_mlx_load_with_options(const char *model_dir, const ffwd_mlx_options_t *opts) {
     return mlx_load_range_ex(model_dir, 0, -1, opts, 0);
 }
 
@@ -756,7 +752,7 @@ void ffwd_mlx_free(ffwd_mlx_ctx_t *ctx) {
 }
 
 ffwd_mlx_late_ctx_t *ffwd_mlx_late_load_with_options(const char *model_dir,
-                                                           const ffwd_mlx_options_t *opts) {
+                                                     const ffwd_mlx_options_t *opts) {
     if (!mlx_model_dir_has_late_projection(model_dir)) {
         fprintf(stderr, "mlx late: missing 1_Dense projection\n");
         return NULL;
@@ -990,7 +986,7 @@ static mlx_array mlx_forward_bert(ffwd_mlx_ctx_t *ctx,
         mlx_add(&mid_b, mid, l->ffn_inter_bias, S);
         mlx_array_free(mid);
         mlx_array g = ctx->config.ffn_act == FFWD_ACT_GELU_TANH ? mlx_gelu_tanh(mid_b, S)
-                                                                   : mlx_gelu_erf(mid_b, S);
+                                                                : mlx_gelu_erf(mid_b, S);
         mlx_array_free(mid_b);
         mlx_array out = linear(g, &l->down_proj, S);
         mlx_array_free(g);
@@ -1171,9 +1167,9 @@ static mlx_array mlx_forward_layers(ffwd_mlx_ctx_t *ctx,
 }
 
 ffwd_mlx_late_vectors_t *ffwd_mlx_late_encode_tokens_device(ffwd_mlx_late_ctx_t *ctx,
-                                                                  const int *token_ids,
-                                                                  int n_tokens,
-                                                                  int normalize) {
+                                                            const int *token_ids,
+                                                            int n_tokens,
+                                                            int normalize) {
     if (!ctx || !ctx->base || !token_ids || n_tokens <= 0 || ctx->token_dim <= 0 ||
         !linear_ok(ctx->projection))
         return NULL;
@@ -1302,9 +1298,7 @@ int ffwd_mlx_late_vectors_token_count(const ffwd_mlx_late_vectors_t *vecs) {
     return vecs ? vecs->tokens : 0;
 }
 
-int ffwd_mlx_late_vectors_dim(const ffwd_mlx_late_vectors_t *vecs) {
-    return vecs ? vecs->dim : 0;
-}
+int ffwd_mlx_late_vectors_dim(const ffwd_mlx_late_vectors_t *vecs) { return vecs ? vecs->dim : 0; }
 
 int ffwd_mlx_late_vectors_copy(const ffwd_mlx_late_vectors_t *vecs, float *out_vectors) {
     if (!vecs || !out_vectors || !arr_ok(vecs->vectors) || vecs->tokens <= 0 || vecs->dim <= 0)
@@ -1351,13 +1345,13 @@ int ffwd_mlx_late_vectors_copy(const ffwd_mlx_late_vectors_t *vecs, float *out_v
  * within MLX's batched-GEMM rounding.
  */
 ffwd_mlx_late_vectors_t *ffwd_mlx_late_encode_docs_device(ffwd_mlx_late_ctx_t *ctx,
-                                                                const int *const *doc_ids,
-                                                                const int *n_tokens,
-                                                                const int *const *keep,
-                                                                const int *n_keep,
-                                                                int n_docs,
-                                                                int normalize,
-                                                                int *out_offsets) {
+                                                          const int *const *doc_ids,
+                                                          const int *n_tokens,
+                                                          const int *const *keep,
+                                                          const int *n_keep,
+                                                          int n_docs,
+                                                          int normalize,
+                                                          int *out_offsets) {
     if (!ctx || !ctx->base || !doc_ids || !n_tokens || !keep || !n_keep || !out_offsets ||
         n_docs <= 0 || ctx->token_dim <= 0 || !linear_ok(ctx->projection))
         return NULL;
@@ -1577,8 +1571,9 @@ cleanup:
  * candidates through ffwd_mlx_late_encode_docs_device, but the late-interaction
  * verification harness (tests/integration/check_late_interaction.py) drives these directly
  * to validate per-document gather and concat against the CPU MaxSim reference. */
-ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_concat(
-    ffwd_mlx_late_ctx_t *ctx, const ffwd_mlx_late_vectors_t *const *items, int count) {
+ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_concat(ffwd_mlx_late_ctx_t *ctx,
+                                                      const ffwd_mlx_late_vectors_t *const *items,
+                                                      int count) {
     if (!ctx || !ctx->base || !items || count <= 0)
         return NULL;
     int dim = 0;
@@ -1627,9 +1622,9 @@ ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_concat(
 }
 
 ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_select(ffwd_mlx_late_ctx_t *ctx,
-                                                            const ffwd_mlx_late_vectors_t *vecs,
-                                                            const int *token_indices,
-                                                            int count) {
+                                                      const ffwd_mlx_late_vectors_t *vecs,
+                                                      const int *token_indices,
+                                                      int count) {
     if (!ctx || !ctx->base || !vecs || vecs->owner != ctx || !arr_ok(vecs->vectors) ||
         !token_indices || count <= 0 || vecs->tokens <= 0 || vecs->dim <= 0)
         return NULL;
@@ -1675,11 +1670,11 @@ ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_select(ffwd_mlx_late_ctx_t *ctx,
 }
 
 int ffwd_mlx_late_maxsim_batch_device(ffwd_mlx_late_ctx_t *ctx,
-                                         const ffwd_mlx_late_vectors_t *query,
-                                         const ffwd_mlx_late_vectors_t *docs,
-                                         const int *doc_offsets,
-                                         int docs_count,
-                                         float *scores) {
+                                      const ffwd_mlx_late_vectors_t *query,
+                                      const ffwd_mlx_late_vectors_t *docs,
+                                      const int *doc_offsets,
+                                      int docs_count,
+                                      float *scores) {
     if (!ctx || !query || !docs || !doc_offsets || docs_count <= 0 || !scores ||
         query->owner != ctx || docs->owner != ctx || query->dim <= 0 || query->dim != docs->dim ||
         query->tokens <= 0 || docs->tokens <= 0 || !arr_ok(query->vectors) ||
@@ -1882,11 +1877,8 @@ cleanup:
     return rc;
 }
 
-int ffwd_mlx_late_encode_tokens(ffwd_mlx_late_ctx_t *ctx,
-                                   const int *token_ids,
-                                   int n_tokens,
-                                   int normalize,
-                                   float *out_vectors) {
+int ffwd_mlx_late_encode_tokens(
+    ffwd_mlx_late_ctx_t *ctx, const int *token_ids, int n_tokens, int normalize, float *out_vectors) {
     ffwd_mlx_late_vectors_t *vecs =
         ffwd_mlx_late_encode_tokens_device(ctx, token_ids, n_tokens, normalize);
     if (!vecs)
@@ -1897,9 +1889,9 @@ int ffwd_mlx_late_encode_tokens(ffwd_mlx_late_ctx_t *ctx,
 }
 
 static int ffwd_mlx_encode_batch_dense(ffwd_mlx_ctx_t *ctx,
-                                          const ffwd_input_t *inputs,
-                                          int batch,
-                                          float *out_embeddings) {
+                                       const ffwd_input_t *inputs,
+                                       int batch,
+                                       float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings || ctx->layer_start != 0 ||
         ctx->layer_end != ctx->config.n_layers)
         return -1;
@@ -2208,10 +2200,8 @@ static int mlx_batch_should_split(const ffwd_input_t *inputs,
     return mlx_padding_exceeds_limit(padded, (size_t)total_tokens);
 }
 
-static int mlx_should_add_to_group(const ffwd_mlx_ctx_t *ctx,
-                                   int group_count,
-                                   int group_max,
-                                   int next_tokens) {
+static int
+mlx_should_add_to_group(const ffwd_mlx_ctx_t *ctx, int group_count, int group_max, int next_tokens) {
     if (!ctx || ctx->config.hidden_size < 2048 || group_count <= 0)
         return 1;
 
@@ -2231,9 +2221,9 @@ static int mlx_should_add_to_group(const ffwd_mlx_ctx_t *ctx,
 }
 
 int ffwd_mlx_encode_batch(ffwd_mlx_ctx_t *ctx,
-                             const ffwd_input_t *inputs,
-                             int batch,
-                             float *out_embeddings) {
+                          const ffwd_input_t *inputs,
+                          int batch,
+                          float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
         return -1;
 
@@ -2306,9 +2296,9 @@ int ffwd_mlx_encode_batch(ffwd_mlx_ctx_t *ctx,
 }
 
 int ffwd_mlx_encode_into(ffwd_mlx_ctx_t *ctx,
-                            const int *token_ids,
-                            int n_tokens,
-                            float *out_embedding) {
+                         const int *token_ids,
+                         int n_tokens,
+                         float *out_embedding) {
     ffwd_input_t input = {token_ids, n_tokens};
     return ffwd_mlx_encode_batch(ctx, &input, 1, out_embedding);
 }
@@ -2333,9 +2323,8 @@ static int mlx_context_padding_exceeds_limit(size_t padded, size_t tokens) {
     return padded * 4 > tokens * 5;
 }
 
-static int mlx_context_batch_should_split(const ffwd_context_input_t *inputs,
-                                          int batch,
-                                          int *out_total_spans) {
+static int
+mlx_context_batch_should_split(const ffwd_context_input_t *inputs, int batch, int *out_total_spans) {
     int max_seq = 0;
     int total_tokens = 0;
     int total_spans = 0;
@@ -2362,9 +2351,9 @@ static int mlx_context_batch_should_split(const ffwd_context_input_t *inputs,
 }
 
 static int ffwd_mlx_encode_spans_batch_dense(ffwd_mlx_ctx_t *ctx,
-                                                const ffwd_context_input_t *inputs,
-                                                int batch,
-                                                float *out_embeddings) {
+                                             const ffwd_context_input_t *inputs,
+                                             int batch,
+                                             float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings || ctx->layer_start != 0 ||
         ctx->layer_end != ctx->config.n_layers || !arr_ok(ctx->embed_tokens) || !arr_ok(ctx->norm))
         return -1;
@@ -2663,9 +2652,9 @@ cleanup:
 }
 
 int ffwd_mlx_encode_spans_batch(ffwd_mlx_ctx_t *ctx,
-                                   const ffwd_context_input_t *inputs,
-                                   int batch,
-                                   float *out_embeddings) {
+                                const ffwd_context_input_t *inputs,
+                                int batch,
+                                float *out_embeddings) {
     if (!ctx || !inputs || batch <= 0 || !out_embeddings)
         return -1;
 
@@ -2748,11 +2737,11 @@ int ffwd_mlx_encode_spans_batch(ffwd_mlx_ctx_t *ctx,
 }
 
 int ffwd_mlx_encode_spans(ffwd_mlx_ctx_t *ctx,
-                             const int *token_ids,
-                             int n_tokens,
-                             const ffwd_span_t *spans,
-                             int n_spans,
-                             float *out_embeddings) {
+                          const int *token_ids,
+                          int n_tokens,
+                          const ffwd_span_t *spans,
+                          int n_spans,
+                          float *out_embeddings) {
     ffwd_context_input_t input = {
         .input = {token_ids, n_tokens},
         .spans = spans,

@@ -105,9 +105,7 @@ const ffwd_config_t *ffwd_late_model_config(const ffwd_late_model_t *model) {
     return model && model->base ? &model->base->config : NULL;
 }
 
-int ffwd_late_model_token_dim(const ffwd_late_model_t *model) {
-    return model ? model->token_dim : 0;
-}
+int ffwd_late_model_token_dim(const ffwd_late_model_t *model) { return model ? model->token_dim : 0; }
 
 /* Internal (internal.h): expose the base model and projection so GPU
  * backends can upload them to device without seeing struct ffwd_late_model. */
@@ -140,12 +138,12 @@ float ffwd_late_maxsim(
 }
 
 int ffwd_late_maxsim_batch(const float *query_vectors,
-                              int query_tokens,
-                              const float *doc_vectors,
-                              const int *doc_offsets,
-                              int docs,
-                              int dim,
-                              float *scores) {
+                           int query_tokens,
+                           const float *doc_vectors,
+                           const int *doc_offsets,
+                           int docs,
+                           int dim,
+                           float *scores) {
     if (!query_vectors || !doc_vectors || !doc_offsets || !scores || query_tokens <= 0 || docs <= 0 ||
         dim <= 0 || doc_offsets[0] != 0)
         return -1;
@@ -211,8 +209,8 @@ int ffwd_late_maxsim_batch(const float *query_vectors,
     for (int i = 0; i < docs; i++) {
         int start = doc_offsets[i];
         int end = doc_offsets[i + 1];
-        scores[i] = ffwd_late_maxsim(query_vectors, query_tokens,
-                                        doc_vectors + (size_t)start * dim, end - start, dim);
+        scores[i] = ffwd_late_maxsim(query_vectors, query_tokens, doc_vectors + (size_t)start * dim,
+                                     end - start, dim);
     }
     return 0;
 }

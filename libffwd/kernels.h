@@ -27,8 +27,7 @@ void matmul_t(float *C, const float *A, const float *B, int M, int K, int N);
 void linear(
     float *y, const float *x, const float *W, const float *b, int seq_len, int in_dim, int out_dim);
 
-void linear_nobias(
-    float *y, const float *x, const float *W, int seq_len, int in_dim, int out_dim);
+void linear_nobias(float *y, const float *x, const float *W, int seq_len, int in_dim, int out_dim);
 
 /* bf16 weight variants */
 
@@ -38,27 +37,27 @@ void linear_nobias_bf16(
 
 /* Small-sequence BF16 path: compute two projections with one threaded dispatch. */
 void linear_nobias_bf16_pair(float *a,
-                                   float *b,
-                                   const float *x,
-                                   const uint16_t *Wa_bf16,
-                                   const uint16_t *Wb_bf16,
-                                   int seq_len,
-                                   int in_dim,
-                                   int a_dim,
-                                   int b_dim);
+                             float *b,
+                             const float *x,
+                             const uint16_t *Wa_bf16,
+                             const uint16_t *Wb_bf16,
+                             int seq_len,
+                             int in_dim,
+                             int a_dim,
+                             int b_dim);
 
 /* Small-sequence BF16 path: compute Q/K/V matvecs with one threaded dispatch. */
 void linear_nobias_bf16_qkv(float *q,
-                                  float *k,
-                                  float *v,
-                                  const float *x,
-                                  const uint16_t *Wq_bf16,
-                                  const uint16_t *Wk_bf16,
-                                  const uint16_t *Wv_bf16,
-                                  int seq_len,
-                                  int in_dim,
-                                  int q_dim,
-                                  int kv_dim);
+                            float *k,
+                            float *v,
+                            const float *x,
+                            const uint16_t *Wq_bf16,
+                            const uint16_t *Wk_bf16,
+                            const uint16_t *Wv_bf16,
+                            int seq_len,
+                            int in_dim,
+                            int q_dim,
+                            int kv_dim);
 
 /* Dot product using the best available local SIMD implementation. */
 float dot_f32(const float *a, const float *b, int n);
@@ -68,8 +67,7 @@ float dot_f32(const float *a, const float *b, int n);
  * ======================================================================== */
 
 /* RMS Normalization: out = x / rms(x) * weight */
-void rms_norm(
-    float *out, const float *x, const float *weight, int seq_len, int hidden, float eps);
+void rms_norm(float *out, const float *x, const float *weight, int seq_len, int hidden, float eps);
 
 /* Per-head RMS Normalization for Q/K norms in decoder
  * x: [seq, n_heads, head_dim], weight: [head_dim]
@@ -81,12 +79,12 @@ void rms_norm_per_head(
  * + beta, with mean and biased (population) variance over the hidden axis per
  * row. Unlike RMSNorm this subtracts the mean and adds a bias. */
 void layer_norm(float *out,
-                      const float *x,
-                      const float *gamma,
-                      const float *beta,
-                      int seq_len,
-                      int hidden,
-                      float eps);
+                const float *x,
+                const float *gamma,
+                const float *beta,
+                int seq_len,
+                int hidden,
+                float eps);
 
 /* ========================================================================
  * Activation Functions
@@ -119,6 +117,46 @@ void gelu_tanh_inplace(float *x, int n);
  * offsets[b]..offsets[b+1] span.
  */
 void bidirectional_gqa_attention_packed(float *out,
+                                        const float *Q,
+                                        const float *K,
+                                        const float *V,
+                                        const int *offsets,
+                                        int batch,
+                                        int n_heads,
+                                        int n_kv_heads,
+                                        int head_dim,
+                                        float scale);
+
+/* Optional reusable scratch for the BLAS-tiled packed attention path. */
+size_t bidirectional_gqa_attention_packed_scratch_bytes(const int *offsets, int batch);
+void bidirectional_gqa_attention_packed_with_scratch(float *out,
+                                                     const float *Q,
+                                                     const float *K,
+                                                     const float *V,
+                                                     const int *offsets,
+                                                     int batch,
+                                                     int n_heads,
+                                                     int n_kv_heads,
+                                                     int head_dim,
+                                                     float scale,
+                                                     float *scratch,
+                                                     size_t scratch_bytes);
+
+/*
+ * Causal GQA attention over a packed/ragged batch. Query position i attends
+ * only to positions at or before i within its sequence.
+ */
+void causal_gqa_attention_packed(float *out,
+                                 const float *Q,
+                                 const float *K,
+                                 const float *V,
+                                 const int *offsets,
+                                 int batch,
+                                 int n_heads,
+                                 int n_kv_heads,
+                                 int head_dim,
+                                 float scale);
+void causal_gqa_attention_packed_with_scratch(float *out,
                                               const float *Q,
                                               const float *K,
                                               const float *V,
@@ -127,49 +165,9 @@ void bidirectional_gqa_attention_packed(float *out,
                                               int n_heads,
                                               int n_kv_heads,
                                               int head_dim,
-                                              float scale);
-
-/* Optional reusable scratch for the BLAS-tiled packed attention path. */
-size_t bidirectional_gqa_attention_packed_scratch_bytes(const int *offsets, int batch);
-void bidirectional_gqa_attention_packed_with_scratch(float *out,
-                                                           const float *Q,
-                                                           const float *K,
-                                                           const float *V,
-                                                           const int *offsets,
-                                                           int batch,
-                                                           int n_heads,
-                                                           int n_kv_heads,
-                                                           int head_dim,
-                                                           float scale,
-                                                           float *scratch,
-                                                           size_t scratch_bytes);
-
-/*
- * Causal GQA attention over a packed/ragged batch. Query position i attends
- * only to positions at or before i within its sequence.
- */
-void causal_gqa_attention_packed(float *out,
-                                       const float *Q,
-                                       const float *K,
-                                       const float *V,
-                                       const int *offsets,
-                                       int batch,
-                                       int n_heads,
-                                       int n_kv_heads,
-                                       int head_dim,
-                                       float scale);
-void causal_gqa_attention_packed_with_scratch(float *out,
-                                                    const float *Q,
-                                                    const float *K,
-                                                    const float *V,
-                                                    const int *offsets,
-                                                    int batch,
-                                                    int n_heads,
-                                                    int n_kv_heads,
-                                                    int head_dim,
-                                                    float scale,
-                                                    float *scratch,
-                                                    size_t scratch_bytes);
+                                              float scale,
+                                              float *scratch,
+                                              size_t scratch_bytes);
 
 /* ========================================================================
  * Position Embeddings
