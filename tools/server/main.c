@@ -225,7 +225,7 @@ int main(int argc, char *argv[]) {
             free_model_specs(&model_specs);
             return 0;
         } else if (!strcmp(f, "--build-info")) {
-            ffwd_print_build_info(prog);
+            ffwd_print_build_info();
             free_model_specs(&model_specs);
             return 0;
         } else if (!strcmp(f, "--model")) {
@@ -235,8 +235,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         } else if (!strcmp(f, "--contextual-model")) {
-            if (arg + 1 >= argc || append_model_spec(&model_specs, argv[++arg],
-                                                     FFWD_SERVER_MODEL_CONTEXTUAL, f) != 0) {
+            if (arg + 1 >= argc ||
+                append_model_spec(&model_specs, argv[++arg], FFWD_SERVER_MODEL_CONTEXTUAL, f) != 0) {
                 free_model_specs(&model_specs);
                 return 1;
             }

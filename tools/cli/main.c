@@ -310,7 +310,7 @@ static void print_matrix(const float *embs, int n, int dim, int json, int print_
                 if (j)
                     putchar(',');
                 printf("%.6f", (double)ffwd_cosine_similarity(embs + (size_t)i * dim,
-                                                                 embs + (size_t)j * dim, dim));
+                                                              embs + (size_t)j * dim, dim));
             }
             putchar(']');
         }
@@ -323,7 +323,7 @@ static void print_matrix(const float *embs, int n, int dim, int json, int print_
             if (j)
                 putchar(' ');
             printf("%.6f", (double)ffwd_cosine_similarity(embs + (size_t)i * dim,
-                                                             embs + (size_t)j * dim, dim));
+                                                          embs + (size_t)j * dim, dim));
         }
         putchar('\n');
     }
@@ -459,7 +459,7 @@ int main(int argc, char *argv[]) {
             ffwd_print_version(prog);
             return 0;
         } else if (!strcmp(f, "--build-info")) {
-            ffwd_print_build_info(prog);
+            ffwd_print_build_info();
             return 0;
         } else if (!strcmp(f, "-t") || !strcmp(f, "--threads")) {
             opts.n_threads = atoi(argv[++arg_start]);

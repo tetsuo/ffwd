@@ -37,13 +37,13 @@ static inline void ffwd_print_version(const char *prog) {
     printf("%s %s (%s/%s)\n", prog, FFWD_VERSION, FFWD_BUILD_OS, FFWD_BUILD_ARCH);
 }
 
-static inline void ffwd_print_build_info(const char *prog) {
-    ffwd_print_version(prog);
-    printf("backend:  %s\n"
-           "compiler: %s\n"
-           "built:    %s\n"
-           "commit:   %s\n",
-           ffwd_capability(), __VERSION__, FFWD_BUILD_DATE, FFWD_BUILD_COMMIT);
+static inline void ffwd_print_build_info() {
+    const char *backend = ffwd_capability(); /* empty on a CPU build */
+    printf("Built: %s (commit %s)\n"
+           "Compiler: %s\n",
+           FFWD_BUILD_DATE, FFWD_BUILD_COMMIT, __VERSION__);
+    if (backend[0])
+        printf("Accelerator: %s\n", backend);
 }
 
 #endif /* FFWD_BUILD_H */

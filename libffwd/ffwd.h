@@ -115,8 +115,8 @@ typedef struct {
  * Engine API — the backend-selected inference handle
  *
  * This is the library's primary public interface and the entire supported
- * surface of the shared library. Exactly one backend (CPU, Apple Silicon GPU,
- * or NVIDIA GPU) is linked at build time and implements these functions;
+ * surface of the shared library. Exactly one backend (CPU, Apple Metal, or
+ * NVIDIA CUDA) is linked at build time and implements these functions;
  * callers never branch on the backend. The CLI, the server, and any language
  * binding use only these functions plus the math helpers below.
  *
@@ -165,8 +165,8 @@ FFWD_API int ffwd_init(const ffwd_options_t *opts, char *err, size_t errlen);
 /* First load phase, on the caller's thread: load a CPU model now, or record what
  * a GPU build will load in ffwd_activate. is_late selects a late-interaction
  * model. NULL on failure with a reason in err. */
-FFWD_API ffwd_t *ffwd_open(
-    const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen);
+FFWD_API ffwd_t *
+ffwd_open(const char *model_dir, int is_late, const ffwd_options_t *opts, char *err, size_t errlen);
 /* Second load phase, on the inference thread: create the GPU context. CPU
  * no-op. Returns -1 with a reason in err on failure. */
 FFWD_API int ffwd_activate(ffwd_t *e, char *err, size_t errlen);
@@ -184,21 +184,19 @@ FFWD_API int ffwd_token_dim(const ffwd_t *e);
 FFWD_API int ffwd_uses_dense_batches(const ffwd_t *e);
 
 /* Encode a packed batch into out[batch, hidden_size]. Returns 0 on success. */
-FFWD_API int
-ffwd_encode_batch(ffwd_t *e, const ffwd_input_t *inputs, int batch, float *out);
+FFWD_API int ffwd_encode_batch(ffwd_t *e, const ffwd_input_t *inputs, int batch, float *out);
 /* Encode a contextual document batch, pooling each selected span in order. */
-FFWD_API int ffwd_encode_spans_batch(ffwd_t *e,
-                                           const ffwd_context_input_t *inputs,
-                                           int batch,
-                                           float *out);
+FFWD_API int
+ffwd_encode_spans_batch(ffwd_t *e, const ffwd_context_input_t *inputs, int batch, float *out);
 /* Score one query against its candidate documents into scores[n_docs]. */
 FFWD_API int ffwd_rerank(ffwd_t *e, const ffwd_rerank_input_t *in, float *scores);
 /* Scratch memory the model currently holds, for diagnostics; 0 on GPU. */
 FFWD_API size_t ffwd_scratch_nbytes(const ffwd_t *e);
 
-/* Capability label for --build-info and the startup banner: "CPU", "Apple
- * Silicon GPU", or "NVIDIA GPU". A function, not a macro, so a shared object
- * does not bake in one backend's label and stays correct across a rebuild. */
+/* Accelerator label for --build-info and the startup banner: "Apple Metal",
+ * "NVIDIA CUDA", or "" on a CPU build. A function, not a macro, so a shared
+ * object does not bake in one backend's label and stays correct across a
+ * rebuild. */
 FFWD_API const char *ffwd_capability(void);
 
 /* First-arrival micro-batch wait the backend prefers, in microseconds. */
@@ -248,15 +246,13 @@ typedef struct {
 /* Load the tokenizer for the model in model_dir and resolve its special-token
  * ids. is_late additionally resolves the late-interaction [Q]/[D]/[MASK] ids.
  * NULL on failure with a reason in err. */
-FFWD_API ffwd_tok_t *
-ffwd_tok_open(const char *model_dir, int is_late, char *err, size_t errlen);
+FFWD_API ffwd_tok_t *ffwd_tok_open(const char *model_dir, int is_late, char *err, size_t errlen);
 FFWD_API void ffwd_tok_free(ffwd_tok_t *t);
 
 /* Tokenize text for this model: applies the model's special-token layout and
  * optionally prepends a query instruction. Returns a malloc'd id array (caller
  * frees) and sets *n_out. NULL on error. */
-FFWD_API int *
-ffwd_tokenize(ffwd_tok_t *t, const char *text, const char *query_instruct, int *n_out);
+FFWD_API int *ffwd_tokenize(ffwd_tok_t *t, const char *text, const char *query_instruct, int *n_out);
 
 /* Late-interaction tokenization: [Q]/[D] prefix, [MASK]-pad queries to a fixed
  * length, and mark the document positions to score. Returns 0 on success. */

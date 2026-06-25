@@ -15,13 +15,13 @@
 #    endif
 #endif
 
-/* Hardware-class label for --build-info and the startup banner. */
+/* Accelerator label for --build-info and the startup banner; empty on CPU. */
 #if defined(USE_MLX)
-#    define FFWD_BACKEND_LABEL "Apple Silicon GPU"
+#    define FFWD_BACKEND_LABEL "Apple Metal"
 #elif defined(USE_CUDA)
-#    define FFWD_BACKEND_LABEL "NVIDIA GPU"
+#    define FFWD_BACKEND_LABEL "NVIDIA CUDA"
 #else
-#    define FFWD_BACKEND_LABEL "CPU"
+#    define FFWD_BACKEND_LABEL ""
 #endif
 
 #endif /* FFWD_PLATFORM_H */
