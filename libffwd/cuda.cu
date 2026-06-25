@@ -1157,7 +1157,8 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             float scale,
                                                             int causal_skip,
                                                             int kv_stride,
-                                                            int kv_head_div) {
+                                                            int kv_head_div,
+                                                            int rescale_skip) {
     enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
     // Q stays resident; the K/V region is a single double-buffer when PIPELINED
     // (two K stages + two V stages) and a single K+V tile otherwise.
@@ -1290,12 +1291,19 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                     float m_new = fmaxf(m[j], warp_group4_max(tile_m));
                     float corr = (m_new == neg_inf) ? 1.0f : __expf(m[j] - m_new);
                     denom[j] *= corr;
+                    // Skip the 64-FMA o rescale when the running max is unchanged for
+                    // the whole warp (corr == 1 -> o *= 1 is identity). At long context
+                    // the max settles early, so most tiles skip. Warp-uniform via
+                    // __all_sync, so it stays bit-identical to always rescaling.
+                    bool allone = __all_sync(0xffffffffu, corr == 1.0f);
+                    if (!(rescale_skip && allone)) {
 #pragma unroll
-                    for (int dc = 0; dc < DCHUNKS; dc++) {
-                        o[dc][r0 + 0] *= corr;
-                        o[dc][r0 + 1] *= corr;
-                        o[dc][r0 + 4] *= corr;
-                        o[dc][r0 + 5] *= corr;
+                        for (int dc = 0; dc < DCHUNKS; dc++) {
+                            o[dc][r0 + 0] *= corr;
+                            o[dc][r0 + 1] *= corr;
+                            o[dc][r0 + 4] *= corr;
+                            o[dc][r0 + 5] *= corr;
+                        }
                     }
                     float p0 =
                         (s[r0 + 0] == neg_inf || m_new == neg_inf) ? 0.0f : __expf(s[r0 + 0] - m_new);
@@ -2788,6 +2796,22 @@ static int qwen_ldmv_env(void) {
     return on;
 }
 
+// Skip the online-softmax output rescale on tiles where the running max is
+// unchanged warp-wide (corr == 1, a no-op). Bit-identical, occupancy-neutral;
+// pays off at long context where the max settles early (-4.8% attention at 32k).
+// Default on; FFWD_CUDA_QWEN_RSKIP=0/off disables it for A/B. Only the pipelined
+// tc128 path honors it.
+static int qwen_rescale_skip(void) {
+    static int init = 0, on = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_QWEN_RSKIP");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            on = 0;
+        init = 1;
+    }
+    return on;
+}
+
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
     if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
@@ -3515,15 +3539,16 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
                 <<<grid, block, 0, ctx->stream>>>(                                                   \
                     (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
                     (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                    cskip, kv_stride, kv_head_div);                                                  \
+                    cskip, kv_stride, kv_head_div, rskip);                                           \
         else                                                                                         \
             attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P), (LV)>                                  \
                 <<<grid, block, 0, ctx->stream>>>(                                                   \
                     (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
                     (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                    cskip, kv_stride, kv_head_div);                                                  \
+                    cskip, kv_stride, kv_head_div, rskip);                                           \
     } while (0)
             int ldmv = qwen_ldmv_env();
+            int rskip = qwen_rescale_skip();
             if (qpipe) {
                 if (ldmv) {
                     if (w == 2)
