@@ -29,15 +29,11 @@ signed char quantize_int8_tanh(float x) {
 char *encode_embedding(const float *emb, int dims, const char *encoding) {
     if (!strcmp(encoding, "base64")) {
         /* OpenAI/DashScope (Qwen3): base64 of the raw little-endian float32
-         * vector. Copy through a byte buffer instead of reinterpret-casting the
-         * float pointer; x86_64 and aarch64 are little-endian, so the bytes
-         * match the wire format with no swap. */
+         * vector. x86_64 and aarch64 are little-endian, so the float bytes are
+         * already the wire format; read them directly through an unsigned char
+         * pointer. */
         size_t nbytes = (size_t)dims * sizeof(float);
-        unsigned char *buf = xmalloc(nbytes);
-        memcpy(buf, emb, nbytes);
-        char *out = base64_encode(buf, nbytes);
-        free(buf);
-        return out;
+        return base64_encode((const unsigned char *)emb, nbytes);
     }
     if (!strcmp(encoding, "base64_binary")) {
         size_t bytes = (size_t)dims / 8;
