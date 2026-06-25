@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Build, test and bench the OpenBLAS backend in a throwaway Ubuntu container to
-# catch Linux portability breakage a macOS/Accelerate build hides. Needs Apple's
-# `container` CLI running. Run from anywhere in the repo: it finds the repo root
-# via git, bind-mounts it at /work, installs the Runpod toolchain, re-execs
-# itself inside with --in-container, and runs make cpu/test/bench/bench-server-
-# utils/debug, then `make clean` (skip with KEEP=1). Override the image with
-# IMAGE=ubuntu:22.04. Exits non-zero at the first failing step.
+# Build, test and bench the OpenBLAS backend in an Ubuntu container to catch
+# Linux portability breakage a macOS/Accelerate build hides.
+# It finds the repo root via git, bind-mounts it at /work, installs the Runpod
+# toolchain, re-execs itself inside with --in-container, and runs
+# make cpu/test/bench/bench-server-utils/debug, then `make clean`.
+# Skip clean with KEEP=1. Override the image with IMAGE=ubuntu:22.04.
 set -euo pipefail
 
 IMAGE="${IMAGE:-ubuntu:24.04}"
@@ -20,13 +19,13 @@ run_in_container() {
     # export map (ffwd.map) is generated at build time by devtools/gen_exports.py
     # (see libffwd/Makefile), so `make cpu` fails without it.
     apt-get install -y --no-install-recommends \
-        build-essential ca-certificates libcjson-dev libopenblas-dev \
+        build-essential ca-certificates libyyjson-dev libopenblas-dev \
         pkg-config git python3 >/dev/null
 
     echo "==================== system / toolchain ===================="
     uname -a
     cc --version | sed -n '1p'
-    echo "libcjson  $(pkg-config --modversion libcjson 2>/dev/null || echo MISSING) :: $(pkg-config --cflags --libs libcjson 2>/dev/null)"
+    echo "libyyjson  $(pkg-config --modversion libyyjson 2>/dev/null || echo MISSING) :: $(pkg-config --cflags --libs libyyjson 2>/dev/null)"
     echo "openblas  $(pkg-config --modversion openblas 2>/dev/null || echo MISSING) :: $(pkg-config --cflags --libs openblas 2>/dev/null)"
 
     cd /work

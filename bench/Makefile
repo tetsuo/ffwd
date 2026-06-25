@@ -4,6 +4,7 @@ include ../build.mk
 CFLAGS += -std=c11
 
 BLAS_LIBS := $(HOST_BLAS_LDFLAGS)
+JSON_LIBS := $(YYJSON_LDFLAGS)
 
 # Benchmarks link the blas libffwd archive from the per-config build tree and
 # include its headers.
@@ -30,24 +31,24 @@ all: $(BENCHES)
 libffwd-blas:
 	$(MAKE) -C $(LIBFFWD_DIR) BACKEND=blas
 
-$(eval $(call c_program_deps,bench_kernels,bench_kernels.c,bench.h libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm))
+$(eval $(call c_program_deps,bench_kernels,bench_kernels.c,bench.h libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm))
 
-$(eval $(call c_program_deps,bench_tokenizer,bench_tokenizer.c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),-lm))
+$(eval $(call c_program_deps,bench_tokenizer,bench_tokenizer.c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),$(JSON_LIBS) -lm))
 
 # The server utilities (base64, sbuf, util) depend on no library, so the bench
 # compiles those sources directly here and keeps the build self-contained.
 SERVER_UTIL_SRCS := $(SERVER_DIR)/base64.c $(SERVER_DIR)/sbuf.c $(SERVER_DIR)/util.c
 $(eval $(call c_program_deps,bench_server_utils,bench_server_utils.c $(SERVER_UTIL_SRCS),bench.h,,-I$(SERVER_DIR),-lm))
 
-$(eval $(call c_program_deps,bench_model,bench_model.c,bench.h libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm))
+$(eval $(call c_program_deps,bench_model,bench_model.c,bench.h libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm))
 
-$(eval $(call c_program_deps,bench_late_rerank,bench_late_rerank.c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm))
+$(eval $(call c_program_deps,bench_late_rerank,bench_late_rerank.c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm))
 
 # MLX rerank benchmark: the blas engine archive for the CPU reference paths plus
 # mlx.c for the device API. The archive calls cblas, so the bench links
 # Accelerate/OpenBLAS itself ($(HOST_BLAS_LDFLAGS)) on top of Metal/MLX. macOS only.
 MLX_DRIVER_CFLAGS := -pthread -DCHECK_MLX -I$(MLXC_PREFIX)/include -I$(LIBFFWD_DIR) $(HOST_BLAS_CFLAGS)
-MLX_DRIVER_LDLIBS := $(MLX_BACKEND_LDFLAGS) $(HOST_BLAS_LDFLAGS) -lm
+MLX_DRIVER_LDLIBS := $(MLX_BACKEND_LDFLAGS) $(HOST_BLAS_LDFLAGS) $(JSON_LIBS) -lm
 $(eval $(call c_program_deps,bench_late_rerank_mlx,bench_late_rerank.c $(LIBFFWD_DIR)/mlx.c,libffwd-blas,$(LIBFFWD_A),$(MLX_DRIVER_CFLAGS),$(MLX_DRIVER_LDLIBS)))
 
 bench: bench_kernels

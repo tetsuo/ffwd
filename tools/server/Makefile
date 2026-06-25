@@ -15,10 +15,10 @@ TEST_BINS := test_base64 test_sbuf test_encode test_json test_schedule test_mode
 TEST_OBJS := $(filter-out $(OBJDIR)/main.o,$(OBJS))
 
 LIBS := $(OUTDIR)/libffwd.a $(OUTDIR)/libae.a
-LDLIBS := $(CJSON_LDFLAGS) $(BACKEND_LDFLAGS) -lm
+LDLIBS := $(YYJSON_LDFLAGS) $(BACKEND_LDFLAGS) -lm
 
 CFLAGS += -std=gnu11 -pthread
-CPPFLAGS += -I. -I$(LIBFFWD) -I$(AE) $(CJSON_CFLAGS)
+CPPFLAGS += -I. -I$(LIBFFWD) -I$(AE)
 
 $(OBJDIR)/main.o: CFLAGS += $(VERSION_CFLAGS)
 

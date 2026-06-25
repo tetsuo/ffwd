@@ -34,18 +34,18 @@ ifeq ($(strip $(OPENBLAS_LDFLAGS)),)
     OPENBLAS_LDFLAGS = -lopenblas
 endif
 
-CJSON_CFLAGS  ?= $(shell sh -c 'pkg-config --cflags libcjson 2>/dev/null')
-CJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs libcjson 2>/dev/null')
+YYJSON_CFLAGS  ?= $(shell sh -c 'pkg-config --cflags yyjson 2>/dev/null')
+YYJSON_LDFLAGS ?= $(shell sh -c 'pkg-config --libs yyjson 2>/dev/null')
 ifeq ($(OS),Darwin)
-ifeq ($(strip $(CJSON_CFLAGS)),)
-    CJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
+ifeq ($(strip $(YYJSON_CFLAGS)),)
+    YYJSON_CFLAGS = -I/opt/homebrew/include -I/usr/local/include
 endif
-ifeq ($(strip $(CJSON_LDFLAGS)),)
-    CJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lcjson
+ifeq ($(strip $(YYJSON_LDFLAGS)),)
+    YYJSON_LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib -lyyjson
 endif
 endif
-ifeq ($(strip $(CJSON_LDFLAGS)),)
-    CJSON_LDFLAGS = -lcjson
+ifeq ($(strip $(YYJSON_LDFLAGS)),)
+    YYJSON_LDFLAGS = -lyyjson
 endif
 
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
@@ -154,9 +154,7 @@ else
 CFLAGS = $(OPT)
 endif
 CPPFLAGS ?=
-# Vendored yyjson (deps/yyjson) is the one JSON parser/writer for the whole
-# tree; every component includes its header from here.
-CPPFLAGS += -I$(ROOT)/deps/yyjson
+CPPFLAGS += $(YYJSON_CFLAGS)
 LDLIBS ?=
 SHARED_LDLIBS ?=
 
@@ -233,7 +231,7 @@ $(1): $(2) $(3)
 endef
 
 export BACKEND MODE ARCH_FLAGS CFLAGS_BASE OPT LDFLAGS_OPT CUDA_HOME NVCC CUDAFLAGS
-export OPENBLAS_CFLAGS OPENBLAS_LDFLAGS CJSON_CFLAGS CJSON_LDFLAGS
+export OPENBLAS_CFLAGS OPENBLAS_LDFLAGS YYJSON_CFLAGS YYJSON_LDFLAGS
 export MLX_PREFIX MLXC_PREFIX
 export HOST_BLAS_CFLAGS HOST_BLAS_LDFLAGS
 export BLAS_BACKEND_CFLAGS BLAS_BACKEND_LDFLAGS

@@ -68,6 +68,9 @@ static void append_embedding_object(sbuf *b, int index, const char *embedding) {
 void append_embedding_value(
     sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api) {
     if (!strcmp(encoding, "float")) {
+        /* Floats are hand-formatted with %.9g (the shortest form that
+         * round-trips float32) and streamed into the sbuf, never serialized
+         * through yyjson's writer. */
         sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", index);
         for (int i = 0; i < dims; i++) {
             if (i)

@@ -1,6 +1,6 @@
 #include "bpe.h"
 
-#include "yyjson.h"
+#include <yyjson.h>
 
 #include <limits.h>
 #include <stdint.h>

@@ -1,8 +1,6 @@
 #include "server_internal.h"
 #include "util.h"
 
-#include <cjson/cJSON.h>
-#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,26 +73,47 @@ void job_set_error(job *j, int status, const char *message, const char *type) {
     j->response = json_error_body(message, type, &j->response_len);
 }
 
-bool ve_add(cJSON *detail, const char *loc_json, const char *msg, const char *type) {
-    cJSON *obj = cJSON_CreateObject();
-    cJSON *loc = cJSON_Parse(loc_json);
-    if (!obj || !loc) {
-        cJSON_Delete(obj);
-        cJSON_Delete(loc);
+yyjson_mut_doc *ve_new(void) {
+    yyjson_mut_doc *detail = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc_set_root(detail, yyjson_mut_arr(detail));
+    return detail;
+}
+
+bool ve_add(yyjson_mut_doc *detail, const char *loc_json, const char *msg, const char *type) {
+    yyjson_mut_val *arr = yyjson_mut_doc_get_root(detail);
+    yyjson_mut_val *obj = yyjson_mut_obj(detail);
+    /* loc is a JSON array literal (mix of strings and integer indices) built by
+     * the caller; parse it and deep-copy it into the detail document so it owns
+     * the values once the temporary parse is freed. */
+    yyjson_doc *loc_doc = yyjson_read(loc_json, strlen(loc_json), 0);
+    yyjson_mut_val *loc = loc_doc ? yyjson_val_mut_copy(detail, yyjson_doc_get_root(loc_doc)) : NULL;
+    yyjson_doc_free(loc_doc);
+    if (!arr || !obj || !loc)
         return false;
-    }
-    cJSON_AddItemToObject(obj, "loc", loc);
-    cJSON_AddStringToObject(obj, "msg", msg ? msg : "");
-    cJSON_AddStringToObject(obj, "type", type ? type : "");
-    cJSON_AddItemToArray(detail, obj);
+    yyjson_mut_obj_add_val(detail, obj, "loc", loc);
+    /* msg may point at a caller stack buffer, so copy the value strings. */
+    yyjson_mut_obj_add_strcpy(detail, obj, "msg", msg ? msg : "");
+    yyjson_mut_obj_add_strcpy(detail, obj, "type", type ? type : "");
+    yyjson_mut_arr_add_val(arr, obj);
     return true;
 }
 
-void job_set_422(job *j, cJSON *detail) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "detail", cJSON_Duplicate(detail, 1));
-    char *s = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+size_t ve_count(yyjson_mut_doc *detail) {
+    return yyjson_mut_arr_size(yyjson_mut_doc_get_root(detail));
+}
+
+void job_set_422(job *j, yyjson_mut_doc *detail) {
+    /* Reparent the detail array under a fresh {"detail":[...]} root in the same
+     * document, then serialize. The caller frees the document right after, so
+     * mutating its root here is safe and avoids a deep copy. */
+    yyjson_mut_val *arr = yyjson_mut_doc_get_root(detail);
+    yyjson_mut_val *root = yyjson_mut_obj(detail);
+    size_t len = 0;
+    char *s = NULL;
+    if (root && arr && yyjson_mut_obj_add_val(detail, root, "detail", arr)) {
+        yyjson_mut_doc_set_root(detail, root);
+        s = yyjson_mut_write(detail, 0, &len);
+    }
     if (!s) {
         job_set_error(j, 500, "failed to render validation error", "server_error");
         return;
@@ -102,57 +121,52 @@ void job_set_422(job *j, cJSON *detail) {
     free(j->response);
     j->status = 422;
     j->content_type = "application/json";
-    j->response = xstrdup(s);
-    j->response_len = strlen(j->response);
-    cJSON_free(s);
+    j->response = s;
+    j->response_len = len;
 }
 
-cJSON *parse_json_body(job *j, cJSON *detail) {
+yyjson_doc *parse_json_body(job *j, yyjson_mut_doc *detail) {
     if (!j->body || j->body_len == 0) {
         ve_add(detail, "[\"body\"]", "body required", "missing");
         return NULL;
     }
-    const char *end = NULL;
-    cJSON *root = cJSON_ParseWithLengthOpts(j->body, j->body_len, &end, false);
-    if (!root) {
+    /* yyjson_read with default flags requires the whole buffer to be one JSON
+     * value (trailing whitespace is allowed, trailing content is an error), so
+     * it already enforces "the entire body must be consumed". */
+    yyjson_doc *doc = yyjson_read(j->body, j->body_len, 0);
+    if (!doc) {
         ve_add(detail, "[\"body\"]", "invalid JSON", "json_invalid");
         return NULL;
     }
-    const char *body_end = j->body + j->body_len;
-    while (end && end < body_end && isspace((unsigned char)*end))
-        end++;
-    if (!end || end != body_end) {
-        ve_add(detail, "[\"body\"]", "invalid JSON", "json_invalid");
-        cJSON_Delete(root);
-        return NULL;
-    }
-    if (!cJSON_IsObject(root)) {
+    if (!yyjson_is_obj(yyjson_doc_get_root(doc))) {
         ve_add(detail, "[\"body\"]", "body must be a JSON object", "type_error.object");
-        cJSON_Delete(root);
+        yyjson_doc_free(doc);
         return NULL;
     }
-    return root;
+    return doc;
 }
 
-bool cjson_is_integer(cJSON *item) {
-    if (!cJSON_IsNumber(item))
+bool json_is_integer(yyjson_val *item) {
+    if (!yyjson_is_num(item))
         return false;
-    double d = item->valuedouble;
-    int i = item->valueint;
-    return d >= (double)INT_MIN && d <= (double)INT_MAX && d == (double)i;
+    double d = yyjson_get_num(item);
+    if (!(d >= (double)INT_MIN && d <= (double)INT_MAX))
+        return false;
+    /* A real such as 5.0 counts as an integer; 5.5 does not. */
+    return d == (double)(int)d;
 }
 
-const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api) {
+const char *encoding_from_root(yyjson_val *root, yyjson_mut_doc *detail, embedding_api_t api) {
     const char *dflt = api == FFWD_API_PERPLEXITY ? "base64_int8" : "float";
-    cJSON *encoding = cJSON_GetObjectItemCaseSensitive(root, "encoding_format");
+    yyjson_val *encoding = yyjson_obj_get(root, "encoding_format");
     if (!encoding)
         return dflt;
-    if (!cJSON_IsString(encoding) || !encoding->valuestring) {
+    const char *v = yyjson_get_str(encoding);
+    if (!v) {
         ve_add(detail, "[\"body\",\"encoding_format\"]", "encoding_format must be a string",
                "type_error.string");
         return dflt;
     }
-    const char *v = encoding->valuestring;
     int ok = api == FFWD_API_PERPLEXITY
                  ? (!strcmp(v, "base64_int8") || !strcmp(v, "base64_binary") || !strcmp(v, "float"))
                  : (!strcmp(v, "float") || !strcmp(v, "base64"));
@@ -171,8 +185,8 @@ const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api) 
 /* Parse the `text_type` hint. Returns 1 when the model's query instruction
  * should be prepended, 0 otherwise (document / absent). Models without a
  * published query instruction reject the field. */
-int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct) {
-    cJSON *tt = cJSON_GetObjectItemCaseSensitive(root, "text_type");
+int text_type_is_query(yyjson_val *root, yyjson_mut_doc *detail, const char *query_instruct) {
+    yyjson_val *tt = yyjson_obj_get(root, "text_type");
     if (!tt)
         return 0;
     if (!query_instruct) {
@@ -180,11 +194,11 @@ int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct) {
                "text_type is only supported for instruction embedding models", "extra_fields");
         return 0;
     }
-    if (!cJSON_IsString(tt) || !tt->valuestring) {
+    const char *v = yyjson_get_str(tt);
+    if (!v) {
         ve_add(detail, "[\"body\",\"text_type\"]", "text_type must be a string", "type_error.string");
         return 0;
     }
-    const char *v = tt->valuestring;
     if (!strcmp(v, "query"))
         return 1;
     if (!strcmp(v, "document"))
@@ -194,15 +208,16 @@ int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct) {
     return 0;
 }
 
-int dimensions_from_root(cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding) {
+int dimensions_from_root(
+    yyjson_val *root, yyjson_mut_doc *detail, int min_dim, int max_dim, const char *encoding) {
     int dims = max_dim;
-    cJSON *dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
+    yyjson_val *dimensions = yyjson_obj_get(root, "dimensions");
     if (dimensions) {
-        if (!cjson_is_integer(dimensions)) {
+        if (!json_is_integer(dimensions)) {
             ve_add(detail, "[\"body\",\"dimensions\"]", "dimensions must be an integer",
                    "type_error.integer");
         } else {
-            dims = dimensions->valueint;
+            dims = (int)yyjson_get_num(dimensions);
             if (dims < min_dim || dims > max_dim) {
                 char msg[96];
                 snprintf(msg, sizeof(msg), "dimensions must be between %d and %d", min_dim, max_dim);

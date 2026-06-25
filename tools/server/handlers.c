@@ -249,22 +249,21 @@ void execute_contextual_request_list(contextual_request **reqs, int n_reqs) {
     free(items);
 }
 
-static int validate_common(cJSON *root,
-                           cJSON *detail,
+static int validate_common(yyjson_val *root,
+                           yyjson_mut_doc *detail,
                            model_kind expected_kind,
                            loaded_model **out_model,
                            int *out_dims,
                            const char **out_encoding,
                            http_server *s) {
-    cJSON *model_item = cJSON_GetObjectItemCaseSensitive(root, "model");
+    yyjson_val *model_item = yyjson_obj_get(root, "model");
     const char *model_id = NULL;
     loaded_model *m = NULL;
     if (!model_item) {
         ve_add(detail, "[\"body\",\"model\"]", "field required", "missing");
-    } else if (!cJSON_IsString(model_item) || !model_item->valuestring) {
+    } else if (!(model_id = yyjson_get_str(model_item))) {
         ve_add(detail, "[\"body\",\"model\"]", "model must be a string", "type_error.string");
     } else {
-        model_id = model_item->valuestring;
         m = loaded_model_for_label(s, model_id);
         if (!m) {
             ve_add(detail, "[\"body\",\"model\"]",
@@ -284,12 +283,13 @@ static int validate_common(cJSON *root,
     return 0;
 }
 
-void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_request *out) {
+void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, embedding_request *out) {
     memset(out, 0, sizeof(*out));
     out->j = j;
-    out->root = root;
+    out->root = root_doc;
+    yyjson_val *root = yyjson_doc_get_root(root_doc);
 
-    cJSON *detail = cJSON_CreateArray();
+    yyjson_mut_doc *detail = ve_new();
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
@@ -303,47 +303,49 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
                                      ? m->info->query_instruct
                                      : NULL;
 
-    cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
+    yyjson_val *input = yyjson_obj_get(root, "input");
     int n_inputs = 0;
     if (!input) {
         ve_add(detail, "[\"body\",\"input\"]", "field required", "missing");
-    } else if (cJSON_IsString(input)) {
-        if (!input->valuestring || input->valuestring[0] == '\0')
+    } else if (yyjson_is_str(input)) {
+        const char *text = yyjson_get_str(input);
+        if (!text || text[0] == '\0')
             ve_add(detail, "[\"body\",\"input\"]", "input must not be empty", "value_error.empty");
         n_inputs = 1;
-    } else if (cJSON_IsArray(input)) {
-        n_inputs = cJSON_GetArraySize(input);
+    } else if (yyjson_is_arr(input)) {
+        n_inputs = (int)yyjson_arr_size(input);
         if (n_inputs < 1)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at least 1 item",
                    "value_error.list.min_items");
         else if (n_inputs > FFWD_API_MAX_STANDARD_INPUTS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 512 items",
                    "value_error.list.max_items");
-        cJSON *item;
-        int i = 0;
-        cJSON_ArrayForEach(item, input) {
+        size_t idx, max;
+        yyjson_val *item;
+        yyjson_arr_foreach(input, idx, max, item) {
             char loc[64];
-            snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", i);
-            if (!cJSON_IsString(item)) {
+            snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)idx);
+            if (!yyjson_is_str(item)) {
                 ve_add(detail, loc, "input item must be a string", "type_error.string");
-            } else if (!item->valuestring || item->valuestring[0] == '\0') {
-                ve_add(detail, loc, "input item must not be empty", "value_error.empty");
+            } else {
+                const char *text = yyjson_get_str(item);
+                if (!text || text[0] == '\0')
+                    ve_add(detail, loc, "input item must not be empty", "value_error.empty");
             }
-            i++;
         }
     } else {
         ve_add(detail, "[\"body\",\"input\"]", "input must be a string or an array of strings",
                "type_error");
     }
 
-    if (cJSON_GetArraySize(detail) == 0 && m && input) {
+    if (ve_count(detail) == 0 && m && input) {
         out->n_inputs = n_inputs;
         out->tokens = xcalloc((size_t)n_inputs, sizeof(*out->tokens));
         out->inputs = xmalloc((size_t)n_inputs * sizeof(*out->inputs));
 
-        int idx = 0;
-        if (input && cJSON_IsString(input) && input->valuestring) {
-            if (tokenize_input(m, j, input->valuestring, query_instruct, &out->tokens[0]) != 0) {
+        const char *single = yyjson_get_str(input);
+        if (single) {
+            if (tokenize_input(m, j, single, query_instruct, &out->tokens[0]) != 0) {
                 ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
                        "value_error.tokenization");
             } else {
@@ -355,16 +357,17 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
                            "value_error.context_length");
             }
         } else {
-            cJSON *item;
-            cJSON_ArrayForEach(item, input) {
+            size_t idx, max;
+            yyjson_val *item;
+            yyjson_arr_foreach(input, idx, max, item) {
                 char loc[64];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", idx);
-                if (!cJSON_IsString(item) || !item->valuestring) {
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)idx);
+                const char *text = yyjson_get_str(item);
+                if (!text) {
                     ve_add(detail, loc, "input item must be a string", "type_error.string");
-                    idx++;
                     continue;
                 }
-                if (tokenize_input(m, j, item->valuestring, query_instruct, &out->tokens[idx]) != 0) {
+                if (tokenize_input(m, j, text, query_instruct, &out->tokens[idx]) != 0) {
                     ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
                 } else {
                     out->inputs[idx].ids = out->tokens[idx].ids;
@@ -374,7 +377,6 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
                         ve_add(detail, loc, "input exceeds 32768 token limit",
                                "value_error.context_length");
                 }
-                idx++;
             }
         }
 
@@ -383,22 +385,26 @@ void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_re
                    "value_error.context_length");
     }
 
-    if (cJSON_GetArraySize(detail) > 0) {
+    if (ve_count(detail) > 0) {
         job_set_422(j, detail);
         embedding_request_free(out);
         out->j = j;
     } else {
         out->ready = 1;
     }
-    cJSON_Delete(detail);
+    yyjson_mut_doc_free(detail);
 }
 
-void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_request *out) {
+void prepare_contextual_request(job *j,
+                                yyjson_doc *root_doc,
+                                http_server *s,
+                                contextual_request *out) {
     memset(out, 0, sizeof(*out));
     out->j = j;
-    out->root = root;
+    out->root = root_doc;
+    yyjson_val *root = yyjson_doc_get_root(root_doc);
 
-    cJSON *detail = cJSON_CreateArray();
+    yyjson_mut_doc *detail = ve_new();
     loaded_model *m = NULL;
     int dims = 0;
     const char *encoding = NULL;
@@ -407,94 +413,92 @@ void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_
     out->dims = dims;
     out->encoding = encoding;
 
-    cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
+    yyjson_val *input = yyjson_obj_get(root, "input");
     int n_docs = 0;
     int total_chunks = 0;
     if (!input) {
         ve_add(detail, "[\"body\",\"input\"]", "field required", "missing");
-    } else if (!cJSON_IsArray(input)) {
+    } else if (!yyjson_is_arr(input)) {
         ve_add(detail, "[\"body\",\"input\"]", "input must be an array of document chunk arrays",
                "type_error.array");
     } else {
-        n_docs = cJSON_GetArraySize(input);
+        n_docs = (int)yyjson_arr_size(input);
         if (n_docs < 1)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at least 1 document",
                    "value_error.list.min_items");
         else if (n_docs > FFWD_API_MAX_CONTEXT_DOCS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 512 documents",
                    "value_error.list.max_items");
-        cJSON *doc_arr;
-        int di = 0;
-        cJSON_ArrayForEach(doc_arr, input) {
-            if (!cJSON_IsArray(doc_arr)) {
+        size_t di, dn;
+        yyjson_val *doc_arr;
+        yyjson_arr_foreach(input, di, dn, doc_arr) {
+            if (!yyjson_is_arr(doc_arr)) {
                 char loc[64];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)di);
                 ve_add(detail, loc, "document must be an array of strings", "type_error.array");
-                di++;
                 continue;
             }
-            int doc_chunks = cJSON_GetArraySize(doc_arr);
+            int doc_chunks = (int)yyjson_arr_size(doc_arr);
             if (doc_chunks > FFWD_API_MAX_CONTEXT_CHUNKS - total_chunks)
                 total_chunks = FFWD_API_MAX_CONTEXT_CHUNKS + 1;
             else
                 total_chunks += doc_chunks;
             if (doc_chunks < 1) {
                 char loc[64];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)di);
                 ve_add(detail, loc, "document must contain at least 1 chunk",
                        "value_error.list.min_items");
             }
-            cJSON *chunk;
-            int ci = 0;
-            cJSON_ArrayForEach(chunk, doc_arr) {
+            size_t ci, cn;
+            yyjson_val *chunk;
+            yyjson_arr_foreach(doc_arr, ci, cn, chunk) {
                 char loc[80];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", di, ci);
-                if (!cJSON_IsString(chunk)) {
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", (int)di, (int)ci);
+                if (!yyjson_is_str(chunk)) {
                     ve_add(detail, loc, "chunk must be a string", "type_error.string");
-                } else if (!chunk->valuestring || chunk->valuestring[0] == '\0') {
-                    ve_add(detail, loc, "chunk must not be empty", "value_error.empty");
+                } else {
+                    const char *text = yyjson_get_str(chunk);
+                    if (!text || text[0] == '\0')
+                        ve_add(detail, loc, "chunk must not be empty", "value_error.empty");
                 }
-                ci++;
             }
-            di++;
         }
         if (total_chunks > FFWD_API_MAX_CONTEXT_CHUNKS)
             ve_add(detail, "[\"body\",\"input\"]", "input must contain at most 16000 chunks",
                    "value_error.list.max_items");
     }
 
-    if (cJSON_GetArraySize(detail) == 0 && m) {
+    if (ve_count(detail) == 0 && m) {
         out->n_docs = n_docs;
         out->docs = xcalloc((size_t)n_docs, sizeof(*out->docs));
         int64_t request_tokens = 0;
-        cJSON *doc_arr;
-        int di = 0;
-        cJSON_ArrayForEach(doc_arr, input) {
+        size_t di, dn;
+        yyjson_val *doc_arr;
+        yyjson_arr_foreach(input, di, dn, doc_arr) {
             contextual_doc *doc = &out->docs[di];
-            int n_chunks = cJSON_GetArraySize(doc_arr);
+            int n_chunks = (int)yyjson_arr_size(doc_arr);
             token_buf *chunk_tokens = xcalloc((size_t)n_chunks, sizeof(*chunk_tokens));
             doc->spans = xcalloc((size_t)n_chunks, sizeof(*doc->spans));
             doc->n_spans = n_chunks;
             int64_t doc_tokens = n_chunks > 1 ? n_chunks - 1 : 0;
             int doc_valid = 1;
 
-            cJSON *chunk;
-            int ci = 0;
-            cJSON_ArrayForEach(chunk, doc_arr) {
+            size_t ci, cn;
+            yyjson_val *chunk;
+            yyjson_arr_foreach(doc_arr, ci, cn, chunk) {
                 char loc[80];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", di, ci);
-                if (tokenize_one(m, j, chunk->valuestring, &chunk_tokens[ci]) != 0) {
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d,%d]", (int)di, (int)ci);
+                if (tokenize_one(m, j, yyjson_get_str(chunk), &chunk_tokens[ci]) != 0) {
                     ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
                     doc_valid = 0;
                 } else {
                     doc_tokens += chunk_tokens[ci].n_tokens;
                 }
-                ci++;
             }
 
             if (doc_tokens > FFWD_API_MAX_ITEM_TOKENS) {
                 char loc[64];
-                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", di);
+                snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)di);
                 ve_add(detail, loc, "document exceeds 32768 token limit",
                        "value_error.context_length");
                 doc_valid = 0;
@@ -506,24 +510,23 @@ void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_
                 doc->ids = xmalloc((size_t)doc->n_tokens * sizeof(*doc->ids));
                 int sep_id = ffwd_tok_context_separator_id(m->tok);
                 int pos = 0;
-                for (ci = 0; ci < n_chunks; ci++) {
-                    doc->spans[ci].start = pos;
-                    doc->spans[ci].n_tokens = chunk_tokens[ci].n_tokens;
+                for (int k = 0; k < n_chunks; k++) {
+                    doc->spans[k].start = pos;
+                    doc->spans[k].n_tokens = chunk_tokens[k].n_tokens;
                     /* n_tokens > 0 implies ids != NULL (tokenize_one sets both
                      * together), and the guard avoids a memcpy(dst, NULL, 0) for
                      * an empty chunk that the static analyzer reports as UB. */
-                    if (chunk_tokens[ci].n_tokens > 0)
-                        memcpy(doc->ids + pos, chunk_tokens[ci].ids,
-                               (size_t)chunk_tokens[ci].n_tokens * sizeof(*doc->ids));
-                    pos += chunk_tokens[ci].n_tokens;
-                    if (ci + 1 < n_chunks) {
+                    if (chunk_tokens[k].n_tokens > 0)
+                        memcpy(doc->ids + pos, chunk_tokens[k].ids,
+                               (size_t)chunk_tokens[k].n_tokens * sizeof(*doc->ids));
+                    pos += chunk_tokens[k].n_tokens;
+                    if (k + 1 < n_chunks) {
                         doc->ids[pos++] = sep_id;
                     }
                 }
             }
             free_token_bufs(chunk_tokens, n_chunks);
             free(chunk_tokens);
-            di++;
         }
         if (request_tokens > FFWD_API_MAX_TOTAL_TOKENS) {
             ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
@@ -534,28 +537,31 @@ void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_
         }
     }
 
-    if (cJSON_GetArraySize(detail) > 0) {
+    if (ve_count(detail) > 0) {
         job_set_422(j, detail);
         contextual_request_free(out);
         out->j = j;
     } else {
         out->ready = 1;
     }
-    cJSON_Delete(detail);
+    yyjson_mut_doc_free(detail);
 }
 
-static int
-validate_rerank_model(cJSON *root, cJSON *detail, http_server *s, loaded_model **out_model) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "model");
+static int validate_rerank_model(yyjson_val *root,
+                                 yyjson_mut_doc *detail,
+                                 http_server *s,
+                                 loaded_model **out_model) {
+    yyjson_val *item = yyjson_obj_get(root, "model");
     if (!item) {
         ve_add(detail, "[\"body\",\"model\"]", "field required", "missing");
         return 0;
     }
-    if (!cJSON_IsString(item) || !item->valuestring) {
+    const char *model_id = yyjson_get_str(item);
+    if (!model_id) {
         ve_add(detail, "[\"body\",\"model\"]", "model must be a string", "type_error.string");
         return 0;
     }
-    loaded_model *m = loaded_model_for_label(s, item->valuestring);
+    loaded_model *m = loaded_model_for_label(s, model_id);
     if (!m) {
         ve_add(detail, "[\"body\",\"model\"]", "value is not a valid enum member for this endpoint",
                "enum");
@@ -569,85 +575,89 @@ validate_rerank_model(cJSON *root, cJSON *detail, http_server *s, loaded_model *
     return 0;
 }
 
-void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out) {
+void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank_request *out) {
     memset(out, 0, sizeof(*out));
     out->j = j;
-    out->root = root;
+    out->root = root_doc;
+    yyjson_val *root = yyjson_doc_get_root(root_doc);
 
-    cJSON *detail = cJSON_CreateArray();
+    yyjson_mut_doc *detail = ve_new();
     validate_rerank_model(root, detail, s, &out->model);
-    cJSON *query = cJSON_GetObjectItemCaseSensitive(root, "query");
-    cJSON *documents = cJSON_GetObjectItemCaseSensitive(root, "documents");
+    yyjson_val *query = yyjson_obj_get(root, "query");
+    yyjson_val *documents = yyjson_obj_get(root, "documents");
     /* query_str is set only once query passes every check; the tokenize step
      * below runs only when detail is empty, so it is non-NULL there. Hoisting it
      * also keeps the validated value explicit for the static analyzer. */
     const char *query_str = NULL;
     if (!query) {
         ve_add(detail, "[\"body\",\"query\"]", "field required", "missing");
-    } else if (!cJSON_IsString(query)) {
+    } else if (!yyjson_is_str(query)) {
         ve_add(detail, "[\"body\",\"query\"]", "query must be a string", "type_error.string");
-    } else if (!query->valuestring || !query->valuestring[0]) {
+    } else if (!yyjson_get_str(query)[0]) {
         ve_add(detail, "[\"body\",\"query\"]", "query must not be empty", "value_error.empty");
     } else {
-        query_str = query->valuestring;
+        query_str = yyjson_get_str(query);
     }
 
     int n_documents = 0;
     if (!documents) {
         ve_add(detail, "[\"body\",\"documents\"]", "field required", "missing");
-    } else if (!cJSON_IsArray(documents)) {
+    } else if (!yyjson_is_arr(documents)) {
         ve_add(detail, "[\"body\",\"documents\"]", "documents must be an array of strings",
                "type_error.array");
     } else {
-        n_documents = cJSON_GetArraySize(documents);
+        n_documents = (int)yyjson_arr_size(documents);
         if (n_documents < 1)
             ve_add(detail, "[\"body\",\"documents\"]", "documents must contain at least 1 item",
                    "value_error.list.min_items");
         else if (n_documents > FFWD_API_MAX_RERANK_DOCUMENTS)
             ve_add(detail, "[\"body\",\"documents\"]", "documents must contain at most 1000 items",
                    "value_error.list.max_items");
-        cJSON *document;
-        int i = 0;
-        cJSON_ArrayForEach(document, documents) {
+        size_t i, dmax;
+        yyjson_val *document;
+        yyjson_arr_foreach(documents, i, dmax, document) {
             char loc[72];
-            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", i++);
-            if (!cJSON_IsString(document))
+            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", (int)i);
+            if (!yyjson_is_str(document)) {
                 ve_add(detail, loc, "document must be a string", "type_error.string");
-            else if (!document->valuestring || !document->valuestring[0])
-                ve_add(detail, loc, "document must not be empty", "value_error.empty");
+            } else {
+                const char *text = yyjson_get_str(document);
+                if (!text || !text[0])
+                    ve_add(detail, loc, "document must not be empty", "value_error.empty");
+            }
         }
     }
 
-    cJSON *top_n = cJSON_GetObjectItemCaseSensitive(root, "top_n");
-    cJSON *top_k = cJSON_GetObjectItemCaseSensitive(root, "top_k");
+    yyjson_val *top_n = yyjson_obj_get(root, "top_n");
+    yyjson_val *top_k = yyjson_obj_get(root, "top_k");
     if (top_n && top_k) {
         ve_add(detail, "[\"body\",\"top_n\"]", "top_n and top_k are aliases; provide only one",
                "value_error.conflict");
     }
-    cJSON *top = top_n ? top_n : top_k;
+    yyjson_val *top = top_n ? top_n : top_k;
     out->top_n = n_documents;
     if (top) {
-        if (!cjson_is_integer(top)) {
+        if (!json_is_integer(top)) {
             ve_add(detail, top_n ? "[\"body\",\"top_n\"]" : "[\"body\",\"top_k\"]",
                    "top_n must be an integer", "type_error.integer");
         } else {
-            out->top_n = top->valueint;
+            out->top_n = (int)yyjson_get_num(top);
             if (out->top_n < 1 || out->top_n > n_documents)
                 ve_add(detail, top_n ? "[\"body\",\"top_n\"]" : "[\"body\",\"top_k\"]",
                        "top_n must be between 1 and the number of documents", "value_error.range");
         }
     }
 
-    cJSON *return_documents = cJSON_GetObjectItemCaseSensitive(root, "return_documents");
+    yyjson_val *return_documents = yyjson_obj_get(root, "return_documents");
     if (return_documents) {
-        if (!cJSON_IsBool(return_documents))
+        if (!yyjson_is_bool(return_documents))
             ve_add(detail, "[\"body\",\"return_documents\"]", "return_documents must be a boolean",
                    "type_error.bool");
         else
-            out->return_documents = cJSON_IsTrue(return_documents);
+            out->return_documents = yyjson_get_bool(return_documents);
     }
 
-    if (cJSON_GetArraySize(detail) == 0 && out->model) {
+    if (ve_count(detail) == 0 && out->model) {
         out->n_documents = n_documents;
         out->documents = xcalloc((size_t)n_documents, sizeof(*out->documents));
         if (tokenize_late_text(out->model, j, query_str, 1, &out->query) != 0) {
@@ -659,12 +669,12 @@ void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request 
                        "value_error.context_length");
         }
 
-        cJSON *document;
-        int i = 0;
-        cJSON_ArrayForEach(document, documents) {
+        size_t i, dmax;
+        yyjson_val *document;
+        yyjson_arr_foreach(documents, i, dmax, document) {
             char loc[72];
-            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", i);
-            if (tokenize_late_text(out->model, j, document->valuestring, 0, &out->documents[i]) !=
+            snprintf(loc, sizeof(loc), "[\"body\",\"documents\",%d]", (int)i);
+            if (tokenize_late_text(out->model, j, yyjson_get_str(document), 0, &out->documents[i]) !=
                 0) {
                 ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
             } else {
@@ -677,7 +687,6 @@ void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request 
                 else
                     out->document_tokens = INT_MAX;
             }
-            i++;
         }
         if (out->query_tokens > FFWD_API_MAX_TOTAL_TOKENS - out->document_tokens) {
             ve_add(detail, "[\"body\",\"documents\"]", "request exceeds 120000 token limit",
@@ -685,14 +694,14 @@ void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request 
         }
     }
 
-    if (cJSON_GetArraySize(detail) > 0) {
+    if (ve_count(detail) > 0) {
         job_set_422(j, detail);
         rerank_request_free(out);
         out->j = j;
     } else {
         out->ready = 1;
     }
-    cJSON_Delete(detail);
+    yyjson_mut_doc_free(detail);
 }
 
 typedef struct {
@@ -764,16 +773,16 @@ void execute_rerank_request(rerank_request *r) {
     t0 = nstime();
     sbuf b = {0};
     sbuf_printf(&b, "{\"object\":\"list\",\"model\":\"%s\",\"results\":[", r->model->info->id);
-    cJSON *documents = cJSON_GetObjectItemCaseSensitive(r->root, "documents");
+    yyjson_val *documents = yyjson_obj_get(yyjson_doc_get_root(r->root), "documents");
     for (int i = 0; i < r->top_n; i++) {
         if (i)
             sbuf_putc(&b, ',');
         sbuf_printf(&b, "{\"index\":%d,\"relevance_score\":%.9g", ranked[i].index,
                     (double)ranked[i].score);
         if (r->return_documents) {
-            cJSON *document = cJSON_GetArrayItem(documents, ranked[i].index);
+            yyjson_val *document = yyjson_arr_get(documents, (size_t)ranked[i].index);
             sbuf_puts(&b, ",\"document\":");
-            append_json_string(&b, document->valuestring);
+            append_json_string(&b, yyjson_get_str(document));
         }
         sbuf_putc(&b, '}');
     }

@@ -9,7 +9,7 @@ LIBFFWD := $(ROOT)/libffwd
 BIN := $(OUTDIR)/ffwd-cli
 SRCS := main.c
 LIBS := $(OUTDIR)/libffwd.a
-LDLIBS := $(BACKEND_LDFLAGS) -lm
+LDLIBS := $(BACKEND_LDFLAGS) $(YYJSON_LDFLAGS) -lm
 
 CFLAGS += -std=gnu11 -pthread
 CPPFLAGS += -I. -I$(LIBFFWD)

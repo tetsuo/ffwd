@@ -13,7 +13,7 @@
 
 #include "ae.h"
 
-#include <cjson/cJSON.h>
+#include <yyjson.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -197,7 +197,7 @@ struct job {
 };
 
 /* Parsed request state, shared by the prepare (handlers), execute (schedule),
- * and render (encode) stages. Each carries its source cJSON root (freed when
+ * and render (encode) stages. Each carries its source JSON document (freed when
  * the request is freed), the resolved model, and the tokenized inputs. */
 typedef struct {
     int *ids;
@@ -206,7 +206,7 @@ typedef struct {
 
 typedef struct {
     job *j;
-    cJSON *root;
+    yyjson_doc *root;
     loaded_model *model;
     int dims;
     const char *encoding;
@@ -226,7 +226,7 @@ typedef struct {
 
 typedef struct {
     job *j;
-    cJSON *root;
+    yyjson_doc *root;
     loaded_model *model;
     int dims;
     const char *encoding;
@@ -242,7 +242,7 @@ typedef ffwd_late_tokens_t late_tokens;
 
 typedef struct {
     job *j;
-    cJSON *root;
+    yyjson_doc *root;
     loaded_model *model;
     late_tokens query;
     late_tokens *documents;
@@ -258,13 +258,20 @@ typedef struct {
 void append_json_string(sbuf *b, const char *s);
 char *json_error_body(const char *message, const char *type, size_t *len);
 void job_set_error(job *j, int status, const char *message, const char *type);
-bool ve_add(cJSON *detail, const char *loc_json, const char *msg, const char *type);
-void job_set_422(job *j, cJSON *detail);
-cJSON *parse_json_body(job *j, cJSON *detail);
-bool cjson_is_integer(cJSON *item);
-const char *encoding_from_root(cJSON *root, cJSON *detail, embedding_api_t api);
-int text_type_is_query(cJSON *root, cJSON *detail, const char *query_instruct);
-int dimensions_from_root(cJSON *root, cJSON *detail, int min_dim, int max_dim, const char *encoding);
+/* Validation errors accumulate in a mutable yyjson document whose root is the
+ * {"detail":[...]} array: ve_new creates it, ve_add appends one entry, ve_count
+ * reports how many were added, and job_set_422 serializes it. Release the
+ * document with yyjson_mut_doc_free. */
+yyjson_mut_doc *ve_new(void);
+bool ve_add(yyjson_mut_doc *detail, const char *loc_json, const char *msg, const char *type);
+size_t ve_count(yyjson_mut_doc *detail);
+void job_set_422(job *j, yyjson_mut_doc *detail);
+yyjson_doc *parse_json_body(job *j, yyjson_mut_doc *detail);
+bool json_is_integer(yyjson_val *item);
+const char *encoding_from_root(yyjson_val *root, yyjson_mut_doc *detail, embedding_api_t api);
+int text_type_is_query(yyjson_val *root, yyjson_mut_doc *detail, const char *query_instruct);
+int dimensions_from_root(
+    yyjson_val *root, yyjson_mut_doc *detail, int min_dim, int max_dim, const char *encoding);
 
 /* ---- server_http.c: connection lifecycle, header parse, response framing ---- */
 int set_nonblock(int fd);
@@ -323,13 +330,16 @@ int load_one_model(http_server *s, const ffwd_server_model_spec_t *spec);
 void free_models(http_server *s);
 
 /* ---- server_handlers.c: per-endpoint prepare / batch-group / execute ---- */
-void prepare_embedding_request(job *j, cJSON *root, http_server *s, embedding_request *out);
+void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, embedding_request *out);
 int embedding_request_compatible(const embedding_request *a, const embedding_request *b);
 void execute_embedding_request_list(embedding_request **reqs, int n_reqs);
-void prepare_contextual_request(job *j, cJSON *root, http_server *s, contextual_request *out);
+void prepare_contextual_request(job *j,
+                                yyjson_doc *root_doc,
+                                http_server *s,
+                                contextual_request *out);
 int contextual_request_compatible(const contextual_request *a, const contextual_request *b);
 void execute_contextual_request_list(contextual_request **reqs, int n_reqs);
-void prepare_rerank_request(job *j, cJSON *root, http_server *s, rerank_request *out);
+void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank_request *out);
 void execute_rerank_request(rerank_request *r);
 
 /* ---- server_schedule.c: job queue, micro-batching, completion ---- */

@@ -35,8 +35,6 @@
 #    include <sys/sysctl.h>
 #endif
 
-#include <cjson/cJSON.h>
-
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_signal_wfd = -1;
 

@@ -298,22 +298,22 @@ static int has_unfinished_jobs(const int *done, int n_jobs) {
     return 0;
 }
 
-static int parse_job_root(job *j, cJSON **out_root) {
-    cJSON *detail = cJSON_CreateArray();
-    cJSON *root = parse_json_body(j, detail);
+static int parse_job_root(job *j, yyjson_doc **out_root) {
+    yyjson_mut_doc *detail = ve_new();
+    yyjson_doc *root = parse_json_body(j, detail);
     if (!root) {
         job_set_422(j, detail);
-        cJSON_Delete(detail);
+        yyjson_mut_doc_free(detail);
         *out_root = NULL;
         return -1;
     }
-    cJSON_Delete(detail);
+    yyjson_mut_doc_free(detail);
     *out_root = root;
     return 0;
 }
 
 static void process_unknown_job(job *j) {
-    cJSON *root = NULL;
+    yyjson_doc *root = NULL;
     if (!j->started_ns)
         j->started_ns = nstime();
     uint64_t t0 = nstime();
@@ -322,7 +322,7 @@ static void process_unknown_job(job *j) {
     if (rc != 0)
         return;
     job_set_error(j, 404, "unknown endpoint", "invalid_request_error");
-    cJSON_Delete(root);
+    yyjson_doc_free(root);
 }
 
 /* Parse and tokenize one job into a heap request attached to j->prep, which the
@@ -344,7 +344,7 @@ void tokenize_job(http_server *s, job *j) {
     else
         return;
 
-    cJSON *root = NULL;
+    yyjson_doc *root = NULL;
     uint64_t t0 = nstime();
     int parse_rc = parse_job_root(j, &root);
     j->parse_ns += nstime() - t0;

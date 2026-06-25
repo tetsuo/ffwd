@@ -89,25 +89,27 @@ static int read_query_instruct_from_files(const char *model_dir, char **out) {
     int rc = read_optional_text_file(model_dir, "config_sentence_transformers.json", &buf);
     if (rc <= 0)
         return rc;
-    cJSON *root = cJSON_Parse(buf);
+    yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
     free(buf);
-    if (!root) {
+    if (!doc) {
         server_log("ffwd-server: invalid config_sentence_transformers.json: %s", model_dir);
         return -1;
     }
-    cJSON *prompts = cJSON_GetObjectItemCaseSensitive(root, "prompts");
-    cJSON *query = prompts ? cJSON_GetObjectItemCaseSensitive(prompts, "query") : NULL;
-    if (query && !cJSON_IsString(query)) {
-        cJSON_Delete(root);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *prompts = yyjson_obj_get(root, "prompts");
+    yyjson_val *query = prompts ? yyjson_obj_get(prompts, "query") : NULL;
+    if (query && !yyjson_is_str(query)) {
+        yyjson_doc_free(doc);
         server_log("ffwd-server: prompts.query must be a string: %s", model_dir);
         return -1;
     }
-    if (query && query->valuestring && query->valuestring[0]) {
-        *out = xstrdup(query->valuestring);
-        cJSON_Delete(root);
+    const char *qs = yyjson_get_str(query);
+    if (qs && qs[0]) {
+        *out = xstrdup(qs);
+        yyjson_doc_free(doc);
         return *out ? 1 : -1;
     }
-    cJSON_Delete(root);
+    yyjson_doc_free(doc);
     return 0;
 }
 
@@ -156,7 +158,7 @@ void embedding_request_free(embedding_request *r) {
     free(r->tokens);
     free(r->inputs);
     if (r->root)
-        cJSON_Delete(r->root);
+        yyjson_doc_free(r->root);
     memset(r, 0, sizeof(*r));
 }
 
@@ -169,7 +171,7 @@ void contextual_request_free(contextual_request *r) {
     }
     free(r->docs);
     if (r->root)
-        cJSON_Delete(r->root);
+        yyjson_doc_free(r->root);
     memset(r, 0, sizeof(*r));
 }
 
@@ -189,7 +191,7 @@ void rerank_request_free(rerank_request *r) {
         late_tokens_free(&r->documents[i]);
     free(r->documents);
     if (r->root)
-        cJSON_Delete(r->root);
+        yyjson_doc_free(r->root);
     memset(r, 0, sizeof(*r));
 }
 

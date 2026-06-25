@@ -4,6 +4,7 @@ include ../build.mk
 CFLAGS += -std=c11
 
 BLAS_LIBS := $(HOST_BLAS_LDFLAGS)
+JSON_LIBS := $(YYJSON_LDFLAGS)
 
 # Every test links the blas libffwd archive (built into the per-config build
 # tree by the libffwd-blas phony) and includes its headers; only the fixture
@@ -57,33 +58,33 @@ late-check-driver: late_check
 late-check-driver-mlx: late_check_mlx
 
 $(foreach t,$(TOK_TESTS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),-lm)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),$(JSON_LIBS) -lm)))
 
 $(foreach t,$(ST_TESTS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),$(JSON_LIBS))))
 
 $(foreach t,$(KERNEL_TESTS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm)))
 
 # Generic (no USE_BLAS) kernel build: compile the kernel sources directly so the
 # scalar/SIMD paths are linked instead of cblas; no Accelerate/OpenBLAS needed.
 $(eval $(call c_program_deps,test_kernels_generic,test_kernels.c $(KERNEL_SRCS),,,-pthread -I$(LIBFFWD_DIR),-lm))
 
 $(foreach t,$(FFWD_TESTS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm)))
 
 $(foreach t,$(PARITY_TOK_DRIVERS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),-lm)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-I$(LIBFFWD_DIR),$(JSON_LIBS) -lm)))
 
 $(foreach t,$(FFWD_DRIVERS),\
-    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) -lm)))
+    $(eval $(call c_program_deps,$(t),$(t).c,libffwd-blas,$(LIBFFWD_A),-pthread -I$(LIBFFWD_DIR),$(BLAS_LIBS) $(JSON_LIBS) -lm)))
 
 # The MLX driver variants reuse the BLAS engine archive for the CPU reference
 # paths (e.g. ffwd_late_maxsim) and add mlx.c for the device API. The archive
 # calls cblas, so the driver links Accelerate/OpenBLAS itself ($(HOST_BLAS_LDFLAGS))
 # on top of the Metal/MLX libraries. macOS only, built on demand.
 MLX_DRIVER_CFLAGS := -pthread -DCHECK_MLX -I$(MLXC_PREFIX)/include -I$(LIBFFWD_DIR) $(HOST_BLAS_CFLAGS)
-MLX_DRIVER_LDLIBS := $(MLX_BACKEND_LDFLAGS) $(HOST_BLAS_LDFLAGS) -lm
+MLX_DRIVER_LDLIBS := $(MLX_BACKEND_LDFLAGS) $(HOST_BLAS_LDFLAGS) $(JSON_LIBS) -lm
 
 $(eval $(call c_program_deps,contextual_batch_mlx,contextual_batch.c $(LIBFFWD_DIR)/mlx.c,libffwd-blas,$(LIBFFWD_A),$(MLX_DRIVER_CFLAGS),$(MLX_DRIVER_LDLIBS)))
 
@@ -102,8 +103,8 @@ COV_ROOT   := ..
 COV_DIR    := coverage
 COV_OUT    := tests/$(COV_DIR)
 COV_FLAGS  := -fprofile-instr-generate -fcoverage-mapping -O0
-COV_CFLAGS := -Wall -Wextra -Ilibffwd -Itests -pthread $(HOST_BLAS_CFLAGS) $(COV_FLAGS)
-COV_LDLIBS := $(BLAS_LIBS) -lm
+COV_CFLAGS := -Wall -Wextra -Ilibffwd -Itests -pthread $(HOST_BLAS_CFLAGS) $(YYJSON_CFLAGS) $(COV_FLAGS)
+COV_LDLIBS := $(BLAS_LIBS) $(JSON_LIBS) -lm
 # Report library sources only: drop the test harnesses (test_*), the fixture
 # headers, and system headers.
 COV_IGNORE := -ignore-filename-regex='test_|_fixture|tiny_model|/opt/|/usr/'

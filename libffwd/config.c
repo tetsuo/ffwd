@@ -1,6 +1,6 @@
 #include "config.h"
 
-#include "yyjson.h"
+#include <yyjson.h>
 
 #include <errno.h>
 #include <limits.h>

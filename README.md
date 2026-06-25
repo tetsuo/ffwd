@@ -30,11 +30,8 @@ architectures include:
 
 Before building, install the dependencies for your platform:
 
-- On Linux, install `libopenblas-dev`.
-- On macOS, install `mlx` and `mlx-c` through Homebrew.
-
-The server also needs `libcjson-dev`/`cjson`. You can skip it if you only want
-`libffwd` and the command-line tool.
+- On Linux, install `libopenblas-dev` and `libyyjson-dev`.
+- On macOS, install `mlx`, `mlx-c` and `yyjson` through Homebrew.
 
 Once the dependencies are in place, run `make` to build the libraries and tools.
 
