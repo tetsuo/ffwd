@@ -1138,7 +1138,9 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                                                             int qkv_dim,
                                                             int q_offset,
                                                             float scale,
-                                                            int causal_skip) {
+                                                            int causal_skip,
+                                                            int kv_stride,
+                                                            int kv_head_div) {
     enum { QT = 16, KT = 16, HD = 128, DCHUNKS = 8 };
     // Q stays resident; the K/V region is a single double-buffer when PIPELINED
     // (two K stages + two V stages) and a single K+V tile otherwise.
@@ -1158,6 +1160,11 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         return;
     int q0 = block_q0 + warp * QT;
     size_t hv = (size_t)head * HD;
+    // GQA: this query head's K/V live in kv head head/kv_head_div, stored compact
+    // (n_kv_heads, stride kv_stride) -- not GQA-expanded to per-query-head, which
+    // removes the separate expand kernel's materialization. kv_head_div=1 is plain
+    // multi-head (kvhv==hv, kv_stride==q_dim), so the layout is unchanged there.
+    size_t kvhv = (size_t)(head / kv_head_div) * HD;
     __nv_bfloat16 *qsh = shmem;
     __nv_bfloat16 *myq = qsh + warp * QT * HD;
 
@@ -1200,19 +1207,21 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
         // cost that grows with sequence length). K lands in the (key, d) row-major
         // swizzle the QK ldmatrix reads directly; V stays plain for the PV gather;
         // the single barrier per tile publishes the freshly staged tile. Qwen
-        // reads K/V from the GQA-expanded kexp/vexp (DIRECT_KV=0), so the stager's
-        // k_offset/v_offset/kv_head/qkv_dim args are unused. Q is kept resident
-        // (not aliased for KV) so a_q need not be preloaded into 32 registers,
-        // which would drop the block below the 2-per-SM occupancy HD=128 needs.
+        // reads K/V from the COMPACT (n_kv_heads, stride kv_stride) bf16 kexp/vexp
+        // and remaps this query head to its kv head via kvhv (DIRECT_KV=0 reads
+        // kexp[(start+key)*kv_stride + kvhv + d]); the separate GQA-expand kernel
+        // is gone. Q is kept resident (not aliased for KV) so a_q need not be
+        // preloaded into 32 registers, which would drop the block below the
+        // 2-per-SM occupancy HD=128 needs.
         __nv_bfloat16 *kstage0 = shmem + Q_ELEMS;
         __nv_bfloat16 *kstage1 = kstage0 + KT * HD;
         __nv_bfloat16 *vstage0 = kstage1 + KT * HD;
         __nv_bfloat16 *vstage1 = vstage0 + KT * HD;
 
         int stage = 0;
-        int async_stage =
-            bert_stage_kv_tile_bf16<HD, KT, float, 0>(kstage0, vstage0, qkv, kexp, vexp, start, L, 0,
-                                                      q_dim, qkv_dim, 0, 0, hv, 0, tid, nthreads);
+        int async_stage = bert_stage_kv_tile_bf16<HD, KT, float, 0>(kstage0, vstage0, qkv, kexp, vexp,
+                                                                    start, L, 0, kv_stride, qkv_dim,
+                                                                    0, 0, kvhv, 0, tid, nthreads);
 
         for (int k0 = 0; k0 < key_hi; k0 += KT) {
             if (async_stage)
@@ -1228,7 +1237,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
             if (next_k0 < key_hi) {
                 async_next = bert_stage_kv_tile_bf16<HD, KT, float, 0>(
                     next_stage ? kstage1 : kstage0, next_stage ? vstage1 : vstage0, qkv, kexp, vexp,
-                    start, L, next_k0, q_dim, qkv_dim, 0, 0, hv, 0, tid, nthreads);
+                    start, L, next_k0, kv_stride, qkv_dim, 0, 0, kvhv, 0, tid, nthreads);
             }
 
             if (!CAUSAL || !causal_skip || k0 < warp_key_hi) {
@@ -1308,7 +1317,7 @@ __global__ static void attn_stream_tc128_bf16_kv_ldm_kernel(__nv_bfloat16 *out,
                 int kk = idx / HD;
                 int d = idx - kk * HD;
                 int key = k0 + kk;
-                size_t kb = (size_t)(start + key) * q_dim + hv + d;
+                size_t kb = (size_t)(start + key) * kv_stride + kvhv + d;
                 __nv_bfloat16 kval = key < L ? kexp[kb] : __float2bfloat16(0.0f);
                 __nv_bfloat16 vval = key < L ? vexp[kb] : __float2bfloat16(0.0f);
                 tc_store_swz_bf16<16>(ksh, d, kk, kval);
@@ -2728,6 +2737,21 @@ static int qwen_causal_skip(void) {
     return on;
 }
 
+// Compact GQA K/V for the Qwen tc128 path. Default on: the K/V convert writes the
+// compact n_kv_heads layout and the attention remaps each query head to its kv
+// head, removing the separate per-query-head expansion kernel's redundant write.
+// env 0/off restores the expanded write for A/B (bit-identical; same K/V values).
+static int qwen_compact_kv(void) {
+    static int init = 0, on = 1;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_QWEN_COMPACT_KV");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            on = 0;
+        init = 1;
+    }
+    return on;
+}
+
 static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int head_dim) {
     int mode = streaming_attention_mode();
     if (mode < 0) // FFWD_CUDA_STREAMING_ATTN=mat/off: force the materialized path
@@ -3290,9 +3314,15 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         } else if (use_tc_kexp_bf16 || (use_bert_flash && out_dtype == CUDA_DTYPE_BF16)) {
             if (!ctx->kexp_bf16)
                 return -1;
-            attn_expand_kv_kernel<<<(exp_count + threads - 1) / threads, threads, 0, ctx->stream>>>(
+            // Qwen tc128 default: write COMPACT GQA K/V (n_kv_heads); the attention
+            // remaps each query head to its kv head, so the per-query-head expand
+            // is gone. BERT (n_kv_heads==n_heads) and the compact-off A/B keep the
+            // expanded write. cnt = total * heads-written * hd.
+            int kvh = (use_tc_kexp_bf16 && qwen_compact_kv()) ? c->n_kv_heads : H;
+            size_t cnt = (size_t)total * kvh * hd;
+            attn_expand_kv_kernel<<<(cnt + threads - 1) / threads, threads, 0, ctx->stream>>>(
                 (__nv_bfloat16 *)ctx->kexp_bf16, (__nv_bfloat16 *)ctx->vexp, (const float *)qkv_src,
-                total, H, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
+                total, kvh, c->n_kv_heads, hd, qkv_dim, k_offset, v_offset);
         } else if (use_bert_flash && out_dtype == CUDA_DTYPE_F16) {
             if (!ctx->kexp_f16)
                 return -1;
@@ -3437,6 +3467,9 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             int w = tc_kv_warps_or(8);
             int qpipe = qwen_flash_pipeline_mode() >= 0;
             int cskip = qwen_causal_skip();
+            int compact_kv = qwen_compact_kv();
+            int kv_stride = compact_kv ? c->n_kv_heads * hd : q_dim; // compact vs expanded row
+            int kv_head_div = compact_kv ? H / c->n_kv_heads : 1;    // query heads per kv head
 #define TC3_LAUNCH(W, P)                                                                         \
     do {                                                                                         \
         dim3 grid((max_L + (W) * 16 - 1) / ((W) * 16), H, batch);                                \
@@ -3445,12 +3478,12 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
             attn_stream_tc128_bf16_kv_ldm_kernel<1, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
                 (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                cskip);                                                                          \
+                cskip, kv_stride, kv_head_div);                                                  \
         else                                                                                     \
             attn_stream_tc128_bf16_kv_ldm_kernel<0, (W), (P)><<<grid, block, 0, ctx->stream>>>(  \
                 (__nv_bfloat16 *)out_16, ctx->qkv, (const __nv_bfloat16 *)ctx->kexp_bf16,        \
                 (const __nv_bfloat16 *)ctx->vexp, ctx->offsets, q_dim, qkv_dim, q_offset, scale, \
-                cskip);                                                                          \
+                cskip, kv_stride, kv_head_div);                                                  \
     } while (0)
             if (qpipe) {
                 if (w == 2)
