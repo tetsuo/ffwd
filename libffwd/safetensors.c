@@ -9,9 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* ========================================================================
- * Minimal JSON parser for safetensors header
- * ======================================================================== */
+/* Minimal JSON parser for safetensors header */
+/* TODO: consider replacing with yyjson */
 
 static void skip_whitespace(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t')
@@ -262,9 +261,7 @@ static int parse_header(safetensors_file_t *sf) {
     return 0;
 }
 
-/* ========================================================================
- * Single file operations
- * ======================================================================== */
+/* Single file operations */
 
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -343,9 +340,7 @@ int64_t safetensor_numel(const safetensor_t *t) {
     return n;
 }
 
-/* ========================================================================
- * Multi-shard operations
- * ======================================================================== */
+/* Multi-shard operations */
 
 static int cmp_shard_names(const void *a, const void *b) {
     const char *sa = (const char *)a;

@@ -13,9 +13,7 @@
 #include <limits.h>
 #include <float.h>
 
-/* ========================================================================
- * Per-layer MLX weight arrays
- * ======================================================================== */
+/* Per-layer MLX weight arrays */
 
 typedef struct {
     mlx_array w;
@@ -33,9 +31,9 @@ typedef struct {
     mlx_array q_norm, k_norm;
     mlx_array input_norm, post_attn_norm;
     mlx_linear_t gate_proj, up_proj, down_proj;
-    /* BERT family (unset for Qwen3; see internal.h). wo/up_proj/down_proj
-     * and input_norm/post_attn_norm are reused as the BERT attention output,
-     * FFN matrices, and the two block LayerNorm weights. */
+    /* BERT family only; unset for Qwen3. See internal.h.
+    * Reuses wo/up_proj/down_proj for BERT attention output and FFN matrices.
+    * Reuses input_norm/post_attn_norm for the two BERT block LayerNorm weights. */
     mlx_array o_bias, attn_ln_bias, ffn_inter_bias, ffn_out_bias, ffn_ln_bias;
 } mlx_layer_t;
 
@@ -44,7 +42,7 @@ struct ffwd_mlx_ctx {
     mlx_array embed_tokens;
     mlx_layer_t *layers; /* heap-allocated [n_layers] */
     mlx_array norm;
-    /* BERT family (unset for Qwen3): learned positions, token-type, embed LN. */
+    /* BERT family only; unset for Qwen3: learned positions, token-type, embed LN. */
     mlx_array position_embeddings, token_type_embeddings, ffwd_ln_w, ffwd_ln_b;
     mlx_stream stream;
     multi_safetensors_t *ms;
@@ -69,9 +67,7 @@ struct ffwd_mlx_late_vectors {
     int dim;
 };
 
-/* ========================================================================
- * Helpers
- * ======================================================================== */
+/* Helpers */
 
 static int arr_ok(mlx_array a) { return a.ctx != NULL; }
 
@@ -158,10 +154,11 @@ static mlx_array load_tensor(multi_safetensors_t *ms, const char *name, const in
     if (!mlx_tensor_has_supported_shape(sf, t, name, shape, ndim))
         return (mlx_array){0};
     if (t->dtype == DTYPE_F16) {
-        /* No F16 forward path on MLX (the matmul fast path keys on BF16). Widen
-         * to F32 on the host at load so the whole forward runs in F32, mirroring
-         * the CPU loader. mlx_array_new_data copies its buffer, so the temporary
-         * is freed immediately. Public F16 snapshots load through here. */
+        /* No F16 forward path on MLX; the matmul fast path uses BF16.
+         * Widen to F32 on the host at load time, so the full forward pass runs in F32,
+         * matching the CPU loader.
+         * mlx_array_new_data copies its buffer, so the temporary is freed immediately.
+         * Public F16 snapshots load through this path. */
         int64_t n = safetensor_numel(t);
         float *tmp = (float *)malloc((size_t)n * sizeof(float));
         if (!tmp)
@@ -341,9 +338,7 @@ static void upcast_f32_inplace(mlx_array *a, mlx_stream s) {
     *a = f;
 }
 
-/* ========================================================================
- * Load
- * ======================================================================== */
+/* Load */
 
 static int mlx_model_dir_has_file(const char *model_dir, const char *rel) {
     char path[1024];
@@ -394,9 +389,9 @@ static int prepare_layer_transposes(mlx_layer_t *l, mlx_stream s) {
            prepare_linear_transpose(&l->down_proj, s);
 }
 
-/* BERT-family MLX loader, mirroring load_bert_weights on the CPU side. The
- * shared post-load below (stream, transposes, optional BF16 upcast) runs after
- * either family fills ctx->layers. */
+/* BERT-family MLX loader, matching CPU load_bert_weights.
+ * The shared post-load step below runs after either family fills ctx->layers:
+ * stream setup, transposes, and optional BF16 upcast. */
 static int load_mlx_bert_weights(ffwd_mlx_ctx_t *ctx, int layer_start, int layer_end) {
     const ffwd_config_t *c = &ctx->config;
     int h = c->hidden_size, inter = c->intermediate_size;
@@ -625,9 +620,11 @@ static ffwd_mlx_ctx_t *mlx_load_range_ex(const char *model_dir,
 loaded:
     ctx->stream = mlx_default_gpu_stream_new();
     ctx->weight_dtype = mlx_array_dtype(ctx->layers[layer_start].wq.w);
-    /* Non-quantized BF16: run RMSNorm and the residual stream in F32. Upcast the
-     * tiny norm vectors so they match the F32 activations in mlx_forward_layers;
-     * the large matmul weights stay BF16. Q8 keeps its existing BF16 norms. */
+    /* Non-quantized BF16:
+     * run RMSNorm and the residual stream in F32.
+     * Upcast the small norm vectors to match the F32 activations in
+     * mlx_forward_layers; keep the large matmul weights in BF16.
+     * Q8 keeps its existing BF16 norms. */
     if (ctx->weight_dtype == MLX_BFLOAT16 && !ctx->quantize_bits) {
         for (int i = layer_start; i < layer_end; i++) {
             mlx_layer_t *l = &ctx->layers[i];
@@ -647,7 +644,7 @@ loaded:
             upcast_f32_inplace(&l->ffn_ln_bias, ctx->stream);
         }
         upcast_f32_inplace(&ctx->norm, ctx->stream);
-        /* BERT embedding stage (no-ops for Qwen): learned position and token-type
+        /* BERT embedding stage; no-ops for Qwen: learned position and token-type
          * embeddings and the embedding LayerNorm all feed the F32 residual. */
         upcast_f32_inplace(&ctx->position_embeddings, ctx->stream);
         upcast_f32_inplace(&ctx->token_type_embeddings, ctx->stream);
@@ -704,9 +701,7 @@ ffwd_mlx_ctx_t *ffwd_mlx_load_with_options(const char *model_dir, const ffwd_mlx
     return mlx_load_range_ex(model_dir, 0, -1, opts, 0);
 }
 
-/* ========================================================================
- * Free
- * ======================================================================== */
+/* Free */
 
 static void free_mlx_layer(mlx_layer_t *l) {
     free_linear(&l->wq);
@@ -827,9 +822,7 @@ const ffwd_config_t *ffwd_mlx_late_config(const ffwd_mlx_late_ctx_t *ctx) {
 
 int ffwd_mlx_late_token_dim(const ffwd_mlx_late_ctx_t *ctx) { return ctx ? ctx->token_dim : 0; }
 
-/* ========================================================================
- * Forward pass
- * ======================================================================== */
+/* Forward pass */
 
 /* Exact erf GeLU: 0.5 * x * (1 + erf(x / sqrt(2))). Frees nothing it is given. */
 static mlx_array mlx_gelu_erf(mlx_array x, mlx_stream S) {
@@ -1569,7 +1562,7 @@ cleanup:
 
 /* Device-resident select/concat primitives. The server rerank path batches
  * candidates through ffwd_mlx_late_encode_docs_device, but the late-interaction
- * verification harness (tests/integration/check_late_interaction.py) drives these directly
+ * verification harness (tests/check_late_interaction.py) drives these directly
  * to validate per-document gather and concat against the CPU MaxSim reference. */
 ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_concat(ffwd_mlx_late_ctx_t *ctx,
                                                       const ffwd_mlx_late_vectors_t *const *items,
@@ -2125,7 +2118,7 @@ static int ffwd_mlx_encode_batch_dense(ffwd_mlx_ctx_t *ctx,
         mlx_array_free(x_normed);
     }
 
-    /* 5. Eval and copy [B, hidden] to CPU. Perplexity embeddings are
+    /* 5. Eval and copy [B, hidden] to CPU. pplx-embed embeddings are
      * intentionally unnormalized; callers should use cosine similarity. */
     mlx_array emb_f32 = mlx_array_new();
     mlx_astype(&emb_f32, emb, MLX_FLOAT32, S);

@@ -1,6 +1,10 @@
-/* backend_blas.c - CPU backend (BLAS), implements the engine API in ffwd.h.
- * Linked only into CPU builds. The CPU model loads on the caller's thread, so
- * ffwd_open does the full load and activate/worker_free are no-ops. */
+/* CPU backend.
+ * Implements the engine API in ffwd.h and is linked only into CPU builds.
+ *
+ * The CPU model loads on the caller's thread, so ffwd_open does the full load.
+ * activate and worker_free are no-ops.
+ */
+
 #include "internal.h"
 #include "threadpool.h"
 #include "platform.h"

@@ -1,10 +1,13 @@
-/* main.c - ffwd-server entry point.
+/* ffwd HTTP frontend.
  *
- * The frontend for the ffwd-server binary: argument parsing, model-spec
- * handling, and main(). The server logic lives in server.c; this file only
- * builds the ffwd_server_config_t and calls ffwd_run_server. It is split
- * from server.c so the test suite can include server.c (for its internal
- * functions) without a conflicting main() and without a compile-out guard. */
+ * Handles argument parsing, model specs, and main().
+ * Server logic lives in server.c; this file only builds ffwd_server_config_t
+ * and calls ffwd_run_server.
+ *
+ * Split from server.c so tests can include server.c for internal functions
+ * without a conflicting main() or compile-out guard.
+ */
+
 #include "build.h"
 #include "server.h"
 #include "server_internal.h"

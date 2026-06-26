@@ -1,8 +1,13 @@
-/* Parity driver for the WordPiece tokenizer. Loads a BERT vocab dir, encodes
- * each argument through both encode entry points (and cross-checks they agree),
- * then prints "<count> <id> <id> ..." per line. check_wordpiece_parity.py builds
- * this with `make parity-wordpiece-driver` and compares the ids against the
- * stored reference vectors in tests/test-vectors/wordpiece/. Links libtok. */
+/* WordPiece tokenizer parity driver.
+ * Loads a BERT vocab dir, encodes each argument through both encode entry
+ * points, and checks that they agree.
+ *
+ * Prints one line per argument: "<count> <id> <id> ...".
+ *
+ * check_wordpiece_parity.py builds this with `make parity-wordpiece-driver` and
+ * compares ids against reference vectors in tests/test-vectors/wordpiece/.
+ */
+
 #include "wordpiece.h"
 
 #include <stdio.h>

@@ -1,5 +1,5 @@
 /*
- * tp.c - CPU thread pool
+ * CPU thread pool.
  */
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)
@@ -116,15 +116,19 @@ void tp_set_threads(int n) {
 }
 
 #ifndef __APPLE__
-/* CPU bandwidth this process may actually use, in whole cores, or 0 if there
- * is no cgroup limit. Containers (Docker --cpus, Kubernetes, RunPod) expose
- * every host CPU through sysconf()/cpuset, but the CFS quota caps the CPU time
- * the process really gets. Sizing the BLAS/thread pool to the host count then
- * oversubscribes that quota: the threads spend the period's budget early and
- * the scheduler throttles them for the rest of each period, which adds large,
- * bursty stalls (e.g. a 16-thread default against a 5.1-core quota ran the
- * 0.6B model ~2x slower than a 5-thread pool). Floor, not ceil, so a fully
- * busy pool stays under the quota and never trips throttling. */
+/* CPU quota available to this process, in whole cores, or 0 if uncapped.
+ * Containers such as Docker --cpus, Kubernetes, and RunPod may expose every host
+ * CPU through sysconf()/cpuset, while CFS quota limits the CPU time the process
+ * can actually use.
+ *
+ * Sizing the BLAS/thread pool to the host CPU count oversubscribes that quota:
+ * threads use the period budget early, then get throttled for the rest of the
+ * period, causing large bursty stalls. Example: a 16-thread default against a
+ * 5.1-core quota ran the 0.6B model about 2x slower than a 5-thread pool.
+ *
+ * Floor instead of ceil, so a fully busy pool stays under quota and avoids
+ * throttling.
+ */
 static int cgroup_cpu_quota(void) {
     /* cgroup v2: "/sys/fs/cgroup/cpu.max" is "<quota> <period>", or
      * "max <period>" when unlimited. */

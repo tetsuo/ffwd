@@ -1,4 +1,4 @@
-/* tests/model_fixture.h - shared model+tokenizer fixture writer. */
+/* Shared model+tokenizer fixture writer. */
 
 #ifndef MODEL_FIXTURE_H
 #define MODEL_FIXTURE_H

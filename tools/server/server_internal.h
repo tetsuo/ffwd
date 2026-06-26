@@ -254,7 +254,7 @@ typedef struct {
     int ready;
 } rerank_request;
 
-/* ---- server_json.c: request validation and error bodies ---- */
+/* json.c: request validation and error bodies */
 void append_json_string(sbuf *b, const char *s);
 char *json_error_body(const char *message, const char *type, size_t *len);
 void job_set_error(job *j, int status, const char *message, const char *type);
@@ -273,7 +273,7 @@ int text_type_is_query(yyjson_val *root, yyjson_mut_doc *detail, const char *que
 int dimensions_from_root(
     yyjson_val *root, yyjson_mut_doc *detail, int min_dim, int max_dim, const char *encoding);
 
-/* ---- server_http.c: connection lifecycle, header parse, response framing ---- */
+/* http.c: connection lifecycle, header parse, response framing */
 int set_nonblock(int fd);
 void client_incref(client *c);
 void client_decref_n(client *c, int n);
@@ -293,7 +293,7 @@ void read_cb(aeEventLoop *loop, int fd, void *clientData, int mask);
 /* Defined in server.c (request routing): framed requests are handed here. */
 void dispatch_request(client *c);
 
-/* ---- server_encode.c: embedding output encoding ---- */
+/* encode.c: embedding output encoding */
 signed char quantize_int8_tanh(float x);
 void append_embedding_value(
     sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api);
@@ -304,14 +304,14 @@ void job_render_free(job *j);
 void job_set_embedding_render(job *j, const embedding_request *r, const float *embs);
 int render_job_response(job *j);
 
-/* ---- server_models.c: model load/lifecycle, tokenize/inference dispatch ---- */
+/* models.c: model load/lifecycle, tokenize/inference dispatch */
 loaded_model *loaded_model_for_label(http_server *s, const char *label);
 void free_token_bufs(token_buf *t, int n);
 void embedding_request_free(embedding_request *r);
 void contextual_request_free(contextual_request *r);
 void late_tokens_free(late_tokens *t);
 void rerank_request_free(rerank_request *r);
-/* Thin timing wrappers over libffwd's ffwd_tokenize / ffwd_tokenize_late. */
+/* Thin timing wrappers over libffwd's ffwd_tokenize/ffwd_tokenize_late. */
 int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *out);
 int tokenize_input(
     loaded_model *m, job *j, const char *text, const char *query_instruct, token_buf *out);
@@ -328,7 +328,7 @@ int finalize_loaded_model(loaded_model *m);
 int load_one_model(http_server *s, const ffwd_server_model_spec_t *spec);
 void free_models(http_server *s);
 
-/* ---- server_handlers.c: per-endpoint prepare / batch-group / execute ---- */
+/* handlers.c: per-endpoint prepare/batch-group/execute */
 void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, embedding_request *out);
 int embedding_request_compatible(const embedding_request *a, const embedding_request *b);
 void execute_embedding_request_list(embedding_request **reqs, int n_reqs);
@@ -341,7 +341,7 @@ void execute_contextual_request_list(contextual_request **reqs, int n_reqs);
 void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank_request *out);
 void execute_rerank_request(rerank_request *r);
 
-/* ---- server_schedule.c: job queue, micro-batching, completion ---- */
+/* schedule.c: job queue, micro-batching, completion */
 void enqueue_job(job *j);
 int worker_has_pending_jobs(http_server *s);
 void enqueue_raw_job(job *j);

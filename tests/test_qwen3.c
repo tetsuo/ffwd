@@ -1,4 +1,4 @@
-/* tests/test_qwen3.c - hermetic Qwen3 model semantics. */
+/* Hermetic Qwen3 model semantics. */
 
 #include "internal.h"
 #include "tiny_model.h"

@@ -1,4 +1,4 @@
-/* tests/test_qwen2.c - hermetic GTE-Qwen2 block and task semantics. */
+/* Hermetic GTE-Qwen2 block and task semantics. */
 
 #include "internal.h"
 #include "tiny_model.h"

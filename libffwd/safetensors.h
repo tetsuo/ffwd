@@ -1,5 +1,5 @@
 /*
- * safetensors.h - Safetensors file format reader (multi-shard support)
+ * Safetensors file format reader with multi-shard support.
  */
 
 #ifndef SAFETENSORS_H
@@ -40,8 +40,7 @@ typedef struct {
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
 } safetensors_file_t;
 
-/* Multi-shard wrapper: opens all shard files and provides unified tensor lookup
- */
+/* Multi-shard wrapper: opens all shard files and provides unified tensor lookup */
 typedef struct {
     safetensors_file_t *shards[SAFETENSORS_MAX_SHARDS];
     int num_shards;

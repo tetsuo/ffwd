@@ -1,6 +1,7 @@
-/* tests/tiny_model.h - synthesize a tiny 1-layer model directory (config.json
- * + model.safetensors) for hermetic tests. Values are BF16-representable so an
- * F32 and a BF16 copy of the same model produce identical embeddings. */
+/* Synthesize a tiny 1-layer model directory (config.json + model.safetensors) for hermetic
+ * tests. Values are BF16-representable so an F32 and a BF16 copy of the same model produce
+ * identical embeddings.
+ */
 
 #ifndef TINY_MODEL_H
 #define TINY_MODEL_H

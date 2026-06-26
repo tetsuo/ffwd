@@ -1,10 +1,12 @@
-/* bench/bench_kernels.c - regression microbenchmarks for the hot kernels.
+/* Regression microbenchmarks for the hot kernels.
  *
  * Shapes are the real pplx-embed-v1-0.6b dimensions (hidden 1024, 16 query /
  * 8 KV heads x head_dim 128, intermediate 3072) so a slowdown here predicts
- * a slowdown in inference. Single-threaded by default for stable numbers;
- * --threads N opts into the pool. Build and record via `make bench`,
- * compare records with bench/benchstat.py.
+ * a slowdown in inference.
+ *
+ * Single-threaded by default for stable numbers; --threads N opts into the pool.
+ *
+ * Build and record via make bench, compare records with bench/benchstat.py.
  */
 
 #include "bench.h"
@@ -133,7 +135,7 @@ static void bm_bf16_widen(bench_state_t *b) {
     free(src);
 }
 
-/* ---- attention pieces ---- */
+/* attention pieces */
 
 static void bm_attn_scores(bench_state_t *b) {
     /* one head: scores[seq,seq] = Q[seq,hd] @ K[seq,hd]^T */
@@ -171,7 +173,7 @@ static void bm_rope(bench_state_t *b) {
     free(x);
 }
 
-/* ---- norms, activations, reductions ---- */
+/* norms, activations, reductions */
 
 static void bm_rms_norm(bench_state_t *b) {
     float *x = alloc_f32((size_t)SEQ * HIDDEN, 23);

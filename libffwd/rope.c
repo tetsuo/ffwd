@@ -1,5 +1,5 @@
 /*
- * rope.c - rotary position embeddings
+ * Rotary position embeddings: cache-free NeoX-style RoPE compute and apply.
  */
 
 #include "kernels.h"
@@ -29,11 +29,7 @@
 #    define M_PI 3.14159265358979323846
 #endif
 
-/* Rotary position embeddings: cache-free NeoX-style RoPE compute and apply. */
-
-/* ========================================================================
- * Position Embeddings
- * ======================================================================== */
+/* Position embeddings */
 
 void compute_rope_neox(
     float *cos_out, float *sin_out, const int *positions, int seq, int head_dim, float theta) {

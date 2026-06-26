@@ -1,8 +1,9 @@
-/* tests/test_tokenizer.c - hermetic byte-level BPE tokenizer tests.
+/* Hermetic byte-level BPE tokenizer tests.
  * Synthesizes a complete GPT-2-style vocab.json (all 256 byte tokens plus
  * merged tokens) and merges.txt, then checks exact token ids through the
  * integer-pair fast path, and that dropping the integer tables (forcing the
- * string-based fallback) produces identical ids. Runs via `make test`. */
+ * string-based fallback) produces identical ids. Runs via make test.
+ */
 
 #include "bpe.h"
 #include "tok_fixture.h"

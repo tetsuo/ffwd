@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Run the contextual batch-versus-singleton parity check.
+"""Run the contextual batch-vs-singleton parity check.
 
-The C side is tests/contextual_batch.c, built by the Makefile target
-`parity-context-driver`; this script builds it and runs it with the requested
-parameters. It compares the single-document path against the batched path in C
-(no external reference), so it needs a model directory but no Python ML stack.
+The C test is tests/contextual_batch.c, built by the Makefile target
+`parity-context-driver`.
 
+This script builds the driver and runs it with the requested parameters. It
+compares the single-document path against the batched path in C, with no
+external reference.
+
+Requires a model directory.
+
+Usage:
   tests/check_contextual_batch_parity.py --model-dir DIR
 """
 

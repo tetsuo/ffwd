@@ -1,13 +1,8 @@
-/*
- * ffwd.h - ffwd API
- */
-
 #ifndef FFWD_H
 #define FFWD_H
 
-/* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying FFWD_API are exported
- * from the shared library; everything else stays internal. */
+/* The libraries are built with -fvisibility=hidden, so only declarations carrying
+ * FFWD_API are exported from the shared library; everything else stays internal. */
 #ifndef FFWD_API
 #    if defined(__GNUC__)
 #        define FFWD_API __attribute__((visibility("default")))
@@ -19,25 +14,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ========================================================================
- * Shared constants and family defaults
- * ======================================================================== */
+/* Shared constants and defaults */
 
 #define FFWD_VOCAB_SIZE                 151936
 #define FFWD_HEAD_DIM                   128
 #define FFWD_MAX_LAYERS                 64     /* upper bound for stack arrays */
 #define FFWD_CONTEXT_SEPARATOR_TOKEN_ID 151643 /* <|endoftext|> */
 
-/* Late-interaction (ColBERT) special-token id fallbacks and the query pad
- * length, used when a model's tokenizer does not define the tokens itself. */
+/* Late-interaction (ColBERT) fallback special-token ids and query pad length.
+ * Used when the model tokenizer does not define these tokens itself. */
 #define FFWD_LATE_QUERY_TOKENS       32
 #define FFWD_LATE_MASK_TOKEN_ID      151642
 #define FFWD_LATE_QUERY_PREFIX_ID    151669
 #define FFWD_LATE_DOCUMENT_PREFIX_ID 151670
 
-/* ========================================================================
- * Model Configuration (populated from config.json at load time)
- * ======================================================================== */
+/* Model Configuration (populated from config.json at load time) */
 
 typedef enum {
     FFWD_ATTENTION_BIDIRECTIONAL = 0,
@@ -86,12 +77,14 @@ typedef struct {
     ffwd_attention_mode_t attention_mode;
     ffwd_pooling_mode_t pooling_mode;
     int normalize_embeddings;
-    /* Qwen3-Embedding pools the last token, which is the tokenizer's
-     * <|endoftext|> suffix added by its post-processor - not the model's chat
-     * eos_token_id (<|im_end|>). Text frontends append it and resolve the id
-     * from the tokenizer exactly like the contextual separator
-     * (FFWD_CONTEXT_SEPARATOR_TOKEN_ID is the released-model fallback). The
-     * model forward consumes token ids exactly and never appends. */
+    /* Qwen3-Embedding pools the last token: the tokenizer's <|endoftext|> suffix
+     * added by its post-processor, not the model's chat eos_token_id (<|im_end|>).
+     *
+     * Text frontends append it and resolve its id from the tokenizer, just like the
+     * contextual separator. FFWD_CONTEXT_SEPARATOR_TOKEN_ID is the released-model
+     * fallback.
+     *
+     * Model forward consumes token ids exactly and never appends. */
     int append_terminal_token;
 } ffwd_config_t;
 
@@ -111,24 +104,31 @@ typedef struct {
     int n_spans;
 } ffwd_context_input_t;
 
-/* ========================================================================
- * Engine API — the backend-selected inference handle
+/*
+ * Backend-selected inference handle.
  *
- * This is the library's primary public interface and the entire supported
- * surface of the shared library. Exactly one backend (CPU, Apple Metal, or
- * NVIDIA CUDA) is linked at build time and implements these functions;
- * callers never branch on the backend. The CLI, the server, and any language
- * binding use only these functions plus the math helpers below.
+ * This is the library's main public interface and the full supported surface of
+ * the shared library. Exactly one backend is linked at build time: CPU, Apple Metal,
+ * or NVIDIA CUDA. That backend implements these functions, so callers never branch
+ * on backend.
  *
- * A model loads in two phases so a GPU context can be created on the thread
- * that will own it. ffwd_open runs on the caller's thread and loads a CPU
- * model immediately; a GPU build only records what to load. ffwd_activate then
- * runs on the inference thread and creates the GPU context (a no-op for CPU).
- * Teardown mirrors this: ffwd_worker_free releases the GPU context from the
- * inference thread, ffwd_free releases the rest.
- * ======================================================================== */
+ * The CLI, server, and language bindings use only these functions plus the math
+ * helpers below.
+ *
+ * Model loading has two phases so a GPU context can be created on the thread
+ * that owns it.
+ *
+ * ffwd_open runs on the caller's thread. It loads a CPU model immediately; in a
+ * GPU build, it only records what to load.
+ *
+ * ffwd_activate runs on the inference thread and creates the GPU context. It is
+ * a no-op for CPU.
+ *
+ * Teardown mirrors activation: ffwd_worker_free releases the GPU context from
+ * the inference thread, and ffwd_free releases the rest.
+ */
 
-/* Opaque inference handle; its layout is private to the linked backend. */
+/* Opaque inference handle; layout is private to the linked backend. */
 typedef struct embed ffwd_t;
 
 /* Backend tuning, parsed from the command line. A backend reads the fields it
@@ -220,22 +220,27 @@ FFWD_API int ffwd_l2_normalize(float *vec, int dim);
  */
 FFWD_API float ffwd_cosine_similarity(const float *a, const float *b, int dim);
 
-/* ========================================================================
- * Tokenization — text into the token ids a model expects
+/*
+ * Tokenization: text -> token ids the model expects.
  *
- * The tokenizer is backend-independent (text -> ids is identical on CPU or
- * GPU), so it is its own handle, separate from ffwd_t. ffwd_tok_open picks the
- * tokenizer by the files in model_dir (WordPiece vocab.txt, SentencePiece
- * .model, or byte-level vocab.json) and resolves the model's special-token ids.
- * ffwd_tokenize then applies that model's layout: BERT and XLM-R wrap the ids
- * with [CLS]..[SEP] (<s>..</s>), Qwen appends its terminal token.
- * ======================================================================== */
+ * Tokenization is backend-independent because text -> ids is the same on CPU
+ * and GPU, so it has its own handle, separate from ffwd_t.
+ *
+ * ffwd_tok_open selects the tokenizer from files in model_dir: WordPiece
+ * vocab.txt, SentencePiece .model, or byte-level vocab.json. It also resolves
+ * the model's special-token ids.
+ *
+ * ffwd_tokenize applies the model's token layout: BERT and XLM-R wrap ids with
+ * [CLS]..[SEP] (<s>..</s>), while Qwen appends its terminal token.
+ */
 
 /* Opaque tokenizer handle; owns the tokenizer and its resolved special tokens. */
 typedef struct ffwd_tok ffwd_tok_t;
 
-/* Late-interaction tokens: ids, plus the document positions to score. For a
- * query, keep is NULL (every position is kept) and n_keep == n_tokens. */
+/* Late-interaction tokens:
+ * token ids plus the document positions to score.
+ * For queries, keep is NULL because every position is kept, and
+ * n_keep == n_tokens. */
 typedef struct {
     int *ids;
     int n_tokens;

@@ -4,7 +4,7 @@
 /* Shared harness for the ffwd-server unit tests. TEST_ASSERT records failures
  * (rather than aborting) so a single run reports every failure, not just the
  * first. Each test file includes this, runs its checks, and ends main with
- * `return TEST_REPORT("label");`, which prints a summary and yields the exit
+ * return TEST_REPORT("label");, which prints a summary and yields the exit
  * code (0 when clean, 1 otherwise). */
 
 #include <stdio.h>

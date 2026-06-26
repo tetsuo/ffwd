@@ -1,5 +1,5 @@
 /*
- * bpe.h - Qwen2/Qwen3 BPE tokenizer (GPT-2 byte-level)
+ * Qwen2/Qwen3 BPE tokenizer (GPT-2 byte-level).
  *
  * Supports:
  *  - decode token ID   -> UTF-8 text

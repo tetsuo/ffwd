@@ -1,10 +1,14 @@
 /*
- * tokenize.c - model-aware tokenization: text -> the token ids a model expects.
+ * Model-aware tokenization: text -> token ids the model expects.
  *
- * Backend-independent, so this is its own handle (ffwd_tok_t), not part of the
- * per-backend ffwd_t. ffwd_tok_open picks the tokenizer by the files present
- * and resolves the model's special-token ids; ffwd_tokenize applies that
- * model's layout (BERT/XLM-R [CLS]..[SEP], Qwen appended terminal token).
+ * Backend-independent, so this uses its own handle, ffwd_tok_t, instead of the
+ * per-backend ffwd_t.
+ *
+ * ffwd_tok_open selects the tokenizer from the files present and resolves the
+ * model's special-token ids.
+ *
+ * ffwd_tokenize applies the model's token layout: BERT/XLM-R [CLS]..[SEP], or
+ * Qwen appended terminal token.
  */
 
 #include "ffwd.h"

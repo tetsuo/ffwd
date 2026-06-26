@@ -1,3 +1,16 @@
+/* HTTP/1.1 connection lifecycle, header parsing, and response framing.
+ *
+ *  - One refcounted client per connection.
+ *  - The event loop holds a reference while the socket is open; the worker thread
+ *    holds one while a job from that connection is in flight.
+ *  - If a request completes after the peer disconnects, the client is still freed
+ *    safely.
+ *  - read_cb accumulates bytes until a full request is framed, then hands it to
+ *    dispatch_request in server.c.
+ *  - write_cb drains the response, then either closes the connection or arms the
+ *    next pipelined request.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 
@@ -10,17 +23,6 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-/* ========================================================================
- * HTTP/1.1 connection lifecycle, header parsing, and response framing
- *
- * One client per connection, refcounted: the event loop holds a reference
- * while the socket is open and the worker thread holds one while a job derived
- * from the connection is in flight, so a request that completes after the peer
- * disconnects frees the client safely. read_cb accumulates bytes until a full
- * request is framed, then hands off to dispatch_request (server.c); write_cb
- * drains the response and either closes or arms the next pipelined request.
- * ======================================================================== */
 
 int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);

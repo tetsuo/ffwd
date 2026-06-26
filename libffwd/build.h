@@ -1,8 +1,12 @@
-/* ffwd_build.h - build identity and capability information for the ffwd tools
+/* Build identity and capability information.
  *
  * The real values come from the Makefile's VERSION_CFLAGS at compile time; the
- * fallbacks below apply when those flags are absent. Front-end only: the
- * inference library does not use these. */
+ * fallbacks below apply when those flags are absent. The core library doesn't use
+ * these; it's for frontends only.
+ */
+
+/* TODO: tools should not depend on the internal library. */
+
 #ifndef FFWD_BUILD_H
 #define FFWD_BUILD_H
 

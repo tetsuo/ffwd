@@ -1,5 +1,5 @@
-/* tests/test_bf16_model.c - F32 vs BF16 vs F16 loader/dispatch parity on a tiny
- * synthetic model. Hermetic: builds its own model dirs. Runs via `make test`.
+/* F32 vs BF16 vs F16 loader/dispatch parity on a tiny synthetic model.
+ * Hermetic: builds its own model dirs. Runs via make test.
  * F16 has no fused kernel: the loader widens it to F32 once at load, so an F16
  * copy must match the F32 copy as closely as the BF16 copy does. */
 

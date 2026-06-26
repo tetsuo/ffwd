@@ -4,10 +4,11 @@
 #include <stdint.h>
 #include <limits.h>
 
-/* Sequence-capacity growth policy for the forward-pass workspaces: for new
- * growth, never allocate fewer than the minimum, and round up to the
- * granularity so small length changes do not trigger a realloc on every call.
- * Existing larger capacity is preserved. */
+/* Sequence-capacity growth policy for the forward-pass workspaces:
+ * For new growth:
+ *  - never allocate less than the minimum required size.
+ *  - round up to the granularity so small length changes do not trigger a realloc on every call.
+ *  - keep existing capacity if it is already larger. */
 #define FFWD_MIN_WORKSPACE_SEQ_CAP     16
 #define FFWD_WORKSPACE_SEQ_GRANULARITY 16
 

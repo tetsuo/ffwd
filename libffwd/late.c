@@ -1,3 +1,16 @@
+/*
+ * Late-interaction model.
+ *
+ * A late-interaction model is a pooled base model plus a 1_Dense linear
+ * projection from hidden states to token vectors.
+ *
+ * Instead of pooling to one vector, it keeps one projected vector per kept token
+ * and scores query/doc pairs with MaxSim.
+ *
+ * Reuses the base model's packed forward pass and workspace. This layer only
+ * owns the projection, token-vector buffer, and scoring.
+ */
+
 #include "ffwd.h"
 #include "model_internal.h"
 #include "kernels.h"
@@ -7,17 +20,6 @@
 #include <string.h>
 #include <limits.h>
 #include <float.h>
-
-/* ========================================================================
- * Late-interaction model
- *
- * A late-interaction model is a pooled base model plus a 1_Dense linear
- * projection from hidden states to token vectors. Instead of pooling to one
- * vector, it keeps one projected vector per kept token and scores query/doc
- * pairs with MaxSim. It reuses the base model's packed forward pass and
- * workspace; only the projection, the token-vector buffer, and the scoring
- * live here.
- * ======================================================================== */
 
 struct ffwd_late_model {
     ffwd_model_t *base;
@@ -107,8 +109,9 @@ const ffwd_config_t *ffwd_late_model_config(const ffwd_late_model_t *model) {
 
 int ffwd_late_model_token_dim(const ffwd_late_model_t *model) { return model ? model->token_dim : 0; }
 
-/* Internal (internal.h): expose the base model and projection so GPU
- * backends can upload them to device without seeing struct ffwd_late_model. */
+/* Internal (internal.h):
+ * expose the base model and projection so GPU backends can upload them to the
+ * device without seeing struct ffwd_late_model. */
 ffwd_model_t *ffwd_late_model_base(const ffwd_late_model_t *model) {
     return model ? model->base : NULL;
 }

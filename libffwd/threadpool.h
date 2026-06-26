@@ -1,12 +1,14 @@
 #ifndef TP_THREADPOOL_H
 #define TP_THREADPOOL_H
 
-/* Persistent worker pool for the CPU math kernels: a fixed set of threads that
- * sleep until parallel_for() hands them a callback, plus the CPU-count helper
- * that sizes the pool (cgroup-quota aware). Separated from the math so the
- * kernels depend only on the parallel_for / tp_num_threads interface, not on
- * the pool's internals. kernels.h includes this, so kernel callers need no
- * extra include. */
+/* Persistent worker pool for CPU kernels.
+ * Uses a fixed thread set that sleeps until parallel_for() gives it a callback.
+ * Also provides the cgroup-quota-aware CPU-count helper used to size the pool.
+ *
+ * Kept separate from the kernels so they depend only on parallel_for and
+ * tp_num_threads, not pool internals.
+ *
+ * kernels.h includes this, so kernel callers need no extra include. */
 
 /* Worker callback: (thread index, total threads, user arg). */
 typedef void (*parallel_fn_t)(int tid, int n_threads, void *arg);

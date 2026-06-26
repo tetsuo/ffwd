@@ -1,7 +1,3 @@
-/*
- * attn.c - attention
- */
-
 #include "kernels.h"
 #include "impl.h"
 #include "threadpool.h"
@@ -25,9 +21,7 @@
 /* Packed block-diagonal attention: causal (Qwen) and bidirectional (BERT/GTE)
  * GQA, each with an online-softmax and a BLAS-GEMM path. */
 
-/* ========================================================================
- * Attention Operations
- * ======================================================================== */
+/* Attention operations */
 
 float dot_f32(const float *a, const float *b, int n) { return dot_f32_impl(a, b, n); }
 

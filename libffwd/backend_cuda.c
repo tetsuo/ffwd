@@ -1,7 +1,13 @@
-/* backend_cuda.c - NVIDIA GPU backend (CUDA), implements the engine API in ffwd.h.
- * Linked only into CUDA builds. The context is owned by the inference thread:
- * open records what to load, activate creates the context, worker_free destroys
- * it. CUDA encodes on the device and scores MaxSim on the host. */
+/* NVIDIA CUDA backend.
+ * Implements the API in ffwd.h and is linked only into CUDA builds.
+ *
+ * The context is owned by the inference thread:
+ * open records what to load, activate creates the context, and worker_free
+ * destroys it.
+ *
+ * CUDA encodes on the device and scores MaxSim on the host.
+ */
+
 #include "internal.h"
 #include "cuda.h"
 #include "platform.h"

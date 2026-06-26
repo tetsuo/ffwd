@@ -1,11 +1,11 @@
-/* bench/bench_model.c - end-to-end embedding throughput against real
- * weights, for regression tracking (kernels are covered by bench_kernels.c;
- * this catches slowdowns in the orchestration between them).
+/* End-to-end embedding throughput against real weights, for regression tracking.
  *
+ * Kernels are  covered by bench_kernels.c; this catches slowdowns in the orchestration
+ * between them:
  *   make bench-model MODEL_DIR=/path/to/pplx-embed-v1-0.6b
  *
- * Uses deterministic synthetic token ids, so only config.json and
- * model.safetensors are needed (no tokenizer). Single-threaded by default;
+ * Uses deterministic synthetic token ids, so only config.json and model.safetensors
+ * are needed (no tokenizer). Single-threaded by default;
  * --threads N opts into the pool.
  */
 

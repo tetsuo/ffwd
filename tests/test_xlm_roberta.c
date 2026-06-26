@@ -1,4 +1,4 @@
-/* tests/test_xlm_roberta.c - hermetic XLM-R/RoBERTa bridge checks. */
+/* Hermetic XLM-R/RoBERTa bridge checks. */
 
 #include "internal.h"
 #include "tiny_model.h"

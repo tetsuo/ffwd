@@ -1,5 +1,5 @@
 /*
- * sentencepiece.c - SentencePiece Unigram tokenizer.
+ * SentencePiece Unigram tokenizer.
  *
  * The implementation reads the small subset of ModelProto needed at runtime:
  * pieces, scores, piece types, trainer model_type, and normalizer options. The

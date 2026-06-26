@@ -1,5 +1,5 @@
 /*
- * neon.c - ARM NEON hot kernels
+ * ARM NEON hot kernels.
  */
 
 #include "impl.h"

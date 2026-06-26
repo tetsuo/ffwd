@@ -1,9 +1,10 @@
-/*
- * model_types.h - in-memory layout of a loaded model: the model and workspace
- * structs, the per-layer weight references, and the accessors that expose them
- * to the GPU backends. Shared by the CPU model code and the CUDA backend; not
- * part of the public ABI (ffwd.h). Companion to model_internal.h, which
- * declares the CPU model's private functions.
+/* In-memory layout of a loaded model: model/workspace structs, per-layer weight
+ * references, and accessors for GPU backends.
+ *
+ * Shared by CPU model code and the CUDA backend. Not part of the public ABI
+ * (ffwd.h).
+ *
+ * model_internal.h declares the CPU model's private functions.
  */
 
 #ifndef FFWD_MODEL_TYPES_H

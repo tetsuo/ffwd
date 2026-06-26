@@ -1,4 +1,4 @@
-/* gen_fixture.c - write a tiny model fixture to a directory.
+/* Write a tiny model fixture to a directory.
  *
  * Thin command-line front end over tests/model_fixture.h, so out-of-process
  * callers (shell scripts, Python) can materialize the same synthetic model the

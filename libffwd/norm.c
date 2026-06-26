@@ -1,5 +1,6 @@
 /*
- * norm.c - Normalization
+ * Normalization kernels: RMSNorm (Qwen) and LayerNorm (BERT), plus the
+ * per-head RMSNorm used for QK-norm.
  */
 
 #include "kernels.h"
@@ -21,12 +22,7 @@
 #    define M_PI 3.14159265358979323846
 #endif
 
-/* Normalization kernels: RMSNorm (Qwen) and LayerNorm (BERT), plus the
- * per-head RMSNorm used for QK-norm. */
-
-/* ========================================================================
- * Normalization
- * ======================================================================== */
+/* Normalization */
 
 /* Rows split across the pool only when the tensor is big enough to pay
  * for the dispatch. */

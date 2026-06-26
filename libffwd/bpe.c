@@ -8,9 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ========================================================================
- * GPT-2 Bytes-to-Unicode Mapping
- * ======================================================================== */
+/* GPT-2 bytes-to-unicode mapping */
 
 static int gpt2_byte_to_unicode[256];
 static int gpt2_unicode_to_byte[512]; /* codepoints up to ~384 */
@@ -124,9 +122,7 @@ static char *decode_gpt2_token(const char *token_str) {
     return (char *)bytes;
 }
 
-/* ========================================================================
- * String->int hash map (open addressing)
- * ======================================================================== */
+/* String->int hash map (open addressing) */
 
 typedef struct {
     char *key; /* NULL means empty slot */
@@ -252,9 +248,7 @@ static int map_get_pair(const str_int_entry_t *map, int cap, const char *a, cons
     return -1;
 }
 
-/* ========================================================================
- * BPE helpers
- * ======================================================================== */
+/* BPE helpers */
 
 static int utf8_char_len(unsigned char c) {
     if ((c & 0x80) == 0)
@@ -319,9 +313,7 @@ static char *str_concat2(const char *a, const char *b) {
     return r;
 }
 
-/* ========================================================================
- * Integer-pair BPE merges: (left_id, right_id) -> (rank, merged_id)
- * ======================================================================== */
+/* Integer-pair BPE merges: (left_id, right_id) -> (rank, merged_id) */
 
 typedef struct {
     uint64_t key; /* (left_id << 32) | right_id; UINT64_MAX = empty */
@@ -1253,11 +1245,14 @@ static int encode_bpe_word_into_slow(const tok_bpe_t *tok,
     return 0;
 }
 
-/* Integer-pair BPE merge: token ids in a doubly-linked array with cached
- * pair ranks; each merge updates only the two adjacent pairs. Falls back to
- * the string-based loop when the int tables are unavailable. Identical
- * output: initial ids are the byte-level single-char token ids and every
- * merge result is the vocab id of the concatenated pair. */
+/* Integer-pair BPE merge.
+ * Uses token ids in a doubly-linked array with cached pair ranks.
+ * Each merge updates only the two adjacent pairs.
+ *
+ * Falls back to the string-based loop when int tables are unavailable.
+ *
+ * Output is identical: initial ids are byte-level single-char token ids, and
+ * each merge result is the vocab id of the concatenated pair. */
 static int encode_bpe_word_into(const tok_bpe_t *tok,
                                 tok_bpe_workspace_t *ws,
                                 const char *mapped,
@@ -1650,9 +1645,7 @@ static int load_merges_map(tok_bpe_t *tok, const char *merges_path) {
     return 0;
 }
 
-/* ========================================================================
- * Public API
- * ======================================================================== */
+/* Public API */
 
 tok_bpe_t *tok_bpe_load(const char *vocab_json_path) {
     FILE *f = fopen(vocab_json_path, "rb");
@@ -1688,10 +1681,11 @@ tok_bpe_t *tok_bpe_load(const char *vocab_json_path) {
         return NULL;
     }
 
-    /* vocab.json is a flat { token: id } object. Walk it once for the max id to
-     * size the tables, then again to fill them. yyjson unescapes each key
-     * (including \uXXXX) to the same byte-level GPT-2 form the old scanner
-     * produced; decode_gpt2_token then maps that to the raw token text. */
+    /* vocab.json is a flat { token: id } object.
+     * Walk it once to find the max id and size the tables, then again to fill them.
+     * yyjson unescapes each key, including \uXXXX, to the same byte-level GPT-2 form
+     * the old scanner produced.
+     * decode_gpt2_token then maps that to the raw token text. */
     int max_id = 0;
     size_t idx, n;
     yyjson_val *key, *val;

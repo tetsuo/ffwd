@@ -3,9 +3,9 @@
 
 #include <stddef.h>
 
-/* Growable, always-NUL-terminated byte buffer used to build HTTP responses and
- * JSON bodies. Growth is die-on-OOM (see server_util.h), so the mutators never
- * fail; callers do not check return values. */
+/* Growable, always-NUL-terminated byte buffer for HTTP responses and JSON bodies.
+ * Growth is die-on-OOM; see server_util.h.
+ * Mutators never fail, so callers do not check return values. */
 
 typedef struct {
     char *ptr;

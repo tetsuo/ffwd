@@ -1,9 +1,3 @@
-/*
- * internal.h - non-exported, in-tree API shared by the frontends,
- * backends, tests, and benchmarks. The public ABI is ffwd.h; none of these
- * symbols carry FFWD_API visibility or appear in the export maps.
- */
-
 #ifndef FFWD_INTERNAL_H
 #define FFWD_INTERNAL_H
 
@@ -17,7 +11,8 @@ typedef struct ffwd_workspace ffwd_workspace_t;
 typedef struct ffwd_late_model ffwd_late_model_t;
 typedef struct ffwd_late_workspace ffwd_late_workspace_t;
 
-/* Backend-specific help text used by the in-tree frontends. */
+/* Help text used by the frontends. */
+/* TODO: tools should not depend on the internal API */
 void ffwd_cli_help(FILE *f);
 void ffwd_server_help(FILE *f);
 
@@ -91,7 +86,7 @@ int ffwd_model_encode_spans_batch(const ffwd_model_t *model,
 
 /*
  * Late-interaction CPU model API. The public engine path exposes reranking via
- * ffwd_rerank(); these entry points are for in-tree tests/backends only.
+ * ffwd_rerank(); these entry points are for tests/backends only.
  */
 ffwd_late_model_t *ffwd_late_model_load(const char *model_dir);
 void ffwd_late_model_free(ffwd_late_model_t *model);

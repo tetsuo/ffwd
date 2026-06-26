@@ -1,3 +1,15 @@
+/* Request validation and error bodies.
+ *
+ * This code builds two JSON error shapes:
+ *  - OpenAI-style {"error":{message,type}} for transport/auth failures, via
+ *    append_json_error, json_error_body, and job_set_error.
+ *  - Perplexity-style {"detail":[...]} 422 responses for field validation, built
+ *    from ve_add entries.
+ *
+ * parse_* and *_from_root helpers read and validate the request object.
+ * append_json_string escapes a value for use in a response.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 
@@ -5,16 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ========================================================================
- * Request validation and error bodies
- *
- * Two JSON shapes are produced here: the OpenAI-style {"error":{message,type}}
- * body (append_json_error / json_error_body / job_set_error) for transport and
- * auth failures, and the Perplexity-style {"detail":[...]} 422 body built from
- * ve_add entries for field validation. The parse_* / *_from_root helpers read
- * and validate the request object; append_json_string escapes a value for
- * inclusion in a response. */
 
 static void append_json_error(sbuf *b, const char *message, const char *type) {
     sbuf_puts(b, "{\"error\":{\"message\":");
@@ -182,7 +184,7 @@ const char *encoding_from_root(yyjson_val *root, yyjson_mut_doc *detail, embeddi
     return v;
 }
 
-/* Parse the `text_type` hint. Returns 1 when the model's query instruction
+/* Parse the text_type hint. Returns 1 when the model's query instruction
  * should be prepended, 0 otherwise (document / absent). Models without a
  * published query instruction reject the field. */
 int text_type_is_query(yyjson_val *root, yyjson_mut_doc *detail, const char *query_instruct) {

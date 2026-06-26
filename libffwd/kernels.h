@@ -1,5 +1,5 @@
 /*
- * kernels.h - tkern public API: transformer inference kernels (CPU, float32)
+ * Transformer inference kernels (CPU, float32).
  *
  * Low-level math operations. All operate on float32 tensors in row-major order.
  */
@@ -10,15 +10,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ========================================================================
- * Basic Operations
- * ======================================================================== */
+/* Basic operations */
 
 void add_inplace(float *a, const float *b, int n);
 
-/* ========================================================================
- * Matrix Operations
- * ======================================================================== */
+/* Matrix operations */
 
 /* C = A @ B^T: A[M,K], B[N,K], C[M,N] */
 void matmul_t(float *C, const float *A, const float *B, int M, int K, int N);
@@ -62,9 +58,7 @@ void linear_nobias_bf16_qkv(float *q,
 /* Dot product using the best available local SIMD implementation. */
 float dot_f32(const float *a, const float *b, int n);
 
-/* ========================================================================
- * Normalization
- * ======================================================================== */
+/* Normalization */
 
 /* RMS Normalization: out = x / rms(x) * weight */
 void rms_norm(float *out, const float *x, const float *weight, int seq_len, int hidden, float eps);
@@ -75,9 +69,10 @@ void rms_norm(float *out, const float *x, const float *weight, int seq_len, int 
 void rms_norm_per_head(
     float *x, const float *weight, int seq_len, int n_heads, int head_dim, float eps);
 
-/* Layer Normalization (BERT family): out = gamma * (x - mean) / sqrt(var + eps)
- * + beta, with mean and biased (population) variance over the hidden axis per
- * row. Unlike RMSNorm this subtracts the mean and adds a bias. */
+/* Layer normalization for BERT-family models:
+ * out = gamma * (x - mean) / sqrt(var + eps) + beta.
+ * Mean and biased/population variance are computed over the hidden axis per row.
+ * Unlike RMSNorm, this subtracts the mean and adds a bias. */
 void layer_norm(float *out,
                 const float *x,
                 const float *gamma,
@@ -86,25 +81,21 @@ void layer_norm(float *out,
                 int hidden,
                 float eps);
 
-/* ========================================================================
- * Activation Functions
- * ======================================================================== */
+/* Activation functions */
 
 void softmax(float *x, int rows, int cols);
 /* gate = SiLU(gate) * up */
 void silu_mul_inplace(float *gate, const float *up, int n);
 
-/* Exact (erf) GeLU in place: x = 0.5 * x * (1 + erf(x / sqrt(2))). This is the
- * "gelu" activation HF BERT/BGE/MiniLM use, not the tanh approximation. */
+/* Exact (erf) GeLU in place: x = 0.5 * x * (1 + erf(x / sqrt(2))).
+ * This is the "gelu" activation HF BERT/BGE/MiniLM use, not the tanh approximation. */
 void gelu_inplace(float *x, int n);
 
 /* Tanh-approximation GeLU in place (HF gelu_new / gelu_pytorch_tanh):
  * x = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). */
 void gelu_tanh_inplace(float *x, int n);
 
-/* ========================================================================
- * Attention Operations
- * ======================================================================== */
+/* Attention operations */
 
 /*
  * Bidirectional GQA attention over a packed/ragged batch.
@@ -169,9 +160,7 @@ void causal_gqa_attention_packed_with_scratch(float *out,
                                               float *scratch,
                                               size_t scratch_bytes);
 
-/* ========================================================================
- * Position Embeddings
- * ======================================================================== */
+/* Position embeddings */
 
 /*
  * NeoX-style RoPE: compute cos/sin for positions.

@@ -1,6 +1,4 @@
-/*
- * act.c - activations
- */
+/* Activation kernels: softmax, SiLU-gated multiply, and the erf and tanh GeLU variants. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -28,13 +26,6 @@
 #ifndef M_PI
 #    define M_PI 3.14159265358979323846
 #endif
-
-/* Activation kernels: softmax, SiLU-gated multiply, and the erf and tanh GeLU
- * variants. */
-
-/* ========================================================================
- * Activation Functions
- * ======================================================================== */
 
 void silu_mul_inplace(float *gate, const float *up, int n) {
 #if defined(__APPLE__) && defined(USE_BLAS)

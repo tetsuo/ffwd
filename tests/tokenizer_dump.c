@@ -1,9 +1,14 @@
-/* Parity driver for the BPE tokenizer. Loads vocab.json (merges.txt is read
- * from the same directory), encodes each argument through the three encode
- * entry points (and cross-checks they agree), then prints "<count> <id> <id>
- * ..." per line. check_tokenizer_parity.py builds this with
- * `make parity-tokenizer-driver` and compares the ids against the stored
- * reference vectors in tests/test-vectors/bpe/. Links libtok. */
+/* BPE tokenizer parity driver.
+ * Loads vocab.json; merges.txt is read from the same directory.
+ * Encodes each argument through the three encode entry points and checks that
+ * they agree.
+ *
+ * Prints one line per argument: "<count> <id> <id> ...".
+ *
+ * check_tokenizer_parity.py builds this with `make parity-tokenizer-driver` and
+ * compares ids against reference vectors in tests/test-vectors/bpe/.
+ */
+
 #include "bpe.h"
 
 #include <stdio.h>

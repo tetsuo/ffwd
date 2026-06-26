@@ -1,5 +1,5 @@
 /*
- * generic.c - architecture-generic hot kernels / non-SIMD fallback
+ * Architecture-generic hot kernels / non-SIMD fallback.
  */
 
 #include "impl.h"

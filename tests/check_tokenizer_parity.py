@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Check the C BPE tokenizer against stored reference vectors.
+"""Check the BPE tokenizer against stored reference vectors.
 
 The reference ids live in tests/test-vectors/bpe/expected.json, generated from
-the Qwen tokenizer by devtools/gen_test_vectors.py. This builds the C BPE driver
-(tests/tokenizer_dump), runs it against the checked-in vocab.json + merges.txt,
-and compares the ids exactly. It imports no transformers and downloads no model,
-so it is hermetic and fast.
+the Qwen tokenizer by devtools/gen_test_vectors.py.
+
+This builds the C BPE driver (tests/tokenizer_dump), runs it against the checked-in
+vocab.json + merges.txt, and compares the ids exactly.
 
   tests/check_tokenizer_parity.py
   tests/check_tokenizer_parity.py --cc clang

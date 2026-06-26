@@ -1,21 +1,24 @@
 /*
- * tok_wp_tokenizer.c - BERT-family WordPiece tokenizer.
+ * BERT-family WordPiece tokenizer.
  *
- * Pipeline (matching transformers' BertTokenizer):
+ * Pipeline matching transformers' BertTokenizer:
  *   BasicTokenizer: clean control/whitespace -> space CJK ideographs ->
- *     whitespace split -> (lowercase + strip accents) -> split on punctuation
- *   WordPiece: greedy longest-match-first against vocab.txt, continuation
- *     pieces marked "##", whole token -> [UNK] when any piece fails to match.
+ *     whitespace split -> lowercase + strip accents, if enabled ->
+ *     split on punctuation.
+ *   WordPiece: greedy longest-match-first against vocab.txt, with continuation
+ *     pieces marked "##". If any piece fails, the whole token becomes [UNK].
  *
- * Unicode handling is full and exact against transformers, driven by generated
- * tables (tok_wp_unicode.h): punctuation and control by Unicode category,
- * whitespace by the complete Zs set, the CJK split by the BERT ideograph ranges,
- * and the do_lower_case fold by a lowercase+NFD+strip-marks table (with Hangul
- * decomposed by formula). Cased and uncased multilingual encoders (e.g.
- * bert-base-multilingual-cased / -uncased) match Hugging Face exactly, including
- * Greek, Cyrillic, Vietnamese and Korean. The fold is per-codepoint, matching
- * transformers, which lowercases character by character (no context-sensitive
- * Greek final sigma).
+ * Unicode handling fully matches transformers using generated tables
+ * (unicode.h): Unicode category for punctuation/control, full Zs set for
+ * whitespace, BERT ideograph ranges for CJK splitting, and a lowercase + NFD +
+ * strip-marks table for do_lower_case, with Hangul decomposed by formula.
+ *
+ * Cased and uncased multilingual encoders, such as
+ * bert-base-multilingual-cased / -uncased, match Hugging Face exactly,
+ * including Greek, Cyrillic, Vietnamese, and Korean.
+ *
+ * Folding is per-codepoint, matching transformers, which lowercases one
+ * character at a time, with no context-sensitive Greek final sigma.
  */
 
 #include "wordpiece.h"
@@ -27,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ===================== string -> int open-addressing map ===================== */
+/* string -> int open-addressing map */
 
 typedef struct {
     const char *key; /* points into tok->id_to_token; not owned */
@@ -55,7 +58,7 @@ static void map_put(wp_entry_t *map, int cap, const char *key, int val) {
     int pos = (int)(fnv1a_hash(key) & mask);
     while (map[pos].key) {
         if (!strcmp(map[pos].key, key)) {
-            map[pos].val = val; /* keep the first (lowest) id, like a dict insert */
+            map[pos].val = val; /* keep the first/lowest id, like a dict insert */
             return;
         }
         pos = (int)((pos + 1) & (int)mask);
@@ -77,10 +80,10 @@ static int map_get(const wp_entry_t *map, int cap, const char *key) {
     return -1;
 }
 
-/* ============================== UTF-8 helpers ================================ */
+/* UTF-8 helpers */
 
-/* Decode one codepoint. Returns bytes consumed (>=1); on a malformed lead byte
- * emits U+FFFD and consumes one byte so iteration always advances. */
+/* Decode one codepoint. Returns bytes consumed (>=1).
+ * On malformed lead byte, emits U+FFFD and consumes one byte so iteration advances. */
 static int utf8_decode(const unsigned char *p, const unsigned char *end, uint32_t *cp) {
     unsigned char c = p[0];
     if (c < 0x80) {
@@ -140,7 +143,7 @@ static int utf8_encode(uint32_t cp, char out[4]) {
     return 4;
 }
 
-/* ========================== Unicode classification ========================== */
+/* Unicode classification */
 
 static int wp_is_whitespace(uint32_t cp) {
     if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r')
@@ -164,9 +167,9 @@ static int wp_in_ranges(uint32_t cp, const wp_range_t *r, int n) {
     return 0;
 }
 
-/* transformers' _is_control: tab/newline/carriage-return are whitespace, not
- * control (they fall through to wp_is_whitespace); everything else is Unicode
- * category Cc, Cf, or Co. */
+/* Match transformers' _is_control:
+ * tab/newline/carriage-return are whitespace, not control, and fall through to
+ * wp_is_whitespace; everything else is Unicode category Cc, Cf, or Co. */
 static int wp_is_control(uint32_t cp) {
     if (cp == '\t' || cp == '\n' || cp == '\r')
         return 0;
@@ -184,10 +187,10 @@ static int wp_is_cjk(uint32_t cp) {
            (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x2F800 && cp <= 0x2FA1F);
 }
 
-/* Hangul syllable decomposition constants (the standard algorithm). Hangul
- * syllables are not cased, so their do_lower_case fold is the canonical NFD into
- * leading (L), vowel (V), and optional trailing (T) jamo - none combining marks
- * - which keeps them out of the generated WP_FOLD table. */
+/* Hangul syllable decomposition constants for the standard algorithm.
+ * Hangul syllables are not cased, so their do_lower_case fold is canonical NFD:
+ * leading (L), vowel (V), and optional trailing (T) jamo.
+ * None are combining marks, so they stay out of the generated WP_FOLD table. */
 enum {
     WP_HANGUL_S = 0xAC00,
     WP_HANGUL_L = 0x1100,
@@ -198,10 +201,12 @@ enum {
     WP_HANGUL_SCOUNT = 11172
 };
 
-/* Apply the do_lower_case fold (Python str.lower then NFD then drop combining
- * marks) to one codepoint, writing 0..3 output codepoints to out and the count
- * to *n_out. 0 outputs means the codepoint is a dropped mark. Hangul decomposes
- * by formula; everything else is the generated WP_FOLD table or an identity. */
+/* Apply do_lower_case to one codepoint:
+ * lowercase using Python-compatible str.lower behavior, then NFD,
+ * then drop combining marks.
+ * Writes 0..3 output codepoints to out and the count to *n_out.
+ * 0 outputs means the codepoint was a dropped mark.
+ * Hangul decomposes by formula; all else uses WP_FOLD or identity. */
 static void wp_fold(uint32_t cp, uint32_t out[3], int *n_out) {
     if (cp >= WP_HANGUL_S && cp < WP_HANGUL_S + WP_HANGUL_SCOUNT) {
         int s = (int)(cp - WP_HANGUL_S);
@@ -235,7 +240,7 @@ static void wp_fold(uint32_t cp, uint32_t out[3], int *n_out) {
     *n_out = 1;
 }
 
-/* =============================== workspace ================================== */
+/* workspace */
 
 struct tok_wp_workspace {
     uint32_t *cps; /* cleaned + CJK-spaced codepoints of the whole input */
@@ -310,7 +315,7 @@ void tok_wp_workspace_free(tok_wp_workspace_t *ws) {
     free(ws);
 }
 
-/* ============================== WordPiece core ============================== */
+/* WordPiece core */
 
 /* Append the WordPiece ids of one BasicTokenizer sub-word (codepoints
  * word[0..n)) to ws->ids[*n_out]. The whole sub-word maps to [UNK] when it is
@@ -381,8 +386,8 @@ tok_wp_subword(const tok_wp_t *tok, tok_wp_workspace_t *ws, const uint32_t *word
     return 0;
 }
 
-/* Run the full BasicTokenizer + WordPiece pipeline into ws->ids. Returns the
- * token count, or -1 on allocation failure. */
+/* Run the full BasicTokenizer + WordPiece pipeline into ws->ids.
+ * Returns the token count, or -1 on allocation failure. */
 static int tok_wp_run(const tok_wp_t *tok, tok_wp_workspace_t *ws, const char *text) {
     /* clean_text + tokenize_chinese_chars, in one pass over the input. */
     const unsigned char *p = (const unsigned char *)text;
@@ -460,7 +465,7 @@ static int tok_wp_run(const tok_wp_t *tok, tok_wp_workspace_t *ws, const char *t
     return n_out;
 }
 
-/* ================================ loading =================================== */
+/* loading */
 
 static char *read_file(const char *path, long *out_len) {
     FILE *f = fopen(path, "rb");
@@ -493,7 +498,7 @@ static char *read_file(const char *path, long *out_len) {
 }
 
 /* do_lower_case from config.json: default true (BERT uncased). A
- * lightweight scan is enough - we only need one boolean and avoid a JSON dep
+ * lightweight scan is enough; we only need one boolean and avoid a JSON dep
  * here, mirroring how the config layer reads small flags. */
 static int read_do_lower_case(const char *model_dir) {
     char path[2048];
@@ -595,7 +600,7 @@ tok_wp_t *tok_wp_load(const char *model_dir) {
     return tok;
 }
 
-/* ============================== public API ================================= */
+/* public API*/
 
 const char *tok_wp_decode(const tok_wp_t *tok, int id) {
     if (!tok || id < 0 || id >= tok->vocab_size)

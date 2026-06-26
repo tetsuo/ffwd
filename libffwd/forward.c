@@ -9,14 +9,12 @@
 #include <math.h>
 #include <limits.h>
 
-/* Below these packed-sequence lengths the fused BF16 row kernels beat widening
- * the weight to F32 and dispatching through BLAS; above them, widen once. */
+/* For packed sequences below these lengths, fused BF16 row kernels beat
+ * widening the weight to F32 and using BLAS. For longer packed sequences, widen once. */
 #define FFWD_BF16_QKV_FUSE_MAX_SEQ  16
 #define FFWD_BF16_PAIR_FUSE_MAX_SEQ 4
 
-/* ========================================================================
- * Linear projections (weight-dtype dispatch) and workspace scratch growth
- * ======================================================================== */
+/* Linear projections (weight-dtype dispatch) and workspace scratch growth */
 
 static void bf16_row_to_f32(float *dst, const uint16_t *src, int n) {
     for (int i = 0; i < n; i++)
@@ -123,14 +121,14 @@ static void linear_pair_weight(ffwd_workspace_t *ws,
     linear_nobias_weight(ws, b, x, wb, seq_len, in_dim, b_dim);
 }
 
-/* ========================================================================
- * Packed forward pass
+/* Packed forward pass.
  *
- * The workspace-growth helpers these call (ensure_buffers, ensure_rope_cache,
- * ensure_attention_scores, ensure_offsets) live in model_blas.c beside the
- * workspace lifecycle and ffwd_workspace_nbytes, whose size accounting mirrors
- * them.
- * ======================================================================== */
+ * Workspace-growth helpers called here live in model_blas.c beside the
+ * workspace lifecycle and ffwd_workspace_nbytes:
+ * ensure_buffers, ensure_rope_cache, ensure_attention_scores, ensure_offsets.
+ *
+ * ffwd_workspace_nbytes mirrors their size accounting.
+ */
 
 static ffwd_attention_fn attention_for_config(const ffwd_config_t *cfg) {
     return cfg->attention_mode == FFWD_ATTENTION_CAUSAL
@@ -298,13 +296,21 @@ int forward_packed_inplace(const ffwd_model_t *model,
                                         0, model->config.n_layers, apply_final_norm);
 }
 
-/* BERT-family forward: token + learned-position + token-type embeddings and an
- * embedding LayerNorm, then post-norm encoder layers (bias on every projection,
- * GeLU feed-forward, no RoPE, no per-head norm). Bidirectional attention is
- * block-diagonal over the packed batch, so each sequence's positions restart at
- * cfg->position_id_offset (0 for BERT, pad_id + 1 for RoBERTa/XLM-R). Leaves the
- * final hidden states in ws->x; pooling reads them as-is because the last
- * layer's LayerNorm is already the model's final normalization. */
+/* BERT-family forward pass.
+ *
+ * Uses token, learned-position, and token-type embeddings, then embedding
+ * LayerNorm.
+ *
+ * Encoder layers are post-norm, with bias on every projection, GeLU
+ * feed-forward, no RoPE, and no per-head norm.
+ *
+ * Bidirectional attention is block-diagonal over the packed batch. Each
+ * sequence's positions restart at cfg->position_id_offset: 0 for BERT, or
+ * pad_id + 1 for RoBERTa/XLM-R.
+ *
+ * Leaves final hidden states in ws->x. Pooling reads them as-is because the last
+ * layer's LayerNorm is already the model's final normalization.
+ */
 static int forward_packed_bert(const ffwd_model_t *model,
                                ffwd_workspace_t *ws,
                                const ffwd_input_t *inputs,
@@ -405,8 +411,8 @@ static int pool_embeddings(const ffwd_model_t *model,
     const ffwd_config_t *cfg = &model->config;
     int hidden = cfg->hidden_size;
     float eps = cfg->rms_norm_eps;
-    /* Qwen pools pre-final-norm states and applies the final RMSNorm here; BERT
-     * pools already-normed states (no final norm), signalled by a NULL norm. */
+    /* Qwen pools pre-final-norm states, then applies final RMSNorm here.
+     * BERT pools already-normalized states, so a NULL norm means no final norm. */
     const float *norm_weight = model->weights.norm;
     const float *x = ws->x;
     if (hidden <= 0 || !x)
@@ -419,8 +425,7 @@ static int pool_embeddings(const ffwd_model_t *model,
         float *emb = out_embeddings + (size_t)b * hidden;
 
         if (cfg->pooling_mode == FFWD_POOL_LAST_TOKEN || cfg->pooling_mode == FFWD_POOL_CLS) {
-            /* Single-token pooling: CLS takes the first token, last-token the
-             * final one. */
+            /* Single-token pooling: CLS uses the first token; last-token uses the final token. */
             int idx = cfg->pooling_mode == FFWD_POOL_CLS ? start : end - 1;
             const float *row = x + (size_t)idx * hidden;
             if (norm_weight) {
@@ -460,9 +465,7 @@ static int pool_embeddings(const ffwd_model_t *model,
     return 0;
 }
 
-/* ========================================================================
- * Public forward/embed APIs
- * ======================================================================== */
+/* Forward/embed APIs */
 
 int ffwd_model_forward_into(const ffwd_model_t *model,
                             ffwd_workspace_t *ws,

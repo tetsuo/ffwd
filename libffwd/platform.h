@@ -1,9 +1,11 @@
-/* platform.h - compile-time backend selection.
+/* Compile-time backend selection.
  *
  * The build passes -DUSE_GPU for a GPU build. This header maps that flag and the
- * host platform to a concrete backend: Apple Silicon uses MLX, any other GPU
- * uses CUDA, and a non-GPU build is CPU. Use USE_GPU for the CPU/GPU split;
- * USE_MLX and USE_CUDA only where a specific accelerator API is called. */
+ * host platform to a backend:
+ * Use USE_GPU for the CPU/GPU split; USE_MLX and USE_CUDA only where a specific
+ * accelerator API is called.
+ */
+
 #ifndef FFWD_PLATFORM_H
 #define FFWD_PLATFORM_H
 

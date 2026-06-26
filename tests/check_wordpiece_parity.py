@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Check the C WordPiece tokenizer against stored reference vectors.
+"""Check the WordPiece tokenizer against stored reference vectors.
 
 The reference ids live in tests/test-vectors/wordpiece/expected.json, generated
-from the slow BertTokenizer by devtools/gen_test_vectors.py. This builds the C
-WordPiece driver (tests/wordpiece_dump), runs it against the checked-in
-vocab.txt + tokenizer_config.json, and compares the ids exactly. It imports no
-transformers and downloads no model, so it is hermetic and fast.
+from the slow BertTokenizer by devtools/gen_test_vectors.py.
+
+This builds the C WordPiece driver (tests/wordpiece_dump), runs it against the checked-in
+vocab.txt + tokenizer_config.json, and compares the ids exactly.
 
   tests/check_wordpiece_parity.py
   tests/check_wordpiece_parity.py --cc clang

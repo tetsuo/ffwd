@@ -9,15 +9,15 @@ SHARED := $(OUTDIR)/lib$(LIB).$(SHARED_EXT)
 CFLAGS += -std=c11 -pthread $(BACKEND_CFLAGS)
 CPPFLAGS += -I.
 SHARED_FLAGS += -pthread
+
 # Restrict the shared library's exported symbols to the public ABI.
 SHARED_LDFLAGS += $(EXPORT_FLAGS)
 
-# Tokenizer, config, safetensors reader, and L2/cosine helpers: every backend.
+# Tokenizer, config, safetensors reader, and vector helpers.
 COMMON_SRCS := config.c vec.c tokenize.c bpe.c sentencepiece.c wordpiece.c safetensors.c
 
-# CPU math kernels and SIMD dispatch. generic.c is always built; avx.c and
-# neon.c each guard their entire body by arch (__AVX2__ / __ARM_NEON), so the
-# off-target file compiles to an empty translation unit.
+# CPU kernels and SIMD dispatch.
+# generic.c is always built; avx.c and neon.c each guarded by arch (__AVX2__ / __ARM_NEON).
 KERNEL_SRCS := act.c gemm.c norm.c rope.c attn.c threadpool.c generic.c avx.c neon.c
 
 BLAS_SRCS := backend_blas.c model.c model_blas.c forward.c late.c late_blas.c alloc.c \
@@ -45,22 +45,17 @@ all: $(STATIC) $(SHARED)
 
 $(eval $(call static_archive,$(STATIC),$(OBJS)))
 $(eval $(call shared_library,$(SHARED),$(OBJS),,$(BACKEND_LDFLAGS) $(YYJSON_LDFLAGS) -lm))
-# yyjson is vendored under deps/yyjson; build its archive before linking the
-# shared library (the static libffwd.a does not embed it — consumers link both).
+
 YYJSON := $(ROOT)/deps/yyjson
 $(OUTDIR)/libyyjson.a:
 	$(MAKE) -C $(YYJSON)
 $(SHARED): $(OUTDIR)/libyyjson.a
-# The export map is generated from the public ABI (the FFWD_API declarations in
-# ffwd.h) instead of being committed, so it cannot drift from the header. It is
-# regenerated when the header or the generator changes, and the shared library
-# relinks when it does.
+
+# The export map is auto-generated from the FFWD_API declarations in ffwd.h.
 $(EXPORT_FILE): ffwd.h $(ROOT)/devtools/gen_exports.py
 	python3 $(ROOT)/devtools/gen_exports.py --outdir $(ROOT)
 $(SHARED): $(EXPORT_FILE)
 
-# Removes only this MODE/BACKEND's objects and artifacts; the root `make clean`
-# removes the whole build/ tree.
 clean:
 	$(RM) -r $(OBJDIR) $(STATIC) $(SHARED) $(SHARED).dSYM
 

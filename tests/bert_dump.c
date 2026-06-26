@@ -1,10 +1,15 @@
-/* Parity driver for the BERT-family forward. Loads a sentence-transformers
- * checkpoint, wraps each argument with [CLS]/[SEP], runs the BERT forward
- * (mean pool + L2 normalize inside ffwd_model_encode_into), and prints
- * "<dim> <f> <f> ..." per line. check_bert_parity.py builds this with
- * `make parity-bert-driver` and compares against SentenceTransformer.encode.
- * This one needs the real model weights, so it stays a manual --model-dir
- * check rather than a hermetic stored-vector test. */
+/* Parity driver for the BERT-family forward.
+ *
+ * Loads a sentence-transformers checkpoint, wraps each argument with [CLS]/[SEP],
+ * runs the BERT forward (mean pool + L2 normalize inside ffwd_model_encode_into),
+ * and prints "<dim> <f> <f> ..." per line.
+ *
+ * check_bert_parity.py builds this with `make parity-bert-driver` and compares against
+ * SentenceTransformer.encode.
+ *
+ * Needs the real model weights to run.
+ */
+
 #include "internal.h"
 #include "wordpiece.h"
 

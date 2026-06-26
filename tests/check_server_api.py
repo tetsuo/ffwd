@@ -64,9 +64,7 @@ def expect(cond: bool, what: str) -> None:
         fail(what)
 
 
-# --------------------------------------------------------------------------
 # Build + fixture + launch
-# --------------------------------------------------------------------------
 
 def ensure_tool(path: str, make_dir: str, make_target: str) -> None:
     """Build a Make target if its output binary is missing."""

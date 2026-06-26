@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Each backend is its own binary now: `make <backend>` builds the CLI into
+# Each backend is its own binary now: make <backend> builds the CLI into
 # build/release/<dir>/ffwd-cli (and refreshes the ./ffwd-cli root symlink).
 BUILD_DIR = {"cpu": "blas", "mlx": "mlx", "cuda": "cuda"}
 

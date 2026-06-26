@@ -1,9 +1,6 @@
 #ifndef FFWD_SERVER_H
 #define FFWD_SERVER_H
 
-/* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying FFWD_API are exported
- * from the shared library; everything else stays internal. */
 #ifndef FFWD_API
 #    if defined(__GNUC__)
 #        define FFWD_API __attribute__((visibility("default")))

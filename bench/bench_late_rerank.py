@@ -2,7 +2,7 @@
 """Benchmark late-interaction MaxSim reranking shapes.
 
 Builds the C bench (bench/bench_late_rerank.c) via the Makefile and runs it
-against a late model directory (e.g. pplx-embed-v1-late-0.6b). python3 only.
+against a late model directory (e.g. pplx-embed-v1-late-0.6b).
 
   bench/bench_late_rerank.py --model-dir DIR
 """

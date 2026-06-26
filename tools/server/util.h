@@ -5,10 +5,13 @@
 #include <stddef.h>
 
 /* Die-on-OOM allocation, monotonic clocks, and timestamped logging shared by
- * the ffwd-server translation units. The x* allocators abort the process on
- * failure rather than returning NULL, so callers never null-check them; the
- * attributes below carry that contract across translation-unit boundaries so
- * the static analyzer does not flag the (correctly) unchecked uses. */
+ * ffwd-server translation units.
+ *
+ * x* allocators abort on failure instead of returning NULL, so callers never
+ * null-check them.
+ *
+ * The attributes below carry that contract across translation-unit boundaries,
+ * preventing static-analyzer warnings for correctly unchecked uses. */
 
 #if defined(__GNUC__) || defined(__clang__)
 #    define SERVER_NORETURN        __attribute__((noreturn))

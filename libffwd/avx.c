@@ -1,12 +1,14 @@
-/*
- * avx.c - x86 SIMD hot kernels (AVX2+FMA, with AVX-512 when available)
+/* x86 SIMD hot kernels: AVX2+FMA, plus AVX-512 when available.
  *
- * bf16 to f32 conversion: load 16 uint16, zero-extend to 32-bit, shift left 16.
- * Uses AVX-512F+BW for 16-wide bf16 matvec (dominant for seq_len==1), and
- * AVX2+FMA / AVX-512F for f32 attention helpers (which operate on cache-resident data).
+ * BF16 -> F32 conversion:
+ * load 16 uint16 values, zero-extend to 32-bit, then shift left 16.
  *
- * The bf16 matvec processes 4 output rows simultaneously to reduce instruction
- * overhead and improve out-of-order execution on memory-bound workloads.
+ * Uses AVX-512F+BW for 16-wide BF16 matvec, dominant when seq_len == 1.
+ * Uses AVX2+FMA / AVX-512F for F32 attention helpers, which operate on
+ * cache-resident data.
+ *
+ * BF16 matvec processes 4 output rows at once to reduce instruction overhead
+ * and improve out-of-order execution on memory-bound workloads.
  */
 
 #include "impl.h"
@@ -16,9 +18,7 @@
 #    include <immintrin.h>
 #    include <string.h>
 
-/* =====================================================================
- * BF16 matvec - uses AVX-512F+BW when available, AVX2 fallback otherwise
- * ===================================================================== */
+/* BF16 matvec: uses AVX-512F+BW when available, AVX2 fallback otherwise */
 
 #    if defined(__AVX512F__) && defined(__AVX512BW__)
 

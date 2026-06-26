@@ -10,11 +10,14 @@ BACKEND ?= blas
 MODE    ?= release
 prefix  ?= /usr/local
 
-# Per-configuration build tree under the repo root. Each MODE/BACKEND pair gets
-# its own objects and artifacts, so switching configs never reuses another's
-# output and needs no clean in between. A consumer sets ROOT (path to the repo
-# root) and COMPONENT (a unique name) before including this file; objects land in
-# $(OBJDIR), final artifacts in $(OUTDIR).
+# Per-configuration build tree under the repo root.
+# Each MODE/BACKEND pair gets its own objects and artifacts, so switching configs
+# never reuses another config's output and needs no clean.
+#
+# A consumer sets ROOT, the repo root path, and COMPONENT, a unique name, before
+# including this file.
+#
+# Objects go in $(OBJDIR); final artifacts go in $(OUTDIR).
 ROOT      ?= .
 COMPONENT ?= misc
 BUILDREL  := build/$(MODE)/$(BACKEND)
@@ -34,8 +37,7 @@ ifeq ($(strip $(OPENBLAS_LDFLAGS)),)
     OPENBLAS_LDFLAGS = -lopenblas
 endif
 
-# yyjson is vendored under deps/yyjson and built into a per-config static archive
-# (deps/yyjson/Makefile), so there is no system or pkg-config dependency.
+# yyjson is vendored under deps/yyjson and built into a per-config static archive.
 # YYJSON_CFLAGS resolves <yyjson.h> to the vendored header; YYJSON_LDFLAGS names
 # the archive by full path (as the server links libae.a), which links the same
 # way on macOS and Linux. Consumers build it via $(MAKE) -C deps/yyjson.
@@ -45,20 +47,24 @@ YYJSON_LDFLAGS := $(OUTDIR)/libyyjson.a
 MLX_PREFIX  := $(shell brew --prefix mlx 2>/dev/null)
 MLXC_PREFIX := $(shell brew --prefix mlx-c 2>/dev/null)
 
-# Allow FP reassociation and contraction so reduction loops vectorize, but do
-# not assume finite math or approximate libm calls: full -ffast-math produced
-# NaN embeddings on GCC/OpenBLAS Linux builds (-ffinite-math-only and
-# -fapprox-func are the unsafe parts and stay off).
-# -fvisibility=hidden pairs with FFWD_API in the public headers: a new
-# public function without the annotation will be missing from the shared lib.
-# _DEFAULT_SOURCE exposes POSIX/BSD declarations (strdup, strndup, ...) under
-# -std=c11: strict C11 defines __STRICT_ANSI__, so glibc otherwise hides them,
-# and an implicit int return truncates the 64-bit pointer (crashes on Linux;
-# macOS declares them regardless, which hid this).
+# Allow FP reassociation and contraction so reduction loops vectorize, without
+# assuming finite math or approximate libm calls.
+#
+# Full -ffast-math produced NaN embeddings on GCC/OpenBLAS Linux builds.
+# The unsafe parts, -ffinite-math-only and -fapprox-func, stay off.
+#
+# -fvisibility=hidden pairs with FFWD_API in public headers. A new public
+# function without FFWD_API will be missing from the shared library.
+#
+# _DEFAULT_SOURCE exposes POSIX/BSD declarations such as strdup and strndup under
+# -std=c11. Strict C11 defines __STRICT_ANSI__, so glibc otherwise hides them.
+# An implicit int return then truncates the 64-bit pointer and crashes on Linux.
+# macOS declares them regardless, which hid this.
+#
 # -Werror=implicit-function-declaration turns a missing prototype into a build
-# failure instead of a buried -Wall warning: that is exactly how the strdup
-# truncation above slipped through (an implicit int return -> mangled pointer,
-# crashing only on Linux). It is a hard error in C23 anyway.
+# failure instead of a buried -Wall warning. That is how the strdup truncation
+# above slipped through: implicit int return -> mangled pointer -> Linux-only
+# crash. It is also a hard error in C23.
 CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -fPIC -fvisibility=hidden \
               -D_DEFAULT_SOURCE -Werror=implicit-function-declaration \
               -fno-math-errno -ffp-contract=fast -fno-trapping-math \
@@ -99,13 +105,14 @@ else
     HOST_BLAS_LDFLAGS = $(OPENBLAS_LDFLAGS)
 endif
 
-# Each backend defines only the flags its own compiled sources need.
-# blas: the CPU build; the kernel files call cblas, so USE_BLAS is on.
-# mlx: the Apple GPU build runs all math on the GPU and compiles no kernel
-#   files, so it defines neither USE_BLAS nor links Accelerate. USE_GPU selects
-#   MLX via platform.h.
-# cuda: the NVIDIA GPU build still compiles the CPU kernel files for host-side
-#   work, so it keeps USE_BLAS (OpenBLAS) alongside the CUDA libraries.
+# Each backend defines only the flags needed by its compiled sources.
+#
+# - blas: CPU build: Kernel files call cblas, so USE_BLAS is enabled.
+# - mlx: Apple Metal build: All math runs on the GPU and no kernel files are
+#        compiled, so it defines neither USE_BLAS nor links Accelerate.
+#        USE_GPU selects MLX through platform.h.
+# - cuda: NVIDIA CUDA build:  Still compiles CPU kernel files for host-side work,
+#         so it keeps USE_BLAS/OpenBLAS along with the CUDA libraries.
 BLAS_BACKEND_CFLAGS  = $(HOST_BLAS_CFLAGS)
 BLAS_BACKEND_LDFLAGS = $(HOST_BLAS_LDFLAGS)
 MLX_BACKEND_CFLAGS   = -DUSE_GPU -I$(MLXC_PREFIX)/include

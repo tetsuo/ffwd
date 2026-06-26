@@ -3,7 +3,9 @@
  * No external library is involved; it checks the C code against itself. With a
  * positive run count it also times the batched path. check_contextual_batch_parity.py
  * builds this with `make parity-context-driver` (or parity-context-driver-mlx)
- * and passes the model dir plus tolerances as positional arguments. */
+ * and passes the model dir plus tolerances as positional arguments.
+ */
+
 #include "internal.h"
 #ifdef CHECK_MLX
 #    include "mlx.h"

@@ -4,13 +4,20 @@
 
 usage: benchstat.py OLD.json NEW.json [--alpha 0.05] [--threshold 3.0]
 
-Per benchmark: median ns/op of both sample sets, the delta, and a
-Mann-Whitney U significance test. A delta only counts when it is BOTH
-significant at --alpha AND at least --threshold percent: back-to-back
-runs of an unchanged binary drift a couple of percent with machine state
-(thermals, core scheduling), so smaller shifts are below the
-reproducibility floor even when statistically clean. Everything else
-prints as "~" - treat it as noise, not improvement or regression.
+Per benchmark:
+median ns/op for both sample sets, the delta, and a Mann-Whitney U
+significance test.
+
+A delta counts only when it is both:
+- significant at --alpha
+- at least --threshold percent
+
+Back-to-back runs of an unchanged binary can drift a few percent with machine
+state, such as thermals and core scheduling. Smaller shifts are below the
+reproducibility floor even when statistically clean.
+
+Everything else prints as "~"; treat it as noise, not improvement or regression.
+
 Exits 1 if any benchmark regresses past both bars.
 """
 

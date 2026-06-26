@@ -1,7 +1,7 @@
-/* tests/test_workspace.c - model/workspace API lifecycle tests.
+/* Model/workspace API lifecycle tests.
  * Hermetic by default (synthesizes a tiny model + tokenizer fixture);
  * pass a MODEL_DIR to run the same checks against real weights, which is
- * what tests/integration/check_workspace_api.py does. Runs via `make test`. */
+ * what tests/integration/check_workspace_api.py does. Runs via make test. */
 
 #include "internal.h"
 #include "bpe.h"

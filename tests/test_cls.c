@@ -1,5 +1,6 @@
-/* tests/test_cls.c - hermetic CLS (first-token) pooling across the load path,
- * the encode path, and the public pooling API. */
+/* Hermetic CLS (first-token) pooling across the load path, the encode path, and the
+ * public pooling API.
+ */
 
 #include "internal.h"
 #include "tiny_model.h"

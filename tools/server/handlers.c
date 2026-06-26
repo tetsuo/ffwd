@@ -1,3 +1,17 @@
+/* Endpoint handlers: prepare, batch, execute, render.
+ *
+ * Each endpoint has one prepare_* function that validates request JSON and
+ * tokenizes inputs into a *_request.
+ *
+ * The worker in schedule.c groups compatible ready requests and calls the
+ * matching execute_*_request_list.
+ *
+ * execute_*_request_list runs the batched forward pass through model_ffwd_* and
+ * renders each response through encode.c.
+ *
+ * Rerank scores late-interaction token vectors with MaxSim.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 #include "ffwd.h"
@@ -6,16 +20,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ========================================================================
- * Endpoint handlers: prepare, batch, execute, render
- *
- * One prepare_* per endpoint validates the request JSON and tokenizes its
- * inputs into a *_request; the worker (schedule.c) groups compatible
- * ready requests and calls the matching execute_*_request_list, which runs the
- * batched forward pass through model_ffwd_* and renders each response via
- * encode.c. Rerank runs MaxSim over late-interaction token vectors.
- * ======================================================================== */
 
 int embedding_request_compatible(const embedding_request *a, const embedding_request *b) {
     return a->ready && b->ready && a->model == b->model && a->dims == b->dims &&
@@ -27,10 +31,11 @@ typedef struct {
     int output_index;
 } embedding_batch_item;
 
-/* Hand JSON serialization to the renderer thread only when another batch is
- * already queued, so the worker can start that GPU launch while these results
- * serialize. With nothing else queued the worker renders inline, which avoids a
- * thread hand-off that buys no overlap and adds latency to the reply. */
+/* Send JSON serialization to the renderer thread only when another batch is
+ * already queued, letting the worker start that GPU launch while these results
+ * serialize.
+ * If nothing else is queued, the worker renders inline to avoid a thread handoff
+ * that adds reply latency without buying overlap. */
 static int render_should_defer(http_server *s) { return worker_has_pending_jobs(s); }
 
 static int embedding_batch_item_cmp(const void *a, const void *b) {
@@ -513,9 +518,9 @@ void prepare_contextual_request(job *j,
                 for (int k = 0; k < n_chunks; k++) {
                     doc->spans[k].start = pos;
                     doc->spans[k].n_tokens = chunk_tokens[k].n_tokens;
-                    /* n_tokens > 0 implies ids != NULL (tokenize_one sets both
-                     * together), and the guard avoids a memcpy(dst, NULL, 0) for
-                     * an empty chunk that the static analyzer reports as UB. */
+                    /* n_tokens > 0 means ids != NULL because tokenize_one sets both together.
+                     * The guard also avoids memcpy(dst, NULL, 0) for empty chunks, which static
+                     * analyzers report as UB. */
                     if (chunk_tokens[k].n_tokens > 0)
                         memcpy(doc->ids + pos, chunk_tokens[k].ids,
                                (size_t)chunk_tokens[k].n_tokens * sizeof(*doc->ids));
@@ -585,9 +590,9 @@ void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank
     validate_rerank_model(root, detail, s, &out->model);
     yyjson_val *query = yyjson_obj_get(root, "query");
     yyjson_val *documents = yyjson_obj_get(root, "documents");
-    /* query_str is set only once query passes every check; the tokenize step
-     * below runs only when detail is empty, so it is non-NULL there. Hoisting it
-     * also keeps the validated value explicit for the static analyzer. */
+    /* query_str is set only once query passes every check; the tokenize step below runs only
+     * when detail is empty, so it is non-NULL there.
+     * Hoisting it also keeps the validated value explicit for the static analyzer. */
     const char *query_str = NULL;
     if (!query) {
         ve_add(detail, "[\"body\",\"query\"]", "field required", "missing");

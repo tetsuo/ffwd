@@ -1,4 +1,4 @@
-/* tests/test_sentencepiece.c - hermetic SentencePiece Unigram checks. */
+/* Hermetic SentencePiece Unigram checks. */
 
 #include "sentencepiece.h"
 

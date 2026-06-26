@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Run the workspace / model API smoke test against real weights.
+"""Run the workspace/model API smoke test with real weights.
 
-The C side is tests/test_workspace.c, the same source `make test` builds with
-the synthetic fixture. Given a MODEL_DIR it loads real weights from that
-directory instead and exercises the workspace and batch APIs. Needs only
-python3 and a model directory (with vocab.json), no reference stack.
+The C test is tests/test_workspace.c, the same source `make test` builds with
+the synthetic fixture. With MODEL_DIR, it loads real weights from that directory
+instead and exercises the workspace and batch APIs.
 
-For mean-pooled models, the test additionally checks that a whole-sequence span
-pools to the embedding and that half-spans recombine by token-count weighting.
-For last-token/CLS models, those mean-span identities are skipped because the
-sentence embedding and contextual span APIs intentionally pool different rows.
+Requires only python3 and a model directory with vocab.json; no reference stack.
 
+For mean-pooled models, also checks that:
+- a whole-sequence span pools to the embedding
+- half-spans recombine by token-count weighting
+
+For last-token/CLS models, these mean-span checks are skipped because sentence
+embedding and contextual span APIs intentionally pool different rows.
+
+Usage:
   tests/check_workspace_api.py --model-dir DIR
 """
 

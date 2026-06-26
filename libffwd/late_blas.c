@@ -5,8 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* CPU late-interaction encoding. The late model loader and MaxSim scoring live
- * in late.c because CUDA reuses those without linking the CPU transformer. */
+/* CPU late-interaction encoding.
+ * The late model loader and MaxSim scoring stay in late.c because CUDA reuses
+ * them without linking the CPU transformer. */
 
 struct ffwd_late_workspace {
     const ffwd_late_model_t *model;

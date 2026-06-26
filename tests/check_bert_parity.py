@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the C BERT-family forward against SentenceTransformers.
+"""Compare the BERT-family forward against SentenceTransformers.
 
 Builds a small C driver that loads the WordPiece tokenizer and the BERT model
 from a sentence-transformers checkpoint, wraps each text with [CLS]/[SEP],
@@ -7,8 +7,7 @@ encodes it (BERT forward + mean pool + L2 normalize), and prints the vector.
 The reference is SentenceTransformer(model).encode(normalize_embeddings=True),
 which runs the same pipeline. Defaults to all-MiniLM-L6-v2.
 
-This one needs the real model weights to run the C forward, so it stays a
-manual --model-dir check rather than a hermetic stored-vector test.
+Needs the real model weights to run the C forward.
 
   uv run --python 3.12 --with-requirements requirements-reference.txt \
       tests/check_bert_parity.py --model-dir DIR

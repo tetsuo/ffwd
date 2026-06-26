@@ -1,5 +1,3 @@
-/* main.c - ffwd-cli command-line tool */
-
 #include "ffwd.h"
 #include "internal.h"
 #include "build.h"
@@ -51,9 +49,7 @@ static void print_usage(const char *prog) {
             prog, prog);
 }
 
-/* ========================================================================
- * Embed one text: tokenize > forward > return float[dim]
- * ======================================================================== */
+/* Embed one text: tokenize > forward > return float[dim] */
 
 typedef struct {
     ffwd_t *backend;
@@ -99,9 +95,7 @@ static void free_tokens(token_buf_t *tokens, int n) {
         free(tokens[i].ids);
 }
 
-/* ========================================================================
- * Output helpers
- * ======================================================================== */
+/* Output helpers */
 
 static void print_embedding_raw(const float *emb, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -140,9 +134,7 @@ print_embedding_json(const float *emb, int dim, int n_tokens, double ms, size_t 
     fflush(stdout);
 }
 
-/* ========================================================================
- * Stdin mode: read lines from stdin, write JSON to stdout
- * ======================================================================== */
+/* Stdin mode: read lines from stdin, write JSON to stdout */
 
 static int process_stdin_batch(runner_t *e, char **lines, int n_lines) {
     if (n_lines <= 0)
@@ -275,9 +267,7 @@ static int run_stdin(runner_t *e, int batch_size) {
     return rc;
 }
 
-/* ========================================================================
- * Batch mode: embed args or stdin lines, then print similarity or vectors
- * ======================================================================== */
+/* Batch mode: embed args or stdin lines, then print similarity or vectors */
 
 static int append_text(char ***texts, int *n_texts, int *cap, const char *s) {
     if (*n_texts == *cap) {
@@ -296,9 +286,12 @@ static int append_text(char ***texts, int *n_texts, int *cap, const char *s) {
     return 0;
 }
 
-/* Cosine similarity matrix. --json emits a JSON array of rows; otherwise one
- * row of space-separated values per line. With print_embs the raw embeddings
- * follow, one per line after a blank line (plain-text output only). */
+/* Cosine similarity matrix.
+ * --json emits a JSON array of rows.
+ * Otherwise, prints one row of space-separated values per line.
+ *
+ * With print_embs, raw embeddings follow after a blank line, one per line.
+ * This is plain-text output only. */
 static void print_matrix(const float *embs, int n, int dim, int json, int print_embs) {
     if (json) {
         putchar('[');
@@ -434,10 +427,6 @@ oom_texts:
     return 1;
 }
 
-/* ========================================================================
- * Main
- * ======================================================================== */
-
 int main(int argc, char *argv[]) {
     const char *model_dir = NULL;
     int print_embs = 0;
@@ -492,9 +481,7 @@ int main(int argc, char *argv[]) {
             arg_start++;
             break;
         } else if (f[0] == '-' && f[1] == '-') {
-            /* An unrecognized --option is a hard error, not silently-embedded
-             * text. Catches typos and stale flags (e.g. the removed --backend)
-             * loudly instead of running the default path or embedding the flag. */
+            /* An unrecognized --option is a hard error. */
             fprintf(stderr, "unknown option: %s\n", f);
             print_usage(prog);
             return 1;

@@ -8,9 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* ========================================================================
- * Model-directory probes
- * ======================================================================== */
+/* Model-directory probes */
 
 static int model_dir_has_file(const char *model_dir, const char *rel) {
     char path[1024];
@@ -29,9 +27,7 @@ int model_dir_has_late_projection(const char *model_dir) {
            model_dir_has_file(model_dir, "1_Dense/model.safetensors");
 }
 
-/* ========================================================================
- * Weight tensor loading and validation (direct mmap pointers into safetensors)
- * ======================================================================== */
+/* Weight tensor loading and validation (direct mmap pointers into safetensors) */
 
 static size_t dtype_size(safetensor_dtype_t dtype) {
     switch (dtype) {
@@ -125,8 +121,7 @@ int tensor_has_supported_shape(const safetensors_file_t *sf,
     return 1;
 }
 
-/* Widen a safetensors tensor to f32 (caller frees). libsafetensors is a pure
- * reader now, so the dtype conversion lives here, next to its only callers. */
+/* Widen a safetensors tensor to f32. Caller frees. */
 static float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
     int64_t n = safetensor_numel(t);
     if (n <= 0)
@@ -206,15 +201,19 @@ load_norm_f32(multi_safetensors_t *ms, const char *name, const int64_t *shape, i
     return safetensors_get_f32(sf, t);
 }
 
-/* ========================================================================
- * Model / workspace load and free
- * ======================================================================== */
+/* Model / workspace load and free */
 
-/* BERT-family weight loader. The tensor names differ entirely from the Qwen
- * block (encoder.layer.N.*, embeddings.*), so the family gets its own entry
- * point. Reused ffwd_layer_t slots carry their BERT meaning: wo is the
- * attention output dense, input_norm/post_attn_norm are the two block LayerNorm
- * weights, up_proj/down_proj are the two FFN matrices (see internal.h). */
+/* BERT-family weight loader.
+ * Tensor names differ completely from Qwen
+ * (encoder.layer.N.*, embeddings.*), so this family has its own entry point.
+ *
+ * Reused ffwd_layer_t slots keep their BERT meanings:
+ * wo is the attention output dense;
+ * input_norm/post_attn_norm are the two block LayerNorm weights;
+ * up_proj/down_proj are the two FFN matrices.
+ *
+ * See internal.h.
+ */
 static int
 load_bert_weights(ffwd_model_t *model, multi_safetensors_t *ms, int layer_start, int layer_end) {
     const ffwd_config_t *cfg = &model->config;

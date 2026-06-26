@@ -1,15 +1,16 @@
 /*
- * impl.h - internal architecture dispatch for hot kernels
+ * Internal architecture dispatch for hot kernels.
  *
- * The small vector primitives (dot product, scale, axpy, scale-add, scaled
- * multiply) are defined here as static inline so they fold directly into the
- * caller's loop: a row of RMSNorm or attention issues no call and the compiler
- * keeps the row in registers across the reduction and the write-back. The
- * generic scalar versions stay out of line in generic.c as a reference for the
- * kernel tests and as the fallback on platforms with no SIMD path.
+ * Small vector primitives (dot product, scale, axpy, scale-add, scaled
+ * multiply) are static inline here so they fold into the caller's loop.
+ * For example, an RMSNorm or attention row has no call overhead, and the
+ * compiler can keep the row in registers across reduction and write-back.
  *
- * bf16_matvec_fused is large (a full matrix-vector product) and is called once
- * per output tile rather than inside a tight loop, so it stays out of line.
+ * Generic scalar versions stay out of line in generic.c. They are the reference
+ * for kernel tests and the fallback when no SIMD path is available.
+ *
+ * bf16_matvec_fused is a large full matrix-vector product, called once per
+ * output tile rather than inside a tight loop, so it stays out of line.
  */
 
 #ifndef KERNELS_IMPL_H

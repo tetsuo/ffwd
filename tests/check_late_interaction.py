@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Smoke-check late-interaction token vectors and MaxSim ranking.
 
-The C side is tests/late_check.c, built by the Makefile target
-`late-check-driver`. Plain mode runs the driver against a real late model and
-checks the expected ranking; it needs only python3 and a late model directory
-(e.g. pplx-embed-v1-late-0.6b). With --compare-pylate it also compares the C
-token vectors against PyLate, which needs the pylate package:
+The C test is tests/late_check.c, built by the Makefile target
+`late-check-driver`.
 
+Plain mode runs the driver against a real late model and checks the expected
+ranking. It requires only python3 and a late model directory, such as
+pplx-embed-v1-late-0.6b.
+
+With --compare-pylate, it also compares C token vectors against PyLate. This
+requires the pylate package.
+
+Usage:
   tests/check_late_interaction.py --model-dir DIR
   uv run --python 3.12 --with pylate tests/check_late_interaction.py \
       --model-dir DIR --compare-pylate

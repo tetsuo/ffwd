@@ -2,13 +2,7 @@
 
 #include <math.h>
 
-/* ========================================================================
- * Vector helpers
- *
- * Standalone post-processing on embedding vectors: callers (CLI, server) use
- * these to L2-normalize outputs and to score pooled embeddings with cosine
- * similarity. They touch no model or tensor internals, only the public API.
- * ======================================================================== */
+/* Vector helpers */
 
 int ffwd_l2_normalize(float *vec, int dim) {
     if (!vec || dim <= 0)

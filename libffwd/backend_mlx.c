@@ -1,7 +1,12 @@
-/* backend_mlx.c - Apple GPU backend (MLX), implements the engine API in ffwd.h.
- * Linked only into Apple Silicon GPU builds. MLX streams are thread-local, so
- * the context is created and destroyed on the inference thread: open only
- * records what to load, activate creates the context, worker_free destroys it. */
+/* Metal backend.
+ * Implements the API in ffwd.h and is linked only into Apple Metal builds.
+ *
+ * MLX streams are thread-local, so the context is created and destroyed on the
+ * inference thread.
+ * open only records what to load; activate creates the context; worker_free
+ * destroys it.
+ */
+
 #include "internal.h"
 #include "mlx.h"
 #include "platform.h"

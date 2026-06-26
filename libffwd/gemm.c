@@ -1,5 +1,5 @@
 /*
- * gemm.c - general Matrix Multiplication
+ * General matrix multiplication.
  */
 
 #include "kernels.h"
@@ -30,21 +30,18 @@
 #    define M_PI 3.14159265358979323846
 #endif
 
-/* Matrix and vector ops: GEMM, the dtype-dispatch linear kernels, and the
- * BF16-fused matvec/QKV/pair workers, plus the elementwise residual add. */
+/* Matrix and vector ops:
+ * GEMM, dtype-dispatch linear kernels, BF16-fused matvec/QKV/pair workers,
+ * and element-wise residual add. */
 
-/* ========================================================================
- * Basic Element-wise Operations
- * ======================================================================== */
+/* Basic element-wise operations */
 
 void add_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++)
         a[i] += b[i];
 }
 
-/* ========================================================================
- * Matrix Operations
- * ======================================================================== */
+/* Matrix operations */
 
 void matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
@@ -425,7 +422,8 @@ void linear_nobias_bf16(
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
     }
-    /* Callers route longer sequences through an F32-widened weight matrix in
-     * caller-owned scratch; this per-row path stays correct for any length. */
+    /* Callers send longer sequences through an F32-widened weight matrix in
+     * caller-owned scratch.
+     * This per-row path remains correct for any length. */
     bf16_linear_rows(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
 }

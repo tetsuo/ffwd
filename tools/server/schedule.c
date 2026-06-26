@@ -1,3 +1,21 @@
+/* Job queue, micro-batching, and completion.
+ *
+ * dispatch_request in server.c enqueues one job per framed request.
+ *
+ * The inference worker thread, worker_main in server.c, drains jobs with
+ * collect_job_batch. A short first-arrival wait groups concurrent arrivals.
+ *
+ * process_job_group routes each job to its endpoint handler and merges all
+ * compatible requests into one pool. execute_*_request_list then repacks that
+ * pool into token-budget batches.
+ *
+ * Finished jobs go to the done queue and wake the event loop through the
+ * completion pipe.
+ *
+ * completion_cb writes each response on the loop thread, so sockets are only
+ * touched there.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 
@@ -8,19 +26,6 @@
 #include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
-
-/* ========================================================================
- * Job queue, micro-batching, and completion
- *
- * dispatch_request (server.c) enqueues one job per framed request; the
- * inference worker thread (worker_main, server.c) drains them with
- * collect_job_batch (a short first-arrival wait groups concurrent arrivals) and
- * runs process_job_group, which routes each job to its endpoint handler and
- * merges all compatible requests into one pool that execute_*_request_list
- * re-packs into token-budget batches. Finished jobs go on the done queue and
- * wake the event loop through the completion pipe; completion_cb writes each
- * response back on the loop thread, so sockets are only ever touched there.
- * ======================================================================== */
 
 static void enqueue_done(job *j) {
     http_server *s = j->srv;
@@ -324,12 +329,17 @@ static void process_unknown_job(job *j) {
     yyjson_doc_free(root);
 }
 
-/* Parse and tokenize one job into a heap request attached to j->prep, which the
- * worker then moves into its request array. Runs on the tokenizer thread, or on
- * the worker itself for a request that reached the job queue untokenized. An
- * unknown endpoint leaves prep_kind 0 (process_unknown_job handles it); a parse
- * failure leaves prep NULL with the 422 already set, so the worker finishes it
- * as not-ready. The tokenized flag guards against tokenizing twice. */
+/* Parse and tokenize one job into a heap request attached to j->prep.
+ * The worker later moves it into its request array.
+ *
+ * Runs on the tokenizer thread, or on the worker for requests that reached the
+ * job queue untokenized.
+ *
+ * Unknown endpoints leave prep_kind as 0; process_unknown_job handles them.
+ * Parse failures leave prep NULL with the 422 already set, so the worker
+ * finishes them as not-ready.
+ *
+ * tokenized prevents tokenizing twice. */
 void tokenize_job(http_server *s, job *j) {
     j->tokenized = 1;
     if (!j->started_ns)

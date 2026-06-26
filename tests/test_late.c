@@ -1,6 +1,6 @@
-/* tests/test_late.c - late-interaction (ColBERT-style MaxSim) API tests.
+/* Late-interaction (ColBERT-style MaxSim) API tests.
  * Hermetic: synthesizes a tiny base model, a 1_Dense projection head, and a
- * byte-complete tokenizer fixture. Runs via `make test`. */
+ * byte-complete tokenizer fixture. Runs via make test. */
 
 #include "internal.h"
 #include "bpe.h"

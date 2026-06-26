@@ -1,9 +1,13 @@
-/* bench/bench_late_rerank.c - late-interaction MaxSim rerank benchmark.
- * Build via `make bench-late-rerank`; run with:
+/* Late-interaction MaxSim rerank benchmark.
+ *
+ * Build via make bench-late-rerank; run with:
  *   ./bench_late_rerank MODEL_DIR CANDIDATES DOC_REPEAT RUNS
+ *
  * Encodes a query and N candidate documents to token vectors, then times the
  * packed MaxSim rerank. check it against bench_late_rerank.py, which builds and
- * runs this binary. */
+ * runs this binary.
+ */
+
 #include "internal.h"
 #ifdef CHECK_MLX
 #    include "mlx.h"

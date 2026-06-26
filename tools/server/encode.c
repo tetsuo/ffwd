@@ -1,3 +1,12 @@
+/* Embedding output encoding.
+ *
+ * Turns a pooled float vector into the requested wire form.
+ *
+ *  - OpenAI-compatible models emit true float32 arrays by default.
+ *  - Perplexity-compatible models emit tanh-quantized int8 by default,
+ *    and their "float" view is the decoded int8 value for SDK compatibility.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 #include "sbuf.h"
@@ -8,15 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ========================================================================
- * Embedding output encoding
- *
- * Turns a pooled float vector into the requested wire form. OpenAI-compatible
- * models emit true float32 arrays by default. Perplexity-compatible models
- * emit tanh-quantized int8 by default, and their "float" view is the decoded
- * int8 value for SDK compatibility.
- * ======================================================================== */
-
 signed char quantize_int8_tanh(float x) {
     int v = (int)lrintf(tanhf(x) * 127.0f);
     if (v > 127)
@@ -26,9 +26,10 @@ signed char quantize_int8_tanh(float x) {
     return (signed char)v;
 }
 
-/* The bytes to base64 for `encoding`. "base64" aliases the float vector
- * (*owned = 0); "base64_int8" and "base64_binary" return a freshly allocated
- * buffer the caller frees (*owned = 1). */
+/* Bytes to base64-encode.
+ * "base64" aliases the float vector (*owned = 0).
+ * "base64_int8" and "base64_binary" return a new buffer for the caller to free
+ * (*owned = 1). */
 static const unsigned char *
 embedding_bytes(const float *emb, int dims, const char *encoding, size_t *n_out, int *owned) {
     if (!strcmp(encoding, "base64")) {
@@ -71,9 +72,8 @@ static void sbuf_append_base64(sbuf *b, const unsigned char *src, size_t n) {
 void append_embedding_value(
     sbuf *b, int index, const float *emb, int dims, const char *encoding, embedding_api_t api) {
     if (!strcmp(encoding, "float")) {
-        /* Floats are hand-formatted with %.9g (the shortest form that
-         * round-trips float32) and streamed into the sbuf, never serialized
-         * through yyjson's writer. */
+        /* Floats are hand-formatted with %.9g (the shortest form that round-trips float32)
+         * and streamed into the sbuf, never serialized through yyjson's writer. */
         sbuf_printf(b, "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", index);
         for (int i = 0; i < dims; i++) {
             if (i)

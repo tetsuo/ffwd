@@ -1,6 +1,6 @@
-/* tests/test_safetensors.c - safetensors parser limit and rejection tests.
- * Hermetic: synthesizes every fixture in a temp directory. Runs via
- * `make test`. */
+/* safetensors parser limit and rejection tests.
+ * Hermetic: synthesizes every fixture in a temp directory.
+ */
 
 #include "safetensors.h"
 

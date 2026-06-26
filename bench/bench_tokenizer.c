@@ -1,5 +1,6 @@
-/* bench/bench_tokenizer.c - tokenizer encode-path benchmark.
- * Build via `make bench-tokenizer`; accepts a model dir or vocab.json. */
+/* Tokenizer encode-path benchmark.
+ * Build via make bench-tokenizer; accepts a model dir or vocab.json.
+ */
 
 #include "bpe.h"
 #include "sentencepiece.h"

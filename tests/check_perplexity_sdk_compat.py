@@ -66,9 +66,7 @@ CONTEXT_DOCS = {
 }
 
 
-# -------------------------------------------------------------------------
 # Server launch (skipped when --base-url points at a running server)
-# -------------------------------------------------------------------------
 
 def ensure_server() -> None:
     if not SERVER_BIN.exists():
@@ -120,9 +118,7 @@ def wait_ready(base_url: str, api_key: str, model: str,
     die_with_log(proc, log_path, "server did not become ready in time")
 
 
-# -------------------------------------------------------------------------
 # SDK checks
-# -------------------------------------------------------------------------
 
 def decode_int8(embedding: str) -> np.ndarray:
     raw = base64.b64decode(embedding)

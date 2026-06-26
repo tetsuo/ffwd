@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Build, test and bench the OpenBLAS backend in an Ubuntu container to catch
-# Linux portability breakage a macOS/Accelerate build hides.
-# It finds the repo root via git, bind-mounts it at /work, installs the Runpod
-# toolchain, re-execs itself inside with --in-container, and runs
-# make cpu/test/bench/bench-server-utils/debug, then `make clean`.
-# Skip clean with KEEP=1. Override the image with IMAGE=ubuntu:22.04.
+# Build, test, and benchmark the OpenBLAS backend in an Ubuntu container.
+# Finds the repo root with git, bind-mounts it at /work, installs the RunPod
+# toolchain, re-execs itself inside with --in-container, and runs:
+# make cpu/test/bench/bench-server-utils/debug, then make clean.
+# Set KEEP=1 to skip clean. Set IMAGE=ubuntu:22.04 to override the image.
 set -euo pipefail
 
 IMAGE="${IMAGE:-ubuntu:24.04}"
@@ -69,7 +68,7 @@ run_in_container() {
     echo "==================== ALL STEPS COMPLETED ===================="
 }
 
-# --- host side: launch the container and re-exec this script inside it --------
+# Launch the container and re-exec this script inside it.
 launch_on_host() {
     command -v container >/dev/null 2>&1 || {
         echo "error: Apple 'container' CLI not found on PATH" >&2; exit 1; }

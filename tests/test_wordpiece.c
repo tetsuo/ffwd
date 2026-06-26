@@ -1,7 +1,7 @@
-/* tests/test_wordpiece.c - hermetic WordPiece tokenizer checks. A synthetic
- * vocab exercises greedy ## matching, [UNK], casing, accent stripping,
- * punctuation splitting, CJK char-splitting, special-token resolution, and the
- * workspace encode paths. No model files or network needed. */
+/* Hermetic WordPiece tokenizer checks. A synthetic vocab exercises greedy
+ * ## matching, [UNK], casing, accent stripping, punctuation splitting, CJK char-splitting,
+ * special-token resolution, and the workspace encode paths.
+ */
 
 #include "wordpiece.h"
 

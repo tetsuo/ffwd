@@ -1,4 +1,4 @@
-/* bench/bench.h - minimal microbenchmark harness.
+/* Minimal microbenchmark harness.
  *
  * A benchmark function receives a bench_state_t and must run its measured
  * loop exactly b->n times. Call bench_begin(b) after setup so allocation

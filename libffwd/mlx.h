@@ -1,15 +1,12 @@
 /*
- * ffwd_mlx.h - MLX GPU backend for Apple Silicon
- *
- * Uses Apple's mlx-c to run the transformer on Metal.
+ * Run the transformer on Metal using mlx-c.
  */
 
 #ifndef FFWD_MLX_H
 #define FFWD_MLX_H
 
-/* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying FFWD_API are exported
- * from the shared library; everything else stays internal. */
+/* The libraries are built with -fvisibility=hidden, so only declarations carrying
+ * FFWD_API are exported from the shared library; everything else is internal. */
 #ifndef FFWD_API
 #    if defined(__GNUC__)
 #        define FFWD_API __attribute__((visibility("default")))
@@ -79,13 +76,16 @@ FFWD_API void ffwd_mlx_late_vectors_free(ffwd_mlx_late_vectors_t *vecs);
 FFWD_API int ffwd_mlx_late_vectors_token_count(const ffwd_mlx_late_vectors_t *vecs);
 FFWD_API int ffwd_mlx_late_vectors_dim(const ffwd_mlx_late_vectors_t *vecs);
 FFWD_API int ffwd_mlx_late_vectors_copy(const ffwd_mlx_late_vectors_t *vecs, float *out_vectors);
-/*
- * Encode n_docs documents in one padded transformer pass and pack each
- * document's kept token vectors back-to-back into [total_keep, token_dim] in
- * document order. out_offsets[n_docs + 1] receives the prefix sum of kept
- * counts, so the result feeds ffwd_mlx_late_maxsim_batch_device directly.
- * Returns NULL on error; the handle must not outlive ctx.
- */
+
+/* Encode n_docs documents in one padded transformer pass.
+ *
+ * Packs each document's kept token vectors back-to-back into [total_keep, token_dim]
+ * in document order.
+ *
+ * out_offsets[n_docs + 1] gets the prefix sum of kept counts, so the result can
+ * feed ffwd_mlx_late_maxsim_batch_device directly.
+ *
+ * Returns NULL on error. The handle must not outlive ctx. */
 FFWD_API ffwd_mlx_late_vectors_t *ffwd_mlx_late_encode_docs_device(ffwd_mlx_late_ctx_t *ctx,
                                                                    const int *const *doc_ids,
                                                                    const int *n_tokens,
@@ -94,9 +94,9 @@ FFWD_API ffwd_mlx_late_vectors_t *ffwd_mlx_late_encode_docs_device(ffwd_mlx_late
                                                                    int n_docs,
                                                                    int normalize,
                                                                    int *out_offsets);
-/* Device-resident select/concat primitives, retained for the late-interaction
- * verification harness (tests/integration/check_late_interaction.py); the server rerank
- * path uses ffwd_mlx_late_encode_docs_device. */
+/* Device-resident select/concat primitives.
+ * Kept for the late-interaction verification harness (tests/check_late_interaction.py).
+ * The server rerank path uses ffwd_mlx_late_encode_docs_device. */
 FFWD_API ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_concat(
     ffwd_mlx_late_ctx_t *ctx, const ffwd_mlx_late_vectors_t *const *items, int count);
 FFWD_API ffwd_mlx_late_vectors_t *ffwd_mlx_late_vectors_select(ffwd_mlx_late_ctx_t *ctx,
@@ -124,7 +124,7 @@ FFWD_API int
 ffwd_mlx_encode_into(ffwd_mlx_ctx_t *ctx, const int *token_ids, int n_tokens, float *out_embedding);
 
 /*
- * Compute a true padded dense batch on MLX.
+ * Compute a true padded dense batch.
  *
  * out_embeddings is caller-provided [batch, hidden_size].
  * Pooling and attention masking follow the loaded model configuration.

@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Verbosity flag, read across the codebase for optional stderr diagnostics.
+/* Verbosity flag for optional stderr diagnostics across the codebase.
  * Defined in config.c because every backend links it. */
 int ffwd_verbose = 0;
 
@@ -20,11 +20,13 @@ typedef enum {
     JSON_BOOL_INVALID = -1,
 } json_bool_t;
 
-/* Field readers over a parsed JSON object. yyjson getters are NULL-tolerant, so
- * a missing key or wrong-typed value falls back cleanly. These replace a
- * substring scanner that could match a key nested anywhere in the document
- * (e.g. a field inside a nested sub-config), which is exactly the failure mode
- * a real parser removes. */
+/* Read fields from a parsed JSON object.
+ * yyjson getters tolerate NULL, so missing keys or wrong types cleanly return
+ * the fallback.
+ *
+ * This replaces substring scanning, which could match a key anywhere in the
+ * document, including inside nested sub-configs. A real parser avoids that
+ * failure mode. */
 static int json_get_int(yyjson_val *obj, const char *key, int fallback) {
     yyjson_val *v = yyjson_obj_get(obj, key);
     if (yyjson_is_int(v))

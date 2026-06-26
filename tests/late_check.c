@@ -1,8 +1,11 @@
 /* Late-interaction smoke driver: encodes a query and three documents to
  * token vectors, runs scalar and batched MaxSim, and checks the expected
- * ranking. With --json it emits vectors and scores for the optional PyLate
- * comparison in check_late_interaction.py, which builds this via
- * `make late-check-driver` (or late-check-driver-mlx). */
+ * ranking.
+ * With --json it emits vectors and scores for the optional PyLate comparison
+ * in check_late_interaction.py, which builds this via make late-check-driver
+ * (or late-check-driver-mlx).
+ */
+
 #include "internal.h"
 #ifdef CHECK_MLX
 #    include "mlx.h"

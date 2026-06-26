@@ -20,7 +20,7 @@ static void test_quantize_int8_tanh(void) {
     TEST_ASSERT(quantize_int8_tanh(0.5f) == 59);
 }
 
-/* Assert that rendering emb under `encoding` puts the base64 of `expect` in the
+/* Assert that rendering emb under encoding puts the base64 of expect in the
  * embedding field of the response object. */
 static void assert_base64_field(const float *emb,
                                 int dims,

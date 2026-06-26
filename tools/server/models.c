@@ -1,3 +1,16 @@
+/* Model load/lifecycle, plus tokenization and inference dispatch.
+ *
+ * Each loaded model owns resolved serving metadata for the operator-chosen
+ * label.
+ *
+ * Transformer behavior comes from model files through ffwd_config.
+ * Server-only facts missing from those files, such as output API family and
+ * Matryoshka floor, come from the load spec.
+ *
+ * tokenize_* and model_ffwd_* helpers are the request handlers' single dispatch
+ * point, hiding the compiled backend choice behind one signature.
+ */
+
 #include "server_internal.h"
 #include "util.h"
 
@@ -7,17 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-/* ========================================================================
- * Model load/lifecycle, and tokenize/inference dispatch
- *
- * Each loaded model owns resolved serving metadata for the operator-chosen
- * label. Transformer behavior comes from the model files through ffwd_config;
- * server-only facts absent from those files, such as output API family and
- * Matryoshka floor, come from the load spec. The tokenize_* and model_ffwd_*
- * helpers are the single dispatch point the request handlers call, hiding the
- * compiled backend choice behind one signature.
- * ======================================================================== */
 
 loaded_model *loaded_model_for_label(http_server *s, const char *label) {
     if (!label)
@@ -195,9 +197,8 @@ void rerank_request_free(rerank_request *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* Tokenization itself lives in libffwd (ffwd_tok). These thin wrappers only
- * add the server's per-stage timing onto the job; the request handlers call
- * them unchanged. */
+/* Thin wrappers that add server per-stage timing to the tokenization job.
+ * Request handlers call them unchanged. */
 int tokenize_input(
     loaded_model *m, job *j, const char *text, const char *query_instruct, token_buf *out) {
     uint64_t t0 = nstime();

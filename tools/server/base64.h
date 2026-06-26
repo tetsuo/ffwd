@@ -5,8 +5,8 @@
 
 /* Standard base64 (with '=' padding). */
 
-/* Number of base64 characters for n input bytes, excluding any NUL. Aborts
- * (die-on-OOM) if n is so large the length would overflow. */
+/* Number of base64 characters for n input bytes, excluding any NUL.
+ * Aborts (die-on-OOM) if n is so large the length would overflow. */
 size_t base64_encoded_len(size_t n);
 
 /* Encode n bytes of src as base64 into dst, writing exactly base64_encoded_len(n)

@@ -1,8 +1,8 @@
 /*
- * sentencepiece.h - SentencePiece tokenizer for XLM-R style models.
+ * SentencePiece tokenizer for XLM-R style models.
  *
- * Loads a SentencePiece ModelProto (`sentencepiece.bpe.model`, `tokenizer.model`,
- * or `spiece.model`) and implements the Unigram Viterbi encoder used by XLM-R
+ * Loads a SentencePiece ModelProto (sentencepiece.bpe.model, tokenizer.model,
+ * or spiece.model) and implements the Unigram Viterbi encoder used by XLM-R
  * and multilingual E5. It encodes text only; frontends add the model's special
  * token layout, e.g. <s> ... </s> for XLM-R.
  */

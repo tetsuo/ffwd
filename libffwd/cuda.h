@@ -1,13 +1,11 @@
 /*
- * ffwd_cuda.h - CUDA/cuBLAS backend
+ * CUDA/cuBLAS backend
  */
 
 #ifndef FFWD_CUDA_H
 #define FFWD_CUDA_H
 
-/* Public-API export annotation. The libraries are built with
- * -fvisibility=hidden, so only declarations carrying FFWD_API are exported
- * from the shared library; everything else stays internal. */
+/* Public-API export annotation. */
 #ifndef FFWD_API
 #    if defined(__GNUC__)
 #        define FFWD_API __attribute__((visibility("default")))
