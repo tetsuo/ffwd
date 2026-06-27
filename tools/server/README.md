@@ -5,7 +5,7 @@ ffwd HTTP server.
 ## Quickstart
 
 ```bash
-make # use make gpu for GPU
+make  # use make gpu for GPU
 
 ./ffwd-server \
   --model pplx=./pplx-model:api=perplexity:min_dim=128 \
@@ -36,10 +36,10 @@ The flags are repeatable, so several models can share a server.
 Each flag also accepts inline, colon-separated per-model options appended to the
 directory:
 
-- `:api=openai|perplexity` — the output-compatibility mode (see below).
-- `:min_dim=N` — the Matryoshka truncation floor; requests may ask for any
+- `:api=openai|perplexity` - the output-compatibility mode (see below).
+- `:min_dim=N` - the Matryoshka truncation floor; requests may ask for any
   `dimensions` from `N` up to the model's full size.
-- `:query=STR` — a query-prompt override for models that prepend one.
+- `:query=STR` - a query-prompt override for models that prepend one.
 
 For example: `--model qwen=./qwen3-model:api=openai:min_dim=32`.
 
@@ -55,7 +55,7 @@ Run `./ffwd-server --help` for the exact, current list. Some important flags:
 | Flag                       | Default     | Meaning                                                                           |
 | -------------------------- | ----------- | --------------------------------------------------------------------------------- |
 | `--host HOST`              | `127.0.0.1` | Bind address.                                                                     |
-| `--port PORT`              | —           | Listen port.                                                                      |
+| `--port PORT`              | -           | Listen port.                                                                      |
 | `-t, --threads N`          | backend     | Worker thread count for CPU inference.                                            |
 | `-b, --batch-size N`       | `32`        | Max texts or contextual documents per inference micro-batch.                      |
 | `--max-batch-tokens N`     | `16384`     | Token budget per batch (packed for CPU, padded dense rows for MLX).               |
@@ -68,14 +68,37 @@ Run `./ffwd-server --help` for the exact, current list. Some important flags:
 | `--api-key TOKEN`          | off         | Require `Authorization: Bearer TOKEN`. `FFWD_API_KEY` is also honored.            |
 | `-v, --verbose`            | off         | Verbose logging.                                                                  |
 
-`-b 32` is a balanced default for concurrent short requests. Long-document
-throughput is compute-bound and largely insensitive to `-b`; for large models on
-memory-limited GPUs, prefer a smaller `-b` (for example `8`) to bound activation
-memory and queue latency.
+**Batching:**
 
-The reduced-precision GPU modes (`--gpu-gemm-mode`, `--gpu-weight-dtype bf16`,
-`--gpu-quant-bits`) are precision trades judged by output quality (cosine /
-ranking), never by latency against the exact path.
+- `-b 32` is a balanced default for concurrent short requests.
+- Long-document throughput is compute-bound and largely insensitive to `-b`; for
+  large models on memory-limited GPUs, prefer a smaller `-b` (for example `8`)
+  to bound activation memory and queue latency.
+
+**GPU precision flags:**
+
+- `--gpu-gemm-mode` sets the GEMM compute precision - how the matmuls are
+  computed. `f32` (the default) is exact. `bf16`/`16f` run the tensor-core
+  reduced-precision matmul (16-bit operands, F32 accumulation). This flag also
+  gates the reduced-precision attention/FFN fast paths; with the default `f32`
+  they stay off.
+- `--gpu-weight-dtype` sets the weight storage precision - how weights are held
+  in GPU memory. `bf16`/`f16` roughly halve the weight footprint.
+
+Because these two settings are independent, changing only `--gpu-weight-dtype`
+bf16 means your calculations (GEMMs) will still run in full, precise `F32`.
+While this saves memory by compressing the weights, it won't actually speed up
+your processing.
+
+To get the full speed benefits of reduced precision during serving, you need to
+set the compute mode and ensure your storage dtype matches it:
+
+```
+# bf16 inference (recommended production GPU default):
+ffwd-server --cuda --model my=/path/to/model --gpu-gemm-mode bf16 --gpu-weight-dtype bf16
+# fp16 inference:
+ffwd-server --cuda --model my=/path/to/model --gpu-gemm-mode 16f  --gpu-weight-dtype f16
+```
 
 ## API compatibility modes
 
@@ -92,16 +115,16 @@ output contract for that model's endpoint, not just a default encoding:
 the embedding _is_ the tanh-quantized int8 vector, so even a `float` response is
 that vector dequantized, not a separate full-precision one.
 
-- `base64_int8` — `round(tanh(x) * 127)` after Matryoshka truncation, base64 of
+- `base64_int8` - `round(tanh(x) * 127)` after Matryoshka truncation, base64 of
   the signed int8 bytes.
-- `base64_binary` — sign bits packed LSB-first; requires `dimensions` divisible
+- `base64_binary` - sign bits packed LSB-first; requires `dimensions` divisible
   by 8.
-- `float` (perplexity) — the int8 values as floats (`int8 / 128`), lossy.
-- `base64` (openai) — the raw little-endian float32 bytes, base64-encoded,
+- `float` (perplexity) - the int8 values as floats (`int8 / 128`), lossy.
+- `base64` (openai) - the raw little-endian float32 bytes, base64-encoded,
   lossless.
 
 A request whose `encoding_format` is not in the model's accepted set returns
-`422`. pplx-embed vectors are unnormalized — always compare with cosine
+`422`. pplx-embed vectors are unnormalized - always compare with cosine
 similarity; the core API exposes `ffwd_l2_normalize()` for clients that need an
 inner-product index.
 
