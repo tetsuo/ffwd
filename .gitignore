@@ -44,3 +44,7 @@ tools/server/test_*
 tests/coverage/
 build/
 
+prof-bench/
+speed-bench/
+devtools/runpod/
+
