@@ -15,6 +15,11 @@ on:
         options:
         - minor
         - patch
+      dry_run:
+        description: "Dry run"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -167,7 +172,15 @@ jobs:
         cd tmp
         sha256sum *.tar.gz > SHA256SUMS
 
+    - name: Upload artifacts (dry run)
+      if: ${{ inputs.dry_run }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-artifacts
+        path: tmp/
+
     - name: Release
+      if: ${{ !inputs.dry_run }}
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
