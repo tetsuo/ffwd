@@ -45,7 +45,7 @@ Once the dependencies are in place, build the project by running:
 make  # or make gpu for GPU build
 ```
 
-### Performance
+## Performance
 
 ffwd implements custom FlashAttention-style kernels from scratch. On NVIDIA
 Blackwell and Ada GPUs, it approaches the theoretical peak performance of `bf16`
