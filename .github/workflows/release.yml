@@ -139,6 +139,11 @@ jobs:
         echo "BUILD_VERSION=$BUILD_VERSION"
         echo "TAG_NAME=$TAG_NAME"
 
+    - name: Install CUDA toolkit
+      uses: Jimver/cuda-toolkit@v0.2.35
+      with:
+        cuda: '12.8.0'
+
     - name: Build release artifacts
       env:
         CC: ccache gcc
@@ -156,6 +161,7 @@ jobs:
         esac
 
         NAME="ffwd-linux-${ARCH}"
+        NAME_CUDA="${NAME}-cuda"
 
         make cpu \
           ARCH_FLAGS="-march=x86-64" \
@@ -168,6 +174,19 @@ jobs:
         mkdir -p "tmp/$NAME"
         cp ffwd-cli ffwd-server LICENSE README.md "tmp/$NAME/"
         tar -C tmp -czf "tmp/${NAME}.tar.gz" "$NAME"
+
+        make gpu \
+          ARCH_FLAGS="-march=x86-64" \
+          CUDAFLAGS="-O3 -std=c++17 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_100,code=sm_100 -gencode arch=compute_120,code=sm_120 -Xcompiler -fPIC,-fvisibility=hidden" \
+          VERSION="$BUILD_VERSION" \
+          BUILD_COMMIT="$GITHUB_SHA" \
+          BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          BUILD_OS="linux" \
+          BUILD_ARCH="$ARCH"
+
+        mkdir -p "tmp/$NAME_CUDA"
+        cp ffwd-cli ffwd-server LICENSE README.md "tmp/$NAME_CUDA/"
+        tar -C tmp -czf "tmp/${NAME_CUDA}.tar.gz" "$NAME_CUDA"
 
         cd tmp
         sha256sum *.tar.gz > SHA256SUMS
