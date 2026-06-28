@@ -42,7 +42,6 @@ jobs:
           clang \
           clang-tidy \
           clang-tools \
-          libyyjson-dev \
           libopenblas-dev \
           pkg-config \
           valgrind
@@ -50,7 +49,6 @@ jobs:
         cc --version | sed -n '1,2p'
         clang --version | sed -n '1,2p'
         clang-tidy --version | sed -n '1,2p'
-        pkg-config --modversion libyyjson 2>/dev/null || true
 
     - name: Cache ccache
       uses: actions/cache@v4
