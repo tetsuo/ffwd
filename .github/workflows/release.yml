@@ -172,7 +172,7 @@ jobs:
           BUILD_ARCH="$ARCH"
 
         mkdir -p "tmp/$NAME"
-        cp ffwd-cli ffwd-server LICENSE README.md "tmp/$NAME/"
+        cp ffwd-cli ffwd-server LICENSE "tmp/$NAME/"
         tar -C tmp -czf "tmp/${NAME}.tar.gz" "$NAME"
 
         make gpu \
@@ -185,7 +185,7 @@ jobs:
           BUILD_ARCH="$ARCH"
 
         mkdir -p "tmp/$NAME_CUDA"
-        cp ffwd-cli ffwd-server LICENSE README.md "tmp/$NAME_CUDA/"
+        cp ffwd-cli ffwd-server LICENSE "tmp/$NAME_CUDA/"
         tar -C tmp -czf "tmp/${NAME_CUDA}.tar.gz" "$NAME_CUDA"
 
         cd tmp
