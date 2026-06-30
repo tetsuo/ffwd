@@ -1,17 +1,14 @@
 # ffwd
 
-ffwd is an experimental, lightweight inference engine for text embedding models,
-written from scratch in C.
+ffwd is a lightweight inference engine for text embedding models.
 
-It runs on NVIDIA GPUs (CUDA), Apple silicon (via MLX), and x86/arm64 CPUs
-(OpenBLAS/Accelerate).
+It runs on NVIDIA and Apple silicon GPUs, as well as x86 and arm64 CPUs with
+BLAS acceleration.
 
-Supported models include:
-
-- **Qwen3:** the `Qwen3-Embedding` family, with full support for `pplx-embed-v1`
-- **Qwen2:** `GTE-Qwen2`
-- **BERT/RoBERTa:** `BERT`, `BGE`, `MiniLM`, and `XLM-R` multilingual encoders,
-  including `multilingual-E5` and `Snowflake Arctic`
+ffwd supports Qwen3 embedding models such as `Qwen3-Embedding`, the
+`pplx-embed-v1` family, Qwen2 models such as `GTE-Qwen2`, and BERT/RoBERTa-style
+encoders including `BERT`, `BGE`, `MiniLM`, `XLM-R`, `multilingual-E5`, and
+`Snowflake Arctic`.
 
 ## Components
 
@@ -31,9 +28,19 @@ contextualized embeddings.
 [ffwd-cli](./tools/cli) is a command-line tool for generating embeddings and
 computing cosine similarity.
 
+## Installation
+
+You can download the latest ffwd build for your platform from the
+[releases](https://github.com/tetsuo/ffwd/releases) page.
+
+ffwd supports models in
+[safetensors](https://huggingface.co/docs/safetensors/index) format. You can
+download compatible models from Hugging Face using the
+[Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
+
 ## Building
 
-Before building, install the dependencies for your platform:
+To build ffwd from source, first install the dependencies for your platform:
 
 - **Linux:** Install `libopenblas-dev` (required for both CPU and GPU builds).
 - **macOS:** Install `mlx` and `mlx-c` via Homebrew if you're targeting
@@ -47,21 +54,29 @@ make  # or make gpu for GPU build
 
 ## Performance
 
-ffwd implements custom FlashAttention-style kernels from scratch. On NVIDIA
-Blackwell and Ada GPUs, it approaches the theoretical peak performance of `bf16`
-math without relying on libraries such as CUTLASS or cuDNN. However, at longer
-context lengths—for example, above 16k tokens for `Qwen3-Embedding`—vendor
-kernels begin to take the lead.
+When comparing ffwd with other open-source solutions, the main differentiator in
+terms of speed is attention performance.
 
-When comparing ffwd with
-[TEI](https://github.com/huggingface/text-embeddings-inference), the main factor
-is attention speed. ffwd is very fast at short and medium context lengths
-because the work around the attention kernel is kept extremely low-overhead. But
-once both engines are pushed toward saturation—especially with a single long
-context or very large batches—the bottleneck becomes attention-kernel
-throughput. Unsurprisingly, this is where TEI, which leverages CuTe-based
+ffwd implements custom FlashAttention-style CUDA kernels from scratch (optimized
+for Blackwell and Ada architectures), without relying on libraries such as
+CUTLASS or cuDNN.
+
+It is very fast and competitive at short and medium context lengths, up to
+around 16k tokens for Qwen3, mainly because the work surrounding the attention
+kernel is kept extremely low-overhead.
+
+However, once pushed toward saturation, especially with a single long context or
+very large batches, the bottleneck becomes attention-kernel throughput.
+Unsurprisingly, this is where engines such as TEI, which leverages CuTe-based
 [Flash Attention](https://github.com/HazyResearch/flash-attention), began to
 outperform ffwd in my benchmarks.
+
+That said, the v0.2.0 release was also a useful reality check and a good
+learning experience: it is very hard to beat machine-generated kernels, no
+matter how many sub-agents you fork to benchmark and hypertune your code across
+architectures 😄 At some point, you either end up writing a DSL or moving toward
+heavily templated code, which is exactly what these libraries are designed to
+provide.
 
 ## Acknowledgements
 
