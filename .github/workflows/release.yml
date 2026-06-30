@@ -160,7 +160,7 @@ jobs:
           *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
         esac
 
-        NAME="ffwd-linux-${ARCH}"
+        NAME="ffwd-${BUILD_VERSION}-linux-${ARCH}"
         NAME_CUDA="${NAME}-cuda"
 
         make cpu \
