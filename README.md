@@ -1,6 +1,7 @@
 # ffwd
 
-ffwd is a lightweight inference engine for text embedding models.
+ffwd is a lightweight inference engine for transformer-based text embedding
+models.
 
 It runs on NVIDIA and Apple silicon GPUs, as well as x86 and arm64 CPUs with
 BLAS acceleration.
