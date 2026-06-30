@@ -229,7 +229,7 @@ jobs:
         git push origin "$TAG_NAME"
 
         gh release create "$TAG_NAME" \
-          tmp/ffwd-linux-*.tar.gz \
+          tmp/ffwd-$BUILD_VERSION-linux-*.tar.gz \
           tmp/SHA256SUMS \
           --title "$TAG_NAME" \
           --generate-notes
