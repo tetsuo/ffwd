@@ -2863,15 +2863,20 @@ static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int hea
     return (mode == 0 || mode == 8) && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
 }
 
-// cuDNN fused attention (cuda_sdpa.h). Unset/1 dispatches the 16-bit flash
-// shapes to cuDNN whenever the runtime supports them; FFWD_CUDA_SDPA=0 forces
-// the built-in kernels (the A/B instrument and the rescue switch).
+// cuDNN fused attention (cuda_sdpa.h). Unset routes the Qwen bf16 hd128 shape
+// to cuDNN (measured faster at every length, growing with context) and keeps
+// BERT on the built-in kernels (whose direct packed-QKV staging still beats
+// the extra Q-pack/expand the cuDNN path needs at BERT lengths). 1/on extends
+// cuDNN to the BERT flash shapes; 0/off forces the built-in kernels everywhere
+// (the A/B instrument and the rescue switch).
 static int sdpa_mode(void) {
     static int init = 0, mode = 0;
     if (!init) {
         const char *e = getenv("FFWD_CUDA_SDPA");
         if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
             mode = -1;
+        else if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "force")))
+            mode = 1;
         init = 1;
     }
     return mode;
@@ -3412,8 +3417,8 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     // hand-written kernels, and any cuDNN refusal falls back to them). It
     // consumes the staged contiguous K/V, so the BERT direct-QKV read shortcut
     // is bypassed while it is active.
-    int use_sdpa = sdpa_mode() >= 0 && ctx->sdpa && ctx->q16 && ctx->sdpa_batch_bucket > 0 &&
-                   (use_tc_kexp_bf16 || use_bert_flash);
+    int use_sdpa = ctx->sdpa && ctx->q16 && ctx->sdpa_batch_bucket > 0 &&
+                   ((use_tc_kexp_bf16 && sdpa_mode() >= 0) || (use_bert_flash && sdpa_mode() > 0));
     if (use_sdpa)
         use_bert_direct_kv = 0;
 
@@ -3869,11 +3874,11 @@ static void bert_cuda_plan(ffwd_cuda_ctx_t *ctx, int total, bert_cuda_plan_t *p)
     p->qkv16 = p->flash && p->cublaslt_avail && qkv16_mode >= 0 &&
                (qkv16_mode > 0 || total >= BERT_QKV16_MIN_TOKENS);
     // The cuDNN fused-attention path reads staged contiguous K/V, so while it
-    // is a candidate the direct packed-QKV read is not planned and the K/V
-    // expansion buffers stay allocated (the dispatch relies on them, including
-    // for its fallback).
+    // is a candidate (BERT: forced on only) the direct packed-QKV read is not
+    // planned and the K/V expansion buffers stay allocated (the dispatch
+    // relies on them, including for its fallback).
     p->direct_kv =
-        p->flash && p->qkv16 && bert_direct_kv_mode() >= 0 && !(ctx->sdpa && sdpa_mode() >= 0);
+        p->flash && p->qkv16 && bert_direct_kv_mode() >= 0 && !(ctx->sdpa && sdpa_mode() > 0);
 }
 
 static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_seq) {
@@ -3902,9 +3907,11 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
     int act_cols = 2 * c->intermediate_size;
     int ffn_gate_up_cols = 2 * c->intermediate_size;
     // Packed 16-bit Q for the cuDNN fused-attention path: any shape whose
-    // 16-bit flash kernel could dispatch to cuDNN needs it staged.
-    int need_q16 = ctx->sdpa && sdpa_mode() >= 0 &&
-                   (is_bert ? bp.flash : (ctx->weights_bf16 && c->head_dim == 128));
+    // 16-bit flash kernel could dispatch to cuDNN needs it staged. BERT only
+    // dispatches when cuDNN is forced on (see sdpa_mode).
+    int need_q16 =
+        ctx->sdpa && (is_bert ? (bp.flash && sdpa_mode() > 0)
+                              : (ctx->weights_bf16 && c->head_dim == 128 && sdpa_mode() >= 0));
 
     if (is_bert) {
         need_x_norm = 0;
