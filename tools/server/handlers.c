@@ -385,8 +385,8 @@ void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, emb
             }
         }
 
-        if (out->total_tokens > FFWD_API_MAX_TOTAL_TOKENS)
-            ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
+        if (out->total_tokens > s->max_request_tokens)
+            ve_add(detail, "[\"body\",\"input\"]", "request exceeds the request token limit",
                    "value_error.context_length");
     }
 
@@ -533,8 +533,8 @@ void prepare_contextual_request(job *j,
             free_token_bufs(chunk_tokens, n_chunks);
             free(chunk_tokens);
         }
-        if (request_tokens > FFWD_API_MAX_TOTAL_TOKENS) {
-            ve_add(detail, "[\"body\",\"input\"]", "request exceeds 120000 token limit",
+        if (request_tokens > s->max_request_tokens) {
+            ve_add(detail, "[\"body\",\"input\"]", "request exceeds the request token limit",
                    "value_error.context_length");
         } else {
             out->total_tokens = (int)request_tokens;
@@ -693,8 +693,8 @@ void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank
                     out->document_tokens = INT_MAX;
             }
         }
-        if (out->query_tokens > FFWD_API_MAX_TOTAL_TOKENS - out->document_tokens) {
-            ve_add(detail, "[\"body\",\"documents\"]", "request exceeds 120000 token limit",
+        if (out->query_tokens > s->max_request_tokens - out->document_tokens) {
+            ve_add(detail, "[\"body\",\"documents\"]", "request exceeds the request token limit",
                    "value_error.context_length");
         }
     }

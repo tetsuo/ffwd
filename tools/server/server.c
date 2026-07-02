@@ -341,6 +341,8 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
     s.batch_size = cfg->batch_size > 0 ? cfg->batch_size : FFWD_SERVER_DEFAULT_BATCH_SIZE;
     s.max_batch_tokens =
         cfg->max_batch_tokens > 0 ? cfg->max_batch_tokens : FFWD_SERVER_DEFAULT_MAX_BATCH_TOKENS;
+    s.max_request_tokens =
+        cfg->max_request_tokens > 0 ? cfg->max_request_tokens : FFWD_API_MAX_TOTAL_TOKENS;
     s.batch_wait_us = cfg->batch_wait_us >= 0 ? cfg->batch_wait_us : ffwd_default_batch_wait_us();
     s.backend_opts = backend_opts;
     if (cfg->api_key && cfg->api_key[0])

@@ -92,6 +92,7 @@ typedef struct {
     int port;
     int batch_size;
     int max_batch_tokens;
+    int max_request_tokens; // per-request total-token cap (FFWD_API_MAX_TOTAL_TOKENS default)
     int batch_wait_us;
     char *api_key;
     loaded_model *models;

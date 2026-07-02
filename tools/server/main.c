@@ -38,6 +38,7 @@ static void print_usage(const char *prog) {
             "  -b, --batch-size N        Max texts or documents per inference batch\n"
             "                            (default: 32)\n"
             "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
+            "  --max-request-tokens N    Max total tokens per API request (default: 120000)\n"
             "  --batch-wait-us N         First-arrival micro-batch deadline in us\n"
             "                            (default: %d)\n",
             prog, ffwd_default_batch_wait_us());
@@ -210,6 +211,7 @@ int main(int argc, char *argv[]) {
     int verbose = 0;
     int batch_size = 0;
     int max_batch_tokens = 0;
+    int max_request_tokens = 0;
     int batch_wait_us = -1;
     /* Backend tuning flags parse into opts regardless of backend; the linked
      * backend uses what it supports. */
@@ -279,6 +281,13 @@ int main(int argc, char *argv[]) {
                 free_model_specs(&model_specs);
                 return 1;
             }
+        } else if (!strcmp(f, "--max-request-tokens")) {
+            max_request_tokens = atoi(argv[++arg]);
+            if (max_request_tokens <= 0) {
+                fprintf(stderr, "--max-request-tokens must be > 0\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
         } else if (!strcmp(f, "--batch-wait-us")) {
             batch_wait_us = atoi(argv[++arg]);
             if (batch_wait_us < 0) {
@@ -333,6 +342,7 @@ int main(int argc, char *argv[]) {
         .port = port,
         .batch_size = batch_size > 0 ? batch_size : FFWD_SERVER_DEFAULT_BATCH_SIZE,
         .max_batch_tokens = max_batch_tokens,
+        .max_request_tokens = max_request_tokens,
         .batch_wait_us = batch_wait_us,
         .gpu_quantize_bits = opts.gpu_quant_bits,
         .gpu_quantize_group_size = opts.gpu_quant_group_size,
