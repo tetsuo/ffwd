@@ -30,7 +30,7 @@ ifeq ($(BACKEND),mlx)
     CU_SRCS :=
 else ifeq ($(BACKEND),cuda)
     SRCS := $(CUDA_SRCS)
-    CU_SRCS := cuda.cu
+    CU_SRCS := cuda.cu cuda_sdpa.cu
 else
     SRCS := $(BLAS_SRCS)
     CU_SRCS :=

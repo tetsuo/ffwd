@@ -3,6 +3,8 @@ extern "C" {
 #include "model_types.h"
 }
 
+#include "cuda_sdpa.h"
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -108,6 +110,18 @@ struct ffwd_cuda_ctx {
     void *kexp_bf16; // BF16 K expansion for tensor-core streaming attention
     void *kexp_f16;  // FP16 K expansion for tensor-core streaming attention
     float *vexp;
+    // cuDNN fused attention (cuda_sdpa.h). q16 is the packed 16-bit Q
+    // [total x q_dim]; sdpa_meta holds the per-forward sequence metadata
+    // (lengths + ragged offsets) in one device block, staged by
+    // cuda_upload_packed_inputs and shared by every layer.
+    ffwd_sdpa_t *sdpa;
+    void *q16;
+    int *sdpa_meta;      // device: [seq_len bb][ragged_q bb+1][ragged_kv bb+1]
+    int *sdpa_meta_host; // persistent host mirror for the async upload
+    int sdpa_meta_cap;   // capacity in int entries
+    int sdpa_batch_bucket;
+    int sdpa_smax_bucket;
+    int sdpa_kv_row; // K/V row width in elements the staged ragged_kv assumes
     float *attn_scores;
     void *attn_probs; // BF16 softmax output (bf16 weights)
     long long attn_scores_elems;
@@ -518,7 +532,11 @@ rms_norm_kernel(OUT_T *out, const float *x, const float *weight, int rows, int d
 
 // One grid covers Q and K: blockIdx.y < n_heads selects the Q head with
 // q_norm/q_offset, the remaining blocks the K head with k_norm/k_offset.
+// q16, when non-NULL, receives a packed BF16 copy of the final (normed,
+// rotated) Q rows as [rows x n_heads*head_dim] for the fused-attention path;
+// the store is free here because the kernel already produces every Q element.
 __global__ static void rms_norm_rope_qk_kernel(float *x,
+                                               __nv_bfloat16 *q16,
                                                const float *q_norm,
                                                const float *k_norm,
                                                const int *positions,
@@ -545,6 +563,7 @@ __global__ static void rms_norm_rope_qk_kernel(float *x,
     float sign = tid < half ? -1.0f : 1.0f;
     const float *weight = head < n_heads ? q_norm : k_norm;
     int base_offset = head < n_heads ? q_offset : k_offset;
+    int q_head = head < n_heads ? head : -1;
     if (head >= n_heads)
         head -= n_heads;
     size_t base = (size_t)row * row_stride + base_offset + head * head_dim;
@@ -578,7 +597,11 @@ __global__ static void rms_norm_rope_qk_kernel(float *x,
             a *= inv * weight[tid];
             b *= inv * weight[pair_d];
         }
-        x[base + tid] = a * c + sign * b * s;
+        float r = a * c + sign * b * s;
+        x[base + tid] = r;
+        if (q16 && q_head >= 0)
+            q16[(size_t)row * n_heads * head_dim + (size_t)q_head * head_dim + tid] =
+                __float2bfloat16(r);
     }
 }
 
@@ -597,6 +620,22 @@ silu_mul_packed_kernel(OUT_T *out, int out_stride, const float *gate_up, int row
         float g = gate_up[base + d];
         float u = gate_up[base + intermediate + d];
         store_act(out, (size_t)row * out_stride + d, (g / (1.0f + expf(-g))) * u);
+    }
+}
+
+// Packs the Q columns of the fused QKV projection into a contiguous 16-bit
+// [total x q_dim] tensor for the cuDNN fused-attention path (which needs Q in
+// the same dtype as K/V). The Qwen path gets this for free inside
+// rms_norm_rope_qk_kernel; this kernel serves the families without RoPE.
+template <typename IN_T, typename OUT_T>
+__global__ static void
+pack_q16_kernel(OUT_T *q16, const IN_T *qkv, int total, int q_dim, int qkv_dim, int q_offset) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = total * q_dim;
+    if (i < n) {
+        int row = i / q_dim;
+        int d = i - row * q_dim;
+        q16[i] = (OUT_T)(float)qkv[(size_t)row * qkv_dim + q_offset + d];
     }
 }
 
@@ -2824,6 +2863,20 @@ static int use_streaming_attention(const ffwd_config_t *c, int out_bf16, int hea
     return (mode == 0 || mode == 8) && c->family == FFWD_FAMILY_QWEN3 && out_bf16 && head_dim == 128;
 }
 
+// cuDNN fused attention (cuda_sdpa.h). Unset/1 dispatches the 16-bit flash
+// shapes to cuDNN whenever the runtime supports them; FFWD_CUDA_SDPA=0 forces
+// the built-in kernels (the A/B instrument and the rescue switch).
+static int sdpa_mode(void) {
+    static int init = 0, mode = 0;
+    if (!init) {
+        const char *e = getenv("FFWD_CUDA_SDPA");
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            mode = -1;
+        init = 1;
+    }
+    return mode;
+}
+
 // Grow the F32 weight-widen scratch to hold `elems` floats. The memory-only
 // BF16 path materializes one F32 weight at a time into this buffer.
 static int ensure_weight_f32(ffwd_cuda_ctx_t *ctx, size_t elems) {
@@ -3354,6 +3407,15 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
     int direct_kv_mode = bert_direct_kv_mode();
     int use_bert_direct_kv = use_bert_flash && qkv_dtype != CUDA_DTYPE_F32 &&
                              qkv_dtype == out_dtype && direct_kv_mode >= 0;
+    // cuDNN fused attention takes exactly the shapes the built-in 16-bit flash
+    // kernels would run (same selection gates; FFWD_CUDA_SDPA=0 restores the
+    // hand-written kernels, and any cuDNN refusal falls back to them). It
+    // consumes the staged contiguous K/V, so the BERT direct-QKV read shortcut
+    // is bypassed while it is active.
+    int use_sdpa = sdpa_mode() >= 0 && ctx->sdpa && ctx->q16 && ctx->sdpa_batch_bucket > 0 &&
+                   (use_tc_kexp_bf16 || use_bert_flash);
+    if (use_sdpa)
+        use_bert_direct_kv = 0;
 
     int threads = 256;
     size_t exp_count = (size_t)total * q_dim;
@@ -3404,6 +3466,47 @@ static int cuda_attention_gemm(ffwd_cuda_ctx_t *ctx,
         }
         if (launch_check() != 0)
             return -1;
+    }
+
+    if (use_sdpa) {
+        // Q must match the K/V dtype: the Qwen path already wrote ctx->q16
+        // inside the RoPE kernel; the BERT path packs it here from the
+        // (possibly still F32) fused QKV projection.
+        if (c->family == FFWD_FAMILY_BERT) {
+            size_t n = (size_t)total * q_dim;
+            int blocks = (int)((n + threads - 1) / threads);
+            if (out_dtype == CUDA_DTYPE_F16) {
+                if (qkv_dtype == CUDA_DTYPE_F16)
+                    pack_q16_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                        (__half *)ctx->q16, (const __half *)qkv_src, total, q_dim, qkv_dim, q_offset);
+                else
+                    pack_q16_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                        (__half *)ctx->q16, (const float *)qkv_src, total, q_dim, qkv_dim, q_offset);
+            } else {
+                if (qkv_dtype == CUDA_DTYPE_BF16)
+                    pack_q16_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                        (__nv_bfloat16 *)ctx->q16, (const __nv_bfloat16 *)qkv_src, total, q_dim,
+                        qkv_dim, q_offset);
+                else
+                    pack_q16_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                        (__nv_bfloat16 *)ctx->q16, (const float *)qkv_src, total, q_dim, qkv_dim,
+                        q_offset);
+            }
+            if (launch_check() != 0)
+                return -1;
+        }
+        const void *ksrc = out_dtype == CUDA_DTYPE_F16 ? ctx->kexp_f16 : ctx->kexp_bf16;
+        int bb = ctx->sdpa_batch_bucket;
+        const int32_t *seq = (const int32_t *)ctx->sdpa_meta;
+        const int32_t *rq = seq + bb;
+        const int32_t *rkv = rq + bb + 1;
+        int hkv_eff = ctx->sdpa_kv_row / hd;
+        if (ffwd_sdpa_run(ctx->sdpa, ctx->stream, ctx->q16, ksrc, ctx->vexp, out_16, seq, rq, rkv, bb,
+                          ctx->sdpa_smax_bucket, H, hkv_eff, hd, scale, causal,
+                          out_dtype == CUDA_DTYPE_F16) == 0)
+            return 0;
+        // Unsupported shape or execution failure: the staged K/V and Q remain
+        // valid for the built-in kernels below.
     }
 
     if (use_bert_flash) {
@@ -3765,7 +3868,12 @@ static void bert_cuda_plan(ffwd_cuda_ctx_t *ctx, int total, bert_cuda_plan_t *p)
     int qkv16_mode = bert_qkv16_mode();
     p->qkv16 = p->flash && p->cublaslt_avail && qkv16_mode >= 0 &&
                (qkv16_mode > 0 || total >= BERT_QKV16_MIN_TOKENS);
-    p->direct_kv = p->flash && p->qkv16 && bert_direct_kv_mode() >= 0;
+    // The cuDNN fused-attention path reads staged contiguous K/V, so while it
+    // is a candidate the direct packed-QKV read is not planned and the K/V
+    // expansion buffers stay allocated (the dispatch relies on them, including
+    // for its fallback).
+    p->direct_kv =
+        p->flash && p->qkv16 && bert_direct_kv_mode() >= 0 && !(ctx->sdpa && sdpa_mode() >= 0);
 }
 
 static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_seq) {
@@ -3793,6 +3901,10 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
     int need_act_f16 = ctx->weights_f16;
     int act_cols = 2 * c->intermediate_size;
     int ffn_gate_up_cols = 2 * c->intermediate_size;
+    // Packed 16-bit Q for the cuDNN fused-attention path: any shape whose
+    // 16-bit flash kernel could dispatch to cuDNN needs it staged.
+    int need_q16 = ctx->sdpa && sdpa_mode() >= 0 &&
+                   (is_bert ? bp.flash : (ctx->weights_bf16 && c->head_dim == 128));
 
     if (is_bert) {
         need_x_norm = 0;
@@ -3835,6 +3947,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
     scratch_key |= need_act_f16 << 16;
     scratch_key |= is_bert << 17;
     scratch_key |= (bp.flash ? 1 : 0) << 18;
+    scratch_key |= need_q16 << 19;
 
     if (total > ctx->seq_cap || scratch_key != ctx->scratch_key) {
         cudaFree(ctx->x);
@@ -3853,6 +3966,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         cudaFree(ctx->kexp_bf16);
         cudaFree(ctx->kexp_f16);
         cudaFree(ctx->vexp);
+        cudaFree(ctx->q16);
         cudaFree(ctx->act_bf16);
         cudaFree(ctx->act_f16);
         cudaFree(ctx->rope_cos);
@@ -3870,6 +3984,7 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
         ctx->kexp = ctx->vexp = NULL;
         ctx->kexp_bf16 = NULL;
         ctx->kexp_f16 = NULL;
+        ctx->q16 = NULL;
         ctx->act_bf16 = NULL;
         ctx->act_f16 = NULL;
         ctx->rope_cos = NULL;
@@ -3911,6 +4026,8 @@ static int ensure_buffers(ffwd_cuda_ctx_t *ctx, int total, int batch, int max_se
             CUDA_CHECK(cudaMalloc(&ctx->kexp_f16, (size_t)total * c->q_dim * sizeof(__half)));
         if (need_vexp)
             CUDA_CHECK(cudaMalloc((void **)&ctx->vexp, (size_t)total * c->q_dim * vexp_elem_bytes));
+        if (need_q16)
+            CUDA_CHECK(cudaMalloc(&ctx->q16, (size_t)total * c->q_dim * sizeof(uint16_t)));
         if (need_act_bf16)
             CUDA_CHECK(cudaMalloc(&ctx->act_bf16, (size_t)total * act_cols * sizeof(__nv_bfloat16)));
         if (need_act_f16)
@@ -4118,6 +4235,11 @@ static ffwd_cuda_ctx_t *cuda_ctx_from_model(ffwd_model_t *cpu, int own_cpu) {
         ffwd_cuda_free(ctx);
         return NULL;
     }
+    // cuDNN fused attention; NULL (missing/old libcudnn or FFWD_CUDA_SDPA=0)
+    // keeps the built-in kernels. Only 16-bit weight paths can dispatch to it,
+    // so exact-F32 models skip loading libcudnn entirely.
+    if (sdpa_mode() >= 0 && (ctx->weights_bf16 || ctx->weights_f16))
+        ctx->sdpa = ffwd_sdpa_create();
     // cuBLASLt handle + workspace + a small 16-bit bias scratch for the fused
     // bias/GeLU epilogue GEMMs (the bias is cast to the output dtype per call).
     ctx->lt_ws_bytes = (size_t)32 << 20;
@@ -4213,6 +4335,10 @@ void ffwd_cuda_free(ffwd_cuda_ctx_t *ctx) {
     cudaFree(ctx->kexp_bf16);
     cudaFree(ctx->kexp_f16);
     cudaFree(ctx->vexp);
+    cudaFree(ctx->q16);
+    cudaFree(ctx->sdpa_meta);
+    free(ctx->sdpa_meta_host);
+    ffwd_sdpa_free(ctx->sdpa);
     cudaFree(ctx->act_bf16);
     cudaFree(ctx->act_f16);
     cudaFree(ctx->weight_f32);
@@ -4243,6 +4369,60 @@ const ffwd_config_t *ffwd_cuda_config(const ffwd_cuda_ctx_t *ctx) {
 // Pack inputs into the device scratch every forward shares: token ids, the
 // per-sequence positions 0..L-1, and the batch offsets. Grows scratch via
 // ensure_buffers. Returns the packed token count in *out_total, or -1 on error.
+// Stages the cuDNN fused-attention sequence metadata for one forward pass:
+// per-sequence lengths plus ragged element offsets for Q/O and K/V rows,
+// padded to a power-of-two batch bucket (padded entries are zero-length
+// sequences) so the per-shape graph cache stays small. Layer-invariant, so it
+// runs once per forward and every attention call reuses the device block.
+static int cuda_sdpa_stage_meta(ffwd_cuda_ctx_t *ctx, const int *h_offsets, int batch) {
+    const ffwd_config_t *c = &ctx->config;
+    int total = h_offsets[batch];
+    if ((long long)total * c->q_dim > INT_MAX)
+        return -1; // ragged offsets are int32 element counts
+    int max_L = 0;
+    for (int b = 0; b < batch; b++) {
+        int L = h_offsets[b + 1] - h_offsets[b];
+        if (L > max_L)
+            max_L = L;
+    }
+    int bb = 1;
+    while (bb < batch)
+        bb <<= 1;
+    int smax = 64;
+    while (smax < max_L)
+        smax <<= 1;
+    int kv_row = (c->family == FFWD_FAMILY_QWEN3 && qwen_compact_kv()) ? c->n_kv_heads * c->head_dim
+                                                                       : c->q_dim;
+    int need = bb + 2 * (bb + 1);
+    if (need > ctx->sdpa_meta_cap) {
+        cudaFree(ctx->sdpa_meta);
+        free(ctx->sdpa_meta_host);
+        ctx->sdpa_meta = NULL;
+        ctx->sdpa_meta_cap = 0;
+        ctx->sdpa_meta_host = (int *)malloc((size_t)need * sizeof(int));
+        if (!ctx->sdpa_meta_host)
+            return -1;
+        CUDA_CHECK(cudaMalloc((void **)&ctx->sdpa_meta, (size_t)need * sizeof(int)));
+        ctx->sdpa_meta_cap = need;
+    }
+    int *seq = ctx->sdpa_meta_host;
+    int *rq = seq + bb;
+    int *rkv = rq + bb + 1;
+    for (int b = 0; b < bb; b++)
+        seq[b] = b < batch ? h_offsets[b + 1] - h_offsets[b] : 0;
+    for (int b = 0; b <= bb; b++) {
+        int off = b <= batch ? h_offsets[b] : total;
+        rq[b] = off * c->q_dim;
+        rkv[b] = off * kv_row;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ctx->sdpa_meta, ctx->sdpa_meta_host, (size_t)need * sizeof(int),
+                               cudaMemcpyHostToDevice, ctx->stream));
+    ctx->sdpa_batch_bucket = bb;
+    ctx->sdpa_smax_bucket = smax;
+    ctx->sdpa_kv_row = kv_row;
+    return 0;
+}
+
 static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
                                      const ffwd_input_t *inputs,
                                      int batch,
@@ -4296,6 +4476,11 @@ static int cuda_upload_packed_inputs(ffwd_cuda_ctx_t *ctx,
     if (ce == cudaSuccess)
         ce = cudaMemcpyAsync(ctx->offsets, h_offsets, (size_t)(batch + 1) * sizeof(int),
                              cudaMemcpyHostToDevice, ctx->stream);
+    // Metadata staging failure only disables the cuDNN attention path for this
+    // forward; the built-in kernels do not need it.
+    ctx->sdpa_batch_bucket = 0;
+    if (ce == cudaSuccess && ctx->q16)
+        (void)cuda_sdpa_stage_meta(ctx, h_offsets, batch);
     free(h_offsets);
     free(h_ids);
     free(h_pos);
@@ -4842,9 +5027,9 @@ static int cuda_forward_batch(ffwd_cuda_ctx_t *ctx, const ffwd_input_t *inputs, 
         }
 
         rms_norm_rope_qk_kernel<<<dim3(total, c->n_heads + c->n_kv_heads), 128, 0, ctx->stream>>>(
-            ctx->qkv, l->q_norm, l->k_norm, ctx->positions, ctx->rope_cos, ctx->rope_sin, total,
-            c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim, q_offset, k_offset, c->qk_norm,
-            c->rms_norm_eps);
+            ctx->qkv, (__nv_bfloat16 *)ctx->q16, l->q_norm, l->k_norm, ctx->positions, ctx->rope_cos,
+            ctx->rope_sin, total, c->n_heads, c->n_kv_heads, c->head_dim, qkv_dim, q_offset, k_offset,
+            c->qk_norm, c->rms_norm_eps);
         if (launch_check() != 0)
             return -1;
 

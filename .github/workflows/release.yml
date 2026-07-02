@@ -144,6 +144,16 @@ jobs:
       with:
         cuda: '12.8.0'
 
+    # cuDNN headers for the fused-attention path (libffwd/cuda_sdpa.cu). Only
+    # the headers are needed: libcudnn is dlopen'd at runtime. The pip wheel is
+    # the most reliable cross-runner source for them.
+    - name: Install cuDNN headers
+      run: |
+        python3 -m pip install --user nvidia-cudnn-cu12
+        CUDNN_INC="$(python3 -c 'import os, nvidia.cudnn; print(os.path.join(nvidia.cudnn.__path__[0], "include"))')"
+        test -f "$CUDNN_INC/cudnn.h"
+        echo "CUDNN_INC=$CUDNN_INC" >> "$GITHUB_ENV"
+
     - name: Build release artifacts
       env:
         CC: ccache gcc

@@ -120,9 +120,33 @@ MLX_BACKEND_LDFLAGS  = -framework Metal -framework Foundation \
                        -L$(MLXC_PREFIX)/lib -lmlxc \
                        -L$(MLX_PREFIX)/lib -lmlx \
                        -Wl,-rpath,$(MLX_PREFIX)/lib -Wl,-rpath,$(MLXC_PREFIX)/lib
+# cuDNN fused attention (libffwd/cuda_sdpa.cu): compiles against the vendored
+# cudnn-frontend headers and dlopens libcudnn at runtime, so only cudnn.h is
+# needed and only at build time. CUDNN_INC overrides the probe below (point it
+# at the directory containing cudnn.h, e.g. a pip nvidia-cudnn-cu12 wheel's
+# include/); when no cudnn.h is found the CUDA backend builds without the
+# fused path and keeps the built-in kernels.
+CUDNN_INC ?=
+ifeq ($(strip $(CUDNN_INC)),)
+    CUDNN_H := $(firstword $(wildcard /usr/include/cudnn.h \
+                 /usr/include/x86_64-linux-gnu/cudnn.h $(CUDA_HOME)/include/cudnn.h))
+    ifneq ($(strip $(CUDNN_H)),)
+        CUDNN_INC := $(patsubst %/,%,$(dir $(CUDNN_H)))
+    endif
+endif
+ifneq ($(strip $(CUDNN_INC)),)
+    CUDNN_SDPA_CFLAGS = -I$(ROOT)/deps/cudnn-frontend/include -I$(CUDNN_INC) \
+                        -DFFWD_CUDA_SDPA=1 -DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+else
+    CUDNN_SDPA_CFLAGS =
+endif
+
 CUDA_BACKEND_CFLAGS  = -DUSE_BLAS -DUSE_OPENBLAS -DUSE_GPU $(OPENBLAS_CFLAGS) \
-                       -I$(CUDA_HOME)/include
-CUDA_BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 $(OPENBLAS_LDFLAGS) -lcudart -lcublas -lcublasLt
+                       -I$(CUDA_HOME)/include $(CUDNN_SDPA_CFLAGS)
+# -lstdc++: cuda_sdpa.o uses the C++ runtime (cudnn-frontend), and the tools
+# link with the C driver.
+CUDA_BACKEND_LDFLAGS = -L$(CUDA_HOME)/lib64 $(OPENBLAS_LDFLAGS) -lcudart -lcublas -lcublasLt \
+                       -ldl -lstdc++
 
 ifeq ($(BACKEND),blas)
     BACKEND_CFLAGS  = $(BLAS_BACKEND_CFLAGS)
