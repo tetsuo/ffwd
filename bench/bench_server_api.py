@@ -56,10 +56,18 @@ def cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def make_input(request_id: int, texts_per_request: int) -> list[str]:
+def make_input(request_id: int, texts_per_request: int,
+               tokens_per_text: int = 0) -> list[str]:
     out = []
     for i in range(texts_per_request):
-        out.append(TEXTS[(request_id + i) % len(TEXTS)])
+        if tokens_per_text > 0:
+            # One common word per token, with a distinct prefix so batch entries
+            # are not identical. Special tokens push the exact count slightly
+            # above the target; throughput is reported from usage tokens anyway.
+            word = TEXTS[(request_id + i) % len(TEXTS)].split()[0]
+            out.append(" ".join([word] + ["hello"] * (tokens_per_text - 1)))
+        else:
+            out.append(TEXTS[(request_id + i) % len(TEXTS)])
     return out
 
 
@@ -103,7 +111,8 @@ def parse_server_timing(value: str | None) -> dict[str, float]:
 def post_embeddings(args: argparse.Namespace, request_id: int,
                     texts: list[str] | None = None) -> tuple[float, int, int, dict[str, float]]:
     if texts is None:
-        texts = make_input(request_id, args.texts_per_request)
+        texts = make_input(request_id, args.texts_per_request,
+                           getattr(args, "tokens_per_text", 0))
     payload = {
         "model": args.model,
         "dimensions": args.dimensions,
@@ -151,9 +160,16 @@ def post_embeddings(args: argparse.Namespace, request_id: int,
     for i, row in enumerate(rows):
         if row["index"] != i:
             raise RuntimeError(f"bad index at request {request_id}: {row['index']} != {i}")
-        raw = base64.b64decode(row["embedding"])
-        if len(raw) != args.dimensions:
-            raise RuntimeError(f"bad decoded length: {len(raw)} != {args.dimensions}")
+        emb = row["embedding"]
+        if isinstance(emb, list):
+            # OpenAI-family float output.
+            if len(emb) != args.dimensions:
+                raise RuntimeError(f"bad embedding length: {len(emb)} != {args.dimensions}")
+        else:
+            # Base64: int8 (1 byte/dim, pplx) or float32 (4 bytes/dim, OpenAI).
+            raw = base64.b64decode(emb)
+            if len(raw) not in (args.dimensions, 4 * args.dimensions):
+                raise RuntimeError(f"bad decoded length: {len(raw)} != {args.dimensions}")
 
     return elapsed_ms, len(texts), int(data["usage"]["prompt_tokens"]), timing
 
@@ -203,6 +219,8 @@ def main() -> int:
     ap.add_argument("--requests", type=int, default=100)
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--texts-per-request", type=int, default=1)
+    ap.add_argument("--tokens-per-text", type=int, default=0,
+                    help="synthesize inputs of about this many tokens instead of the stock texts")
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--server-pid", type=int)
     ap.add_argument("--verify-ranking", action="store_true")
