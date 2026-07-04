@@ -39,7 +39,9 @@ typedef struct {
     int port;
     int batch_size;
     int max_batch_tokens;
-    int max_request_tokens; /* per-request total-token cap; 0 = default 120000 */
+    int max_request_tokens;      /* per-request total-token cap; 0 = default 120000 */
+    int max_concurrent_requests; /* in-flight request cap before 429; 0 = default 512 */
+    int auto_truncate;           /* truncate over-long inputs instead of rejecting them */
     int batch_wait_us;
     /* GPU build tuning; ignored by backends that do not use it. */
     int gpu_quantize_bits;

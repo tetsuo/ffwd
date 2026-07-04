@@ -94,6 +94,21 @@ void dispatch_request(client *c) {
         return;
     }
 
+    /* Admission control: beyond the in-flight cap, shed load with an immediate
+     * 429 instead of queueing without bound. The counter lives on the event
+     * loop thread (incremented here, decremented in completion_cb), so no lock
+     * is needed. */
+    if (c->srv->inflight_jobs >= c->srv->max_concurrent_requests) {
+        size_t len;
+        char *body = json_error_body("server is overloaded", "overloaded_error", &len);
+        append_http_response(c, 429, "application/json", body, len);
+        free(body);
+        if (queue_write(c) != AE_OK)
+            close_client(c);
+        return;
+    }
+    c->srv->inflight_jobs++;
+
     job *j = xcalloc(1, sizeof(*j));
     j->srv = c->srv;
     j->c = c;
@@ -343,6 +358,9 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         cfg->max_batch_tokens > 0 ? cfg->max_batch_tokens : FFWD_SERVER_DEFAULT_MAX_BATCH_TOKENS;
     s.max_request_tokens =
         cfg->max_request_tokens > 0 ? cfg->max_request_tokens : FFWD_API_MAX_TOTAL_TOKENS;
+    s.max_concurrent_requests = cfg->max_concurrent_requests > 0 ? cfg->max_concurrent_requests
+                                                                 : FFWD_SERVER_DEFAULT_MAX_CONCURRENT;
+    s.auto_truncate = cfg->auto_truncate ? 1 : 0;
     s.batch_wait_us = cfg->batch_wait_us >= 0 ? cfg->batch_wait_us : ffwd_default_batch_wait_us();
     s.backend_opts = backend_opts;
     if (cfg->api_key && cfg->api_key[0])
@@ -458,6 +476,18 @@ int ffwd_run_server(const ffwd_server_config_t *cfg) {
         pthread_cond_destroy(&s.cv);
         pthread_mutex_destroy(&s.mu);
         return 1;
+    }
+
+    /* Capacity line per model, after worker init so a GPU build has finalized
+     * the config: the effective per-input token cap and the batch shape make
+     * the serving envelope visible at startup. */
+    for (int i = 0; i < s.n_models; i++) {
+        loaded_model *m = &s.models[i];
+        server_log("ffwd-server: model %s: max %d tokens per input%s, batch budget %d tokens x %d "
+                   "rows, max %d concurrent requests",
+                   m->info->id, model_item_token_cap(m->info, s.max_batch_tokens),
+                   s.auto_truncate ? " (auto-truncate)" : "", s.max_batch_tokens, s.batch_size,
+                   s.max_concurrent_requests);
     }
 
     /* Started after worker init so the tokenizer sees a finalized model config

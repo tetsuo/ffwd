@@ -39,9 +39,14 @@ static void print_usage(const char *prog) {
             "                            (default: 32)\n"
             "  --max-batch-tokens N      Max tokens per inference batch (default: 16384)\n"
             "  --max-request-tokens N    Max total tokens per API request (default: 120000)\n"
+            "  --max-concurrent-requests N\n"
+            "                            In-flight request cap; excess requests get 429\n"
+            "                            (default: %d)\n"
+            "  --auto-truncate           Truncate inputs that exceed the per-input token\n"
+            "                            cap instead of rejecting them with 422\n"
             "  --batch-wait-us N         First-arrival micro-batch deadline in us\n"
             "                            (default: %d)\n",
-            prog, ffwd_default_batch_wait_us());
+            prog, FFWD_SERVER_DEFAULT_MAX_CONCURRENT, ffwd_default_batch_wait_us());
     ffwd_server_help(stderr);
     fprintf(stderr,
             "  -v, --verbose             Verbose (-vv for debug)\n"
@@ -212,6 +217,8 @@ int main(int argc, char *argv[]) {
     int batch_size = 0;
     int max_batch_tokens = 0;
     int max_request_tokens = 0;
+    int max_concurrent_requests = 0;
+    int auto_truncate = 0;
     int batch_wait_us = -1;
     /* Backend tuning flags parse into opts regardless of backend; the linked
      * backend uses what it supports. */
@@ -288,6 +295,15 @@ int main(int argc, char *argv[]) {
                 free_model_specs(&model_specs);
                 return 1;
             }
+        } else if (!strcmp(f, "--max-concurrent-requests")) {
+            max_concurrent_requests = atoi(argv[++arg]);
+            if (max_concurrent_requests <= 0) {
+                fprintf(stderr, "--max-concurrent-requests must be > 0\n");
+                free_model_specs(&model_specs);
+                return 1;
+            }
+        } else if (!strcmp(f, "--auto-truncate")) {
+            auto_truncate = 1;
         } else if (!strcmp(f, "--batch-wait-us")) {
             batch_wait_us = atoi(argv[++arg]);
             if (batch_wait_us < 0) {
@@ -343,6 +359,8 @@ int main(int argc, char *argv[]) {
         .batch_size = batch_size > 0 ? batch_size : FFWD_SERVER_DEFAULT_BATCH_SIZE,
         .max_batch_tokens = max_batch_tokens,
         .max_request_tokens = max_request_tokens,
+        .max_concurrent_requests = max_concurrent_requests,
+        .auto_truncate = auto_truncate,
         .batch_wait_us = batch_wait_us,
         .gpu_quantize_bits = opts.gpu_quant_bits,
         .gpu_quantize_group_size = opts.gpu_quant_group_size,

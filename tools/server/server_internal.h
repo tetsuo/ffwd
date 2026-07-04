@@ -42,6 +42,9 @@
  * was no faster and inflated long-document tail latency. */
 #define FFWD_SERVER_DEFAULT_BATCH_SIZE       32
 #define FFWD_SERVER_DEFAULT_MAX_BATCH_TOKENS 16384
+/* In-flight request cap; dispatch answers 429 beyond it so overload sheds load
+ * instead of growing the job queues without bound. */
+#define FFWD_SERVER_DEFAULT_MAX_CONCURRENT 512
 /* Microseconds the worker waits for more requests before dispatching a batch.
  * CUDA uses a 1 ms window so arrivals group into one launch and keep the GPU
  * busy; MLX and CPU dispatch immediately, where waiting only adds latency.
@@ -65,6 +68,13 @@ typedef struct {
     int dim;
     int min_dim;
     int token_dim;
+    /* Positional capacity in tokens (max_position_embeddings minus the
+     * position-id offset); 0 when the config does not state one. Inputs past
+     * this fail in the forward pass, so admission enforces it up front. */
+    int max_seq_tokens;
+    /* The token layout ends with a required special token ([SEP], </s>, or the
+     * Qwen terminal) that truncation must keep as the final token. */
+    int truncate_keep_tail;
     ffwd_attention_mode_t attention_mode;
     ffwd_pooling_mode_t pooling_mode;
     int normalize_embeddings;
@@ -92,7 +102,10 @@ typedef struct {
     int port;
     int batch_size;
     int max_batch_tokens;
-    int max_request_tokens; // per-request total-token cap (FFWD_API_MAX_TOTAL_TOKENS default)
+    int max_request_tokens;      // per-request total-token cap (FFWD_API_MAX_TOTAL_TOKENS default)
+    int max_concurrent_requests; // in-flight request cap; dispatch answers 429 beyond it
+    int inflight_jobs;           // loop-thread only: jobs created and not yet completed
+    int auto_truncate;           // truncate over-long inputs instead of rejecting them
     int batch_wait_us;
     char *api_key;
     loaded_model *models;
@@ -312,6 +325,8 @@ void embedding_request_free(embedding_request *r);
 void contextual_request_free(contextual_request *r);
 void late_tokens_free(late_tokens *t);
 void rerank_request_free(rerank_request *r);
+int model_item_token_cap(const model_info *info, int max_batch_tokens);
+void truncate_token_buf(token_buf *t, int cap, int keep_tail);
 /* Thin timing wrappers over libffwd's ffwd_tokenize/ffwd_tokenize_late. */
 int tokenize_one(loaded_model *m, job *j, const char *text, token_buf *out);
 int tokenize_input(

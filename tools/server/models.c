@@ -197,6 +197,31 @@ void rerank_request_free(rerank_request *r) {
     memset(r, 0, sizeof(*r));
 }
 
+/* Largest token count one input may carry for a model: the smallest of the
+ * model's positional capacity, the API item cap, and the per-batch token
+ * budget. Including the batch budget keeps --max-batch-tokens an honest bound
+ * on a single inference launch; without it a lone oversized input would run as
+ * a batch bigger than the configured budget. */
+int model_item_token_cap(const model_info *info, int max_batch_tokens) {
+    int cap = FFWD_API_MAX_ITEM_TOKENS;
+    if (info && info->max_seq_tokens > 0 && info->max_seq_tokens < cap)
+        cap = info->max_seq_tokens;
+    if (max_batch_tokens > 0 && max_batch_tokens < cap)
+        cap = max_batch_tokens;
+    return cap;
+}
+
+/* Cut a tokenized input to cap tokens. When the layout ends with a required
+ * special token ([SEP], </s>, or the Qwen terminal), that token moves to the
+ * new end so the truncated sequence keeps a valid layout. */
+void truncate_token_buf(token_buf *t, int cap, int keep_tail) {
+    if (!t || !t->ids || cap <= 0 || t->n_tokens <= cap)
+        return;
+    if (keep_tail)
+        t->ids[cap - 1] = t->ids[t->n_tokens - 1];
+    t->n_tokens = cap;
+}
+
 /* Thin wrappers that add server per-stage timing to the tokenization job.
  * Request handlers call them unchanged. */
 int tokenize_input(
@@ -277,6 +302,15 @@ int configure_loaded_model(loaded_model *m, const ffwd_config_t *config, int tok
     m->info->dim = config->hidden_size;
     m->info->min_dim = min_dim;
     m->info->token_dim = token_dim;
+    /* Positional capacity: BERT-family positions live in a learned table of
+     * max_position_embeddings rows starting at position_id_offset; RoPE models
+     * state a trained context length. 0 (absent) means no model-side cap. */
+    m->info->max_seq_tokens = 0;
+    if (config->max_position_embeddings > 0) {
+        int cap = config->max_position_embeddings - config->position_id_offset;
+        m->info->max_seq_tokens = cap > 0 ? cap : 0;
+    }
+    m->info->truncate_keep_tail = config->family == FFWD_FAMILY_BERT || config->append_terminal_token;
     m->info->attention_mode = config->attention_mode;
     m->info->pooling_mode = config->pooling_mode;
     m->info->normalize_embeddings = config->normalize_embeddings;

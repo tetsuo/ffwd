@@ -288,6 +288,26 @@ static int validate_common(yyjson_val *root,
     return 0;
 }
 
+/* Apply the per-item token cap after tokenization: truncate when the server
+ * policy allows it, otherwise record a 422 validation error. Returns 0 when
+ * the input is admitted. Enforced at admission because an over-capacity
+ * sequence fails inside the forward pass, which would fail every request
+ * merged into the same batch. */
+static int admit_input_tokens(
+    http_server *s, const loaded_model *m, token_buf *t, yyjson_mut_doc *detail, const char *loc) {
+    int cap = model_item_token_cap(m->info, s->max_batch_tokens);
+    if (t->n_tokens <= cap)
+        return 0;
+    if (s->auto_truncate) {
+        truncate_token_buf(t, cap, m->info->truncate_keep_tail);
+        return 0;
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "input exceeds %d token limit", cap);
+    ve_add(detail, loc, msg, "value_error.context_length");
+    return -1;
+}
+
 void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, embedding_request *out) {
     memset(out, 0, sizeof(*out));
     out->j = j;
@@ -353,13 +373,11 @@ void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, emb
             if (tokenize_input(m, j, single, query_instruct, &out->tokens[0]) != 0) {
                 ve_add(detail, "[\"body\",\"input\"]", "tokenization failed",
                        "value_error.tokenization");
-            } else {
+            } else if (admit_input_tokens(s, m, &out->tokens[0], detail, "[\"body\",\"input\"]") ==
+                       0) {
                 out->inputs[0].ids = out->tokens[0].ids;
                 out->inputs[0].n_tokens = out->tokens[0].n_tokens;
                 out->total_tokens = out->tokens[0].n_tokens;
-                if (out->tokens[0].n_tokens > FFWD_API_MAX_ITEM_TOKENS)
-                    ve_add(detail, "[\"body\",\"input\"]", "input exceeds 32768 token limit",
-                           "value_error.context_length");
             }
         } else {
             size_t idx, max;
@@ -374,13 +392,10 @@ void prepare_embedding_request(job *j, yyjson_doc *root_doc, http_server *s, emb
                 }
                 if (tokenize_input(m, j, text, query_instruct, &out->tokens[idx]) != 0) {
                     ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
-                } else {
+                } else if (admit_input_tokens(s, m, &out->tokens[idx], detail, loc) == 0) {
                     out->inputs[idx].ids = out->tokens[idx].ids;
                     out->inputs[idx].n_tokens = out->tokens[idx].n_tokens;
                     out->total_tokens += out->tokens[idx].n_tokens;
-                    if (out->tokens[idx].n_tokens > FFWD_API_MAX_ITEM_TOKENS)
-                        ve_add(detail, loc, "input exceeds 32768 token limit",
-                               "value_error.context_length");
                 }
             }
         }
@@ -474,6 +489,11 @@ void prepare_contextual_request(job *j,
     }
 
     if (ve_count(detail) == 0 && m) {
+        /* A packed document (chunks joined by separators) must fit the model
+         * and the batch budget like any other sequence. Truncation is not
+         * offered here: cutting the packed stream would drop chunks whose
+         * embeddings the response is required to contain. */
+        int item_cap = model_item_token_cap(m->info, s->max_batch_tokens);
         out->n_docs = n_docs;
         out->docs = xcalloc((size_t)n_docs, sizeof(*out->docs));
         int64_t request_tokens = 0;
@@ -501,11 +521,12 @@ void prepare_contextual_request(job *j,
                 }
             }
 
-            if (doc_tokens > FFWD_API_MAX_ITEM_TOKENS) {
+            if (doc_tokens > item_cap) {
                 char loc[64];
                 snprintf(loc, sizeof(loc), "[\"body\",\"input\",%d]", (int)di);
-                ve_add(detail, loc, "document exceeds 32768 token limit",
-                       "value_error.context_length");
+                char msg[64];
+                snprintf(msg, sizeof(msg), "document exceeds %d token limit", item_cap);
+                ve_add(detail, loc, msg, "value_error.context_length");
                 doc_valid = 0;
             }
             request_tokens += doc_tokens;
@@ -663,15 +684,20 @@ void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank
     }
 
     if (ve_count(detail) == 0 && out->model) {
+        /* Late-interaction sequences carry keep masks alongside the ids, so
+         * truncation is not offered; over-capacity inputs are rejected. */
+        int item_cap = model_item_token_cap(out->model->info, s->max_batch_tokens);
+        char cap_msg[64];
         out->n_documents = n_documents;
         out->documents = xcalloc((size_t)n_documents, sizeof(*out->documents));
         if (tokenize_late_text(out->model, j, query_str, 1, &out->query) != 0) {
             ve_add(detail, "[\"body\",\"query\"]", "tokenization failed", "value_error.tokenization");
         } else {
             out->query_tokens = out->query.n_tokens;
-            if (out->query_tokens > FFWD_API_MAX_ITEM_TOKENS)
-                ve_add(detail, "[\"body\",\"query\"]", "query exceeds 32768 token limit",
-                       "value_error.context_length");
+            if (out->query_tokens > item_cap) {
+                snprintf(cap_msg, sizeof(cap_msg), "query exceeds %d token limit", item_cap);
+                ve_add(detail, "[\"body\",\"query\"]", cap_msg, "value_error.context_length");
+            }
         }
 
         size_t i, dmax;
@@ -684,9 +710,10 @@ void prepare_rerank_request(job *j, yyjson_doc *root_doc, http_server *s, rerank
                 ve_add(detail, loc, "tokenization failed", "value_error.tokenization");
             } else {
                 int n = out->documents[i].n_tokens;
-                if (n > FFWD_API_MAX_ITEM_TOKENS)
-                    ve_add(detail, loc, "document exceeds 32768 token limit",
-                           "value_error.context_length");
+                if (n > item_cap) {
+                    snprintf(cap_msg, sizeof(cap_msg), "document exceeds %d token limit", item_cap);
+                    ve_add(detail, loc, cap_msg, "value_error.context_length");
+                }
                 if (out->document_tokens <= INT_MAX - n)
                     out->document_tokens += n;
                 else

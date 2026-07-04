@@ -250,6 +250,8 @@ void completion_cb(aeEventLoop *loop, int fd, void *clientData, int mask) {
 
     job *j;
     while ((j = pop_done(s)) != NULL) {
+        /* Every admitted job ends here; release its admission slot. */
+        s->inflight_jobs--;
         client *c = j->c;
         int refs_to_drop = 1; /* job reference */
         if (!c->cancelled) {

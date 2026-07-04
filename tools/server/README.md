@@ -58,7 +58,9 @@ Run `./ffwd-server --help` for the exact, current list. Some important flags:
 | `--port PORT`              | -           | Listen port.                                                                      |
 | `-t, --threads N`          | backend     | Worker thread count for CPU inference.                                            |
 | `-b, --batch-size N`       | `32`        | Max texts or contextual documents per inference micro-batch.                      |
-| `--max-batch-tokens N`     | `16384`     | Token budget per batch (packed for CPU, padded dense rows for MLX).               |
+| `--max-batch-tokens N`     | `16384`     | Token budget per batch (packed for CPU, padded dense rows for MLX). Also caps a single input. |
+| `--max-concurrent-requests N` | `512`    | In-flight request cap; excess requests are answered `429` immediately.            |
+| `--auto-truncate`          | off         | Truncate inputs that exceed the per-input token cap instead of rejecting them.    |
 | `--batch-wait-us N`        | backend     | Micro-batch deadline from the first request's arrival (CPU/MLX `0`, CUDA `1000`). |
 | `--memory-utilization F`   | `0.90`      | Fraction of physical memory the MLX load preflight may plan for.                  |
 | `--gpu-quant-bits N`       | off         | MLX: quantize transformer linear weights at load. Opt-in, approximate.            |
@@ -236,7 +238,16 @@ curl http://127.0.0.1:8000/v1/rerank \
 
 ### Limits and errors
 
-- A request allows up to 512 inputs (1000 documents for `/v1/rerank`), 32768
-  tokens per item, 120000 tokens total, and a 64 MiB body.
+- A request allows up to 512 inputs (1000 documents for `/v1/rerank`), 120000
+  tokens total, and a 64 MiB body.
+- Each input (or packed contextual document, or rerank text) is capped at the
+  smallest of: the model's positional capacity (for example 512 for BERT
+  encoders), `--max-batch-tokens`, and 32768. Inputs past the cap return `422`
+  (`value_error.context_length`, the message states the cap), or are truncated
+  to it when the server runs with `--auto-truncate`. Truncation preserves the
+  model's trailing special token. The server logs each model's effective cap
+  at startup.
 - Invalid input returns `422` with a `detail` list naming the offending field.
   Unknown labels, and labels loaded for another endpoint, also return `422`.
+- Beyond `--max-concurrent-requests` in-flight requests, new requests return
+  `429` immediately instead of queueing; retry with backoff.
