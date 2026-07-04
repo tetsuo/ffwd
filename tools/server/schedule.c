@@ -131,6 +131,23 @@ static int cond_wait_until_ns(pthread_cond_t *cv, pthread_mutex_t *mu, uint64_t 
     return pthread_cond_timedwait(cv, mu, &abs);
 }
 
+/* Tokenized size of a queued job, for bounding the collect window. Jobs reach
+ * the queue through the tokenizer thread, so prep is already filled; a parse
+ * or validation failure leaves prep NULL and counts as 0. */
+static int64_t job_prep_tokens(const job *j) {
+    if (!j->prep)
+        return 0;
+    if (j->prep_kind == 1)
+        return ((const embedding_request *)j->prep)->total_tokens;
+    if (j->prep_kind == 2)
+        return ((const contextual_request *)j->prep)->total_tokens;
+    if (j->prep_kind == 3) {
+        const rerank_request *r = j->prep;
+        return (int64_t)r->query_tokens + r->document_tokens;
+    }
+    return 0;
+}
+
 int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
     if (max_jobs <= 0)
         return 0;
@@ -159,6 +176,7 @@ int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
     uint64_t wait_ns = (uint64_t)s->batch_wait_us * 1000u;
     uint64_t deadline_ns =
         first->created_ns > UINT64_MAX - wait_ns ? UINT64_MAX : first->created_ns + wait_ns;
+    int64_t window_tokens = job_prep_tokens(first);
     while (n < max_jobs) {
         while (!s->job_head && !s->stopping && wait_ns > 0) {
             int rc = cond_wait_until_ns(&s->cv, &s->mu, deadline_ns);
@@ -169,6 +187,15 @@ int collect_job_batch(http_server *s, job **jobs, int max_jobs) {
             break;
         if (wait_ns > 0 && s->job_head->created_ns > deadline_ns)
             break;
+        /* Stop the window at one token budget so the worker returns to the
+         * queue after about one execution group. Requests that arrive while a
+         * group runs then join the very next window instead of waiting for
+         * everything collected here to finish. */
+        int64_t next_tokens = job_prep_tokens(s->job_head);
+        if (s->max_batch_tokens > 0 && window_tokens > 0 && next_tokens > 0 &&
+            window_tokens + next_tokens > s->max_batch_tokens)
+            break;
+        window_tokens += next_tokens;
         jobs[n++] = pop_job_locked(s);
         if (wait_ns == 0 && !s->job_head)
             break;

@@ -66,8 +66,44 @@ static void test_collect_job_batch_zero_wait(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+static void test_collect_job_batch_token_budget(void) {
+    http_server s;
+    memset(&s, 0, sizeof(s));
+    s.batch_size = 32;
+    s.max_batch_tokens = 1000;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+
+    /* 600 + 300 fit the 1000-token window; the 200-token job must wait for
+     * the next window. */
+    embedding_request r1 = {.total_tokens = 600};
+    embedding_request r2 = {.total_tokens = 300};
+    embedding_request r3 = {.total_tokens = 200};
+    job a = {.srv = &s, .tokenized = 1, .prep_kind = 1, .prep = &r1};
+    job b = {.srv = &s, .tokenized = 1, .prep_kind = 1, .prep = &r2};
+    job c = {.srv = &s, .tokenized = 1, .prep_kind = 1, .prep = &r3};
+    snprintf(a.path, sizeof(a.path), "%s", "/v1/embeddings");
+    snprintf(b.path, sizeof(b.path), "%s", "/v1/embeddings");
+    snprintf(c.path, sizeof(c.path), "%s", "/v1/embeddings");
+    enqueue_job(&a);
+    enqueue_job(&b);
+    enqueue_job(&c);
+
+    job *batch[3] = {0};
+    TEST_ASSERT(collect_job_batch(&s, batch, 3) == 2);
+    TEST_ASSERT(batch[0] == &a);
+    TEST_ASSERT(batch[1] == &b);
+    TEST_ASSERT(s.job_head == &c);
+
+    s.job_head = NULL;
+    s.job_tail = NULL;
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.mu);
+}
+
 int main(void) {
     test_collect_job_batch_deadline();
     test_collect_job_batch_zero_wait();
+    test_collect_job_batch_token_budget();
     return TEST_REPORT("schedule");
 }
