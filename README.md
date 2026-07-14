@@ -53,32 +53,6 @@ Once the dependencies are in place, build the project by running:
 make  # or make gpu for GPU build
 ```
 
-## Performance
-
-When comparing ffwd with other open-source solutions, the main differentiator in
-terms of speed is attention performance.
-
-ffwd implements custom FlashAttention-style CUDA kernels from scratch (optimized
-for Blackwell and Ada architectures), without relying on libraries such as
-CUTLASS or cuDNN.
-
-It is very fast and competitive at short and medium context lengths, up to
-around 16k tokens for Qwen3, mainly because the work surrounding the attention
-kernel is kept extremely low-overhead.
-
-However, once pushed toward saturation, especially with a single long context or
-very large batches, the bottleneck becomes attention-kernel throughput.
-Unsurprisingly, this is where engines such as TEI, which leverages CuTe-based
-[Flash Attention](https://github.com/HazyResearch/flash-attention), began to
-outperform ffwd in my benchmarks.
-
-That said, the v0.2.0 release was also a useful reality check and a good
-learning experience: it is very hard to beat machine-generated kernels, no
-matter how many sub-agents you fork to benchmark and hypertune your code across
-architectures 😄 At some point, you either end up writing a DSL or moving toward
-heavily templated code, which is exactly what these libraries are designed to
-provide.
-
 ## Acknowledgements
 
 - This project started as a fork of
