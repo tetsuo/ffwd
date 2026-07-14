@@ -1,34 +1,24 @@
 # ffwd
 
-ffwd is a lightweight inference engine for transformer-based text embedding
-models.
+Super fast inference server for transformer-based text embedding models.
 
-It runs on NVIDIA and Apple silicon GPUs, as well as x86 and arm64 CPUs with
-BLAS acceleration.
+It runs on NVIDIA and Apple silicon GPUs, as well as CPU-only hosts with BLAS
+acceleration. It's mostly tested on Blackwell, Ada, and Apple M4 GPUs, but
+should work with any CUDA or Metal capable device.
 
-ffwd supports Qwen3 embedding models such as `Qwen3-Embedding`, the
+Supported models include Qwen3 embedding models such as `Qwen3-Embedding`, the
 `pplx-embed-v1` family, Qwen2 models such as `GTE-Qwen2`, and BERT/RoBERTa-style
 encoders including `BERT`, `BGE`, `MiniLM`, `XLM-R`, `multilingual-E5`, and
 `Snowflake Arctic`.
 
-#### Components
-
-- [libffwd](./libffwd) is the core embedding inference library. It provides
-  kernels, tokenizers, and model loading.
-- [ffwd-server](./tools/server) is an HTTP server that provides OpenAI and
-  Perplexity compatible embedding APIs, including support for late-interaction
-  and contextualized embeddings.
-- [ffwd-cli](./tools/cli) is a command-line tool for generating embeddings and
-  computing cosine similarity.
-
 ## Installation
 
-You can download the latest ffwd build for your platform from the
+Download the latest build for your platform from the
 [releases](https://github.com/tetsuo/ffwd/releases) page.
 
 ffwd supports models in
-[safetensors](https://huggingface.co/docs/safetensors/index) format. Download
-compatible models from Hugging Face using the
+[safetensors](https://huggingface.co/docs/safetensors/index) format. You can
+download compatible models from Hugging Face using the
 [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
 
 ## Building
@@ -47,7 +37,7 @@ make  # or make gpu for GPU build
 
 ## Getting started
 
-Start a server with one or more models loaded, each with a label:
+You can start the server with one or more models loaded, each with a label:
 
 ```bash
 ffwd-server \
